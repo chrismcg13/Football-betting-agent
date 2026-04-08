@@ -1,0 +1,56 @@
+Create the REST API that the dashboard will consume.
+
+Create src/routes/api.ts with these endpoints:
+
+GET /api/dashboard/summary
+Returns: current bankroll, starting bankroll (500), total P&L, total P&L percentage, agent_status, total_bets, wins, losses, voids, win_percentage, overall_roi_percentage, today_pnl, this_week_pnl, active_bets_count
+
+GET /api/dashboard/performance
+Returns: daily P&L for the last 30 days (for a line chart), cumulative profit over time, win rate by week
+
+GET /api/dashboard/bets?page=1&limit=20&status=all
+Returns: paginated bet history with all fields including model reasoning (model_probability, betfair_implied_probability, calculated_edge), match details, outcome. Sorted by placed_at descending.
+
+GET /api/dashboard/bets/by-league
+Returns: bets grouped by league with: count, wins, losses, win_rate, total_pnl, roi for each league
+
+GET /api/dashboard/bets/by-market
+Returns: bets grouped by market_type with: count, wins, losses, win_rate, total_pnl, roi for each market type
+
+GET /api/dashboard/viability
+Returns the £499 viability calculation:
+- avg_roi_per_bet (net of 2% commission)
+- bets_per_week
+- avg_stake
+- projected_monthly_profit_conservative (50% of paper ROI)
+- projected_monthly_profit_moderate (75%)
+- projected_monthly_profit_optimistic (100%)
+- months_to_recoup_conservative
+- months_to_recoup_moderate
+- months_to_recoup_optimistic
+- minimum_bankroll_for_2month_recoup
+- traffic_light_signal (GREEN/AMBER/RED based on: GREEN = conservative < 2 months, AMBER = moderate < 2 months, RED = optimistic > 2 months)
+- total_settled_bets
+- paper_trading_days
+
+GET /api/dashboard/narratives?limit=20
+Returns: recent learning narratives sorted by created_at descending
+
+GET /api/dashboard/model
+Returns: current model version, accuracy, calibration, top 10 feature importances, accuracy history over time (for a line chart)
+
+GET /api/compliance/logs?page=1&limit=50&action_type=all
+Returns: paginated compliance logs with all details
+
+GET /api/compliance/export?format=csv
+Returns: full compliance log as downloadable CSV
+
+POST /api/agent/control
+Body: { action: "start" | "pause" | "stop" }
+Manually control the agent. Logs all control actions to compliance_logs.
+
+POST /api/agent/config
+Body: { bankroll?: number, max_stake_pct?: number, min_edge_threshold?: number, ... }
+Update agent configuration. Logs all changes to compliance_logs.
+
+Add CORS middleware so the React frontend can call these endpoints.

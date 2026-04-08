@@ -12,6 +12,7 @@ import ingestionRouter from "./ingestion";
 import predictionsRouter from "./predictions";
 import tradingRouter from "./trading";
 import learningRouter from "./learning";
+import apiRouter from "./api";
 
 const router: IRouter = Router();
 
@@ -28,5 +29,6 @@ router.use(ingestionRouter);
 router.use(predictionsRouter);
 router.use(tradingRouter);
 router.use(learningRouter);
+router.use(apiRouter);
 
 export default router;
