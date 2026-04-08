@@ -10,6 +10,7 @@ import modelStateRouter from "./modelState";
 import featuresRouter from "./features";
 import ingestionRouter from "./ingestion";
 import predictionsRouter from "./predictions";
+import tradingRouter from "./trading";
 
 const router: IRouter = Router();
 
@@ -24,5 +25,6 @@ router.use(modelStateRouter);
 router.use(featuresRouter);
 router.use(ingestionRouter);
 router.use(predictionsRouter);
+router.use(tradingRouter);
 
 export default router;

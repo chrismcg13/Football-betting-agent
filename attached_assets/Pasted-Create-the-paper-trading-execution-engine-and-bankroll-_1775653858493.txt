@@ -1,0 +1,43 @@
+Create the paper trading execution engine and bankroll management system.
+
+Create src/services/paperTrading.ts:
+
+1. placePaperBet(matchId, marketType, selection, odds, modelProbability, edge):
+   - Check agent_status is "running"
+   - Check current open bets < max_concurrent_bets
+   - Check today's losses haven't hit daily_loss_limit
+   - Check this week's losses haven't hit weekly_loss_limit
+   - Check bankroll > bankroll_floor
+   - Calculate stake using fractional Kelly: stake = bankroll * (edge / (odds - 1)) * 0.25 (quarter Kelly for safety)
+   - Cap stake at bankroll * max_stake_pct
+   - Minimum stake £2 (Betfair minimum)
+   - Record the bet in paper_bets table with status "pending"
+   - Log to compliance_logs with full decision reasoning
+
+2. settleBets():
+   - Check all pending bets where the match has finished
+   - Get the actual match result from the database
+   - Determine if each bet won or lost
+   - Calculate P&L (including simulated 2% commission on winnings)
+   - Update paper_bets with outcome and settlement_pnl
+   - Update bankroll in agent_config
+   - Log settlement to compliance_logs
+   - If this brings total settled bets to a multiple of 20, trigger model retraining
+
+Create src/services/riskManager.ts:
+
+1. checkDailyLoss() — Sum today's settled losses. If >= 5% of bankroll, set agent_status to "paused_daily" and log a circuit breaker event.
+
+2. checkWeeklyLoss() — Sum this week's losses. If >= 10% of bankroll, set agent_status to "paused_weekly".
+
+3. checkBankrollFloor() — If bankroll <= £200, set agent_status to "stopped".
+
+4. checkConsecutiveLosses() — If last 5 bets all lost, set agent_status to "paused_streak".
+
+5. All pauses are logged to compliance_logs as risk_events and to learning_narratives.
+
+Create a cron job that runs every 15 minutes:
+- Runs the value detection engine on all matches kicking off in the next 2-24 hours
+- Places paper bets on the top value opportunities (max 3 new bets per cycle)
+- Settles any bets where matches have finished
+- Runs risk checks
