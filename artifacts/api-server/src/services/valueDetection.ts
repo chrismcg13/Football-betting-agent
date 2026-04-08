@@ -288,6 +288,84 @@ function computeOpportunityScore(params: {
   return Math.min(Math.round(raw * 100) / 100, 100);
 }
 
+// ─── Synthetic odds generator (paper-trading fallback) ───────────────────────
+//
+// When no exchange odds exist for a match, we generate a realistic bookmaker
+// market using Poisson goal models and team-form features.  A 7% vig is
+// applied so the market is slightly priced against us — the ML model only
+// finds +EV when it has genuine conviction beyond the baseline.
+
+interface SyntheticOddsRow {
+  marketType: string;
+  selectionName: string;
+  backOdds: number;
+  source: "synthetic";
+}
+
+function poissonCdf(lambda: number, k: number): number {
+  let p = 0;
+  let fac = 1;
+  for (let i = 0; i <= k; i++) {
+    if (i > 0) fac *= i;
+    p += (Math.pow(lambda, i) * Math.exp(-lambda)) / fac;
+  }
+  return p;
+}
+
+function generateSyntheticOdds(
+  featureMap: Record<string, number>,
+): SyntheticOddsRow[] {
+  const VIG = 1.07;
+  const clamp = (v: number, lo: number, hi: number) =>
+    Math.min(hi, Math.max(lo, v));
+
+  const homeForm = featureMap["home_form_last5"] ?? 0.4;
+  const awayForm = featureMap["away_form_last5"] ?? 0.35;
+  const homeScoredAvg = featureMap["home_goals_scored_avg"] ?? 1.5;
+  const awayScoredAvg = featureMap["away_goals_scored_avg"] ?? 1.2;
+  const homeConcededAvg = featureMap["home_goals_conceded_avg"] ?? 1.2;
+  const awayConcededAvg = featureMap["away_goals_conceded_avg"] ?? 1.5;
+
+  // 1X2 market via form-adjusted Elo-like strengths
+  const homeStrength = clamp(homeForm + 0.08, 0.05, 0.9); // +8% home advantage
+  const awayStrength = clamp(awayForm, 0.05, 0.85);
+  const rawDraw = clamp(0.28 - 0.15 * Math.abs(homeStrength - awayStrength), 0.05, 0.4);
+  const total = homeStrength + awayStrength + rawDraw;
+  const homeProb = homeStrength / total;
+  const drawProb = rawDraw / total;
+  const awayProb = awayStrength / total;
+
+  const homeOdds = clamp((1 / homeProb) / VIG, 1.05, 20);
+  const drawOdds = clamp((1 / drawProb) / VIG, 1.05, 20);
+  const awayOdds = clamp((1 / awayProb) / VIG, 1.05, 20);
+
+  // BTTS market via Poisson
+  const expHome = clamp((homeScoredAvg + awayConcededAvg) / 2, 0.3, 5);
+  const expAway = clamp((awayScoredAvg + homeConcededAvg) / 2, 0.3, 5);
+  const pHomeSc = 1 - Math.exp(-expHome);
+  const pAwaySc = 1 - Math.exp(-expAway);
+  const bttsYesProb = clamp(pHomeSc * pAwaySc, 0.05, 0.95);
+  const bttsYesOdds = clamp((1 / bttsYesProb) / VIG, 1.05, 20);
+  const bttsNoOdds = clamp((1 / (1 - bttsYesProb)) / VIG, 1.05, 20);
+
+  // Over/Under 2.5 via Poisson CDF
+  const totalLambda = expHome + expAway;
+  const under25Prob = clamp(poissonCdf(totalLambda, 2), 0.05, 0.95);
+  const over25Prob = 1 - under25Prob;
+  const over25Odds = clamp((1 / over25Prob) / VIG, 1.05, 20);
+  const under25Odds = clamp((1 / under25Prob) / VIG, 1.05, 20);
+
+  return [
+    { marketType: "MATCH_ODDS", selectionName: "Home", backOdds: homeOdds, source: "synthetic" },
+    { marketType: "MATCH_ODDS", selectionName: "Draw", backOdds: drawOdds, source: "synthetic" },
+    { marketType: "MATCH_ODDS", selectionName: "Away", backOdds: awayOdds, source: "synthetic" },
+    { marketType: "BTTS", selectionName: "Yes", backOdds: bttsYesOdds, source: "synthetic" },
+    { marketType: "BTTS", selectionName: "No", backOdds: bttsNoOdds, source: "synthetic" },
+    { marketType: "OVER_UNDER_25", selectionName: "Over 2.5 Goals", backOdds: over25Odds, source: "synthetic" },
+    { marketType: "OVER_UNDER_25", selectionName: "Under 2.5 Goals", backOdds: under25Odds, source: "synthetic" },
+  ];
+}
+
 // ─── Main detection function ──────────────────────────────────────────────────
 
 export async function detectValueBets(): Promise<EvaluationSummary> {
@@ -325,13 +403,15 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
   const valueBets: ValueBet[] = [];
   let selectionsEvaluated = 0;
 
+  let syntheticOddsUsed = 0;
+  let realOddsUsed = 0;
+
   for (const match of matches) {
     const oddsRows = await db
       .select()
       .from(oddsSnapshotsTable)
       .where(eq(oddsSnapshotsTable.matchId, match.id))
       .orderBy(desc(oddsSnapshotsTable.snapshotTime));
-    if (oddsRows.length === 0) continue;
 
     const featureRows = await db
       .select()
@@ -352,8 +432,19 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
     const bttsPreds = predictBtts(featureMap);
     const ouPreds = predictOverUnder(featureMap);
 
-    const latestOdds = new Map<string, (typeof oddsRows)[0]>();
-    for (const row of oddsRows) {
+    // Use real odds if available, otherwise generate synthetic odds from features
+    type OddsRow = { marketType: string; selectionName: string; backOdds: string | number | null; source?: string };
+    let oddsSource: OddsRow[];
+    if (oddsRows.length > 0) {
+      realOddsUsed++;
+      oddsSource = oddsRows;
+    } else {
+      syntheticOddsUsed++;
+      oddsSource = generateSyntheticOdds(featureMap);
+    }
+
+    const latestOdds = new Map<string, OddsRow>();
+    for (const row of oddsSource) {
       const key = `${row.marketType}:${row.selectionName}`;
       if (!latestOdds.has(key)) latestOdds.set(key, row);
     }
@@ -498,6 +589,8 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       matchesEvaluated: matches.length,
       selectionsEvaluated,
       valueBetsFound: valueBets.length,
+      realOddsUsed,
+      syntheticOddsUsed,
     },
     "Value detection complete",
   );

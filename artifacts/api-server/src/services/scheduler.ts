@@ -140,10 +140,10 @@ export async function runTradingCycle(): Promise<{
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
-    // 5. Detect value bets for matches kicking off in 2-24 hours
+    // 5. Detect value bets for matches kicking off in 1h – 96h
     const now = new Date();
-    const earliest = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-    const latest   = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);   // 1 h from now
+    const latest   = new Date(now.getTime() + 96 * 60 * 60 * 1000);  // 4 days out
 
     const valueSummary = await detectValueBets();
     const timely = valueSummary.valueBets.filter(
@@ -151,7 +151,7 @@ export async function runTradingCycle(): Promise<{
     );
 
     logger.info(
-      { totalValueBets: valueSummary.valueBets.length, timelyBets: timely.length, window: "2-24h before kickoff" },
+      { totalValueBets: valueSummary.valueBets.length, timelyBets: timely.length, window: "1h-96h before kickoff" },
       "Value detection complete for trading cycle",
     );
 
@@ -160,8 +160,8 @@ export async function runTradingCycle(): Promise<{
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
-    // 6. Place up to 3 best value bets
-    const candidates = timely.slice(0, 3);
+    // 6. Place up to 10 best value bets per cycle
+    const candidates = timely.slice(0, 10);
     let betsPlaced = 0;
 
     for (const bet of candidates) {
