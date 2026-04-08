@@ -1,0 +1,31 @@
+Create a TypeScript Node.js project with the following structure. This is an AI betting agent that paper-trades football bets using the Betfair Exchange Delayed API.
+
+Set up the project with these dependencies:
+- express (API server)
+- pg (PostgreSQL — use Replit's built-in PostgreSQL database)
+- node-cron (scheduled jobs)
+- axios (HTTP requests)
+- cors
+- dotenv
+
+Create the PostgreSQL database schema with these tables:
+
+1. matches — id, home_team, away_team, league, country, kickoff_time, status (scheduled/live/finished), home_score, away_score, betfair_event_id, created_at
+
+2. odds_snapshots — id, match_id (FK), market_type (e.g. MATCH_ODDS, OVER_UNDER_25), selection_name, back_odds, lay_odds, snapshot_time, source (betfair_delayed)
+
+3. features — id, match_id (FK), feature_name, feature_value, computed_at (these store calculated features like team form, H2H stats etc.)
+
+4. paper_bets — id, match_id (FK), market_type, selection_name, bet_type (back/lay), odds_at_placement, stake, potential_profit, model_probability, betfair_implied_probability, calculated_edge, model_version, status (pending/won/lost/void), settlement_pnl, placed_at, settled_at
+
+5. model_state — id, model_version, accuracy_score, calibration_score, total_bets_trained_on, feature_importances (JSON), strategy_weights (JSON), created_at
+
+6. learning_narratives — id, narrative_type (strategy_shift/model_improvement/feature_discovery/risk_event/confidence_signal), narrative_text, related_data (JSON), created_at
+
+7. compliance_logs — id, action_type (decision/placement/settlement/circuit_breaker/risk_adjustment), details (JSON containing: model_probability, betfair_odds, calculated_edge, stake, market_id, event_name, selection, bet_type, odds, betfair_ref_id, model_version, data_sources), timestamp
+
+8. agent_config — id, key, value, updated_at (stores: bankroll, max_stake_pct, daily_loss_limit_pct, weekly_loss_limit_pct, bankroll_floor, max_concurrent_bets, min_edge_threshold, agent_status)
+
+Create a db.ts file with a connection pool and a migration function that creates all tables on startup if they don't exist. Seed agent_config with default values: bankroll=500, max_stake_pct=0.02, daily_loss_limit_pct=0.05, weekly_loss_limit_pct=0.10, bankroll_floor=200, max_concurrent_bets=10, min_edge_threshold=0.03, agent_status=running.
+
+Create an index.ts entry point that runs the migration then starts an Express server on port 3000.
