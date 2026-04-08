@@ -7,8 +7,41 @@ import { placePaperBet, settleBets, getAgentStatus } from "./paperTrading";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
 import { runLearningLoop } from "./learningLoop";
-import { matchesTable, db } from "@workspace/db";
-import { eq, gte, lte, and } from "drizzle-orm";
+
+// ===================== Status tracking =====================
+
+export interface JobStatus {
+  lastRunAt: Date | null;
+  lastRunResult: "success" | "error" | "skipped" | null;
+  isRunning: boolean;
+  runCount: number;
+}
+
+const jobStatus: Record<string, JobStatus> = {
+  ingestion: { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  features:  { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  trading:   { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  learning:  { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+};
+
+export function getSchedulerStatus(): Record<string, JobStatus> {
+  return { ...jobStatus };
+}
+
+function markRun(job: string, result: "success" | "error" | "skipped") {
+  const s = jobStatus[job];
+  if (s) {
+    s.lastRunAt = new Date();
+    s.lastRunResult = result;
+    s.runCount += 1;
+    s.isRunning = false;
+  }
+}
+
+function markStart(job: string) {
+  const s = jobStatus[job];
+  if (s) s.isRunning = true;
+}
 
 // ===================== Guard flags =====================
 let ingestionRunning = false;
@@ -20,13 +53,17 @@ let tradingCycleRunning = false;
 async function safeRunIngestion(): Promise<void> {
   if (ingestionRunning) {
     logger.warn("Data ingestion already in progress — skipping this run");
+    markRun("ingestion", "skipped");
     return;
   }
   ingestionRunning = true;
+  markStart("ingestion");
   try {
     await runDataIngestion();
+    markRun("ingestion", "success");
   } catch (err) {
     logger.error({ err }, "Scheduled data ingestion run failed");
+    markRun("ingestion", "error");
   } finally {
     ingestionRunning = false;
   }
@@ -35,13 +72,17 @@ async function safeRunIngestion(): Promise<void> {
 async function safeRunFeatures(): Promise<void> {
   if (featureRunning) {
     logger.warn("Feature computation already in progress — skipping this run");
+    markRun("features", "skipped");
     return;
   }
   featureRunning = true;
+  markStart("features");
   try {
     await runFeatureEngineForUpcomingMatches();
+    markRun("features", "success");
   } catch (err) {
     logger.error({ err }, "Scheduled feature computation run failed");
+    markRun("features", "error");
   } finally {
     featureRunning = false;
   }
@@ -56,9 +97,11 @@ export async function runTradingCycle(): Promise<{
 }> {
   if (tradingCycleRunning) {
     logger.warn("Trading cycle already in progress — skipping this run");
+    markRun("trading", "skipped");
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
   }
   tradingCycleRunning = true;
+  markStart("trading");
 
   try {
     logger.info("Starting trading cycle");
@@ -66,12 +109,7 @@ export async function runTradingCycle(): Promise<{
     // 1. Settle any finished bets first
     const settlement = await settleBets();
     logger.info(
-      {
-        settled: settlement.settled,
-        won: settlement.won,
-        lost: settlement.lost,
-        pnl: settlement.totalPnl,
-      },
+      { settled: settlement.settled, won: settlement.won, lost: settlement.lost, pnl: settlement.totalPnl },
       "Settlement complete",
     );
 
@@ -79,62 +117,44 @@ export async function runTradingCycle(): Promise<{
     const riskResult = await runAllRiskChecks();
     if (riskResult.anyTriggered) {
       logger.warn("Risk check triggered — skipping bet placement this cycle");
-      return {
-        betsPlaced: 0,
-        betsSettled: settlement.settled,
-        riskTriggered: true,
-      };
+      markRun("trading", "success");
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: true };
     }
 
     // 3. Check agent is running
     const agentStatus = await getAgentStatus();
     if (agentStatus !== "running") {
       logger.info({ agentStatus }, "Agent not running — skipping bet placement");
-      return {
-        betsPlaced: 0,
-        betsSettled: settlement.settled,
-        riskTriggered: false,
-      };
+      markRun("trading", "skipped");
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
     // 4. Check model is available
     const modelVersion = getModelVersion();
     if (!modelVersion) {
       logger.info("No model loaded — skipping value detection");
-      return {
-        betsPlaced: 0,
-        betsSettled: settlement.settled,
-        riskTriggered: false,
-      };
+      markRun("trading", "skipped");
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
     // 5. Detect value bets for matches kicking off in 2-24 hours
     const now = new Date();
     const earliest = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-    const latest = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    const latest   = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
     const valueSummary = await detectValueBets();
     const timely = valueSummary.valueBets.filter(
-      (b) =>
-        new Date(b.kickoffTime) >= earliest &&
-        new Date(b.kickoffTime) <= latest,
+      (b) => new Date(b.kickoffTime) >= earliest && new Date(b.kickoffTime) <= latest,
     );
 
     logger.info(
-      {
-        totalValueBets: valueSummary.valueBets.length,
-        timelyBets: timely.length,
-        window: "2-24h before kickoff",
-      },
+      { totalValueBets: valueSummary.valueBets.length, timelyBets: timely.length, window: "2-24h before kickoff" },
       "Value detection complete for trading cycle",
     );
 
     if (timely.length === 0) {
-      return {
-        betsPlaced: 0,
-        betsSettled: settlement.settled,
-        riskTriggered: false,
-      };
+      markRun("trading", "success");
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
     // 6. Place up to 3 best value bets
@@ -168,17 +188,12 @@ export async function runTradingCycle(): Promise<{
       }
     }
 
-    logger.info(
-      { betsPlaced, betsSettled: settlement.settled },
-      "Trading cycle complete",
-    );
-    return {
-      betsPlaced,
-      betsSettled: settlement.settled,
-      riskTriggered: false,
-    };
+    logger.info({ betsPlaced, betsSettled: settlement.settled }, "Trading cycle complete");
+    markRun("trading", "success");
+    return { betsPlaced, betsSettled: settlement.settled, riskTriggered: false };
   } catch (err) {
     logger.error({ err }, "Trading cycle failed");
+    markRun("trading", "error");
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
   } finally {
     tradingCycleRunning = false;
@@ -191,46 +206,28 @@ export function startScheduler(): void {
   logger.info("Starting schedulers");
 
   // Data ingestion: every 30 min, 06:00–23:30 UTC
-  cron.schedule(
-    "*/30 6-23 * * *",
-    () => {
-      void safeRunIngestion();
-    },
-    { timezone: "UTC" },
-  );
+  cron.schedule("*/30 6-23 * * *", () => { void safeRunIngestion(); }, { timezone: "UTC" });
   logger.info("Ingestion scheduler active — every 30 min, 06:00–23:30 UTC");
 
   // Feature computation: every 6 hours
-  cron.schedule(
-    "0 */6 * * *",
-    () => {
-      void safeRunFeatures();
-    },
-    { timezone: "UTC" },
-  );
+  cron.schedule("0 */6 * * *", () => { void safeRunFeatures(); }, { timezone: "UTC" });
   logger.info("Feature scheduler active — every 6 hours UTC");
 
   // Trading cycle: every 15 minutes
-  cron.schedule(
-    "*/15 * * * *",
-    () => {
-      void runTradingCycle();
-    },
-    { timezone: "UTC" },
-  );
+  cron.schedule("*/15 * * * *", () => { void runTradingCycle(); }, { timezone: "UTC" });
   logger.info("Trading cycle scheduler active — every 15 minutes");
 
-  // Learning loop: daily at 03:00 UTC (after most European football has settled)
-  cron.schedule(
-    "0 3 * * *",
-    () => {
-      logger.info("Daily learning loop triggered by scheduler");
-      void runLearningLoop().catch((err) =>
-        logger.error({ err }, "Scheduled learning loop failed"),
-      );
-    },
-    { timezone: "UTC" },
-  );
+  // Learning loop: daily at 03:00 UTC
+  cron.schedule("0 3 * * *", () => {
+    logger.info("Daily learning loop triggered by scheduler");
+    markStart("learning");
+    void runLearningLoop()
+      .then(() => markRun("learning", "success"))
+      .catch((err) => {
+        logger.error({ err }, "Scheduled learning loop failed");
+        markRun("learning", "error");
+      });
+  }, { timezone: "UTC" });
   logger.info("Learning loop scheduler active — daily at 03:00 UTC");
 }
 
