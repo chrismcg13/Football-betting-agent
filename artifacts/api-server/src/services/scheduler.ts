@@ -16,6 +16,8 @@ import {
   runOddspapiFixtureMapping,
   getOddspapiFixtureId,
   getOddspapiValidation,
+  prefetchAndStoreOddsPapiOdds,
+  type OddsPapiValidationCache,
   logDailyBudgetSummary,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
@@ -172,6 +174,11 @@ export async function runTradingCycle(): Promise<{
     const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);
     const latest   = new Date(now.getTime() + 96 * 60 * 60 * 1000);
 
+    // 5a. Pre-fetch OddsPapi Match Odds for mapped matches into odds_snapshots
+    //     so value detection treats those as real (not synthetic) odds
+    const oddsPapiCache: OddsPapiValidationCache = await prefetchAndStoreOddsPapiOdds(earliest, latest, 4);
+    logger.info({ matchesPrefetched: oddsPapiCache.size }, "OddsPapi pre-fetch done — running value detection");
+
     const valueSummary = await detectValueBets();
     const timely = valueSummary.valueBets.filter(
       (b) => new Date(b.kickoffTime) >= earliest && new Date(b.kickoffTime) <= latest,
@@ -203,15 +210,28 @@ export async function runTradingCycle(): Promise<{
     const enhancedCandidates = await Promise.all(
       top5.map(async (bet) => {
         try {
-          const oddspapiId = await getOddspapiFixtureId(bet.matchId);
-          if (!oddspapiId) return { bet, validation: null, enhancedScore: null };
+          // Check pre-fetch cache first (zero budget cost); fall back to live call for non-MATCH_ODDS
+          let validation: Awaited<ReturnType<typeof getOddspapiValidation>> | null = null;
 
-          const validation = await getOddspapiValidation(
-            oddspapiId,
-            bet.marketType,
-            bet.selectionName,
-            bet.backOdds,
-          );
+          const cachedMatch = oddsPapiCache.get(bet.matchId);
+          if (cachedMatch) {
+            const sel = bet.selectionName as keyof typeof cachedMatch;
+            if (cachedMatch[sel]) {
+              validation = { ...cachedMatch[sel], isContrarian: false, pinnacleAligned: false };
+            }
+          }
+
+          if (!validation) {
+            const oddspapiId = await getOddspapiFixtureId(bet.matchId);
+            if (!oddspapiId) return { bet, validation: null, enhancedScore: null };
+
+            validation = await getOddspapiValidation(
+              oddspapiId,
+              bet.marketType,
+              bet.selectionName,
+              bet.backOdds,
+            );
+          }
 
           const enhanced = computeEnhancedOpportunityScore({
             edge: bet.edge,

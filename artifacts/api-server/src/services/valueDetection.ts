@@ -500,8 +500,10 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       featureMap[f.featureName] = Number(f.featureValue);
     }
 
-    // Determine odds source priority
-    const realOddsRows = oddsRows.filter((r) => r.source?.startsWith("api_football_real"));
+    // Determine odds source priority — both api_football_real and oddspapi are real market odds
+    const realOddsRows = oddsRows.filter(
+      (r) => r.source?.startsWith("api_football_real") || r.source?.startsWith("oddspapi"),
+    );
     const isSynthetic = realOddsRows.length === 0;
 
     if (isSynthetic) {

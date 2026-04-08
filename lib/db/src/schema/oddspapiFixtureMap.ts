@@ -2,6 +2,7 @@ import {
   pgTable,
   serial,
   integer,
+  text,
   timestamp,
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
@@ -13,7 +14,7 @@ export const oddspapiFixtureMapTable = pgTable("oddspapi_fixture_map", {
   matchId: integer("match_id")
     .notNull()
     .references(() => matchesTable.id),
-  oddspapiFixtureId: integer("oddspapi_fixture_id").notNull(),
+  oddspapiFixtureId: text("oddspapi_fixture_id").notNull(),
   cachedAt: timestamp("cached_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

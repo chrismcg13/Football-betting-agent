@@ -10,10 +10,11 @@ import {
   matchesTable,
   oddspapiFixtureMapTable,
   apiUsageTable,
+  oddsSnapshotsTable,
   complianceLogsTable,
   learningNarrativesTable,
 } from "@workspace/db";
-import { eq, and, gte, sql, like } from "drizzle-orm";
+import { eq, and, gte, lte, sql, like } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://api.oddspapi.io/v4";
@@ -185,7 +186,13 @@ function teamMatch(a: string, b: string): boolean {
 // ─── Fixture response parsing ─────────────────────────────────────────────────
 
 interface RawFixture {
-  id: number;
+  // OddsPapi v4 actual format
+  fixtureId?: string;
+  participant1Name?: string;
+  participant2Name?: string;
+  startTime?: string;
+  // Legacy / alternative formats (fallbacks)
+  id?: number | string;
   startDate?: string;
   date?: string;
   kickoff?: string;
@@ -197,7 +204,17 @@ interface RawFixture {
   participants?: Array<{ type?: string; name?: string; id?: number }>;
 }
 
+function extractFixtureStringId(f: RawFixture): string | null {
+  if (f.fixtureId) return String(f.fixtureId);
+  if (f.id != null) return String(f.id);
+  return null;
+}
+
 function extractTeamNames(f: RawFixture): { home: string; away: string } | null {
+  // Format 0 (OddsPapi v4): { participant1Name, participant2Name }
+  if (f.participant1Name && f.participant2Name) {
+    return { home: f.participant1Name, away: f.participant2Name };
+  }
   // Format 1: { homeTeam: { name }, awayTeam: { name } }
   if (f.homeTeam && f.awayTeam) {
     const h = typeof f.homeTeam === "string" ? f.homeTeam : (f.homeTeam.name ?? "");
@@ -224,7 +241,7 @@ function extractTeamNames(f: RawFixture): { home: string; away: string } | null 
 }
 
 function extractFixtureDate(f: RawFixture): string | null {
-  const raw = f.startDate ?? f.date ?? f.kickoff ?? null;
+  const raw = f.startTime ?? f.startDate ?? f.date ?? f.kickoff ?? null;
   if (!raw) return null;
   return raw.slice(0, 10);
 }
@@ -309,14 +326,16 @@ export async function runOddspapiFixtureMapping(): Promise<{
     });
 
     if (found) {
+      const fixId = extractFixtureStringId(found);
+      if (!fixId) continue;
       await db.insert(oddspapiFixtureMapTable).values({
         matchId: match.id,
-        oddspapiFixtureId: found.id,
+        oddspapiFixtureId: fixId,
         cachedAt: new Date(),
       });
 
       logger.info(
-        { matchId: match.id, oddspapiFixtureId: found.id, home: match.homeTeam, away: match.awayTeam },
+        { matchId: match.id, oddspapiFixtureId: fixId, home: match.homeTeam, away: match.awayTeam },
         "OddsPapi fixture mapped",
       );
 
@@ -451,7 +470,7 @@ function extractBookmakers(raw: RawOddsResponse): RawBookmakerOdds[] {
 // ─── 2. Odds validation (up to 5 requests/day per trading cycle) ──────────────
 
 export async function getOddspapiValidation(
-  oddspapiFixtureId: number,
+  oddspapiFixtureId: string,
   marketType: string,
   selectionName: string,
   apiFootballOdds: number,
@@ -475,8 +494,8 @@ export async function getOddspapiValidation(
   if (!(await canMakeOddspapiRequest(1))) return noData;
 
   const rawData = await fetchOddsPapi<RawOddsResponse>(
-    `/fixtures/${oddspapiFixtureId}/odds`,
-    { marketId },
+    "/odds",
+    { fixtureId: oddspapiFixtureId, marketId },
     "odds",
   );
 
@@ -558,13 +577,170 @@ export async function getOddspapiValidation(
 
 // ─── Get cached OddsPapi fixture ID for a match ───────────────────────────────
 
-export async function getOddspapiFixtureId(matchId: number): Promise<number | null> {
+export async function getOddspapiFixtureId(matchId: number): Promise<string | null> {
   const row = await db
     .select({ oddspapiFixtureId: oddspapiFixtureMapTable.oddspapiFixtureId })
     .from(oddspapiFixtureMapTable)
     .where(eq(oddspapiFixtureMapTable.matchId, matchId))
     .limit(1);
   return row[0]?.oddspapiFixtureId ?? null;
+}
+
+// ─── Pre-fetch OddsPapi odds into odds_snapshots for value detection ─────────
+// Called once per trading cycle BEFORE detectValueBets(). Stores real market
+// odds as source="oddspapi" so value detection treats them as non-synthetic.
+// Returns a validation cache keyed by matchId to avoid re-fetching later.
+
+export type OddsPapiValidationCache = Map<
+  number,
+  { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation }
+>;
+
+export async function prefetchAndStoreOddsPapiOdds(
+  earliestKickoff: Date,
+  latestKickoff: Date,
+  maxFetches = 4,
+): Promise<OddsPapiValidationCache> {
+  const cache: OddsPapiValidationCache = new Map();
+
+  const key = process.env.ODDSPAPI_KEY;
+  if (!key) return cache;
+
+  // Check remaining daily budget (leave at least 1 for enhancement)
+  const daily = await getOddspapiUsageToday();
+  const remaining = DAILY_CAP - daily;
+  if (remaining <= 1) {
+    logger.info({ daily, cap: DAILY_CAP }, "OddsPapi budget too low for pre-fetch — skipping");
+    return cache;
+  }
+
+  const limit = Math.min(maxFetches, remaining - 1);
+
+  // Get upcoming mapped matches in the betting window
+  const mappedRows = await db
+    .select({
+      matchId: oddspapiFixtureMapTable.matchId,
+      fixtureId: oddspapiFixtureMapTable.oddspapiFixtureId,
+      homeTeam: matchesTable.homeTeam,
+      awayTeam: matchesTable.awayTeam,
+    })
+    .from(oddspapiFixtureMapTable)
+    .innerJoin(matchesTable, eq(oddspapiFixtureMapTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(matchesTable.status, "scheduled"),
+        gte(matchesTable.kickoffTime, earliestKickoff),
+        lte(matchesTable.kickoffTime, latestKickoff),
+      ),
+    )
+    .limit(limit);
+
+  if (mappedRows.length === 0) return cache;
+
+  logger.info({ count: mappedRows.length, limit }, "Pre-fetching OddsPapi Match Odds for value detection");
+
+  for (const { matchId, fixtureId, homeTeam, awayTeam } of mappedRows) {
+    const marketId = MARKET_IDS["MATCH_ODDS"];
+    if (!marketId || !(await canMakeOddspapiRequest(1))) break;
+
+    const rawData = await fetchOddsPapi<RawOddsResponse>(
+      "/odds",
+      { fixtureId, marketId },
+      "prefetch_odds",
+    );
+
+    if (!rawData) continue;
+
+    const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+    if (!bookmakers.length) continue;
+
+    // Build per-selection best-odds map
+    const selectionOdds: Record<string, { best: number; bookmaker: string; pinnacle: number | null; sharp: number[]; soft: number[] }> = {
+      Home:  { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] },
+      Draw:  { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] },
+      Away:  { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] },
+    };
+
+    for (const bm of bookmakers) {
+      const slug = getBookmakerSlug(bm);
+      const name = getBookmakerName(bm);
+      const selections = extractSelections(bm);
+
+      for (const selName of ["Home", "Draw", "Away"] as const) {
+        const odds = getSelectionOdds(selections, "MATCH_ODDS", selName);
+        if (!odds) continue;
+
+        const so = selectionOdds[selName];
+        if (!so) continue;
+        const implied = 1 / odds;
+
+        if (slug.includes("pinnacle")) so.pinnacle = odds;
+        if (odds > so.best) { so.best = odds; so.bookmaker = name; }
+        if (SHARP_SLUGS.has(slug)) so.sharp.push(implied);
+        if (SOFT_SLUGS.has(slug)) so.soft.push(implied);
+      }
+    }
+
+    // Store in odds_snapshots and build cache
+    const now = new Date();
+    const matchCache: { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation } = {} as any;
+
+    for (const [selName, so] of Object.entries(selectionOdds)) {
+      if (so.best <= 1.01) continue;
+
+      const pinnacleImplied = so.pinnacle ? 1 / so.pinnacle : null;
+      const sharpAvg = so.sharp.length ? so.sharp.reduce((a, b) => a + b, 0) / so.sharp.length : null;
+      const softAvg = so.soft.length ? so.soft.reduce((a, b) => a + b, 0) / so.soft.length : null;
+
+      const validation: OddspapiValidation = {
+        pinnacleOdds: so.pinnacle,
+        pinnacleImplied,
+        bestOdds: so.best,
+        bestBookmaker: so.bookmaker || null,
+        oddsUpliftPct: null,
+        sharpSoftSpread: sharpAvg !== null && softAvg !== null ? softAvg - sharpAvg : null,
+        consensusPct: null,
+        isContrarian: false,
+        pinnacleAligned: false,
+        hasPinnacleData: so.pinnacle !== null,
+      };
+
+      (matchCache as Record<string, OddspapiValidation>)[selName] = validation;
+
+      // Upsert into odds_snapshots (delete old oddspapi snapshot first)
+      await db
+        .delete(oddsSnapshotsTable)
+        .where(
+          and(
+            eq(oddsSnapshotsTable.matchId, matchId),
+            eq(oddsSnapshotsTable.marketType, "MATCH_ODDS"),
+            eq(oddsSnapshotsTable.selectionName, selName),
+            eq(oddsSnapshotsTable.source, "oddspapi"),
+          ),
+        );
+
+      await db.insert(oddsSnapshotsTable).values({
+        matchId,
+        marketType: "MATCH_ODDS",
+        selectionName: selName,
+        backOdds: String(so.best),
+        layOdds: null,
+        snapshotTime: now,
+        source: "oddspapi",
+      });
+    }
+
+    if (Object.keys(matchCache).length > 0) {
+      cache.set(matchId, matchCache as { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation });
+      logger.info(
+        { matchId, home: homeTeam, away: awayTeam, selections: Object.keys(matchCache) },
+        "OddsPapi MATCH_ODDS pre-fetched and stored",
+      );
+    }
+  }
+
+  logger.info({ fetched: cache.size }, "OddsPapi pre-fetch complete");
+  return cache;
 }
 
 // ─── Log daily budget usage summary ──────────────────────────────────────────
