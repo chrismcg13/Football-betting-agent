@@ -1,0 +1,40 @@
+Create the learning loop and narrative engine.
+
+Create src/services/learningLoop.ts:
+
+1. retrainModels():
+   - Fetch all settled paper_bets with their features
+   - Split into training (80%) and validation (20%) sets
+   - Retrain all three models (match result, over/under, BTTS)
+   - Calculate accuracy on the validation set
+   - Calculate calibration score (how close predicted probabilities are to actual outcomes)
+   - Compare to previous model_state accuracy
+   - Save new model_state with version number, accuracy, calibration, feature importances
+   - Trigger the narrative engine
+
+2. calculateStrategyPerformance():
+   - Group settled bets by: league, market_type, and week
+   - Calculate ROI, win rate, and average edge for each group
+   - Identify best and worst performing segments
+   - Store in strategy_weights in model_state
+
+Create src/services/narrativeEngine.ts:
+
+1. generateNarratives(previousModelState, newModelState):
+   Using template logic (NOT an external AI API), generate plain-English narrative entries by comparing previous and current state:
+
+   - If accuracy improved: "Model accuracy improved from {old}% to {new}% after retraining on {n} bets. The agent is getting better at predicting outcomes."
+   
+   - If a league's ROI changed significantly: "The agent has {increased/decreased} focus on {league} {market_type}. Performance over last {n} bets: {ROI}% ROI."
+   
+   - If a feature's importance changed: "Feature '{feature_name}' has {risen/dropped} in importance for {market_type} predictions. Current rank: #{rank} (was #{old_rank})."
+   
+   - If a circuit breaker fired: "Risk control activated: {reason}. Agent paused for {duration}. This is {normal variance / concerning — investigation needed}."
+   
+   - If a market type has sustained positive edge: "{market_type} in {league} has been profitable for {n} consecutive weeks ({total_bets} bets, {ROI}% ROI). Confidence: {HIGH/MEDIUM/LOW}."
+
+   Store each narrative in learning_narratives table.
+
+2. getRecentNarratives(limit) — Return the most recent narratives for the dashboard.
+
+Schedule the learning loop to run daily at 3am UTC (after most European football has settled).

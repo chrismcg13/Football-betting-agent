@@ -619,6 +619,288 @@ export function predictOverUnder(
   };
 }
 
+// ===================== Training sample builder from DB records =====================
+export interface DbTrainingSample {
+  features: number[];
+  outcomeLabel: number;
+  bttsLabel: number;
+  ouLabel: number;
+}
+
+export async function buildSamplesFromDb(): Promise<DbTrainingSample[]> {
+  const settledBets = await db
+    .select({ matchId: paperBetsTable.matchId })
+    .from(paperBetsTable)
+    .where(inArray(paperBetsTable.status, ["won", "lost"]));
+
+  const uniqueMatchIds = [...new Set(settledBets.map((b) => b.matchId))];
+  if (uniqueMatchIds.length === 0) return [];
+
+  const matches = await db
+    .select()
+    .from(matchesTable)
+    .where(inArray(matchesTable.id, uniqueMatchIds));
+
+  const allFeatures = await db
+    .select()
+    .from(featuresTable)
+    .where(inArray(featuresTable.matchId, uniqueMatchIds));
+
+  const samples: DbTrainingSample[] = [];
+
+  for (const match of matches) {
+    if (match.homeScore === null || match.awayScore === null) continue;
+
+    const matchFeatures = allFeatures.filter(
+      (f) => f.matchId === match.id && !f.featureName.startsWith("_"),
+    );
+    if (matchFeatures.length < 8) continue;
+
+    const featureMap: Record<string, number> = {};
+    for (const f of matchFeatures) {
+      featureMap[f.featureName] = Number(f.featureValue);
+    }
+
+    const featureVector = FEATURE_NAMES.map(
+      (name) => featureMap[name as FeatureName] ?? 0,
+    );
+
+    let outcomeLabel: number;
+    if (match.homeScore > match.awayScore) outcomeLabel = OUTCOME_HOME;
+    else if (match.homeScore < match.awayScore) outcomeLabel = OUTCOME_AWAY;
+    else outcomeLabel = OUTCOME_DRAW;
+
+    const bttsLabel =
+      match.homeScore > 0 && match.awayScore > 0 ? BTTS_YES : BTTS_NO;
+    const ouLabel =
+      match.homeScore + match.awayScore > 2 ? OU_OVER : OU_UNDER;
+
+    samples.push({ features: featureVector, outcomeLabel, bttsLabel, ouLabel });
+  }
+
+  return samples;
+}
+
+// Brier score (calibration) — lower is better; 0 = perfect
+function computeBrierScore(
+  model: LogisticRegression,
+  rawFeatures: number[][],
+  labels: number[],
+  featureIndices: readonly number[],
+  means: number[],
+  stds: number[],
+  positiveClass: number,
+): number {
+  if (rawFeatures.length === 0) return 1;
+  const normalizedRows = rawFeatures.map((row) =>
+    normalizeRow(row, featureIndices, means, stds),
+  );
+  let brierSum = 0;
+  for (let i = 0; i < normalizedRows.length; i++) {
+    const row = normalizedRows[i];
+    if (!row) continue;
+    const probs = getProbabilities(model, row);
+    const predicted = probs[positiveClass] ?? 0.5;
+    const actual = labels[i] === positiveClass ? 1 : 0;
+    brierSum += (predicted - actual) ** 2;
+  }
+  return brierSum / normalizedRows.length;
+}
+
+export interface RetrainResult {
+  version: string;
+  trainSize: number;
+  valSize: number;
+  trainAccuracy: { outcome: number; btts: number; overUnder: number; avg: number };
+  valAccuracy: { outcome: number; btts: number; overUnder: number; avg: number };
+  calibrationScore: number;
+  previousAccuracy: number | null;
+  previousVersion: string | null;
+  featureImportances: Record<string, number>;
+}
+
+export async function forceRetrain(): Promise<RetrainResult | null> {
+  const allSamples = await buildSamplesFromDb();
+
+  if (allSamples.length < 20) {
+    logger.warn(
+      { samples: allSamples.length },
+      "Not enough samples for forceRetrain",
+    );
+    return null;
+  }
+
+  // Shuffle then split 80/20
+  const shuffled = [...allSamples].sort(() => Math.random() - 0.5);
+  const splitIdx = Math.floor(shuffled.length * 0.8);
+  const trainSamples = shuffled.slice(0, splitIdx);
+  const valSamples = shuffled.slice(splitIdx);
+
+  // Previous model state
+  const prevRows = await db
+    .select({
+      accuracyScore: modelStateTable.accuracyScore,
+      modelVersion: modelStateTable.modelVersion,
+    })
+    .from(modelStateTable)
+    .orderBy(desc(modelStateTable.createdAt))
+    .limit(1);
+  const previousAccuracy = prevRows[0]?.accuracyScore
+    ? Number(prevRows[0].accuracyScore)
+    : null;
+  const previousVersion = prevRows[0]?.modelVersion ?? null;
+
+  const rawTrain = trainSamples.map((s) => s.features);
+  const { means, stds } = computeNormalization(rawTrain);
+
+  const outcomeModel = trainModel(
+    rawTrain,
+    trainSamples.map((s) => s.outcomeLabel),
+    OUTCOME_IDX,
+    means,
+    stds,
+  );
+  const bttsModel = trainModel(
+    rawTrain,
+    trainSamples.map((s) => s.bttsLabel),
+    BTTS_IDX,
+    means,
+    stds,
+  );
+  const overUnderModel = trainModel(
+    rawTrain,
+    trainSamples.map((s) => s.ouLabel),
+    OVER_UNDER_IDX,
+    means,
+    stds,
+  );
+
+  const rawVal = valSamples.map((s) => s.features);
+  const valOutcomeAcc = computeAccuracy(
+    outcomeModel,
+    rawVal,
+    valSamples.map((s) => s.outcomeLabel),
+    OUTCOME_IDX,
+    means,
+    stds,
+  );
+  const valBttsAcc = computeAccuracy(
+    bttsModel,
+    rawVal,
+    valSamples.map((s) => s.bttsLabel),
+    BTTS_IDX,
+    means,
+    stds,
+  );
+  const valOuAcc = computeAccuracy(
+    overUnderModel,
+    rawVal,
+    valSamples.map((s) => s.ouLabel),
+    OVER_UNDER_IDX,
+    means,
+    stds,
+  );
+  const valAvg = (valOutcomeAcc + valBttsAcc + valOuAcc) / 3;
+
+  const trainOutcomeAcc = computeAccuracy(
+    outcomeModel,
+    rawTrain,
+    trainSamples.map((s) => s.outcomeLabel),
+    OUTCOME_IDX,
+    means,
+    stds,
+  );
+  const trainBttsAcc = computeAccuracy(
+    bttsModel,
+    rawTrain,
+    trainSamples.map((s) => s.bttsLabel),
+    BTTS_IDX,
+    means,
+    stds,
+  );
+  const trainOuAcc = computeAccuracy(
+    overUnderModel,
+    rawTrain,
+    trainSamples.map((s) => s.ouLabel),
+    OVER_UNDER_IDX,
+    means,
+    stds,
+  );
+  const trainAvg = (trainOutcomeAcc + trainBttsAcc + trainOuAcc) / 3;
+
+  // Calibration: Brier score on validation set (outcome model, home win class)
+  const calibration = computeBrierScore(
+    outcomeModel,
+    rawVal,
+    valSamples.map((s) => s.outcomeLabel),
+    OUTCOME_IDX,
+    means,
+    stds,
+    OUTCOME_HOME,
+  );
+
+  const version = `v2.${Date.now()}-loop-${allSamples.length}bets`;
+  const modelSet: ModelSet = {
+    outcomeModel,
+    bttsModel,
+    overUnderModel,
+    featureMeans: means,
+    featureStds: stds,
+    version,
+    trainingSize: trainSamples.length,
+  };
+
+  // Extract feature importances
+  const featureImportances: Record<string, number> = {};
+  const firstClf = outcomeModel.classifiers[0];
+  if (firstClf) {
+    const clfJson = firstClf.toJSON() as { weights?: { data?: number[][] } };
+    if (clfJson.weights?.data?.[0]) {
+      OUTCOME_IDX.forEach((fi, i) => {
+        const name = FEATURE_NAMES[fi];
+        if (name) featureImportances[name] = Math.abs(clfJson.weights!.data![0]![i] ?? 0);
+      });
+    }
+  }
+
+  await db.insert(modelStateTable).values({
+    modelVersion: version,
+    accuracyScore: String(valAvg.toFixed(6)),
+    calibrationScore: String(calibration.toFixed(6)),
+    totalBetsTrainedOn: allSamples.length,
+    featureImportances,
+    strategyWeights: {
+      outcomeModel: outcomeModel.toJSON(),
+      bttsModel: bttsModel.toJSON(),
+      overUnderModel: overUnderModel.toJSON(),
+      featureMeans: means,
+      featureStds: stds,
+      trainingSize: trainSamples.length,
+      accuracies: { outcome: valOutcomeAcc, btts: valBttsAcc, overUnder: valOuAcc },
+    },
+  });
+
+  currentModel = modelSet;
+  lastTrainedBetCount = allSamples.length;
+
+  logger.info(
+    { version, trainSize: trainSamples.length, valSize: valSamples.length, valAvg, calibration },
+    "Force retrain complete",
+  );
+
+  return {
+    version,
+    trainSize: trainSamples.length,
+    valSize: valSamples.length,
+    trainAccuracy: { outcome: trainOutcomeAcc, btts: trainBttsAcc, overUnder: trainOuAcc, avg: trainAvg },
+    valAccuracy: { outcome: valOutcomeAcc, btts: valBttsAcc, overUnder: valOuAcc, avg: valAvg },
+    calibrationScore: calibration,
+    previousAccuracy,
+    previousVersion,
+    featureImportances,
+  };
+}
+
 // ===================== Retraining on settled bets =====================
 const RETRAIN_THRESHOLD = 20;
 let lastTrainedBetCount = 0;

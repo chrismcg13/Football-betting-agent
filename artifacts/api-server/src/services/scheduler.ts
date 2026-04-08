@@ -6,6 +6,7 @@ import { detectValueBets } from "./valueDetection";
 import { placePaperBet, settleBets, getAgentStatus } from "./paperTrading";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
+import { runLearningLoop } from "./learningLoop";
 import { matchesTable, db } from "@workspace/db";
 import { eq, gte, lte, and } from "drizzle-orm";
 
@@ -218,6 +219,19 @@ export function startScheduler(): void {
     { timezone: "UTC" },
   );
   logger.info("Trading cycle scheduler active — every 15 minutes");
+
+  // Learning loop: daily at 03:00 UTC (after most European football has settled)
+  cron.schedule(
+    "0 3 * * *",
+    () => {
+      logger.info("Daily learning loop triggered by scheduler");
+      void runLearningLoop().catch((err) =>
+        logger.error({ err }, "Scheduled learning loop failed"),
+      );
+    },
+    { timezone: "UTC" },
+  );
+  logger.info("Learning loop scheduler active — daily at 03:00 UTC");
 }
 
 // ===================== Manual triggers (for API routes) =====================
