@@ -1,11 +1,11 @@
 import { useState, useMemo } from "react";
-import { usePerformance, useBetsByLeague, useBetsByMarket, useModel } from "@/hooks/use-dashboard";
+import { usePerformance, useBetsByLeague, useBetsByMarket, useModel, useBets } from "@/hooks/use-dashboard";
 import { formatCurrency } from "@/lib/format";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, LineChart,
-  ResponsiveContainer, Tooltip, XAxis, YAxis,
+  ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis, ZAxis,
 } from "recharts";
 
 const TT = {
@@ -113,6 +113,7 @@ export default function Performance() {
   const { data: byLeague, isLoading: leagueLoading } = useBetsByLeague();
   const { data: byMarket, isLoading: marketLoading } = useBetsByMarket();
   const { data: modelData, isLoading: modelLoading } = useModel();
+  const { data: allBetsData } = useBets(1, 200, "all");
 
   const chartData = useMemo(() => {
     const arr = (perfData?.cumulativeProfit as any[]) ?? [];
@@ -163,6 +164,21 @@ export default function Performance() {
     }
     return rows.sort((a, b) => b.roi - a.roi);
   }, [byLeague, byMarket]);
+
+  const scatterData = useMemo(() => {
+    const bets = (allBetsData?.bets as any[]) ?? [];
+    return bets
+      .filter((b: any) => b.opportunityScore != null && b.settlementPnl != null && (b.status === "won" || b.status === "lost"))
+      .map((b: any) => ({
+        score: Number(b.opportunityScore),
+        pnl: Number(b.settlementPnl),
+        status: b.status,
+        label: `${b.homeTeam} vs ${b.awayTeam}`,
+      }));
+  }, [allBetsData]);
+
+  const scatterWon = useMemo(() => scatterData.filter((d) => d.status === "won"), [scatterData]);
+  const scatterLost = useMemo(() => scatterData.filter((d) => d.status === "lost"), [scatterData]);
 
   if (perfLoading) {
     return (
@@ -377,6 +393,74 @@ export default function Performance() {
           </div>
         </Card>
       </div>
+
+      {/* Opportunity Score vs P&L Scatter */}
+      <Card>
+        <CardHead
+          title="Opportunity Score vs Outcome"
+          sub="Does a higher score actually predict wins? Each dot is a settled bet."
+        />
+        <div className="p-5">
+          {scatterData.length < 3 ? (
+            <div className="h-64 flex items-center justify-center text-sm text-slate-500">
+              Not enough scored bets to display — this chart populates as bets settle.
+            </div>
+          ) : (
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <ScatterChart margin={{ top: 8, right: 16, left: 4, bottom: 0 }}>
+                  <CartesianGrid {...GRID} />
+                  <XAxis
+                    type="number"
+                    dataKey="score"
+                    domain={[55, 100]}
+                    {...AXIS}
+                    label={{ value: "Opportunity Score", position: "insideBottom", offset: -2, fontSize: 10, fill: "#64748b" }}
+                  />
+                  <YAxis
+                    type="number"
+                    dataKey="pnl"
+                    {...AXIS}
+                    width={52}
+                    tickFormatter={(v) => `£${v}`}
+                  />
+                  <ZAxis range={[40, 40]} />
+                  <Tooltip
+                    {...TT}
+                    content={({ payload }: any) => {
+                      if (!payload?.length) return null;
+                      const d = payload[0]?.payload;
+                      return (
+                        <div style={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
+                          <p style={{ color: "#94a3b8", marginBottom: 4 }}>{d.label}</p>
+                          <p>Score: <span style={{ color: "#a78bfa", fontWeight: 700 }}>{d.score}</span></p>
+                          <p>P&L: <span style={{ color: d.pnl >= 0 ? "#10b981" : "#ef4444", fontWeight: 700 }}>£{d.pnl.toFixed(2)}</span></p>
+                        </div>
+                      );
+                    }}
+                  />
+                  {scatterWon.length > 0 && (
+                    <Scatter name="Won" data={scatterWon} fill="#10b981" fillOpacity={0.7} />
+                  )}
+                  {scatterLost.length > 0 && (
+                    <Scatter name="Lost" data={scatterLost} fill="#ef4444" fillOpacity={0.5} />
+                  )}
+                </ScatterChart>
+              </ResponsiveContainer>
+              <div className="flex items-center gap-4 justify-center mt-2">
+                <span className="flex items-center gap-1.5 text-xs text-slate-400">
+                  <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: "#10b981" }} />
+                  Won ({scatterWon.length})
+                </span>
+                <span className="flex items-center gap-1.5 text-xs text-slate-400">
+                  <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: "#ef4444" }} />
+                  Lost ({scatterLost.length})
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      </Card>
 
       {/* Segment Table */}
       <Card>

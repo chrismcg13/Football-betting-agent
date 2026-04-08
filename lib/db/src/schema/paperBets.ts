@@ -30,6 +30,7 @@ export const paperBetsTable = pgTable("paper_bets", {
     scale: 6,
   }),
   calculatedEdge: numeric("calculated_edge", { precision: 8, scale: 6 }),
+  opportunityScore: numeric("opportunity_score", { precision: 6, scale: 2 }),
   modelVersion: text("model_version"),
   status: text("status").notNull().default("pending"),
   settlementPnl: numeric("settlement_pnl", { precision: 12, scale: 2 }),

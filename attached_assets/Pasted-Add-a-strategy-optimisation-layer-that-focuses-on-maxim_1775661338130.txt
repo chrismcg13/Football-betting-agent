@@ -1,0 +1,47 @@
+Add a strategy optimisation layer that focuses on maximising ROI without increasing risk to overall capital.
+
+1. Add an "edge quality scoring" system in the value detection engine:
+   - Don't just bet on anything above 3% edge
+   - Score each opportunity on multiple factors:
+     * Edge size (higher = better)
+     * Model confidence (how certain is the prediction — use probability distance from 50%)
+     * Historical accuracy for this league/market combo (if we've been profitable here before, score higher)
+     * Sample size (more historical bets in this segment = more trustworthy)
+     * Odds range sweet spot (odds between 1.8 and 3.5 tend to offer best risk/reward — score these higher)
+   - Combine into a composite "opportunity score" from 0-100
+   - Only bet when opportunity score > 60 (configurable in agent_config as min_opportunity_score)
+
+2. Add dynamic stake sizing based on confidence:
+   - Current: flat quarter-Kelly for everything
+   - New: scale the Kelly fraction based on opportunity score
+     * Score 60-70: use 1/8 Kelly (very conservative, small stake)
+     * Score 70-80: use 1/4 Kelly (standard)
+     * Score 80-90: use 3/8 Kelly (higher confidence, slightly larger stake)
+     * Score 90+: use 1/2 Kelly (highest confidence — but still never exceeds max_stake_pct)
+   - This means the agent bets MORE on its best opportunities and LESS on marginal ones
+   - Max stake still capped at 2% of bankroll — this just allocates within that ceiling more intelligently
+
+3. Add a "cold market" filter:
+   - If the agent has placed 10+ bets in a specific league/market combo and ROI is below -10%, automatically exclude that combo for 2 weeks before trying again
+   - Log this as a strategy_shift narrative: "Temporarily excluding [league] [market] after [N] bets at [ROI]% ROI. Will re-evaluate in 2 weeks."
+
+4. Add a "hot streak" detector:
+   - If a league/market combo has positive ROI for 3+ consecutive weeks with 5+ bets per week, increase its opportunity score bonus by 15 points
+   - This makes the agent lean into what's working while the edge persists
+
+5. Track and display opportunity scores on the dashboard:
+   - Add opportunity_score column to the paper_bets table
+   - Show it in the bet history table and the bet detail expansion
+   - Add an "Average Opportunity Score" metric to the overview page
+   - On the performance page, add a scatter plot: X = opportunity score, Y = P&L per bet. This shows whether higher-scored bets actually perform better.
+
+6. Add all new config values to agent_config with sensible defaults:
+   - min_opportunity_score: 60
+   - cold_market_threshold: -10 (%)
+   - cold_market_min_bets: 10
+   - cold_market_cooldown_days: 14
+   - hot_streak_weeks: 3
+   - hot_streak_min_bets_per_week: 5
+   - hot_streak_bonus: 15
+
+Log all strategy decisions to compliance_logs.

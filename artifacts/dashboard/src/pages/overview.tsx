@@ -159,11 +159,11 @@ export default function Overview() {
       {/* 6-Card Stats Grid */}
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
         <StatCard
-          label="Bankroll"
+          label="Simulated Bankroll"
           value={loadingSummary ? "—" : formatCurrency(bankroll)}
           sub={
             !loadingSummary && summary
-              ? `${bankrollDiff >= 0 ? "+" : ""}${formatCurrency(bankrollDiff)} from £500 start`
+              ? `${bankrollDiff >= 0 ? "+" : ""}${formatCurrency(bankrollDiff)} from £500 paper start`
               : undefined
           }
           color={!loadingSummary ? (bankrollDiff >= 0 ? "green" : "red") : "default"}
@@ -200,10 +200,34 @@ export default function Overview() {
           color={!loadingSummary ? (roi >= 0 ? "green" : "red") : "default"}
         />
         <StatCard
-          label="Today's P&L"
-          value={loadingSummary ? "—" : `${todayPnl >= 0 ? "+" : ""}${formatCurrency(todayPnl)}`}
-          sub={!loadingSummary ? "since midnight UTC" : undefined}
-          color={!loadingSummary ? (todayPnl >= 0 ? "green" : "red") : "default"}
+          label="Avg Opportunity Score"
+          value={
+            loadingSummary
+              ? "—"
+              : summary?.avgOpportunityScore != null
+                ? `${summary.avgOpportunityScore.toFixed(1)}`
+                : "—"
+          }
+          sub={
+            !loadingSummary
+              ? summary?.avgOpportunityScore != null
+                ? summary.avgOpportunityScore >= 80
+                  ? "Strong signal quality"
+                  : summary.avgOpportunityScore >= 70
+                    ? "Good signal quality"
+                    : "Moderate signal quality"
+                : "No scored bets yet"
+              : undefined
+          }
+          color={
+            !loadingSummary && summary?.avgOpportunityScore != null
+              ? summary.avgOpportunityScore >= 80
+                ? "green"
+                : summary.avgOpportunityScore >= 70
+                  ? "amber"
+                  : "default"
+              : "default"
+          }
         />
       </div>
 

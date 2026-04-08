@@ -1,0 +1,176 @@
+This is a comprehensive update combining dashboard overhaul, strategy improvements, additional data sources, and design polish. Please implement everything in this single prompt.
+
+=== PART 1: DASHBOARD OVERHAUL AND DESIGN ===
+
+GLOBAL DESIGN:
+- Dark theme throughout: background #0f172a, cards #1e293b, borders #334155
+- Font: Inter or system-ui
+- All monetary values large and clear with £ symbol
+- Green #10b981 for profit/wins, Red #ef4444 for losses, Amber #f59e0b for pending
+- Rounded-xl cards with subtle shadows
+- Responsive: works on mobile and desktop
+- Auto-refresh every 60 seconds
+
+CRITICAL LABELLING CHANGE:
+- Everywhere the bankroll appears, label it "Simulated Bankroll" not just "Bankroll"
+- Add a small info tooltip or subtitle: "Paper trading with simulated £500 starting capital. No real money at risk."
+- Show "Starting Capital: £500" as a reference point next to current bankroll
+- P&L should always show both £ amount AND percentage from the £500 start
+
+OVERVIEW PAGE:
+- Top stats row (6 cards, 3 columns desktop, 2 mobile):
+  1. SIMULATED BANKROLL: Large £ figure, subtitle "+£X (+Y%) from £500 start"
+  2. TOTAL P&L: Large £ in green/red with percentage
+  3. TOTAL BETS: Large number with "XW - YL" underneath
+  4. WIN RATE: Percentage with trend arrow vs last week
+  5. ROI: Percentage in green/red
+  6. TODAY'S P&L: Large £ figure
+
+- Cumulative P&L line chart: smooth line, green gradient fill if profitable, red if not. Recharts with clean styling.
+
+- Two columns below chart:
+  LEFT — "Upcoming Bets" (pending bets not yet settled):
+    Show: Match, kickoff time (readable: "Tomorrow 3pm"), market, selection, odds, stake, edge%, opportunity score
+    Sorted by kickoff soonest first
+    If none: "Agent analysing fixtures. Next scan in X minutes."
+  
+  RIGHT — "Recent Results" (last 10 settled):
+    Show: Match, selection, odds, stake, P&L in green/red, Won/Lost badge
+    Green left border for wins, red for losses
+
+- "What the Agent Has Learned" section below both columns:
+  Show 5 most recent narratives as cards with:
+  - Emoji icon: lightbulb for discoveries, chart-up for improvements, shield for risk, target for confidence, arrows for strategy shifts
+  - READABLE TEXT not raw type labels. Transform all narrative types:
+    "risk_circuit_breaker" → "Risk control activated: [extract reason from related_data]. Agent paused to protect the bankroll."
+    "sustained_positive_edge" → "Consistent edge found: [league] [market] showing [ROI]% ROI over [N] bets."
+    "strategy_best_segment" → "Best strategy right now: [league] [market] returning [ROI]%."
+    "strategy_worst_segment" → "Weak spot: [league] [market] at [ROI]%. Agent reducing exposure."
+    "feature_importance_change" → "Model insight: [readable feature name] is now the #[rank] most important predictor."
+    "model_accuracy_improvement" → "Model accuracy improved from [old]% to [new]% after retraining on [N] bets."
+  - Relative timestamp: "2 hours ago", "Yesterday"
+
+BET HISTORY PAGE:
+- Filters: Status (All/Won/Lost/Pending), League, Market Type
+- Summary bar: "X bets | Y won | Z lost | P&L: £N"
+- Table: Date, Match, League, Market, Selection, Odds, Stake, Edge%, Opp Score, Result, P&L
+- Won rows subtle green tint, lost subtle red, pending amber
+- Expandable rows showing: "Model estimated X% probability vs implied Y%. Edge: Z%. Opportunity score: N/100. Stake via quarter-Kelly."
+
+PERFORMANCE PAGE:
+- Large P&L chart with date range selector
+- ROI by League horizontal bar chart (green positive, red negative, sorted by ROI)
+- ROI by Market Type horizontal bar chart (same style)
+- Win rate trend line (weekly)
+- Scatter plot: Opportunity Score (X) vs P&L per bet (Y) — shows if higher scored bets perform better
+- Bottom table: every league/market combo ranked by ROI
+
+VIABILITY PAGE:
+- Giant traffic light (3 circles, only one illuminated based on signal)
+- Clear sentence below explaining the signal
+- Three cards: Conservative (50%), Moderate (75%), Optimistic (100%)
+  Each: Monthly profit, Months to recoup £499, Minimum bankroll
+  Conservative card highlighted with accent border
+- Supporting criteria checklist with green ticks / red crosses
+- Add a prominent note: "This projection is based on simulated paper trading. Real-money performance may differ. The conservative scenario (50% of paper ROI) is used for the GO decision."
+
+LEARNING & MODEL PAGE:
+- Model Health card: accuracy, calibration, bets trained on, last retrained date
+- Feature importance bar chart with READABLE labels:
+  away_goals_conceded_avg → "Away Goals Conceded (Avg)"
+  home_form_last5 → "Home Form (Last 5)"
+  h2h_home_win_rate → "Head-to-Head Home Win Rate"
+  league_position_diff → "League Position Gap"
+  home_over25_rate → "Home Over 2.5 Goals Rate"
+  away_over25_rate → "Away Over 2.5 Goals Rate"
+  home_btts_rate → "Home BTTS Rate"
+  away_btts_rate → "Away BTTS Rate"
+  home_goals_scored_avg → "Home Goals Scored (Avg)"
+  away_goals_scored_avg → "Away Goals Scored (Avg)"
+  Map ALL feature names to plain English equivalents.
+- Full narrative feed (paginated, same card style as overview)
+- Accuracy history chart (accuracy over retraining cycles)
+
+COMPLIANCE PAGE:
+- Professional audit styling
+- CSV export button prominent
+- Readable summaries auto-generated from JSON (same as narratives)
+- Expandable rows for raw JSON
+
+=== PART 2: STRATEGY OPTIMISATION ===
+
+Add an edge quality scoring system to value detection:
+
+1. OPPORTUNITY SCORING (0-100):
+   Score each potential bet on:
+   - Edge size: (edge / 0.15) * 25, capped at 25 points
+   - Model confidence: abs(model_prob - 0.5) * 50, capped at 25 points  
+   - Historical segment ROI: if this league/market combo has positive historical ROI, add up to 20 points scaled by ROI %
+   - Sample reliability: min(segment_bet_count / 20, 1) * 15 points
+   - Odds sweet spot: if odds between 1.8-3.5 add 15 points, 1.5-1.8 or 3.5-5.0 add 8 points, outside add 0
+   Only place bets where opportunity_score > 60
+
+2. DYNAMIC STAKE SIZING:
+   Scale Kelly fraction by opportunity score:
+   - Score 60-70: 1/8 Kelly (conservative, small stake)
+   - Score 70-80: 1/4 Kelly (standard)
+   - Score 80-90: 3/8 Kelly (confident)
+   - Score 90+: 1/2 Kelly (high confidence)
+   Max stake still capped at bankroll * max_stake_pct (2%)
+
+3. COLD MARKET FILTER:
+   If 10+ bets in a league/market combo and ROI < -10%, auto-exclude for 14 days.
+   Log as narrative: "Excluding [league] [market] after [N] bets at [ROI]%. Re-evaluating in 2 weeks."
+
+4. HOT STREAK DETECTOR:
+   If a combo has positive ROI for 3+ consecutive weeks with 5+ bets/week, add 15 bonus points to opportunity score.
+   Log as narrative: "Hot streak: [league] [market] profitable for [N] weeks running."
+
+5. Add to agent_config: min_opportunity_score=60, cold_market_threshold=-10, cold_market_min_bets=10, cold_market_cooldown_days=14, hot_streak_weeks=3, hot_streak_bonus=15
+
+6. Add opportunity_score to paper_bets table and display in dashboard bet history and detail views.
+
+=== PART 3: ADDITIONAL DATA SOURCES AND FEATURES ===
+
+1. EXPECTED GOALS (xG) DATA:
+   Add a new data source using the free tier of understat.com or fbref.com (scrape if no API):
+   - Fetch team-level xG (expected goals for and against) for each team's last 10 matches
+   - Add features: home_xg_for_avg, home_xg_against_avg, away_xg_for_avg, away_xg_against_avg
+   - Add xg_difference feature (team xG minus opponent xG — strongest single predictor in football)
+   - If scraping is too complex, calculate a proxy xG from shots on target and conversion rates using football-data.org match statistics
+
+2. VENUE AND SCHEDULING FEATURES:
+   - days_since_last_match: for both teams (fatigue indicator, especially midweek after European games)
+   - is_derby: flag if teams are from the same city (derbies are less predictable)
+   - home_advantage_strength: home win rate for this specific venue from historical data
+
+3. EXPANDED MARKET COVERAGE:
+   When the model has enough data (50+ settled bets), start exploring:
+   - Asian Handicap markets (use football-data.org handicap data if available)
+   - Over/Under 1.5 goals and Over/Under 3.5 goals (not just 2.5)
+   - First half result (if data available)
+   Add these as new model variants that train independently
+
+4. FORM MOMENTUM FEATURES:
+   - points_trajectory: are they improving or declining? Calculate slope of points over last 10 games
+   - goals_trajectory: same for goals scored
+   - clean_sheet_rate: last 5 home/away games
+   - These capture whether a team is on the way up or down, not just their average
+
+5. Add all new features to the feature engine, retrain models to include them, and update the feature importance display with readable labels for all new features:
+   home_xg_for_avg → "Expected Goals For (Home)"
+   days_since_last_match → "Days Since Last Match"
+   is_derby → "Local Derby"
+   points_trajectory → "Form Trajectory"
+   clean_sheet_rate → "Clean Sheet Rate"
+
+Log all new data source activity to compliance_logs. If any scraping or API call fails, fall back gracefully without breaking the system.
+
+=== PART 4: FINAL WIRING ===
+
+Make sure:
+- All cron jobs are running (odds fetch, features, trading cycle, nightly retraining)
+- The server starts cleanly with a health check
+- All new features and scores flow through to the dashboard
+- All strategy decisions are logged to compliance_logs
+- The system is production-ready for publish

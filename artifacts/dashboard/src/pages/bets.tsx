@@ -7,6 +7,29 @@ import { Button } from "@/components/ui/button";
 import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+function OppScoreBadge({ score }: { score: number | null }) {
+  if (score == null) return <span className="text-slate-600 font-mono">—</span>;
+  const color =
+    score >= 80 ? "#10b981" : score >= 70 ? "#3b82f6" : score >= 60 ? "#f59e0b" : "#64748b";
+  return (
+    <span
+      className="font-mono font-bold text-sm"
+      style={{ color }}
+      title={`Opportunity score: ${score}/100`}
+    >
+      {score.toFixed(0)}
+    </span>
+  );
+}
+
+function kellyLabel(score: number | null): string {
+  if (score == null) return "quarter-Kelly";
+  if (score >= 90) return "half-Kelly (high confidence)";
+  if (score >= 80) return "3/8 Kelly (confident)";
+  if (score >= 70) return "quarter-Kelly (standard)";
+  return "1/8 Kelly (conservative)";
+}
+
 function ExpandedReasoning({ bet }: { bet: any }) {
   const modelProb = bet.modelProbability != null ? (bet.modelProbability * 100).toFixed(1) : null;
   const impliedProb = bet.betfairImpliedProbability != null
@@ -16,7 +39,7 @@ function ExpandedReasoning({ bet }: { bet: any }) {
 
   return (
     <tr>
-      <td colSpan={11} className="pb-2 px-4">
+      <td colSpan={12} className="pb-2 px-4">
         <div
           className="rounded-lg border px-5 py-4 text-sm"
           style={{ background: "#0f172a", borderColor: "#334155" }}
@@ -39,20 +62,24 @@ function ExpandedReasoning({ bet }: { bet: any }) {
             )}
             {edge && (
               <span className="text-slate-300">
-                Calculated edge:{" "}
-                <span
-                  className={cn(
-                    "font-semibold font-mono",
-                    Number(edge) >= 0 ? "text-emerald-400" : "text-red-400",
-                  )}
-                >
+                Edge:{" "}
+                <span className={cn("font-semibold font-mono", Number(edge) >= 0 ? "text-emerald-400" : "text-red-400")}>
                   {edge}%
                 </span>
               </span>
             )}
+            {bet.opportunityScore != null && (
+              <span className="text-slate-300">
+                Opportunity score:{" "}
+                <span className="font-semibold font-mono text-violet-400">
+                  {bet.opportunityScore.toFixed(0)}/100
+                </span>
+              </span>
+            )}
             <span className="text-slate-300">
-              Stake: <span className="text-white font-semibold font-mono">{formatCurrency(bet.stake)}</span>
-              {" "}(quarter-Kelly)
+              Stake:{" "}
+              <span className="text-white font-semibold font-mono">{formatCurrency(bet.stake)}</span>
+              {" "}({kellyLabel(bet.opportunityScore)})
             </span>
             {bet.modelVersion && (
               <span className="text-slate-500 font-mono text-xs">Model: {bet.modelVersion}</span>
@@ -281,6 +308,7 @@ export default function Bets() {
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Odds</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Stake</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Edge</th>
+                  <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold" title="Opportunity Score /100">Score</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Result</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold pr-5">P&L</th>
                 </tr>
@@ -335,6 +363,9 @@ export default function Bets() {
                         ) : (
                           <span className="text-slate-600">—</span>
                         )}
+                      </td>
+                      <td className="py-3 px-3 text-right">
+                        <OppScoreBadge score={bet.opportunityScore ?? null} />
                       </td>
                       <td className="py-3 px-3 text-right">
                         <BetStatusBadge status={bet.status} />

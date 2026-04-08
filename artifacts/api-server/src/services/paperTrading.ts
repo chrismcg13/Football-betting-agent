@@ -75,27 +75,31 @@ export async function getAgentStatus(): Promise<string> {
   return (await getConfigValue("agent_status")) ?? "running";
 }
 
-// ===================== Stake calculation =====================
+// ===================== Dynamic stake sizing =====================
 
-function calculateKellyStake(
+function kellyFractionForScore(opportunityScore: number): number {
+  if (opportunityScore >= 90) return 0.5;
+  if (opportunityScore >= 80) return 0.375;
+  if (opportunityScore >= 70) return 0.25;
+  return 0.125; // 60-70
+}
+
+function calculateDynamicKellyStake(
   bankroll: number,
   edge: number,
   backOdds: number,
   maxStakePct: number,
+  opportunityScore: number,
 ): number {
   if (edge <= 0 || backOdds <= 1) return 0;
 
-  // Quarter-Kelly: stake = bankroll * (edge / (odds - 1)) * 0.25
-  const kellyFraction = edge / (backOdds - 1);
-  let stake = bankroll * kellyFraction * 0.25;
+  const fraction = kellyFractionForScore(opportunityScore);
+  const kellyFull = edge / (backOdds - 1);
+  let stake = bankroll * kellyFull * fraction;
 
-  // Cap at max_stake_pct of bankroll
   stake = Math.min(stake, bankroll * maxStakePct);
-
-  // Minimum £2
   stake = Math.max(stake, 2);
 
-  // Round to 2 dp
   return Math.round(stake * 100) / 100;
 }
 
@@ -116,7 +120,10 @@ export async function placePaperBet(
   modelProbability: number,
   edge: number,
   modelVersion?: string | null,
+  opportunityScore?: number,
 ): Promise<BetPlacementResult> {
+  const score = opportunityScore ?? 65;
+
   const logReject = async (reason: string) => {
     logger.info({ matchId, marketType, selectionName, reason }, "Bet rejected");
     await db.insert(complianceLogsTable).values({
@@ -128,6 +135,7 @@ export async function placePaperBet(
         backOdds,
         modelProbability,
         edge,
+        opportunityScore: score,
         reason,
       },
       timestamp: new Date(),
@@ -135,13 +143,11 @@ export async function placePaperBet(
     return { placed: false, reason };
   };
 
-  // 1. Agent must be running
   const status = await getAgentStatus();
   if (status !== "running") {
     return logReject(`Agent is not running (status: ${status})`);
   }
 
-  // 2. Max concurrent bets
   const [maxConcurrent, openCount] = await Promise.all([
     getConfigValue("max_concurrent_bets").then((v) => Number(v ?? "10")),
     getOpenBetsCount(),
@@ -152,7 +158,6 @@ export async function placePaperBet(
     );
   }
 
-  // 3. Bankroll checks
   const bankroll = await getBankroll();
   const bankrollFloor = Number(
     (await getConfigValue("bankroll_floor")) ?? "200",
@@ -163,7 +168,6 @@ export async function placePaperBet(
     );
   }
 
-  // 4. Daily loss limit
   const dailyLossLimitPct = Number(
     (await getConfigValue("daily_loss_limit_pct")) ?? "0.05",
   );
@@ -175,7 +179,6 @@ export async function placePaperBet(
     );
   }
 
-  // 5. Weekly loss limit
   const weeklyLossLimitPct = Number(
     (await getConfigValue("weekly_loss_limit_pct")) ?? "0.10",
   );
@@ -187,11 +190,16 @@ export async function placePaperBet(
     );
   }
 
-  // 6. Calculate stake
   const maxStakePct = Number(
     (await getConfigValue("max_stake_pct")) ?? "0.02",
   );
-  const stake = calculateKellyStake(bankroll, edge, backOdds, maxStakePct);
+  const stake = calculateDynamicKellyStake(
+    bankroll,
+    edge,
+    backOdds,
+    maxStakePct,
+    score,
+  );
 
   if (stake < 2) {
     return logReject(`Calculated stake £${stake} is below minimum £2`);
@@ -201,7 +209,6 @@ export async function placePaperBet(
     Math.round(stake * (backOdds - 1) * 0.98 * 100) / 100;
   const impliedProbability = 1 / backOdds;
 
-  // 7. Insert paper bet
   const [bet] = await db
     .insert(paperBetsTable)
     .values({
@@ -215,12 +222,14 @@ export async function placePaperBet(
       modelProbability: String(modelProbability),
       betfairImpliedProbability: String(impliedProbability),
       calculatedEdge: String(edge),
+      opportunityScore: String(score),
       modelVersion: modelVersion ?? null,
       status: "pending",
     })
     .returning();
 
-  // 8. Compliance log
+  const kellyFraction = kellyFractionForScore(score);
+
   await db.insert(complianceLogsTable).values({
     actionType: "bet_placed",
     details: {
@@ -234,10 +243,11 @@ export async function placePaperBet(
       modelProbability,
       impliedProbability,
       edge,
+      opportunityScore: score,
       bankrollBefore: bankroll,
       openBetsAfter: openCount + 1,
-      kellyFraction: edge / (backOdds - 1),
-      quarterKellyStake: stake,
+      kellyFraction,
+      dynamicKellyFraction: kellyFraction,
       modelVersion,
     },
     timestamp: new Date(),
@@ -252,6 +262,8 @@ export async function placePaperBet(
       backOdds,
       stake,
       edge: edge.toFixed(4),
+      opportunityScore: score,
+      kellyFraction,
     },
     "Paper bet placed",
   );
@@ -342,7 +354,6 @@ export async function settleBets(): Promise<SettlementResult> {
       match.awayScore,
     );
 
-    // 2% Betfair commission on winnings
     const settlementPnl = betWon
       ? Math.round(stake * (odds - 1) * 0.98 * 100) / 100
       : -stake;
@@ -374,6 +385,7 @@ export async function settleBets(): Promise<SettlementResult> {
         stake,
         outcome: newStatus,
         settlementPnl,
+        opportunityScore: Number(bet.opportunityScore ?? 0),
         commission: betWon
           ? Math.round(stake * (odds - 1) * 0.02 * 100) / 100
           : 0,
@@ -392,12 +404,12 @@ export async function settleBets(): Promise<SettlementResult> {
         matchId: match.id,
         outcome: newStatus,
         settlementPnl,
+        opportunityScore: bet.opportunityScore,
       },
       "Bet settled",
     );
   }
 
-  // Update bankroll
   if (settled > 0) {
     const currentBankroll = await getBankroll();
     const newBankroll =
@@ -407,12 +419,13 @@ export async function settleBets(): Promise<SettlementResult> {
     await db.insert(complianceLogsTable).values({
       actionType: "bankroll_updated",
       details: {
-        previous: currentBankroll,
+        bankrollBefore: currentBankroll,
+        bankrollAfter: newBankroll,
         delta: totalPnl,
-        updated: newBankroll,
         betsSettled: settled,
         won,
         lost,
+        reason: "settlement",
       },
       timestamp: new Date(),
     });
@@ -422,7 +435,6 @@ export async function settleBets(): Promise<SettlementResult> {
       "Bankroll updated after settlement",
     );
 
-    // Trigger model retraining if total settled bets is a multiple of 20
     const totalSettledResult = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(paperBetsTable)

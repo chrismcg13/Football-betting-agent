@@ -21,6 +21,13 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   { key: "max_concurrent_bets", value: "10" },
   { key: "min_edge_threshold", value: "0.03" },
   { key: "agent_status", value: "running" },
+  { key: "min_opportunity_score", value: "60" },
+  { key: "cold_market_threshold", value: "-10" },
+  { key: "cold_market_min_bets", value: "10" },
+  { key: "cold_market_cooldown_days", value: "14" },
+  { key: "hot_streak_weeks", value: "3" },
+  { key: "hot_streak_min_bets_per_week", value: "5" },
+  { key: "hot_streak_bonus", value: "15" },
 ];
 
 export async function runMigrations() {
@@ -85,6 +92,11 @@ export async function runMigrations() {
         placed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         settled_at TIMESTAMPTZ
       )
+    `);
+
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS opportunity_score NUMERIC(6,2)
     `);
 
     await db.execute(sql`

@@ -50,6 +50,7 @@ async function getSettledBetsStats() {
       stake: paperBetsTable.stake,
       settlementPnl: paperBetsTable.settlementPnl,
       settledAt: paperBetsTable.settledAt,
+      opportunityScore: paperBetsTable.opportunityScore,
     })
     .from(paperBetsTable)
     .where(inArray(paperBetsTable.status, ["won", "lost", "void"]));
@@ -100,6 +101,19 @@ router.get("/dashboard/summary", async (req, res) => {
     0,
   );
 
+  const betsWithScore = allSettled.filter((b) => b.opportunityScore != null);
+  const avgOpportunityScore =
+    betsWithScore.length > 0
+      ? Math.round(
+          (betsWithScore.reduce(
+            (sum, b) => sum + Number(b.opportunityScore ?? 0),
+            0,
+          ) /
+            betsWithScore.length) *
+            10,
+        ) / 10
+      : null;
+
   res.json({
     currentBankroll: Math.round(bankroll * 100) / 100,
     startingBankroll: STARTING_BANKROLL,
@@ -124,6 +138,7 @@ router.get("/dashboard/summary", async (req, res) => {
     todayPnl: Math.round(todayPnl * 100) / 100,
     thisWeekPnl: Math.round(weekPnl * 100) / 100,
     activeBetsCount: activeBets.length,
+    avgOpportunityScore,
   });
 });
 
@@ -375,6 +390,7 @@ router.get("/dashboard/bets", async (req, res) => {
         modelProbability: paperBetsTable.modelProbability,
         betfairImpliedProbability: paperBetsTable.betfairImpliedProbability,
         calculatedEdge: paperBetsTable.calculatedEdge,
+        opportunityScore: paperBetsTable.opportunityScore,
         modelVersion: paperBetsTable.modelVersion,
         status: paperBetsTable.status,
         settlementPnl: paperBetsTable.settlementPnl,
@@ -410,6 +426,7 @@ router.get("/dashboard/bets", async (req, res) => {
         ? Number(b.betfairImpliedProbability)
         : null,
       calculatedEdge: b.calculatedEdge ? Number(b.calculatedEdge) : null,
+      opportunityScore: b.opportunityScore ? Number(b.opportunityScore) : null,
       settlementPnl: b.settlementPnl ? Number(b.settlementPnl) : null,
     })),
   });

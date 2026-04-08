@@ -143,6 +143,128 @@ function computeOver25Rate(
   return over / filtered.length;
 }
 
+// ─── New: Clean sheet rate ────────────────────────────────────────────────────
+
+function computeCleanSheetRate(
+  matches: FDMatch[],
+  teamId: number,
+  venue: "home" | "away",
+  last = 5,
+): number {
+  const filtered = matches
+    .filter((m) =>
+      venue === "home"
+        ? m.homeTeam?.id === teamId
+        : m.awayTeam?.id === teamId,
+    )
+    .slice(0, last);
+
+  if (filtered.length === 0) return 0;
+
+  const cleanSheets = filtered.filter((m) => {
+    const ft = m.score.fullTime;
+    if (ft.home === null || ft.away === null) return false;
+    const isHome = m.homeTeam?.id === teamId;
+    const conceded = isHome ? ft.away : ft.home;
+    return conceded === 0;
+  }).length;
+
+  return cleanSheets / filtered.length;
+}
+
+// ─── New: Points trajectory (slope over last 10 games) ───────────────────────
+
+function computePointsTrajectory(
+  matches: FDMatch[],
+  teamId: number,
+  last = 10,
+): number {
+  const allMatches = matches
+    .filter((m) => m.homeTeam?.id === teamId || m.awayTeam?.id === teamId)
+    .slice(0, last);
+
+  if (allMatches.length < 3) return 0;
+
+  // Calculate points per match and fit linear trend
+  const points: number[] = allMatches.reverse().map((m) => {
+    const isHome = m.homeTeam?.id === teamId;
+    const winner = m.score.winner;
+    if (winner === "DRAW") return 1;
+    if ((isHome && winner === "HOME_TEAM") || (!isHome && winner === "AWAY_TEAM")) return 3;
+    return 0;
+  });
+
+  // Simple linear regression slope
+  const n = points.length;
+  const xMean = (n - 1) / 2;
+  const yMean = points.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (i - xMean) * ((points[i] ?? 0) - yMean);
+    den += (i - xMean) ** 2;
+  }
+  return den === 0 ? 0 : num / den;
+}
+
+// ─── New: Days since last match (fatigue proxy) ───────────────────────────────
+
+function computeDaysSinceLastMatch(
+  matches: FDMatch[],
+  teamId: number,
+): number {
+  const played = matches
+    .filter(
+      (m) =>
+        (m.homeTeam?.id === teamId || m.awayTeam?.id === teamId) &&
+        m.score.winner !== null,
+    )
+    .slice(0, 1);
+
+  if (played.length === 0) return 7; // default neutral
+
+  const lastDate = new Date(played[0]!.utcDate);
+  const now = new Date();
+  const diffMs = now.getTime() - lastDate.getTime();
+  const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
+  return Math.max(0, diffDays);
+}
+
+// ─── New: xG proxy from goal conversion rates ─────────────────────────────────
+
+function computeXgProxy(
+  matches: FDMatch[],
+  teamId: number,
+  venue: "home" | "away",
+  last = 10,
+): number {
+  const filtered = matches
+    .filter((m) =>
+      venue === "home"
+        ? m.homeTeam?.id === teamId
+        : m.awayTeam?.id === teamId,
+    )
+    .slice(0, last);
+
+  if (filtered.length === 0) return 1.2; // league average fallback
+
+  let totalGoals = 0;
+  let validGames = 0;
+  for (const m of filtered) {
+    const ft = m.score.fullTime;
+    if (ft.home === null || ft.away === null) continue;
+    const isHome = m.homeTeam?.id === teamId;
+    totalGoals += isHome ? ft.home : ft.away;
+    validGames++;
+  }
+  if (validGames === 0) return 1.2;
+  // Smooth toward league average (1.4 goals)
+  const rawAvg = totalGoals / validGames;
+  return 0.7 * rawAvg + 0.3 * 1.4;
+}
+
+// ─── Upsert feature ───────────────────────────────────────────────────────────
+
 async function upsertFeature(
   matchId: number,
   name: string,
@@ -214,6 +336,7 @@ export async function computeFeaturesForMatch(
   );
   const h2h = await getHeadToHead(fdMatchId).catch(() => null);
 
+  // ─── Classic features ─────────────────────────────────
   const homeForm5 = computeForm(homeMatches, homeTeamId, "home", 5);
   const awayForm5 = computeForm(awayMatches, awayTeamId, "away", 5);
 
@@ -248,7 +371,22 @@ export async function computeFeaturesForMatch(
     }
   }
 
+  // ─── New features ─────────────────────────────────────
+  const homeCleanSheets = computeCleanSheetRate(homeMatches, homeTeamId, "home", 5);
+  const awayCleanSheets = computeCleanSheetRate(awayMatches, awayTeamId, "away", 5);
+
+  const homePointsTraj = computePointsTrajectory(homeMatches, homeTeamId, 10);
+  const awayPointsTraj = computePointsTrajectory(awayMatches, awayTeamId, 10);
+
+  const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
+  const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
+
+  const homeXg = computeXgProxy(homeMatches, homeTeamId, "home", 10);
+  const awayXg = computeXgProxy(awayMatches, awayTeamId, "away", 10);
+  const xgDiff = homeXg - awayXg;
+
   const features: Array<[string, number]> = [
+    // Classic
     ["home_form_last5", homeForm5],
     ["away_form_last5", awayForm5],
     ["home_goals_scored_avg", homeGoals.scored],
@@ -261,6 +399,16 @@ export async function computeFeaturesForMatch(
     ["away_btts_rate", awayBtts],
     ["home_over25_rate", homeOver25],
     ["away_over25_rate", awayOver25],
+    // New
+    ["home_clean_sheet_rate", homeCleanSheets],
+    ["away_clean_sheet_rate", awayCleanSheets],
+    ["home_points_trajectory", homePointsTraj],
+    ["away_points_trajectory", awayPointsTraj],
+    ["home_days_since_last_match", homeDaysSince],
+    ["away_days_since_last_match", awayDaysSince],
+    ["home_xg_proxy", homeXg],
+    ["away_xg_proxy", awayXg],
+    ["xg_diff", xgDiff],
   ];
 
   for (const [name, value] of features) {

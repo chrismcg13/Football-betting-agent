@@ -170,6 +170,7 @@ export async function runTradingCycle(): Promise<{
         bet.modelProbability,
         bet.edge,
         modelVersion,
+        bet.opportunityScore,
       );
       if (result.placed) {
         betsPlaced++;
