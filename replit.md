@@ -62,11 +62,49 @@ All routes are under `/api/`:
 - `GET/POST /odds-snapshots` — odds data ingestion
 - `GET/POST /features` — ML feature storage (metadata features prefixed `_` are hidden from GET)
 - `POST /features/compute` — manually trigger feature computation for all upcoming matches
+- `GET /predictions/status` — model loaded status and version
+- `GET /predictions/:matchId` — predict outcome/BTTS/over-under for a match (requires features + model)
+- `POST /predictions/bootstrap` — trigger bootstrap training from last season's historical data
+- `POST /predictions/retrain` — retrain if ≥20 new settled bets since last training
+- `POST /predictions/load` — reload latest model from DB into memory
+- `GET /value-bets` — detect value bets for all upcoming matches with odds (compliance-logged)
 - `GET/POST /model-state`, `GET /model-state/latest` — model versioning
 - `GET/POST /learning-narratives` — agent learning log
 - `GET/POST /compliance-logs` — compliance audit trail
 - `POST /ingestion/run` — manually trigger data ingestion
 - `GET /healthz` — health check
+
+## Prediction Engine (`src/services/predictionEngine.ts`)
+
+Three logistic regression models trained via one-vs-all, bootstrapped from historical season data:
+
+| Model | Classes | Features used |
+|-------|---------|---------------|
+| Outcome | home(0) / draw(1) / away(2) | All 12 features |
+| BTTS | no(0) / yes(1) | features 0–5 + 8,9 |
+| Over/Under 2.5 | under(0) / over(1) | features 0–5 + 10,11 |
+
+**Bootstrap training**: Fetches last season's finished matches from all 8 FEATURE_COMPETITIONS, computes rolling in-dataset features (no extra API calls), trains all 3 models, stores weights in `model_state` as JSON.
+
+**Auto-load on startup**: The server calls `loadLatestModel()` at boot; if no model exists in DB, bootstrap training starts automatically in the background.
+
+**Retraining**: After every 20 new settled paper bets, `retrainIfNeeded()` rebuilds all 3 models using settled bet match data + features from the DB and compares new vs old accuracy.
+
+**Hyperparameters**: 500 gradient steps, learning rate 0.005 (prevents weight saturation / overconfident probabilities).
+
+**Feature normalization**: All features are z-score normalized (mean=0, std=1) before training and inference. Normalization statistics are saved alongside model weights.
+
+## Value Detection (`src/services/valueDetection.ts`)
+
+For each upcoming match with odds snapshots in the DB:
+1. Loads computed features from `features` table
+2. Calls prediction engine for outcome / BTTS / over-under probabilities
+3. For each selection: `implied_prob = 1 / back_odds`, `edge = model_prob - implied_prob`
+4. Flags as value bet if `edge > min_edge_threshold` (default 3%, configurable in agent_config)
+5. Logs every evaluation (bet or skip) to `compliance_logs` with full audit fields
+6. Returns value bets sorted by edge descending
+
+Note: Value bets will be 0 when no odds snapshots exist (requires Betfair access or manual odds seeding).
 
 ## Scheduler
 

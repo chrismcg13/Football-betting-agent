@@ -263,6 +263,33 @@ export function extractOddsFromMatch(match: FDMatch): FDOdds | null {
   };
 }
 
+export async function getHistoricalCompetitionMatches(
+  competitionCode: string,
+  season: number,
+): Promise<FDMatch[]> {
+  const client = getClient();
+  await throttle();
+  try {
+    const response = await client.get<{ matches: FDMatch[] }>(
+      `/competitions/${competitionCode}/matches`,
+      { params: { season, status: "FINISHED" } },
+    );
+    return response.data.matches ?? [];
+  } catch (err) {
+    if (
+      axios.isAxiosError(err) &&
+      (err.response?.status === 403 || err.response?.status === 404)
+    ) {
+      logger.debug(
+        { competitionCode, season },
+        "Historical matches not available in current plan",
+      );
+      return [];
+    }
+    throw err;
+  }
+}
+
 export function mapMatchStatus(
   fdStatus: string,
 ): "scheduled" | "live" | "finished" {

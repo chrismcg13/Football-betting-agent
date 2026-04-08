@@ -9,6 +9,7 @@ import learningNarrativesRouter from "./learningNarratives";
 import modelStateRouter from "./modelState";
 import featuresRouter from "./features";
 import ingestionRouter from "./ingestion";
+import predictionsRouter from "./predictions";
 
 const router: IRouter = Router();
 
@@ -22,5 +23,6 @@ router.use(learningNarrativesRouter);
 router.use(modelStateRouter);
 router.use(featuresRouter);
 router.use(ingestionRouter);
+router.use(predictionsRouter);
 
 export default router;
