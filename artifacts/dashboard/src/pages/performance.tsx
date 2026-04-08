@@ -1,58 +1,72 @@
 import { useState, useMemo } from "react";
 import { usePerformance, useBetsByLeague, useBetsByMarket, useModel } from "@/hooks/use-dashboard";
 import { formatCurrency } from "@/lib/format";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 import {
-  Area,
-  AreaChart,
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
+  Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, LineChart,
+  ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 
-const CHART_STYLE = {
-  tooltip: {
-    contentStyle: {
-      backgroundColor: "hsl(222 47% 10%)",
-      borderColor: "hsl(217 33% 22%)",
-      borderRadius: "6px",
-      fontSize: "12px",
-    },
-    itemStyle: { color: "hsl(210 40% 92%)" },
-    labelStyle: { color: "hsl(215 20% 65%)", fontWeight: 600 },
+const TT = {
+  contentStyle: {
+    background: "#0f172a",
+    border: "1px solid #334155",
+    borderRadius: "8px",
+    fontSize: "12px",
+    color: "#e2e8f0",
   },
-  grid: { strokeDasharray: "3 3", stroke: "hsl(217 33% 18%)", vertical: false },
-  axis: { stroke: "hsl(215 20% 45%)", fontSize: 11, tickLine: false, axisLine: false },
+  itemStyle: { color: "#94a3b8" },
+  labelStyle: { color: "#64748b", fontWeight: 600 },
 };
+
+const AXIS = { stroke: "#475569", fontSize: 10, tickLine: false, axisLine: false };
+const GRID = { strokeDasharray: "3 3", stroke: "#1e3a5f", vertical: false as const };
 
 const DATE_RANGES = [
   { label: "7d", days: 7 },
   { label: "14d", days: 14 },
   { label: "30d", days: 30 },
+  { label: "All", days: 9999 },
 ];
 
-function DateRangeSelector({ value, onChange }: { value: number; onChange: (d: number) => void }) {
+function Card({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className="flex items-center gap-1 bg-slate-800 rounded-md p-0.5">
+    <div
+      className={cn("rounded-xl border", className)}
+      style={{ background: "#1e293b", borderColor: "#334155" }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function CardHead({ title, sub, right }: { title: string; sub?: string; right?: React.ReactNode }) {
+  return (
+    <div className="px-5 py-4 border-b flex items-center justify-between" style={{ borderColor: "#334155" }}>
+      <div>
+        <p className="text-sm font-semibold text-white">{title}</p>
+        {sub && <p className="text-xs text-slate-500 mt-0.5">{sub}</p>}
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function DateRangeBtn({ value, onChange }: { value: number; onChange: (d: number) => void }) {
+  return (
+    <div className="flex items-center gap-0.5 rounded-lg p-0.5" style={{ background: "#0f172a" }}>
       {DATE_RANGES.map(({ label, days }) => (
         <button
           key={days}
           onClick={() => onChange(days)}
           data-testid={`btn-range-${label}`}
-          className={`text-xs px-2.5 py-1 rounded transition-all font-medium ${
+          className={cn(
+            "text-xs px-3 py-1.5 rounded-md font-medium transition-all",
             value === days
               ? "bg-blue-600 text-white"
-              : "text-slate-400 hover:text-slate-200"
-          }`}
+              : "text-slate-500 hover:text-slate-300",
+          )}
         >
           {label}
         </button>
@@ -61,33 +75,23 @@ function DateRangeSelector({ value, onChange }: { value: number; onChange: (d: n
   );
 }
 
-function ROIBarChart({ data, xKey, valueKey, label }: {
-  data: any[];
-  xKey: string;
-  valueKey: string;
-  label: string;
-}) {
+function HorizBarChart({ data, xKey, valueKey }: { data: any[]; xKey: string; valueKey: string }) {
   return (
     <ResponsiveContainer width="100%" height="100%">
-      <BarChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 40 }} layout="vertical">
-        <CartesianGrid {...CHART_STYLE.grid} horizontal={false} vertical />
-        <XAxis
-          type="number"
-          {...CHART_STYLE.axis}
-          tickFormatter={(v) => `${v}%`}
-          domain={["auto", "auto"]}
-        />
+      <BarChart data={data} layout="vertical" margin={{ top: 4, right: 16, left: 0, bottom: 4 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" horizontal={false} />
+        <XAxis type="number" {...AXIS} tickFormatter={(v) => `${v}%`} domain={["auto", "auto"]} />
         <YAxis
           type="category"
           dataKey={xKey}
-          {...CHART_STYLE.axis}
-          width={110}
-          tick={{ fontSize: 11, fill: "hsl(215 20% 65%)" }}
+          {...AXIS}
+          width={120}
+          tick={{ fontSize: 11, fill: "#94a3b8" }}
         />
         <Tooltip
-          {...CHART_STYLE.tooltip}
-          formatter={(value: number) => [`${value.toFixed(1)}%`, label]}
-          cursor={{ fill: "hsl(217 33% 18%)" }}
+          {...TT}
+          formatter={(v: number) => [`${v.toFixed(1)}%`, "ROI"]}
+          cursor={{ fill: "rgba(255,255,255,0.03)" }}
         />
         <Bar dataKey={valueKey} radius={[0, 4, 4, 0]}>
           {data.map((entry: any, idx: number) => (
@@ -105,88 +109,65 @@ function ROIBarChart({ data, xKey, valueKey, label }: {
 
 export default function Performance() {
   const [dateRange, setDateRange] = useState(30);
-
   const { data: perfData, isLoading: perfLoading } = usePerformance();
   const { data: byLeague, isLoading: leagueLoading } = useBetsByLeague();
   const { data: byMarket, isLoading: marketLoading } = useBetsByMarket();
   const { data: modelData, isLoading: modelLoading } = useModel();
 
-  const cumulativeSliced = useMemo(() => {
-    if (!perfData?.cumulativeProfit) return [];
-    const arr = perfData.cumulativeProfit as any[];
+  const chartData = useMemo(() => {
+    const arr = (perfData?.cumulativeProfit as any[]) ?? [];
+    if (dateRange >= 9999) return arr;
     return arr.slice(Math.max(0, arr.length - dateRange));
   }, [perfData, dateRange]);
 
-  const weeklyWinRateData = useMemo(() => {
-    if (!perfData?.weeklyWinRate) return [];
-    return (perfData.weeklyWinRate as any[]).map((w: any) => ({
-      ...w,
-      winRatePct: w.winRate,
-    }));
-  }, [perfData]);
+  const isProfit = useMemo(() => {
+    if (chartData.length === 0) return true;
+    return (chartData[chartData.length - 1]?.cumPnl ?? 0) >= 0;
+  }, [chartData]);
 
-  const accuracyHistory = useMemo(() => {
-    if (!modelData?.accuracyHistory) return [];
-    return (modelData.accuracyHistory as any[]).map((h: any) => ({
-      label: h.version?.slice(0, 16) ?? "",
-      accuracy: h.accuracy != null ? Math.round(h.accuracy * 1000) / 10 : null,
-      calibration: h.calibration,
-      trainedOn: h.trainedOn,
-    }));
-  }, [modelData]);
+  const weeklyWin = useMemo(
+    () => ((perfData?.weeklyWinRate as any[]) ?? []).map((w: any) => ({ ...w, winRatePct: w.winRate })),
+    [perfData],
+  );
 
-  const leagueROI = useMemo(() => {
-    if (!byLeague) return [];
-    return [...(byLeague as any[])].sort((a, b) => b.roi - a.roi);
-  }, [byLeague]);
+  const accuracyHistory = useMemo(
+    () =>
+      ((modelData?.accuracyHistory as any[]) ?? []).map((h: any) => ({
+        label: h.version?.slice(0, 14) ?? "",
+        accuracy: h.accuracy != null ? Math.round(h.accuracy * 1000) / 10 : null,
+        calibration: h.calibration,
+      })),
+    [modelData],
+  );
 
-  const marketROI = useMemo(() => {
-    if (!byMarket) return [];
-    return [...(byMarket as any[])].sort((a, b) => b.roi - a.roi);
-  }, [byMarket]);
+  const leagueROI = useMemo(() => [...((byLeague as any[]) ?? [])].sort((a, b) => b.roi - a.roi), [byLeague]);
+  const marketROI = useMemo(() => [...((byMarket as any[]) ?? [])].sort((a, b) => b.roi - a.roi), [byMarket]);
 
   const statsTable = useMemo(() => {
     const rows: any[] = [];
-    if (byLeague) {
-      for (const l of byLeague as any[]) {
-        rows.push({
-          segment: l.league,
-          type: "League",
-          count: l.count,
-          wins: l.wins,
-          losses: l.losses,
-          winPct: l.wins + l.losses > 0 ? (l.wins / (l.wins + l.losses)) * 100 : 0,
-          roi: l.roi,
-          totalPnl: l.totalPnl,
-        });
-      }
+    for (const l of (byLeague as any[]) ?? []) {
+      rows.push({
+        segment: l.league, type: "League",
+        count: l.count, wins: l.wins, losses: l.losses,
+        winPct: l.wins + l.losses > 0 ? (l.wins / (l.wins + l.losses)) * 100 : 0,
+        roi: l.roi, totalPnl: l.totalPnl,
+      });
     }
-    if (byMarket) {
-      for (const m of byMarket as any[]) {
-        rows.push({
-          segment: m.marketType,
-          type: "Market",
-          count: m.count,
-          wins: m.wins,
-          losses: m.losses,
-          winPct: m.wins + m.losses > 0 ? (m.wins / (m.wins + m.losses)) * 100 : 0,
-          roi: m.roi,
-          totalPnl: m.totalPnl,
-        });
-      }
+    for (const m of (byMarket as any[]) ?? []) {
+      rows.push({
+        segment: m.marketType, type: "Market",
+        count: m.count, wins: m.wins, losses: m.losses,
+        winPct: m.wins + m.losses > 0 ? (m.wins / (m.wins + m.losses)) * 100 : 0,
+        roi: m.roi, totalPnl: m.totalPnl,
+      });
     }
     return rows.sort((a, b) => b.roi - a.roi);
   }, [byLeague, byMarket]);
 
-  const isLoading = perfLoading;
-
-  if (isLoading) {
+  if (perfLoading) {
     return (
       <div className="space-y-6 max-w-7xl mx-auto">
-        <div className="flex flex-col gap-2">
-          <Skeleton className="h-8 w-64" />
-          <Skeleton className="h-4 w-80" />
-        </div>
+        <Skeleton className="h-8 w-64" />
         <Skeleton className="h-[420px] w-full rounded-xl" />
         <div className="grid grid-cols-2 gap-6">
           <Skeleton className="h-[300px] rounded-xl" />
@@ -198,201 +179,175 @@ export default function Performance() {
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
-      <div className="flex flex-col gap-2">
-        <h2 className="text-3xl font-bold tracking-tight">Performance Analytics</h2>
-        <p className="text-muted-foreground">Historical returns, edge analysis, and model health.</p>
+      <div>
+        <h2 className="text-2xl font-bold text-white tracking-tight">Performance Analytics</h2>
+        <p className="text-sm text-slate-500 mt-1">Historical returns, edge analysis, and model health.</p>
       </div>
 
-      {/* Row 1: Cumulative P&L */}
+      {/* Cumulative P&L */}
       <Card>
-        <CardHeader className="flex flex-row items-center justify-between pb-2">
-          <div>
-            <CardTitle>Cumulative P&L</CardTitle>
-            <p className="text-xs text-muted-foreground mt-1">Net profit after 2% Betfair commission</p>
-          </div>
-          <DateRangeSelector value={dateRange} onChange={setDateRange} />
-        </CardHeader>
-        <CardContent>
-          <div className="h-[380px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={cumulativeSliced} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="cumPnlGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.25} />
-                    <stop offset="95%" stopColor="#3b82f6" stopOpacity={0.02} />
-                  </linearGradient>
-                  <linearGradient id="cumPnlGradNeg" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#ef4444" stopOpacity={0.25} />
-                    <stop offset="95%" stopColor="#ef4444" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid {...CHART_STYLE.grid} />
-                <XAxis
-                  dataKey="date"
-                  {...CHART_STYLE.axis}
-                  tickFormatter={(v) =>
-                    new Date(v).toLocaleDateString("en-GB", { month: "short", day: "numeric" })
-                  }
-                />
-                <YAxis
-                  {...CHART_STYLE.axis}
-                  tickFormatter={(v) => `£${v}`}
-                  width={50}
-                />
-                <Tooltip
-                  {...CHART_STYLE.tooltip}
-                  formatter={(value: number) => [formatCurrency(value), "Cumulative P&L"]}
-                  labelFormatter={(label) =>
-                    new Date(label).toLocaleDateString("en-GB", {
-                      year: "numeric",
-                      month: "long",
-                      day: "numeric",
-                    })
-                  }
-                />
-                <Area
-                  type="monotone"
-                  dataKey="cumPnl"
-                  stroke="#3b82f6"
-                  strokeWidth={2}
-                  fillOpacity={1}
-                  fill="url(#cumPnlGrad)"
-                  dot={false}
-                  activeDot={{ r: 4, fill: "#3b82f6" }}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Row 2: ROI by League + ROI by Market */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">ROI by League</CardTitle>
-            <p className="text-xs text-muted-foreground">Return on investment per competition</p>
-          </CardHeader>
-          <CardContent>
-            {leagueLoading ? (
-              <Skeleton className="h-[260px] w-full" />
-            ) : (
-              <div className="h-[260px] w-full">
-                <ROIBarChart data={leagueROI} xKey="league" valueKey="roi" label="ROI" />
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">ROI by Market Type</CardTitle>
-            <p className="text-xs text-muted-foreground">Return on investment per market</p>
-          </CardHeader>
-          <CardContent>
-            {marketLoading ? (
-              <Skeleton className="h-[260px] w-full" />
-            ) : (
-              <div className="h-[260px] w-full">
-                <ROIBarChart data={marketROI} xKey="marketType" valueKey="roi" label="ROI" />
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Row 3: Weekly Win Rate + Model Accuracy */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Win Rate by Week</CardTitle>
-            <p className="text-xs text-muted-foreground">Weekly settled bet win percentage</p>
-          </CardHeader>
-          <CardContent>
-            <div className="h-[260px] w-full">
+        <CardHead
+          title="Cumulative P&L"
+          sub="Net profit after 2% Betfair commission"
+          right={<DateRangeBtn value={dateRange} onChange={setDateRange} />}
+        />
+        <div className="p-5">
+          {chartData.length < 2 ? (
+            <div className="h-80 flex items-center justify-center text-sm text-slate-500">
+              Not enough data yet
+            </div>
+          ) : (
+            <div className="h-80">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={weeklyWinRateData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                  <CartesianGrid {...CHART_STYLE.grid} />
+                <AreaChart data={chartData} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="perfGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.3} />
+                      <stop offset="95%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid {...GRID} />
                   <XAxis
-                    dataKey="week"
-                    {...CHART_STYLE.axis}
-                    tick={{ fontSize: 10, fill: "hsl(215 20% 55%)" }}
-                    angle={-30}
-                    textAnchor="end"
-                    height={40}
+                    dataKey="date"
+                    {...AXIS}
+                    tickFormatter={(v) =>
+                      new Date(v).toLocaleDateString("en-GB", { month: "short", day: "numeric" })
+                    }
                   />
-                  <YAxis
-                    {...CHART_STYLE.axis}
-                    tickFormatter={(v) => `${v}%`}
-                    domain={[0, 100]}
-                    width={44}
-                  />
+                  <YAxis {...AXIS} tickFormatter={(v) => `£${v}`} width={52} />
                   <Tooltip
-                    {...CHART_STYLE.tooltip}
-                    formatter={(value: number, name: string) => [
-                      name === "winRatePct" ? `${value.toFixed(1)}%` : value,
-                      name === "winRatePct" ? "Win Rate" : "Bets",
-                    ]}
+                    {...TT}
+                    formatter={(v: number) => [formatCurrency(v), "Cumulative P&L"]}
+                    labelFormatter={(l) =>
+                      new Date(l).toLocaleDateString("en-GB", { dateStyle: "long" })
+                    }
                   />
-                  <Line
+                  <Area
                     type="monotone"
-                    dataKey="winRatePct"
-                    stroke="#10b981"
-                    strokeWidth={2}
-                    dot={{ r: 3, fill: "#10b981" }}
-                    activeDot={{ r: 5 }}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="bets"
-                    stroke="#64748b"
-                    strokeWidth={1}
-                    strokeDasharray="4 2"
+                    dataKey="cumPnl"
+                    stroke={isProfit ? "#10b981" : "#ef4444"}
+                    strokeWidth={2.5}
+                    fill="url(#perfGrad)"
                     dot={false}
-                    yAxisId={0}
+                    activeDot={{ r: 5, fill: isProfit ? "#10b981" : "#ef4444" }}
                   />
-                </LineChart>
+                </AreaChart>
               </ResponsiveContainer>
             </div>
-            <p className="text-xs text-muted-foreground mt-1">Solid = win rate (%), dashed = bet count</p>
-          </CardContent>
+          )}
+        </div>
+      </Card>
+
+      {/* ROI charts */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card>
+          <CardHead title="ROI by League" sub="Return on investment per competition" />
+          <div className="p-5">
+            {leagueLoading ? <Skeleton className="h-56 w-full" /> : (
+              <div className="h-56">
+                {leagueROI.length === 0
+                  ? <p className="h-full flex items-center justify-center text-sm text-slate-500">No data yet</p>
+                  : <HorizBarChart data={leagueROI} xKey="league" valueKey="roi" />}
+              </div>
+            )}
+          </div>
         </Card>
 
         <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base">Model Accuracy over Time</CardTitle>
-            <p className="text-xs text-muted-foreground">Accuracy score across retraining cycles</p>
-          </CardHeader>
-          <CardContent>
+          <CardHead title="ROI by Market Type" sub="Return on investment per market" />
+          <div className="p-5">
+            {marketLoading ? <Skeleton className="h-56 w-full" /> : (
+              <div className="h-56">
+                {marketROI.length === 0
+                  ? <p className="h-full flex items-center justify-center text-sm text-slate-500">No data yet</p>
+                  : <HorizBarChart data={marketROI} xKey="marketType" valueKey="roi" />}
+              </div>
+            )}
+          </div>
+        </Card>
+      </div>
+
+      {/* Win rate + Model accuracy */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card>
+          <CardHead title="Weekly Win Rate" sub="Win percentage by week" />
+          <div className="p-5">
+            <div className="h-56">
+              {weeklyWin.length < 2 ? (
+                <div className="h-full flex items-center justify-center text-sm text-slate-500">
+                  Needs more settled bets
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={weeklyWin} margin={{ top: 8, right: 8, left: 0, bottom: 24 }}>
+                    <CartesianGrid {...GRID} />
+                    <XAxis
+                      dataKey="week"
+                      {...AXIS}
+                      tick={{ fontSize: 10, fill: "#64748b" }}
+                      angle={-30}
+                      textAnchor="end"
+                      height={40}
+                    />
+                    <YAxis {...AXIS} tickFormatter={(v) => `${v}%`} domain={[0, 100]} width={44} />
+                    <Tooltip
+                      {...TT}
+                      formatter={(v: number, name: string) => [
+                        name === "winRatePct" ? `${v.toFixed(1)}%` : v,
+                        name === "winRatePct" ? "Win Rate" : "Bets",
+                      ]}
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="winRatePct"
+                      stroke="#10b981"
+                      strokeWidth={2.5}
+                      dot={{ r: 3, fill: "#10b981" }}
+                      activeDot={{ r: 5 }}
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="bets"
+                      stroke="#475569"
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                      dot={false}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+            <p className="text-xs text-slate-600 mt-2">Solid green = win rate (%) · dashed = bet count</p>
+          </div>
+        </Card>
+
+        <Card>
+          <CardHead title="Model Accuracy over Time" sub="Accuracy across retraining cycles" />
+          <div className="p-5">
             {modelLoading ? (
-              <Skeleton className="h-[260px] w-full" />
-            ) : accuracyHistory.length === 0 ? (
-              <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
-                No model history yet
+              <Skeleton className="h-56 w-full" />
+            ) : accuracyHistory.length < 2 ? (
+              <div className="h-56 flex items-center justify-center text-sm text-slate-500">
+                Model needs more retraining cycles
               </div>
             ) : (
-              <div className="h-[260px] w-full">
+              <div className="h-56">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={accuracyHistory} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                    <CartesianGrid {...CHART_STYLE.grid} />
+                  <LineChart data={accuracyHistory} margin={{ top: 8, right: 8, left: 0, bottom: 24 }}>
+                    <CartesianGrid {...GRID} />
                     <XAxis
                       dataKey="label"
-                      {...CHART_STYLE.axis}
-                      tick={{ fontSize: 10, fill: "hsl(215 20% 55%)" }}
+                      {...AXIS}
+                      tick={{ fontSize: 9, fill: "#64748b" }}
                       angle={-20}
                       textAnchor="end"
                       height={40}
                     />
-                    <YAxis
-                      {...CHART_STYLE.axis}
-                      tickFormatter={(v) => `${v}%`}
-                      domain={[0, 100]}
-                      width={44}
-                    />
+                    <YAxis {...AXIS} tickFormatter={(v) => `${v}%`} domain={[0, 100]} width={44} />
                     <Tooltip
-                      {...CHART_STYLE.tooltip}
-                      formatter={(value: number, name: string) => [
-                        `${value.toFixed(1)}%`,
+                      {...TT}
+                      formatter={(v: number, name: string) => [
+                        `${v.toFixed(1)}%`,
                         name === "accuracy" ? "Accuracy" : "Calibration",
                       ]}
                     />
@@ -400,7 +355,7 @@ export default function Performance() {
                       type="monotone"
                       dataKey="accuracy"
                       stroke="#3b82f6"
-                      strokeWidth={2}
+                      strokeWidth={2.5}
                       dot={{ r: 4, fill: "#3b82f6" }}
                       activeDot={{ r: 6 }}
                       connectNulls
@@ -410,7 +365,7 @@ export default function Performance() {
                       dataKey="calibration"
                       stroke="#a78bfa"
                       strokeWidth={1.5}
-                      strokeDasharray="4 2"
+                      strokeDasharray="4 3"
                       dot={{ r: 3, fill: "#a78bfa" }}
                       connectNulls
                     />
@@ -418,82 +373,91 @@ export default function Performance() {
                 </ResponsiveContainer>
               </div>
             )}
-            <p className="text-xs text-muted-foreground mt-1">Solid blue = accuracy, dashed purple = calibration</p>
-          </CardContent>
+            <p className="text-xs text-slate-600 mt-2">Solid blue = accuracy · dashed purple = calibration</p>
+          </div>
         </Card>
       </div>
 
-      {/* Row 4: Segment Stats Table */}
+      {/* Segment Table */}
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base">Edge Analysis by Segment</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            Where is the agent finding value? Sorted by ROI descending.
-          </p>
-        </CardHeader>
-        <CardContent className="p-0">
+        <CardHead
+          title="Edge Analysis by Segment"
+          sub="Where is the agent finding value? Sorted by ROI."
+        />
+        <div className="overflow-x-auto">
           {leagueLoading || marketLoading ? (
-            <div className="p-6 space-y-3">
-              {[...Array(6)].map((_, i) => <Skeleton key={i} className="h-8 w-full" />)}
+            <div className="p-5 space-y-3">
+              {[...Array(6)].map((_, i) => <Skeleton key={i} className="h-9 w-full" />)}
             </div>
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow className="border-b border-slate-700">
-                  <TableHead className="text-xs uppercase tracking-wider pl-4">Segment</TableHead>
-                  <TableHead className="text-xs uppercase tracking-wider">Type</TableHead>
-                  <TableHead className="text-xs uppercase tracking-wider text-right">Bets</TableHead>
-                  <TableHead className="text-xs uppercase tracking-wider text-right">Wins</TableHead>
-                  <TableHead className="text-xs uppercase tracking-wider text-right">Losses</TableHead>
-                  <TableHead className="text-xs uppercase tracking-wider text-right">Win%</TableHead>
-                  <TableHead className="text-xs uppercase tracking-wider text-right">ROI%</TableHead>
-                  <TableHead className="text-xs uppercase tracking-wider text-right pr-4">Total P&L</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {statsTable.map((row, i) => (
-                  <TableRow key={i} className="hover:bg-slate-800/30 transition-colors">
-                    <TableCell className="font-medium text-sm pl-4">{row.segment}</TableCell>
-                    <TableCell>
-                      <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${
-                        row.type === "League"
-                          ? "bg-blue-900/40 text-blue-300"
-                          : "bg-purple-900/40 text-purple-300"
-                      }`}>
-                        {row.type}
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-sm">{row.count}</TableCell>
-                    <TableCell className="text-right font-mono text-sm text-emerald-400">{row.wins}</TableCell>
-                    <TableCell className="text-right font-mono text-sm text-red-400">{row.losses}</TableCell>
-                    <TableCell className="text-right font-mono text-sm">
-                      <span className={row.winPct >= 50 ? "text-emerald-400" : "text-red-400"}>
-                        {row.winPct.toFixed(1)}%
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-sm font-semibold">
-                      <span className={row.roi >= 0 ? "text-emerald-400" : "text-red-400"}>
-                        {row.roi >= 0 ? "+" : ""}{row.roi.toFixed(1)}%
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-sm pr-4">
-                      <span className={row.totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}>
-                        {row.totalPnl >= 0 ? "+" : ""}{formatCurrency(row.totalPnl)}
-                      </span>
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {statsTable.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={8} className="text-center text-muted-foreground py-8 text-sm">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b" style={{ borderColor: "#334155" }}>
+                  {["Segment", "Type", "Bets", "Wins", "Losses", "Win%", "ROI%", "Total P&L"].map((h, i) => (
+                    <th
+                      key={h}
+                      className={cn(
+                        "py-3 text-[11px] uppercase tracking-wider text-slate-500 font-semibold",
+                        i === 0 ? "text-left pl-5" : i >= 2 ? "text-right pr-5" : "text-left px-3",
+                      )}
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {statsTable.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="py-10 text-center text-sm text-slate-500">
                       No settled bets yet
-                    </TableCell>
-                  </TableRow>
+                    </td>
+                  </tr>
+                ) : (
+                  statsTable.map((row, i) => (
+                    <tr
+                      key={i}
+                      className="border-b transition-colors hover:bg-slate-800/20"
+                      style={{ borderColor: "#1e3a5f" }}
+                    >
+                      <td className="py-3 pl-5 font-medium text-white">{row.segment}</td>
+                      <td className="py-3 px-3">
+                        <span
+                          className={cn(
+                            "text-[10px] font-mono px-2 py-0.5 rounded",
+                            row.type === "League"
+                              ? "bg-blue-950 text-blue-400 border border-blue-800"
+                              : "bg-purple-950 text-purple-400 border border-purple-800",
+                          )}
+                        >
+                          {row.type}
+                        </span>
+                      </td>
+                      <td className="py-3 text-right pr-5 font-mono text-slate-300">{row.count}</td>
+                      <td className="py-3 text-right pr-5 font-mono text-emerald-400">{row.wins}</td>
+                      <td className="py-3 text-right pr-5 font-mono text-red-400">{row.losses}</td>
+                      <td className="py-3 text-right pr-5 font-mono">
+                        <span className={row.winPct >= 50 ? "text-emerald-400" : "text-red-400"}>
+                          {row.winPct.toFixed(1)}%
+                        </span>
+                      </td>
+                      <td className="py-3 text-right pr-5 font-mono font-semibold">
+                        <span className={row.roi >= 0 ? "text-emerald-400" : "text-red-400"}>
+                          {row.roi >= 0 ? "+" : ""}{row.roi.toFixed(1)}%
+                        </span>
+                      </td>
+                      <td className="py-3 text-right pr-5 font-mono">
+                        <span className={row.totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}>
+                          {row.totalPnl >= 0 ? "+" : ""}{formatCurrency(row.totalPnl)}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
                 )}
-              </TableBody>
-            </Table>
+              </tbody>
+            </table>
           )}
-        </CardContent>
+        </div>
       </Card>
     </div>
   );

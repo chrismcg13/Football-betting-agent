@@ -25,3 +25,17 @@ export function formatDate(dateString: string) {
     timeStyle: 'short',
   }).format(new Date(dateString));
 }
+
+export function formatRelativeTime(dateString: string): string {
+  const date = new Date(dateString);
+  const now = new Date();
+  const diff = now.getTime() - date.getTime();
+  const absDiff = Math.abs(diff);
+
+  if (absDiff < 60_000) return 'Just now';
+  if (absDiff < 3_600_000) return `${Math.floor(absDiff / 60_000)}m ago`;
+  if (absDiff < 86_400_000) return `${Math.floor(absDiff / 3_600_000)}h ago`;
+  if (absDiff < 172_800_000) return 'Yesterday';
+  if (absDiff < 604_800_000) return `${Math.floor(absDiff / 86_400_000)} days ago`;
+  return formatDate(dateString);
+}

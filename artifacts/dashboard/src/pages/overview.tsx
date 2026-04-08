@@ -1,166 +1,455 @@
-import { useSummary, useBets, useNarratives } from "@/hooks/use-dashboard";
-import { formatCurrency, formatPercent, formatNumber, formatDate } from "@/lib/format";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useMemo } from "react";
+import { useSummary, useBets, useNarratives, usePerformance } from "@/hooks/use-dashboard";
+import { formatCurrency, formatRelativeTime } from "@/lib/format";
+import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
+import {
+  Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
+} from "recharts";
 
-export default function Overview() {
-  const { data: summary, isLoading: loadingSummary } = useSummary();
-  const { data: betsData, isLoading: loadingBets } = useBets(1, 10, "all");
-  const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
+// ─── Narrative helpers ────────────────────────────────────────────────────────
+
+function getNarrativeEmoji(type: string): string {
+  const map: Record<string, string> = {
+    risk_circuit_breaker: "🛡️",
+    sustained_positive_edge: "📈",
+    strategy_best_segment: "🎯",
+    strategy_worst_segment: "🔄",
+    feature_importance_shift: "💡",
+    feature_importance_change: "💡",
+    accuracy_change: "📈",
+    calibration_change: "🔄",
+    model_retrain: "💡",
+  };
+  return map[type] ?? "📊";
+}
+
+function translateNarrativeType(type: string): string {
+  const map: Record<string, string> = {
+    risk_circuit_breaker: "Risk Control",
+    sustained_positive_edge: "Positive Edge",
+    strategy_best_segment: "Best Strategy",
+    strategy_worst_segment: "Weak Spot",
+    feature_importance_shift: "Feature Discovery",
+    feature_importance_change: "Feature Discovery",
+    accuracy_change: "Model Update",
+    calibration_change: "Calibration",
+    model_retrain: "Model Retrained",
+  };
+  return map[type] ?? type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function generateNarrativeText(n: any): string {
+  const body = n.body ?? "";
+  if (body && body !== n.narrativeType && body.length > 10) return body;
+  const d = n.relatedData ?? {};
+  switch (n.narrativeType) {
+    case "risk_circuit_breaker":
+      return `Risk control activated: ${d.reason ?? "loss limit reached"}. Agent paused to protect bankroll.`;
+    case "sustained_positive_edge":
+      return `Consistent edge found in ${d.league ?? "—"} ${d.market ?? ""}${d.roi != null ? ` — ${Number(d.roi).toFixed(1)}% ROI` : ""}${d.count != null ? ` over ${d.count} bets` : ""}.`;
+    case "strategy_best_segment":
+      return `Best performing strategy: ${d.league ?? d.segment ?? "—"} ${d.market ?? ""} with ${d.roi != null ? Number(d.roi).toFixed(1) : "?"}% return.`;
+    case "strategy_worst_segment":
+      return `Weak spot identified: ${d.league ?? d.segment ?? "—"} ${d.market ?? ""} at ${d.roi != null ? Number(d.roi).toFixed(1) : "?"}% — agent reducing exposure.`;
+    case "feature_importance_shift":
+    case "feature_importance_change":
+      return `Model update: ${d.feature ?? "a feature"} is now the #${d.rank ?? "?"} most important predictor.`;
+    case "accuracy_change":
+      return `Model accuracy ${(d.delta ?? 0) >= 0 ? "improved" : "decreased"} to ${d.newAccuracy != null ? (Number(d.newAccuracy) * 100).toFixed(1) : "?"}%.`;
+    case "model_retrain":
+      return `Model retrained on ${d.trainedOn ?? "?"} bets.${d.accuracy != null ? ` New accuracy: ${(Number(d.accuracy) * 100).toFixed(1)}%.` : ""}`;
+    default:
+      return n.title ?? translateNarrativeType(n.narrativeType);
+  }
+}
+
+// ─── Stat Card ────────────────────────────────────────────────────────────────
+
+function StatCard({
+  label,
+  value,
+  sub,
+  color,
+}: {
+  label: string;
+  value: React.ReactNode;
+  sub?: React.ReactNode;
+  color?: "green" | "red" | "amber" | "default";
+}) {
+  const valueColor =
+    color === "green" ? "text-emerald-400"
+    : color === "red" ? "text-red-400"
+    : color === "amber" ? "text-amber-400"
+    : "text-white";
 
   return (
-    <div className="space-y-6 max-w-7xl mx-auto">
-      <div className="flex flex-col gap-2">
-        <h2 className="text-3xl font-bold tracking-tight">Overview</h2>
-        <p className="text-muted-foreground">Mission control for the paper trading agent.</p>
-      </div>
-
-      {/* Headline Metrics */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <MetricCard 
-          title="Total P&L" 
-          value={summary?.totalPnl} 
-          formatter={formatCurrency} 
-          trend={summary?.totalPnlPct} 
-          trendFormatter={v => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`}
-          loading={loadingSummary} 
-        />
-        <MetricCard 
-          title="Win Rate" 
-          value={summary?.winPercentage} 
-          formatter={v => `${v.toFixed(1)}%`} 
-          loading={loadingSummary} 
-        />
-        <MetricCard 
-          title="Total Bets" 
-          value={summary?.totalBets} 
-          formatter={formatNumber} 
-          loading={loadingSummary} 
-        />
-        <MetricCard 
-          title="Active Bets" 
-          value={summary?.activeBetsCount} 
-          formatter={formatNumber} 
-          loading={loadingSummary} 
-        />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Recent Bets */}
-        <Card className="lg:col-span-2 flex flex-col min-h-[400px]">
-          <CardHeader>
-            <CardTitle>Recent Activity</CardTitle>
-          </CardHeader>
-          <CardContent className="flex-1 p-0">
-            {loadingBets ? (
-              <div className="p-6 space-y-4">
-                {[...Array(5)].map((_, i) => (
-                  <div key={i} className="h-12 bg-secondary rounded animate-pulse" />
-                ))}
-              </div>
-            ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Match</TableHead>
-                    <TableHead>Selection</TableHead>
-                    <TableHead>Odds</TableHead>
-                    <TableHead>Stake</TableHead>
-                    <TableHead className="text-right">Status</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {betsData?.bets?.map((bet: any) => (
-                    <TableRow key={bet.id}>
-                      <TableCell className="font-medium">
-                        <div className="flex flex-col">
-                          <span>{bet.homeTeam} vs {bet.awayTeam}</span>
-                          <span className="text-xs text-muted-foreground">{bet.league}</span>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-col">
-                          <span>{bet.selectionName}</span>
-                          <span className="text-xs text-muted-foreground">{bet.marketType}</span>
-                        </div>
-                      </TableCell>
-                      <TableCell className="font-mono">{bet.oddsAtPlacement.toFixed(2)}</TableCell>
-                      <TableCell className="font-mono">{formatCurrency(bet.stake)}</TableCell>
-                      <TableCell className="text-right">
-                        <BetStatusBadge status={bet.status} />
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Narratives Feed */}
-        <Card className="flex flex-col min-h-[400px]">
-          <CardHeader>
-            <CardTitle>Agent Narratives</CardTitle>
-          </CardHeader>
-          <CardContent className="flex-1 p-0 relative">
-            <ScrollArea className="h-[400px]">
-              {loadingNarratives ? (
-                <div className="p-6 space-y-4">
-                  {[...Array(4)].map((_, i) => (
-                    <div key={i} className="h-24 bg-secondary rounded animate-pulse" />
-                  ))}
-                </div>
-              ) : (
-                <div className="p-6 space-y-6">
-                  {narrativesData?.narratives?.slice(0, 10).map((narrative: any) => (
-                    <div key={narrative.id} className="space-y-2">
-                      <div className="flex items-center justify-between">
-                        <Badge variant="outline" className="text-xs font-mono">{narrative.narrativeType}</Badge>
-                        <span className="text-xs text-muted-foreground">{formatDate(narrative.createdAt)}</span>
-                      </div>
-                      <h4 className="text-sm font-semibold">{narrative.title}</h4>
-                      <p className="text-sm text-muted-foreground">{narrative.body}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </ScrollArea>
-          </CardContent>
-        </Card>
-      </div>
+    <div
+      className="rounded-xl p-5 border flex flex-col gap-2"
+      style={{ background: "#1e293b", borderColor: "#334155" }}
+    >
+      <p className="text-[11px] font-semibold uppercase tracking-widest text-slate-500">{label}</p>
+      <p className={cn("text-3xl font-bold font-mono leading-none", valueColor)}>{value}</p>
+      {sub && <p className="text-xs text-slate-500 leading-snug">{sub}</p>}
     </div>
   );
 }
 
-function MetricCard({ title, value, formatter, trend, trendFormatter, loading }: any) {
+// ─── Chart tooltip ────────────────────────────────────────────────────────────
+
+const TOOLTIP_STYLE = {
+  contentStyle: {
+    background: "#0f172a",
+    border: "1px solid #334155",
+    borderRadius: "8px",
+    fontSize: "12px",
+    color: "#e2e8f0",
+  },
+  itemStyle: { color: "#94a3b8" },
+  labelStyle: { color: "#64748b", fontWeight: 600 },
+};
+
+// ─── Main Page ────────────────────────────────────────────────────────────────
+
+export default function Overview() {
+  const { data: summary, isLoading: loadingSummary } = useSummary();
+  const { data: allBetsData, isLoading: loadingBets } = useBets(1, 50, "all");
+  const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
+  const { data: perfData, isLoading: loadingPerf } = usePerformance();
+
+  const upcomingBets = useMemo(() => {
+    const bets = (allBetsData?.bets as any[]) ?? [];
+    return bets.filter((b: any) => b.status === "pending").slice(0, 10);
+  }, [allBetsData]);
+
+  const recentResults = useMemo(() => {
+    const bets = (allBetsData?.bets as any[]) ?? [];
+    return bets.filter((b: any) => b.status === "won" || b.status === "lost").slice(0, 10);
+  }, [allBetsData]);
+
+  const narratives = useMemo(
+    () => ((narrativesData?.narratives as any[]) ?? []).slice(0, 5),
+    [narrativesData],
+  );
+
+  const chartData = useMemo(() => {
+    const arr = (perfData?.cumulativeProfit as any[]) ?? [];
+    return arr.slice(-30);
+  }, [perfData]);
+
+  const isProfit = useMemo(() => {
+    if (chartData.length === 0) return true;
+    return (chartData[chartData.length - 1]?.cumPnl ?? 0) >= 0;
+  }, [chartData]);
+
+  const pnl = summary?.totalPnl ?? 0;
+  const todayPnl = summary?.todayPnl ?? 0;
+  const roi = summary?.overallRoiPct ?? 0;
+  const bankroll = summary?.currentBankroll ?? 0;
+  const startingBankroll = 500;
+  const bankrollDiff = bankroll - startingBankroll;
+
   return (
-    <Card>
-      <CardContent className="p-6 flex flex-col justify-between h-full space-y-4">
-        <span className="text-sm font-medium text-muted-foreground uppercase tracking-wider">{title}</span>
-        {loading ? (
-          <div className="h-8 w-24 bg-secondary rounded animate-pulse" />
+    <div className="space-y-6 max-w-7xl mx-auto">
+      <div>
+        <h2 className="text-2xl font-bold text-white tracking-tight">Overview</h2>
+        <p className="text-sm text-slate-500 mt-1">Mission control for the paper trading agent.</p>
+      </div>
+
+      {/* 6-Card Stats Grid */}
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+        <StatCard
+          label="Bankroll"
+          value={loadingSummary ? "—" : formatCurrency(bankroll)}
+          sub={
+            !loadingSummary && summary
+              ? `${bankrollDiff >= 0 ? "+" : ""}${formatCurrency(bankrollDiff)} from £500 start`
+              : undefined
+          }
+          color={!loadingSummary ? (bankrollDiff >= 0 ? "green" : "red") : "default"}
+        />
+        <StatCard
+          label="Total P&L"
+          value={loadingSummary ? "—" : formatCurrency(pnl)}
+          sub={!loadingSummary && summary ? `${roi >= 0 ? "+" : ""}${roi.toFixed(2)}% overall ROI` : undefined}
+          color={!loadingSummary ? (pnl >= 0 ? "green" : "red") : "default"}
+        />
+        <StatCard
+          label="Total Bets"
+          value={loadingSummary ? "—" : (summary?.totalBets ?? 0)}
+          sub={
+            !loadingSummary && summary
+              ? `${summary.wins ?? 0}W — ${summary.losses ?? 0}L`
+              : undefined
+          }
+        />
+        <StatCard
+          label="Win Rate"
+          value={loadingSummary ? "—" : `${(summary?.winPercentage ?? 0).toFixed(1)}%`}
+          sub={!loadingSummary ? "of settled bets" : undefined}
+          color={
+            !loadingSummary
+              ? (summary?.winPercentage ?? 0) >= 50 ? "green" : "red"
+              : "default"
+          }
+        />
+        <StatCard
+          label="ROI"
+          value={loadingSummary ? "—" : `${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`}
+          sub={!loadingSummary ? "total return on stakes" : undefined}
+          color={!loadingSummary ? (roi >= 0 ? "green" : "red") : "default"}
+        />
+        <StatCard
+          label="Today's P&L"
+          value={loadingSummary ? "—" : `${todayPnl >= 0 ? "+" : ""}${formatCurrency(todayPnl)}`}
+          sub={!loadingSummary ? "since midnight UTC" : undefined}
+          color={!loadingSummary ? (todayPnl >= 0 ? "green" : "red") : "default"}
+        />
+      </div>
+
+      {/* Cumulative P&L Chart */}
+      <div
+        className="rounded-xl border p-5"
+        style={{ background: "#1e293b", borderColor: "#334155" }}
+      >
+        <div className="mb-4">
+          <h3 className="text-sm font-semibold text-white">Cumulative P&L</h3>
+          <p className="text-xs text-slate-500 mt-0.5">Net profit over the last 30 data points</p>
+        </div>
+        {loadingPerf ? (
+          <div className="h-48 rounded-lg animate-pulse" style={{ background: "#0f172a" }} />
+        ) : chartData.length < 2 ? (
+          <div className="h-48 flex items-center justify-center text-sm text-slate-500">
+            Not enough data yet — bets will appear here after settlement.
+          </div>
         ) : (
-          <div className="flex items-end justify-between">
-            <span className="text-3xl font-bold font-mono">{value != null ? formatter(value) : '-'}</span>
-            {trend != null && (
-              <span className={cn("text-sm font-medium", trend >= 0 ? "text-emerald-500" : "text-red-500")}>
-                {trendFormatter ? trendFormatter(trend) : trend}
-              </span>
-            )}
+          <div className="h-48">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.3} />
+                    <stop offset="95%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  stroke="#475569"
+                  fontSize={10}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={(v) =>
+                    new Date(v).toLocaleDateString("en-GB", { month: "short", day: "numeric" })
+                  }
+                />
+                <YAxis
+                  stroke="#475569"
+                  fontSize={10}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={(v) => `£${v}`}
+                  width={45}
+                />
+                <Tooltip
+                  {...TOOLTIP_STYLE}
+                  formatter={(v: number) => [formatCurrency(v), "P&L"]}
+                  labelFormatter={(l) =>
+                    new Date(l).toLocaleDateString("en-GB", { dateStyle: "long" })
+                  }
+                />
+                <Area
+                  type="monotone"
+                  dataKey="cumPnl"
+                  stroke={isProfit ? "#10b981" : "#ef4444"}
+                  strokeWidth={2}
+                  fill="url(#pnlGrad)"
+                  dot={false}
+                  activeDot={{ r: 4, fill: isProfit ? "#10b981" : "#ef4444" }}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
         )}
-      </CardContent>
-    </Card>
-  );
-}
+      </div>
 
-export function BetStatusBadge({ status }: { status: string }) {
-  if (status === 'won') return <Badge className="bg-emerald-500/10 text-emerald-500 border-emerald-500/20 hover:bg-emerald-500/20">Won</Badge>;
-  if (status === 'lost') return <Badge className="bg-red-500/10 text-red-500 border-red-500/20 hover:bg-red-500/20">Lost</Badge>;
-  if (status === 'pending') return <Badge className="bg-blue-500/10 text-blue-500 border-blue-500/20 hover:bg-blue-500/20">Pending</Badge>;
-  if (status === 'void') return <Badge className="bg-slate-500/10 text-slate-400 border-slate-500/20 hover:bg-slate-500/20">Void</Badge>;
-  return <Badge variant="outline">{status}</Badge>;
+      {/* Two-column: Upcoming + Recent */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Upcoming Bets */}
+        <div
+          className="rounded-xl border overflow-hidden"
+          style={{ background: "#1e293b", borderColor: "#334155" }}
+        >
+          <div className="px-5 py-4 border-b" style={{ borderColor: "#334155" }}>
+            <h3 className="text-sm font-semibold text-white">Upcoming Bets</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Pending paper bets awaiting settlement</p>
+          </div>
+          <div className="divide-y" style={{ divideColor: "#334155" }}>
+            {loadingBets ? (
+              <div className="p-5 space-y-3">
+                {[...Array(4)].map((_, i) => (
+                  <div key={i} className="h-12 rounded animate-pulse" style={{ background: "#0f172a" }} />
+                ))}
+              </div>
+            ) : upcomingBets.length === 0 ? (
+              <div className="px-5 py-10 text-center">
+                <p className="text-sm text-slate-500">
+                  Agent is analysing upcoming fixtures.
+                </p>
+                <p className="text-xs text-slate-600 mt-1">Next scan in ~15 minutes.</p>
+              </div>
+            ) : (
+              upcomingBets.map((bet: any) => (
+                <div key={bet.id} className="px-5 py-3 hover:bg-slate-700/20 transition-colors">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-white truncate">
+                        {bet.homeTeam} vs {bet.awayTeam}
+                      </p>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        {bet.league} · {bet.selectionName} · {bet.marketType}
+                      </p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <p className="text-sm font-mono font-semibold text-white">
+                        {bet.oddsAtPlacement.toFixed(2)}
+                      </p>
+                      <p className="text-xs text-slate-500 font-mono">{formatCurrency(bet.stake)}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between mt-2">
+                    <span className="text-[10px] text-slate-600">{formatRelativeTime(bet.placedAt)}</span>
+                    {bet.calculatedEdge != null && (
+                      <span
+                        className={cn(
+                          "text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded",
+                          bet.calculatedEdge >= 0
+                            ? "bg-emerald-950 text-emerald-400"
+                            : "bg-red-950 text-red-400",
+                        )}
+                      >
+                        Edge {(bet.calculatedEdge * 100).toFixed(1)}%
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Recent Results */}
+        <div
+          className="rounded-xl border overflow-hidden"
+          style={{ background: "#1e293b", borderColor: "#334155" }}
+        >
+          <div className="px-5 py-4 border-b" style={{ borderColor: "#334155" }}>
+            <h3 className="text-sm font-semibold text-white">Recent Results</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Last settled bets</p>
+          </div>
+          <div>
+            {loadingBets ? (
+              <div className="p-5 space-y-3">
+                {[...Array(5)].map((_, i) => (
+                  <div key={i} className="h-12 rounded animate-pulse" style={{ background: "#0f172a" }} />
+                ))}
+              </div>
+            ) : recentResults.length === 0 ? (
+              <div className="px-5 py-10 text-center">
+                <p className="text-sm text-slate-500">No settled bets yet.</p>
+              </div>
+            ) : (
+              <div className="divide-y" style={{ divideColor: "#334155" }}>
+                {recentResults.map((bet: any) => (
+                  <div
+                    key={bet.id}
+                    className={cn(
+                      "px-5 py-3 flex items-center gap-3 border-l-[3px] transition-colors",
+                      bet.status === "won"
+                        ? "border-l-emerald-500 hover:bg-emerald-950/20"
+                        : "border-l-red-500 hover:bg-red-950/20",
+                    )}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm font-medium text-white truncate">
+                          {bet.homeTeam} vs {bet.awayTeam}
+                        </p>
+                        <BetStatusBadge status={bet.status} />
+                      </div>
+                      <p className="text-xs text-slate-500 mt-0.5 truncate">
+                        {bet.selectionName} @ {bet.oddsAtPlacement.toFixed(2)} · {formatCurrency(bet.stake)}
+                      </p>
+                    </div>
+                    {bet.settlementPnl != null && (
+                      <p
+                        className={cn(
+                          "text-sm font-bold font-mono shrink-0",
+                          bet.settlementPnl >= 0 ? "text-emerald-400" : "text-red-400",
+                        )}
+                      >
+                        {bet.settlementPnl >= 0 ? "+" : ""}
+                        {formatCurrency(bet.settlementPnl)}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* What the Agent Has Learned */}
+      <div>
+        <div className="mb-4">
+          <h3 className="text-base font-semibold text-white">What the Agent Has Learned</h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Intelligence signals generated by the learning engine
+          </p>
+        </div>
+
+        {loadingNarratives ? (
+          <div className="space-y-3">
+            {[...Array(3)].map((_, i) => (
+              <div key={i} className="h-20 rounded-xl animate-pulse" style={{ background: "#1e293b" }} />
+            ))}
+          </div>
+        ) : narratives.length === 0 ? (
+          <div
+            className="rounded-xl border p-10 text-center text-sm text-slate-500"
+            style={{ background: "#1e293b", borderColor: "#334155" }}
+          >
+            No learning signals yet. They appear after the first retraining cycle.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {narratives.map((n: any) => {
+              const text = generateNarrativeText(n);
+              const emoji = getNarrativeEmoji(n.narrativeType);
+              const label = translateNarrativeType(n.narrativeType);
+              return (
+                <div
+                  key={n.id}
+                  className="rounded-xl border flex items-start gap-4 px-5 py-4"
+                  style={{ background: "#1e293b", borderColor: "#334155" }}
+                >
+                  <span className="text-2xl leading-none mt-0.5 shrink-0">{emoji}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-1">
+                      {label}
+                    </p>
+                    <p className="text-sm text-slate-200 leading-relaxed">{text}</p>
+                  </div>
+                  <p className="text-[11px] text-slate-600 shrink-0 pt-0.5">
+                    {formatRelativeTime(n.createdAt)}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }

@@ -1,0 +1,96 @@
+The dashboard needs a complete visual and UX overhaul. Make it look like a professional trading platform — clean, clear, and easy to understand for someone with no technical background.
+
+GLOBAL CHANGES:
+- Use a consistent dark theme: background #0f172a (slate-900), cards #1e293b (slate-800), borders #334155 (slate-700)
+- Primary font: Inter or system-ui, clean and readable
+- All monetary values prominently displayed in large font with £ symbol
+- Green (#10b981) for profit/wins, Red (#ef4444) for losses, Amber (#f59e0b) for warnings/pending
+- Add subtle card shadows and rounded corners (rounded-xl) for a modern feel
+- Make sure all pages are responsive and work on mobile
+
+OVERVIEW PAGE overhaul:
+- Top stats row: 6 cards in a grid (3 columns on desktop, 2 on mobile):
+  1. BANKROLL: Large £ figure, small text showing +/- from £500 starting
+  2. TOTAL P&L: Large £ figure in green/red, percentage underneath
+  3. TOTAL BETS: Large number, with "W/L" breakdown underneath (e.g. "28W - 32L")
+  4. WIN RATE: Large percentage, with small trend arrow (up/down vs last week)
+  5. ROI: Large percentage in green/red
+  6. TODAY'S P&L: Large £ figure
+
+- PROFIT CHART: Full-width cumulative P&L line chart below the stats. Smooth line, gradient fill below the line (green if profitable, red if not). X-axis = dates, Y-axis = £ profit. Use recharts with custom styling.
+
+- Two columns below the chart:
+
+  LEFT COLUMN — "Upcoming Bets" section:
+  - Show all pending/active paper bets that haven't settled yet
+  - For each: Match name, kickoff time (human readable like "Tomorrow 3pm"), market type, selection, odds, stake, calculated edge %
+  - Sort by kickoff time ascending (soonest first)
+  - If no upcoming bets, show "Agent is analysing upcoming fixtures. Next scan in X minutes."
+
+  RIGHT COLUMN — "Recent Results" section:
+  - Last 10 settled bets
+  - For each: Match name, selection, odds, stake, P&L (green/red), outcome badge (Won/Lost)
+  - Make won rows have a subtle green left border, lost rows a red left border
+
+- Below both columns — "Agent Intelligence" section:
+  - Show the 5 most recent learning narratives
+  - Each narrative displayed as a card with:
+    - Icon on the left: 💡 for discoveries, 📈 for improvements, 🛡️ for risk events, 🎯 for confidence signals, 🔄 for strategy shifts
+    - The narrative text in plain English (NOT the raw type like "risk_circuit_breaker" — translate these to readable text)
+    - Timestamp on the right as relative time ("2 hours ago", "Yesterday")
+  - Title this section "What the Agent Has Learned" 
+  - If narrative text is just a type label, generate a readable sentence from the related_data JSON. For example:
+    - "risk_circuit_breaker" → "Risk control activated: [reason from data]. Agent paused to protect bankroll."
+    - "sustained_positive_edge" → "Consistent edge found in [league] [market] — [X]% ROI over [N] bets."
+    - "strategy_best_segment" → "Best performing strategy: [league] [market] with [ROI]% return."
+    - "feature_importance_change" → "Model update: [feature] is now the #[rank] most important predictor."
+    - "strategy_worst_segment" → "Weak spot identified: [league] [market] at [ROI]% — agent reducing exposure."
+
+BET HISTORY PAGE:
+- Clean table with alternating row shading
+- Columns: Date (relative), Match, League, Market, Selection, Odds, Stake, Edge%, Result, P&L
+- Won rows: subtle green background tint. Lost rows: subtle red tint. Pending: amber tint.
+- Click any row to expand and see full reasoning: "Model probability: X% vs Betfair implied: Y%. Edge: Z%. Stake calculated via quarter-Kelly criterion."
+- Filters at top: Status (All/Won/Lost/Pending), League dropdown, Market Type dropdown
+- Summary bar at top of table: "Showing X bets | Y won | Z lost | Total P&L: £N"
+
+PERFORMANCE PAGE:
+- Large cumulative P&L chart (same style as overview but bigger, with date range selector)
+- Two bar charts side by side:
+  - ROI by League: Horizontal bars, sorted by ROI descending. Green positive, red negative.
+  - ROI by Market Type: Same style.
+- Win Rate trend line chart (weekly win % over time)
+- Bottom table: Every league/market combination ranked by ROI with bet count, wins, losses, P&L
+
+VIABILITY PAGE:
+- Giant traffic light at the top (actual colored circles: green/amber/red, only one lit up)
+- Below the light: one clear sentence explaining the signal
+- Three scenario cards: Conservative (50%), Moderate (75%), Optimistic (100%)
+  - Each showing: Monthly projected profit, Months to recoup £499, Minimum bankroll needed
+  - Conservative card highlighted with a border — this is the decision-making one
+- Supporting criteria checklist below with green ticks or red crosses
+- Make this page feel like a decision dashboard — it should make the £499 choice obvious
+
+LEARNING & MODEL PAGE:
+- "Model Health" card at top: accuracy %, calibration score, bets trained on, last retrained timestamp
+- Feature importance horizontal bar chart (top 10 features, labelled in plain English not variable names):
+  - "away_goals_conceded_avg" → "Goals Conceded (Away)"
+  - "home_form_last5" → "Home Form (Last 5)"
+  - etc. Map all feature names to readable labels.
+- Full narrative feed below (same card style as overview but showing all narratives, paginated)
+- Accuracy history line chart showing model accuracy improving over retraining cycles
+
+COMPLIANCE PAGE:
+- Professional, audit-ready styling
+- Export CSV button prominently placed
+- Clean table with columns: Time, Action, Summary
+- Summary column should auto-generate readable text from the JSON (same approach as narratives)
+- Expandable rows showing raw JSON for technical detail
+
+NAVIGATION:
+- Left sidebar should have clear icons and labels
+- Active page highlighted
+- Agent status indicator (green dot + "Running" / amber + "Paused" / red + "Stopped") always visible
+- Bankroll always visible in sidebar or top bar
+
+Make sure everything auto-refreshes every 60 seconds without a full page reload.
