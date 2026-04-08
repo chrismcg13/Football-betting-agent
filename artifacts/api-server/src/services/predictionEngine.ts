@@ -619,6 +619,71 @@ export function predictOverUnder(
   };
 }
 
+// ===================== Cards + Corners predictions (Poisson heuristic) =====================
+// These use Poisson modeling with team-stats features from API-Football.
+// As cards/corners bets settle, the learning loop can graduate these to full LR models.
+
+function poissonProb(lambda: number, k: number): number {
+  let p = 0;
+  let fac = 1;
+  for (let i = 0; i <= k; i++) {
+    if (i > 0) fac *= i;
+    p += (Math.pow(lambda, i) * Math.exp(-lambda)) / fac;
+  }
+  return p;
+}
+
+function poissonOver(lambda: number, threshold: number): number {
+  // P(X > threshold) = 1 - P(X <= floor(threshold))
+  const k = Math.floor(threshold);
+  return Math.max(0.01, Math.min(0.99, 1 - poissonProb(lambda, k)));
+}
+
+export function predictCards(featureMap: Record<string, number>): {
+  over35: number; under35: number;
+  over45: number; under45: number;
+} | null {
+  const homeCards = featureMap["home_yellow_cards_avg"];
+  const awayCards = featureMap["away_yellow_cards_avg"];
+  // Need at least one cards feature
+  if (homeCards === undefined && awayCards === undefined) return null;
+
+  const hCards = homeCards ?? 1.8;
+  const aCards = awayCards ?? 1.6;
+  const lambda = hCards + aCards;
+
+  const over35 = poissonOver(lambda, 3.5);
+  const over45 = poissonOver(lambda, 4.5);
+  return {
+    over35,
+    under35: 1 - over35,
+    over45,
+    under45: 1 - over45,
+  };
+}
+
+export function predictCorners(featureMap: Record<string, number>): {
+  over95: number; under95: number;
+  over105: number; under105: number;
+} | null {
+  const homeCorners = featureMap["home_corners_avg"];
+  const awayCorners = featureMap["away_corners_avg"];
+  if (homeCorners === undefined && awayCorners === undefined) return null;
+
+  const hCorners = homeCorners ?? 5.2;
+  const aCorners = awayCorners ?? 4.8;
+  const lambda = hCorners + aCorners;
+
+  const over95 = poissonOver(lambda, 9.5);
+  const over105 = poissonOver(lambda, 10.5);
+  return {
+    over95,
+    under95: 1 - over95,
+    over105,
+    under105: 1 - over105,
+  };
+}
+
 // ===================== Training sample builder from DB records =====================
 export interface DbTrainingSample {
   features: number[];

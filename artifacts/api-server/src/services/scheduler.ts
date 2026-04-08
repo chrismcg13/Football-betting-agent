@@ -7,6 +7,12 @@ import { placePaperBet, settleBets, getAgentStatus } from "./paperTrading";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
 import { runLearningLoop } from "./learningLoop";
+import {
+  fetchAndStoreOddsForAllUpcoming,
+  fetchTeamStatsForUpcomingMatches,
+} from "./apiFootball";
+import { db, agentConfigTable } from "@workspace/db";
+import { eq } from "drizzle-orm";
 
 // ===================== Status tracking =====================
 
@@ -142,8 +148,8 @@ export async function runTradingCycle(): Promise<{
 
     // 5. Detect value bets for matches kicking off in 1h – 96h
     const now = new Date();
-    const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);   // 1 h from now
-    const latest   = new Date(now.getTime() + 96 * 60 * 60 * 1000);  // 4 days out
+    const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);
+    const latest   = new Date(now.getTime() + 96 * 60 * 60 * 1000);
 
     const valueSummary = await detectValueBets();
     const timely = valueSummary.valueBets.filter(
@@ -151,7 +157,14 @@ export async function runTradingCycle(): Promise<{
     );
 
     logger.info(
-      { totalValueBets: valueSummary.valueBets.length, timelyBets: timely.length, window: "1h-96h before kickoff" },
+      {
+        totalValueBets: valueSummary.valueBets.length,
+        timelyBets: timely.length,
+        realOdds: valueSummary.realOddsCount,
+        syntheticOdds: valueSummary.syntheticOddsCount,
+        byMarketType: valueSummary.byMarketType,
+        window: "1h-96h before kickoff",
+      },
       "Value detection complete for trading cycle",
     );
 
@@ -160,11 +173,33 @@ export async function runTradingCycle(): Promise<{
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
-    // 6. Place up to 10 best value bets per cycle
-    const candidates = timely.slice(0, 10);
-    let betsPlaced = 0;
+    // 6. Load diversity limits from config
+    const configRows = await db.select().from(agentConfigTable);
+    const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
+    const maxPerCycle = Number(cfg.max_bets_per_cycle ?? "5");
+    const maxPerLeague = Number(cfg.max_bets_per_league ?? "2");
+    const maxPerMarket = Number(cfg.max_bets_per_market ?? "2");
 
-    for (const bet of candidates) {
+    // 7. Apply diversity rules and place up to maxPerCycle best bets
+    let betsPlaced = 0;
+    const leagueCounts: Record<string, number> = {};
+    const marketCounts: Record<string, number> = {};
+
+    for (const bet of timely) {
+      if (betsPlaced >= maxPerCycle) break;
+
+      const leagueCount = leagueCounts[bet.league] ?? 0;
+      if (leagueCount >= maxPerLeague) {
+        logger.debug({ league: bet.league, limit: maxPerLeague }, "Skipping bet — league diversity limit");
+        continue;
+      }
+
+      const marketCount = marketCounts[bet.marketType] ?? 0;
+      if (marketCount >= maxPerMarket) {
+        logger.debug({ marketType: bet.marketType, limit: maxPerMarket }, "Skipping bet — market diversity limit");
+        continue;
+      }
+
       const result = await placePaperBet(
         bet.matchId,
         bet.marketType,
@@ -174,9 +209,13 @@ export async function runTradingCycle(): Promise<{
         bet.edge,
         modelVersion,
         bet.opportunityScore,
+        bet.oddsSource,
       );
+
       if (result.placed) {
         betsPlaced++;
+        leagueCounts[bet.league] = leagueCount + 1;
+        marketCounts[bet.marketType] = marketCount + 1;
         logger.info(
           {
             matchId: bet.matchId,
@@ -186,6 +225,8 @@ export async function runTradingCycle(): Promise<{
             selectionName: bet.selectionName,
             edge: bet.edge.toFixed(4),
             stake: result.stake,
+            oddsSource: bet.oddsSource,
+            opportunityScore: bet.opportunityScore,
           },
           "Automated bet placed",
         );
@@ -220,6 +261,24 @@ export function startScheduler(): void {
   // Trading cycle: every 15 minutes
   cron.schedule("*/15 * * * *", () => { void runTradingCycle(); }, { timezone: "UTC" });
   logger.info("Trading cycle scheduler active — every 15 minutes");
+
+  // API-Football: fetch real odds every 8 hours (biggest budget item ~30 req)
+  cron.schedule("0 */8 * * *", () => {
+    logger.info("API-Football odds refresh triggered by scheduler");
+    void fetchAndStoreOddsForAllUpcoming().catch((err) => {
+      logger.error({ err }, "API-Football odds refresh failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("API-Football odds scheduler active — every 8 hours UTC");
+
+  // API-Football: fetch team stats every 12 hours (~20 req)
+  cron.schedule("0 */12 * * *", () => {
+    logger.info("API-Football team stats refresh triggered by scheduler");
+    void fetchTeamStatsForUpcomingMatches().catch((err) => {
+      logger.error({ err }, "API-Football team stats refresh failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("API-Football team stats scheduler active — every 12 hours UTC");
 
   // Learning loop: daily at 03:00 UTC
   cron.schedule("0 3 * * *", () => {

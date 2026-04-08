@@ -8,12 +8,14 @@ import {
   paperBetsTable,
   learningNarrativesTable,
 } from "@workspace/db";
-import { eq, desc, and, gte, lt, sql } from "drizzle-orm";
+import { eq, desc, and, gte, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
   predictOutcome,
   predictBtts,
   predictOverUnder,
+  predictCards,
+  predictCorners,
   getModelVersion,
 } from "./predictionEngine";
 
@@ -31,6 +33,7 @@ export interface ValueBet {
   backOdds: number;
   modelVersion: string | null;
   opportunityScore: number;
+  oddsSource: string;
 }
 
 export interface EvaluationSummary {
@@ -39,9 +42,12 @@ export interface EvaluationSummary {
   valueBetsFound: number;
   modelVersion: string | null;
   valueBets: ValueBet[];
+  realOddsCount: number;
+  syntheticOddsCount: number;
+  byMarketType: Record<string, number>;
 }
 
-// ─── Segment stats (for scoring and filters) ──────────────────────────────────
+// ─── Segment stats ────────────────────────────────────────────────────────────
 
 interface SegmentStats {
   betCount: number;
@@ -55,21 +61,6 @@ async function getSegmentStats(
   league: string,
   marketType: string,
 ): Promise<SegmentStats> {
-  const settled = await db
-    .select({
-      stake: paperBetsTable.stake,
-      settlementPnl: paperBetsTable.settlementPnl,
-      status: paperBetsTable.status,
-      matchId: paperBetsTable.matchId,
-    })
-    .from(paperBetsTable)
-    .where(
-      and(
-        eq(paperBetsTable.marketType, marketType),
-        eq(paperBetsTable.status, "won"),
-      ),
-    );
-
   const leagueSettled = await db
     .select({
       id: paperBetsTable.id,
@@ -110,10 +101,7 @@ async function getSegmentStats(
 
 // ─── Cold-market exclusion ────────────────────────────────────────────────────
 
-interface ColdMarketEntry {
-  excludedUntil: Date;
-}
-
+interface ColdMarketEntry { excludedUntil: Date }
 const coldMarketCache = new Map<string, ColdMarketEntry>();
 
 async function isColdMarket(
@@ -125,12 +113,9 @@ async function isColdMarket(
   cooldownDays: number,
 ): Promise<boolean> {
   const key = `${league}::${marketType}`;
-
   const cached = coldMarketCache.get(key);
   if (cached) {
-    if (new Date() < cached.excludedUntil) {
-      return true;
-    }
+    if (new Date() < cached.excludedUntil) return true;
     coldMarketCache.delete(key);
   }
 
@@ -141,32 +126,18 @@ async function isColdMarket(
 
     await db.insert(learningNarrativesTable).values({
       narrativeType: "strategy_shift",
-      narrativeText: `Temporarily excluding ${league} ${marketType} after ${stats.betCount} bets at ${stats.roi.toFixed(1)}% ROI. Will re-evaluate in ${cooldownDays} days.`,
+      narrativeText: `Pausing ${league} ${marketType} after ${stats.betCount} bets at ${stats.roi.toFixed(1)}% ROI. Reassessing in ${cooldownDays} days.`,
       relatedData: { league, marketType, betCount: stats.betCount, roi: stats.roi, excludedUntil },
       createdAt: new Date(),
     });
-
     await db.insert(complianceLogsTable).values({
       actionType: "decision",
-      details: {
-        action: "cold_market_excluded",
-        league,
-        marketType,
-        betCount: stats.betCount,
-        roi: stats.roi,
-        excludedUntil,
-        reason: `ROI ${stats.roi.toFixed(1)}% below threshold ${threshold}% after ${stats.betCount} bets`,
-      },
+      details: { action: "cold_market_excluded", league, marketType, betCount: stats.betCount, roi: stats.roi, excludedUntil },
       timestamp: new Date(),
     });
-
-    logger.warn(
-      { league, marketType, roi: stats.roi, excludedUntil },
-      "Cold market excluded",
-    );
+    logger.warn({ league, marketType, roi: stats.roi }, "Cold market excluded");
     return true;
   }
-
   return false;
 }
 
@@ -185,29 +156,15 @@ async function getHotStreakBonus(
   weeksAgo.setDate(weeksAgo.getDate() - hotStreakWeeks * 7);
 
   const recentBets = await db
-    .select({
-      stake: paperBetsTable.stake,
-      settlementPnl: paperBetsTable.settlementPnl,
-      status: paperBetsTable.status,
-      settledAt: paperBetsTable.settledAt,
-    })
+    .select({ stake: paperBetsTable.stake, settlementPnl: paperBetsTable.settlementPnl, status: paperBetsTable.status, settledAt: paperBetsTable.settledAt })
     .from(paperBetsTable)
     .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
-    .where(
-      and(
-        eq(matchesTable.league, league),
-        eq(paperBetsTable.marketType, marketType),
-        gte(paperBetsTable.settledAt, weeksAgo),
-      ),
-    );
+    .where(and(eq(matchesTable.league, league), eq(paperBetsTable.marketType, marketType), gte(paperBetsTable.settledAt, weeksAgo)));
 
-  const finalBets = recentBets.filter(
-    (b) => b.status === "won" || b.status === "lost",
-  );
+  const finalBets = recentBets.filter((b) => b.status === "won" || b.status === "lost");
   if (finalBets.length === 0) return 0;
 
-  // Group by ISO week
-  const weekMap = new Map<string, { bets: number; pnl: number; stake: number }>();
+  const weekMap = new Map<string, { bets: number; pnl: number }>();
   for (const b of finalBets) {
     if (!b.settledAt) continue;
     const d = new Date(b.settledAt);
@@ -215,17 +172,14 @@ async function getHotStreakBonus(
     const monday = new Date(d);
     monday.setUTCDate(d.getUTCDate() - ((dayOfWeek + 6) % 7));
     const key = monday.toISOString().slice(0, 10);
-    const entry = weekMap.get(key) ?? { bets: 0, pnl: 0, stake: 0 };
+    const entry = weekMap.get(key) ?? { bets: 0, pnl: 0 };
     entry.bets++;
     entry.pnl += Number(b.settlementPnl ?? 0);
-    entry.stake += Number(b.stake ?? 0);
     weekMap.set(key, entry);
   }
 
   const weeks = [...weekMap.values()];
-  const profitableWeeks = weeks.filter(
-    (w) => w.bets >= minBetsPerWeek && w.pnl > 0,
-  );
+  const profitableWeeks = weeks.filter((w) => w.bets >= minBetsPerWeek && w.pnl > 0);
 
   if (profitableWeeks.length >= hotStreakWeeks) {
     const streakKey = `${league}::${marketType}`;
@@ -245,7 +199,7 @@ async function getHotStreakBonus(
   return 0;
 }
 
-// ─── Opportunity scoring ──────────────────────────────────────────────────────
+// ─── Opportunity scoring (revised formula) ────────────────────────────────────
 
 function computeOpportunityScore(params: {
   edge: number;
@@ -253,16 +207,17 @@ function computeOpportunityScore(params: {
   backOdds: number;
   segmentStats: SegmentStats;
   hotStreakBonus: number;
+  isSynthetic: boolean;
 }): number {
-  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus } = params;
+  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus, isSynthetic } = params;
 
-  // 1. Edge size: (edge / 0.15) * 25, max 25
+  // 1. Edge size: (edge / 0.15) × 25, max 25
   const edgeScore = Math.min((edge / 0.15) * 25, 25);
 
-  // 2. Model confidence: distance from 50% × 50, max 25
+  // 2. Model confidence: abs(prob - 0.5) × 50, max 25
   const confidenceScore = Math.min(Math.abs(modelProbability - 0.5) * 50, 25);
 
-  // 3. Historical segment ROI (max 20)
+  // 3. Historical segment ROI (max 20) — only when positive
   let segmentScore = 0;
   if (segmentStats.betCount >= 3 && segmentStats.roi > 0) {
     segmentScore = Math.min(segmentStats.roi, 20);
@@ -271,29 +226,22 @@ function computeOpportunityScore(params: {
   // 4. Sample reliability: min(count/20, 1) × 15, max 15
   const reliabilityScore = Math.min(segmentStats.betCount / 20, 1) * 15;
 
-  // 5. Odds sweet spot
+  // 5. Odds sweet spot: 1.9–3.2 → 15pts, 1.5–1.9 or 3.2–4.5 → 8pts, outside → 0
   let oddsScore = 0;
-  if (backOdds >= 1.8 && backOdds <= 3.5) {
-    oddsScore = 15;
-  } else if (
-    (backOdds >= 1.5 && backOdds < 1.8) ||
-    (backOdds > 3.5 && backOdds <= 5.0)
-  ) {
-    oddsScore = 8;
-  }
+  if (backOdds >= 1.9 && backOdds <= 3.2) oddsScore = 15;
+  else if ((backOdds >= 1.5 && backOdds < 1.9) || (backOdds > 3.2 && backOdds <= 4.5)) oddsScore = 8;
 
-  const raw =
-    edgeScore + confidenceScore + segmentScore + reliabilityScore + oddsScore + hotStreakBonus;
+  const raw = edgeScore + confidenceScore + segmentScore + reliabilityScore + oddsScore + hotStreakBonus;
+  const score = Math.min(Math.round(raw * 100) / 100, 100);
 
-  return Math.min(Math.round(raw * 100) / 100, 100);
+  // KEY FIX: Synthetic-only odds are capped at 55 — below the 65 threshold
+  // This prevents placing bets based solely on our own Poisson model
+  if (isSynthetic) return Math.min(score, 55);
+
+  return score;
 }
 
-// ─── Synthetic odds generator (paper-trading fallback) ───────────────────────
-//
-// When no exchange odds exist for a match, we generate a realistic bookmaker
-// market using Poisson goal models and team-form features.  A 7% vig is
-// applied so the market is slightly priced against us — the ML model only
-// finds +EV when it has genuine conviction beyond the baseline.
+// ─── Synthetic odds generator (fallback only — capped at score 55) ────────────
 
 interface SyntheticOddsRow {
   marketType: string;
@@ -303,8 +251,7 @@ interface SyntheticOddsRow {
 }
 
 function poissonCdf(lambda: number, k: number): number {
-  let p = 0;
-  let fac = 1;
+  let p = 0, fac = 1;
   for (let i = 0; i <= k; i++) {
     if (i > 0) fac *= i;
     p += (Math.pow(lambda, i) * Math.exp(-lambda)) / fac;
@@ -312,12 +259,9 @@ function poissonCdf(lambda: number, k: number): number {
   return p;
 }
 
-function generateSyntheticOdds(
-  featureMap: Record<string, number>,
-): SyntheticOddsRow[] {
+function generateSyntheticOdds(featureMap: Record<string, number>): SyntheticOddsRow[] {
   const VIG = 1.07;
-  const clamp = (v: number, lo: number, hi: number) =>
-    Math.min(hi, Math.max(lo, v));
+  const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
   const homeForm = featureMap["home_form_last5"] ?? 0.4;
   const awayForm = featureMap["away_form_last5"] ?? 0.35;
@@ -326,8 +270,7 @@ function generateSyntheticOdds(
   const homeConcededAvg = featureMap["home_goals_conceded_avg"] ?? 1.2;
   const awayConcededAvg = featureMap["away_goals_conceded_avg"] ?? 1.5;
 
-  // 1X2 market via form-adjusted Elo-like strengths
-  const homeStrength = clamp(homeForm + 0.08, 0.05, 0.9); // +8% home advantage
+  const homeStrength = clamp(homeForm + 0.08, 0.05, 0.9);
   const awayStrength = clamp(awayForm, 0.05, 0.85);
   const rawDraw = clamp(0.28 - 0.15 * Math.abs(homeStrength - awayStrength), 0.05, 0.4);
   const total = homeStrength + awayStrength + rawDraw;
@@ -335,35 +278,88 @@ function generateSyntheticOdds(
   const drawProb = rawDraw / total;
   const awayProb = awayStrength / total;
 
-  const homeOdds = clamp((1 / homeProb) / VIG, 1.05, 20);
-  const drawOdds = clamp((1 / drawProb) / VIG, 1.05, 20);
-  const awayOdds = clamp((1 / awayProb) / VIG, 1.05, 20);
-
-  // BTTS market via Poisson
   const expHome = clamp((homeScoredAvg + awayConcededAvg) / 2, 0.3, 5);
   const expAway = clamp((awayScoredAvg + homeConcededAvg) / 2, 0.3, 5);
   const pHomeSc = 1 - Math.exp(-expHome);
   const pAwaySc = 1 - Math.exp(-expAway);
   const bttsYesProb = clamp(pHomeSc * pAwaySc, 0.05, 0.95);
-  const bttsYesOdds = clamp((1 / bttsYesProb) / VIG, 1.05, 20);
-  const bttsNoOdds = clamp((1 / (1 - bttsYesProb)) / VIG, 1.05, 20);
-
-  // Over/Under 2.5 via Poisson CDF
   const totalLambda = expHome + expAway;
   const under25Prob = clamp(poissonCdf(totalLambda, 2), 0.05, 0.95);
   const over25Prob = 1 - under25Prob;
-  const over25Odds = clamp((1 / over25Prob) / VIG, 1.05, 20);
-  const under25Odds = clamp((1 / under25Prob) / VIG, 1.05, 20);
 
   return [
-    { marketType: "MATCH_ODDS", selectionName: "Home", backOdds: homeOdds, source: "synthetic" },
-    { marketType: "MATCH_ODDS", selectionName: "Draw", backOdds: drawOdds, source: "synthetic" },
-    { marketType: "MATCH_ODDS", selectionName: "Away", backOdds: awayOdds, source: "synthetic" },
-    { marketType: "BTTS", selectionName: "Yes", backOdds: bttsYesOdds, source: "synthetic" },
-    { marketType: "BTTS", selectionName: "No", backOdds: bttsNoOdds, source: "synthetic" },
-    { marketType: "OVER_UNDER_25", selectionName: "Over 2.5 Goals", backOdds: over25Odds, source: "synthetic" },
-    { marketType: "OVER_UNDER_25", selectionName: "Under 2.5 Goals", backOdds: under25Odds, source: "synthetic" },
+    { marketType: "MATCH_ODDS", selectionName: "Home", backOdds: clamp((1 / homeProb) / VIG, 1.05, 20), source: "synthetic" },
+    { marketType: "MATCH_ODDS", selectionName: "Draw", backOdds: clamp((1 / drawProb) / VIG, 1.05, 20), source: "synthetic" },
+    { marketType: "MATCH_ODDS", selectionName: "Away", backOdds: clamp((1 / awayProb) / VIG, 1.05, 20), source: "synthetic" },
+    { marketType: "BTTS", selectionName: "Yes", backOdds: clamp((1 / bttsYesProb) / VIG, 1.05, 20), source: "synthetic" },
+    { marketType: "BTTS", selectionName: "No", backOdds: clamp((1 / (1 - bttsYesProb)) / VIG, 1.05, 20), source: "synthetic" },
+    { marketType: "OVER_UNDER_25", selectionName: "Over 2.5 Goals", backOdds: clamp((1 / over25Prob) / VIG, 1.05, 20), source: "synthetic" },
+    { marketType: "OVER_UNDER_25", selectionName: "Under 2.5 Goals", backOdds: clamp((1 / under25Prob) / VIG, 1.05, 20), source: "synthetic" },
   ];
+}
+
+// ─── Model probability dispatcher ────────────────────────────────────────────
+
+function getModelProbability(
+  marketType: string,
+  selectionName: string,
+  featureMap: Record<string, number>,
+): number | null {
+  const outcomePreds = predictOutcome(featureMap);
+  const bttsPreds = predictBtts(featureMap);
+  const ouPreds = predictOverUnder(featureMap);
+  const cardsPreds = predictCards(featureMap);
+  const cornersPreds = predictCorners(featureMap);
+
+  if (marketType === "MATCH_ODDS" && outcomePreds) {
+    if (selectionName === "Home") return outcomePreds.home;
+    if (selectionName === "Draw") return outcomePreds.draw;
+    if (selectionName === "Away") return outcomePreds.away;
+  }
+  if (marketType === "BTTS" && bttsPreds) {
+    if (selectionName === "Yes") return bttsPreds.yes;
+    if (selectionName === "No") return bttsPreds.no;
+  }
+  if ((marketType === "OVER_UNDER_25" || marketType === "OVER_UNDER") && ouPreds) {
+    if (selectionName.startsWith("Over")) return ouPreds.over;
+    if (selectionName.startsWith("Under")) return ouPreds.under;
+  }
+  if (marketType === "OVER_UNDER_15" && ouPreds) {
+    // Adjust for 1.5 line using goals averages
+    const homeGoals = featureMap["home_goals_scored_avg"] ?? 1.4;
+    const awayGoals = featureMap["away_goals_scored_avg"] ?? 1.1;
+    const lambda = homeGoals + awayGoals;
+    const p0 = Math.exp(-lambda);
+    const p1 = lambda * Math.exp(-lambda);
+    const under15 = Math.max(0.01, Math.min(0.99, p0 + p1));
+    if (selectionName.startsWith("Over")) return 1 - under15;
+    if (selectionName.startsWith("Under")) return under15;
+  }
+  if (marketType === "OVER_UNDER_35" && ouPreds) {
+    const homeGoals = featureMap["home_goals_scored_avg"] ?? 1.4;
+    const awayGoals = featureMap["away_goals_scored_avg"] ?? 1.1;
+    const lambda = homeGoals + awayGoals;
+    const under35 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 3)));
+    if (selectionName.startsWith("Over")) return 1 - under35;
+    if (selectionName.startsWith("Under")) return under35;
+  }
+  if (marketType === "TOTAL_CARDS_35" && cardsPreds) {
+    if (selectionName.startsWith("Over")) return cardsPreds.over35;
+    if (selectionName.startsWith("Under")) return cardsPreds.under35;
+  }
+  if (marketType === "TOTAL_CARDS_45" && cardsPreds) {
+    if (selectionName.startsWith("Over")) return cardsPreds.over45;
+    if (selectionName.startsWith("Under")) return cardsPreds.under45;
+  }
+  if (marketType === "TOTAL_CORNERS_95" && cornersPreds) {
+    if (selectionName.startsWith("Over")) return cornersPreds.over95;
+    if (selectionName.startsWith("Under")) return cornersPreds.under95;
+  }
+  if (marketType === "TOTAL_CORNERS_105" && cornersPreds) {
+    if (selectionName.startsWith("Over")) return cornersPreds.over105;
+    if (selectionName.startsWith("Under")) return cornersPreds.under105;
+  }
+  return null;
 }
 
 // ─── Main detection function ──────────────────────────────────────────────────
@@ -372,22 +368,11 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
   const modelVersion = getModelVersion();
   logger.info({ modelVersion }, "Running value detection");
 
-  const configKeys = [
-    "min_edge_threshold",
-    "min_opportunity_score",
-    "cold_market_threshold",
-    "cold_market_min_bets",
-    "cold_market_cooldown_days",
-    "hot_streak_weeks",
-    "hot_streak_min_bets_per_week",
-    "hot_streak_bonus",
-  ];
-
   const configRows = await db.select().from(agentConfigTable);
   const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
 
   const minEdge = Number(cfg.min_edge_threshold ?? "0.03");
-  const minOppScore = Number(cfg.min_opportunity_score ?? "60");
+  const minOppScore = Number(cfg.min_opportunity_score ?? "65");
   const coldThreshold = Number(cfg.cold_market_threshold ?? "-10");
   const coldMinBets = Number(cfg.cold_market_min_bets ?? "10");
   const coldCooldownDays = Number(cfg.cold_market_cooldown_days ?? "14");
@@ -402,9 +387,9 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
 
   const valueBets: ValueBet[] = [];
   let selectionsEvaluated = 0;
-
-  let syntheticOddsUsed = 0;
-  let realOddsUsed = 0;
+  let syntheticOddsCount = 0;
+  let realOddsCount = 0;
+  const byMarketType: Record<string, number> = {};
 
   for (const match of matches) {
     const oddsRows = await db
@@ -418,9 +403,7 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       .from(featuresTable)
       .where(eq(featuresTable.matchId, match.id));
 
-    const publicFeatures = featureRows.filter(
-      (f) => !f.featureName.startsWith("_"),
-    );
+    const publicFeatures = featureRows.filter((f) => !f.featureName.startsWith("_"));
     if (publicFeatures.length < 8) continue;
 
     const featureMap: Record<string, number> = {};
@@ -428,20 +411,36 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       featureMap[f.featureName] = Number(f.featureValue);
     }
 
-    const outcomePreds = predictOutcome(featureMap);
-    const bttsPreds = predictBtts(featureMap);
-    const ouPreds = predictOverUnder(featureMap);
+    // Determine odds source priority
+    const realOddsRows = oddsRows.filter((r) => r.source?.startsWith("api_football_real"));
+    const isSynthetic = realOddsRows.length === 0;
 
-    // Use real odds if available, otherwise generate synthetic odds from features
-    type OddsRow = { marketType: string; selectionName: string; backOdds: string | number | null; source?: string };
-    let oddsSource: OddsRow[];
-    if (oddsRows.length > 0) {
-      realOddsUsed++;
-      oddsSource = oddsRows;
+    if (isSynthetic) {
+      syntheticOddsCount++;
     } else {
-      syntheticOddsUsed++;
-      oddsSource = generateSyntheticOdds(featureMap);
+      realOddsCount++;
     }
+
+    type OddsRow = { marketType: string; selectionName: string; backOdds: string | number | null; source?: string | null };
+    const oddsSource: OddsRow[] = isSynthetic ? generateSyntheticOdds(featureMap) : oddsRows;
+
+    // Log which odds source was used
+    const oddsSourceLabel = isSynthetic
+      ? "synthetic"
+      : (realOddsRows[0]?.source ?? "api_football_real").replace("api_football_real:", "");
+
+    await db.insert(complianceLogsTable).values({
+      actionType: "value_detection_odds_source",
+      details: {
+        matchId: match.id,
+        homeTeam: match.homeTeam,
+        awayTeam: match.awayTeam,
+        oddsSource: oddsSourceLabel,
+        isSynthetic,
+        oddsRowCount: oddsSource.length,
+      },
+      timestamp: new Date(),
+    });
 
     const latestOdds = new Map<string, OddsRow>();
     for (const row of oddsSource) {
@@ -455,78 +454,20 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       if (backOdds <= 1.01) continue;
       const impliedProb = 1 / backOdds;
 
-      let modelProb: number | null = null;
-      if (oddsRow.marketType === "MATCH_ODDS" && outcomePreds) {
-        if (oddsRow.selectionName === "Home") modelProb = outcomePreds.home;
-        else if (oddsRow.selectionName === "Draw") modelProb = outcomePreds.draw;
-        else if (oddsRow.selectionName === "Away") modelProb = outcomePreds.away;
-      } else if (oddsRow.marketType === "BTTS" && bttsPreds) {
-        if (oddsRow.selectionName === "Yes") modelProb = bttsPreds.yes;
-        else if (oddsRow.selectionName === "No") modelProb = bttsPreds.no;
-      } else if (oddsRow.marketType === "OVER_UNDER_25" && ouPreds) {
-        if (oddsRow.selectionName === "Over 2.5 Goals") modelProb = ouPreds.over;
-        else if (oddsRow.selectionName === "Under 2.5 Goals") modelProb = ouPreds.under;
-      }
-
+      const modelProb = getModelProbability(oddsRow.marketType, oddsRow.selectionName, featureMap);
       if (modelProb === null) continue;
-      selectionsEvaluated++;
 
+      selectionsEvaluated++;
       const edge = modelProb - impliedProb;
-      if (edge <= minEdge) {
-        await db.insert(complianceLogsTable).values({
-          actionType: "value_detection_evaluation",
-          details: {
-            matchId: match.id,
-            homeTeam: match.homeTeam,
-            awayTeam: match.awayTeam,
-            marketType: oddsRow.marketType,
-            selectionName: oddsRow.selectionName,
-            backOdds,
-            impliedProbability: impliedProb,
-            modelProbability: modelProb,
-            calculatedEdge: edge,
-            minEdgeThreshold: minEdge,
-            decision: "skip_low_edge",
-            modelVersion,
-          },
-          timestamp: new Date(),
-        });
-        continue;
-      }
+
+      if (edge <= minEdge) continue;
 
       const segmentStats = await getSegmentStats(match.league, oddsRow.marketType);
 
-      const cold = await isColdMarket(
-        match.league,
-        oddsRow.marketType,
-        segmentStats,
-        coldMinBets,
-        coldThreshold,
-        coldCooldownDays,
-      );
-      if (cold) {
-        await db.insert(complianceLogsTable).values({
-          actionType: "value_detection_evaluation",
-          details: {
-            matchId: match.id,
-            marketType: oddsRow.marketType,
-            selectionName: oddsRow.selectionName,
-            decision: "skip_cold_market",
-            league: match.league,
-            segmentRoi: segmentStats.roi,
-          },
-          timestamp: new Date(),
-        });
-        continue;
-      }
+      const cold = await isColdMarket(match.league, oddsRow.marketType, segmentStats, coldMinBets, coldThreshold, coldCooldownDays);
+      if (cold) continue;
 
-      const streakBonus = await getHotStreakBonus(
-        match.league,
-        oddsRow.marketType,
-        hotWeeks,
-        hotMinBets,
-        hotBonus,
-      );
+      const streakBonus = await getHotStreakBonus(match.league, oddsRow.marketType, hotWeeks, hotMinBets, hotBonus);
 
       const opportunityScore = computeOpportunityScore({
         edge,
@@ -534,10 +475,10 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         backOdds,
         segmentStats,
         hotStreakBonus: streakBonus,
+        isSynthetic,
       });
 
-      const decision =
-        opportunityScore >= minOppScore ? "value_bet" : "skip_low_score";
+      const decision = opportunityScore >= minOppScore ? "value_bet" : "skip_low_score";
 
       await db.insert(complianceLogsTable).values({
         actionType: "value_detection_evaluation",
@@ -556,12 +497,15 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
           segmentStats,
           hotStreakBonus: streakBonus,
           decision,
+          isSynthetic,
+          oddsSource: oddsSourceLabel,
           modelVersion,
         },
         timestamp: new Date(),
       });
 
       if (opportunityScore >= minOppScore) {
+        byMarketType[oddsRow.marketType] = (byMarketType[oddsRow.marketType] ?? 0) + 1;
         valueBets.push({
           matchId: match.id,
           homeTeam: match.homeTeam,
@@ -576,6 +520,7 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
           backOdds,
           modelVersion,
           opportunityScore,
+          oddsSource: oddsSourceLabel,
         });
       }
     }
@@ -585,13 +530,7 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
   valueBets.sort((a, b) => b.opportunityScore - a.opportunityScore);
 
   logger.info(
-    {
-      matchesEvaluated: matches.length,
-      selectionsEvaluated,
-      valueBetsFound: valueBets.length,
-      realOddsUsed,
-      syntheticOddsUsed,
-    },
+    { matchesEvaluated: matches.length, selectionsEvaluated, valueBetsFound: valueBets.length, realOddsCount, syntheticOddsCount },
     "Value detection complete",
   );
 
@@ -601,5 +540,8 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
     valueBetsFound: valueBets.length,
     modelVersion,
     valueBets,
+    realOddsCount,
+    syntheticOddsCount,
+    byMarketType,
   };
 }

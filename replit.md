@@ -2,7 +2,7 @@
 
 ## Overview
 
-pnpm workspace monorepo using TypeScript. This is an AI betting agent that paper-trades football bets using the Betfair Exchange Delayed API.
+pnpm workspace monorepo using TypeScript. This is an AI betting agent that paper-trades football bets using the Betfair Exchange Delayed API and API-Football v3 for real odds.
 
 ## Stack
 
@@ -13,14 +13,12 @@ pnpm workspace monorepo using TypeScript. This is an AI betting agent that paper
 - **API framework**: Express 5
 - **Database**: PostgreSQL + Drizzle ORM
 - **Validation**: Zod (`zod/v4`), `drizzle-zod`
-- **API codegen**: Orval (from OpenAPI spec)
 - **Build**: esbuild (CJS bundle)
 
 ## Key Commands
 
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - `pnpm --filter @workspace/api-server run dev` — run API server locally
 
@@ -32,14 +30,15 @@ All tables for the AI betting agent:
 
 1. **matches** — Football matches with team names, league, kickoff time, scores, Betfair event ID
 2. **odds_snapshots** — Market odds snapshots from Betfair delayed API (back/lay odds)
-3. **features** — Computed ML features per match (team form, H2H stats, etc.)
-4. **paper_bets** — Simulated bets with edge calculation, model probability, settlement tracking
+3. **features** — Computed ML features per match (team form, H2H stats, API-Football extras)
+4. **paper_bets** — Simulated bets with edge, model probability, odds source, settlement tracking
 5. **model_state** — Versioned model snapshots with accuracy, calibration, feature importances
 6. **learning_narratives** — AI-generated narratives about strategy shifts and model improvements
 7. **compliance_logs** — Full audit trail of all agent decisions and actions
-8. **agent_config** — Runtime configuration (bankroll, stake limits, edge thresholds, status)
+8. **agent_config** — Runtime configuration (bankroll, stake limits, edge thresholds, status, diversity rules)
+9. **api_usage** — Daily API-Football request budget tracker (cap: 90 req/day)
 
-## Agent Config Defaults
+## Agent Config Defaults (21 keys)
 
 | Key | Default |
 |-----|---------|
@@ -51,6 +50,19 @@ All tables for the AI betting agent:
 | max_concurrent_bets | 10 |
 | min_edge_threshold | 0.03 |
 | agent_status | running |
+| opportunity_score_threshold | 65 |
+| max_bets_per_cycle | 5 |
+| max_bets_per_league | 2 |
+| max_bets_per_market | 2 |
+| cold_market_min_volume | 100 |
+| hot_streak_window | 10 |
+| hot_streak_win_rate | 0.70 |
+| odds_sweet_spot_min | 1.9 |
+| odds_sweet_spot_max | 3.2 |
+| synthetic_odds_score_cap | 55 |
+| cards_corners_kelly_multiplier | 0.7 |
+| api_football_daily_budget | 90 |
+| data_source | football_data_fallback |
 
 ## API Routes
 
@@ -60,66 +72,99 @@ All routes are under `/api/`:
 - `GET/POST/PATCH /matches` — match management
 - `GET/POST /paper-bets`, `PATCH /paper-bets/:id/settle` — bet placement and settlement
 - `GET/POST /odds-snapshots` — odds data ingestion
-- `GET/POST /features` — ML feature storage (metadata features prefixed `_` are hidden from GET)
-- `POST /features/compute` — manually trigger feature computation for all upcoming matches
-- `GET /predictions/status` — model loaded status and version
-- `GET /predictions/:matchId` — predict outcome/BTTS/over-under for a match (requires features + model)
-- `POST /predictions/bootstrap` — trigger bootstrap training from last season's historical data
-- `POST /predictions/retrain` — retrain if ≥20 new settled bets since last training
-- `POST /predictions/load` — reload latest model from DB into memory
-- `GET /value-bets` — detect value bets for all upcoming matches with odds (compliance-logged)
+- `GET/POST /features` — ML feature storage
+- `POST /features/compute` — manually trigger feature computation
+- `GET /predictions/status`, `GET /predictions/:matchId` — ML predictions
+- `POST /predictions/bootstrap`, `/retrain`, `/load` — model management
+- `GET /value-bets` — detect value bets (compliance-logged)
 - `GET/POST /model-state`, `GET /model-state/latest` — model versioning
 - `GET/POST /learning-narratives` — agent learning log
 - `GET/POST /compliance-logs` — compliance audit trail
 - `POST /ingestion/run` — manually trigger data ingestion
+- `POST /features/run` — manually trigger feature computation
+- `POST /trading/run` — manually trigger trading cycle
+- `GET /dashboard/summary` — dashboard KPIs
+- `GET /dashboard/performance` — performance chart data
+- `GET /dashboard/bets` — paginated bet history (with oddsSource)
+- `GET /dashboard/bets/by-league` — bets grouped by league
+- `GET /dashboard/bets/by-market` — bets grouped by market
+- `GET /dashboard/viability` — opportunity pipeline
+- `GET /dashboard/model` — model metrics
+- `GET /dashboard/narratives` — learning narratives
+- `GET /dashboard/api-budget` — API-Football daily quota status
+- `POST /odds/fetch` — manually trigger API-Football odds ingestion
+- `POST /agent/control` — start/pause/stop agent
 - `GET /healthz` — health check
 
-## Prediction Engine (`src/services/predictionEngine.ts`)
+## Market Types
 
-Three logistic regression models trained via one-vs-all, bootstrapped from historical season data:
+| Market | Description | Model |
+|--------|-------------|-------|
+| MATCH_ODDS | 1X2 outcome | Logistic Regression |
+| BTTS | Both teams to score | Logistic Regression |
+| OVER_UNDER_25 | Over/under 2.5 goals | Logistic Regression |
+| TOTAL_CARDS_35 | Total cards > 3.5 | Poisson heuristic |
+| TOTAL_CARDS_45 | Total cards > 4.5 | Poisson heuristic |
+| TOTAL_CORNERS_95 | Total corners > 9.5 | Poisson heuristic |
+| TOTAL_CORNERS_105 | Total corners > 10.5 | Poisson heuristic |
 
-| Model | Classes | Features used |
-|-------|---------|---------------|
-| Outcome | home(0) / draw(1) / away(2) | All 12 features |
-| BTTS | no(0) / yes(1) | features 0–5 + 8,9 |
-| Over/Under 2.5 | under(0) / over(1) | features 0–5 + 10,11 |
+Cards/corners models use a 0.7× Kelly multiplier until sufficient settled data accumulates.
 
-**Bootstrap training**: Fetches last season's finished matches from all 8 FEATURE_COMPETITIONS, computes rolling in-dataset features (no extra API calls), trains all 3 models, stores weights in `model_state` as JSON.
+## Opportunity Scoring System (valueDetection.ts)
 
-**Auto-load on startup**: The server calls `loadLatestModel()` at boot; if no model exists in DB, bootstrap training starts automatically in the background.
+5-component score (0–100), threshold: **65**. Synthetic odds hard-capped at **55** (blocks them from being placed):
 
-**Retraining**: After every 20 new settled paper bets, `retrainIfNeeded()` rebuilds all 3 models using settled bet match data + features from the DB and compares new vs old accuracy.
+| Component | Weight | Description |
+|-----------|--------|-------------|
+| Edge component | 30 | Model edge vs implied probability |
+| Confidence | 20 | Model confidence (distance from 0.5) |
+| Odds sweet spot | 20 | Bonus for odds 1.9–3.2 |
+| Market quality | 15 | Volume/liquidity |
+| Form alignment | 15 | Hot/cold streak detection |
 
-**Hyperparameters**: 500 gradient steps, learning rate 0.005 (prevents weight saturation / overconfident probabilities).
+Real odds (Bet365/Bwin/1xBet via API-Football) required to score above 65. Synthetic odds score ≤ 55.
 
-**Feature normalization**: All features are z-score normalized (mean=0, std=1) before training and inference. Normalization statistics are saved alongside model weights.
+## Kelly Staking Tiers
 
-## Value Detection (`src/services/valueDetection.ts`)
+| Score | Fraction | Use case |
+|-------|----------|----------|
+| 88+ | 1/2 Kelly | Very high confidence |
+| 80–88 | 3/8 Kelly | High confidence |
+| 72–80 | 1/4 Kelly | Standard |
+| 65–72 | 1/8 Kelly | Conservative |
 
-For each upcoming match with odds snapshots in the DB:
-1. Loads computed features from `features` table
-2. Calls prediction engine for outcome / BTTS / over-under probabilities
-3. For each selection: `implied_prob = 1 / back_odds`, `edge = model_prob - implied_prob`
-4. Flags as value bet if `edge > min_edge_threshold` (default 3%, configurable in agent_config)
-5. Logs every evaluation (bet or skip) to `compliance_logs` with full audit fields
-6. Returns value bets sorted by edge descending
+Cards/corners: all tiers multiplied by 0.7×.
 
-Note: Value bets will be 0 when no odds snapshots exist (requires Betfair access or manual odds seeding).
+## Diversity Rules (Scheduler)
 
-## Scheduler
+Per trading cycle:
+- Max **5 bets** total
+- Max **2 bets** per league
+- Max **2 bets** per market type
 
-Two scheduled jobs run automatically:
+## Prediction Engine (src/services/predictionEngine.ts)
 
-| Job | Schedule | Description |
-|-----|----------|-------------|
-| Data ingestion | Every 30 min, 06:00–23:30 UTC | Fetches matches from football-data.org (or Betfair) |
-| Feature computation | Every 6 hours UTC | Computes all 12 ML features for upcoming matches |
+Three logistic regression models trained via one-vs-all, bootstrapped from historical season data. Cards/corners use Poisson heuristics until bet data accumulates.
 
-Both jobs are guarded against concurrent runs (skip-if-busy).
+**Bootstrap training**: Fetches last season's finished matches, computes rolling features, trains models, stores weights in `model_state`.
 
-## Feature Engine (`src/services/featureEngine.ts`)
+**Auto-load on startup**: Server loads latest model from DB at boot.
 
-Computes 12 ML features per upcoming match using football-data.org team history APIs:
+**Retraining**: After every 20 new settled paper bets, `retrainIfNeeded()` rebuilds all 3 LR models.
+
+**Hyperparameters**: 500 gradient steps, learning rate 0.005.
+
+## API-Football Integration (src/services/apiFootball.ts)
+
+- **Budget**: 90 req/day hard cap tracked in `api_usage` table
+- **Fixture mapping**: Discovers upcoming matches and fuzzy-matches team names
+- **Real odds**: Ingests Bet365, Bwin, 1xBet odds for upcoming fixtures (every 8h)
+- **Team stats**: Fetches yellow cards avg, corners avg, shots stats (every 12h)
+- **Budget endpoint**: `GET /api/dashboard/api-budget` → `{used, cap, remaining, date}`
+
+## Feature Engine (src/services/featureEngine.ts)
+
+Computes 17 ML features per upcoming match:
 
 | Feature | Description |
 |---------|-------------|
@@ -129,39 +174,57 @@ Computes 12 ML features per upcoming match using football-data.org team history 
 | `home_goals_conceded_avg` | Home team avg goals conceded (last 10 home) |
 | `away_goals_scored_avg` | Away team avg goals scored (last 10 away) |
 | `away_goals_conceded_avg` | Away team avg goals conceded (last 10 away) |
-| `home_btts_rate` | Both-teams-to-score rate in home team's last 10 home matches |
-| `away_btts_rate` | Both-teams-to-score rate in away team's last 10 away matches |
-| `home_over25_rate` | Over 2.5 goals rate in home team's last 10 home matches |
-| `away_over25_rate` | Over 2.5 goals rate in away team's last 10 away matches |
+| `home_btts_rate` | BTTS rate in home team's last 10 home matches |
+| `away_btts_rate` | BTTS rate in away team's last 10 away matches |
+| `home_over25_rate` | Over 2.5 rate in home team's last 10 home matches |
+| `away_over25_rate` | Over 2.5 rate in away team's last 10 away matches |
 | `h2h_home_win_rate` | Home win rate in last 5 H2H meetings |
-| `league_position_diff` | (away rank − home rank) / total teams, normalised |
+| `league_position_diff` | (away rank − home rank) / total teams |
+| `home_yellow_cards_avg` | Home team avg yellow cards (API-Football) |
+| `away_yellow_cards_avg` | Away team avg yellow cards (API-Football) |
+| `corners_avg` | Combined corners average |
+| `shots_on_target_avg` | Avg shots on target |
+| `goal_momentum` | Recent scoring trend |
 
-Prerequisites: Ingestion must run at least once so team IDs are stored (as `_home_team_id` / `_away_team_id` metadata features) before the feature engine can run.
+## Scheduler (src/services/scheduler.ts)
 
-API calls are sequential (not parallel) to respect the 10 req/min rate limit.
+| Job | Schedule | Description |
+|-----|----------|-------------|
+| Data ingestion | Every 30 min, 06:00–23:30 UTC | Fetches matches from football-data.org |
+| Feature computation | Every 6 hours UTC | Computes all ML features |
+| Trading cycle | Every 15 minutes | Detects value bets, places paper bets |
+| API-Football odds | Every 8 hours UTC | Ingests real odds from Bet365/Bwin/1xBet |
+| API-Football team stats | Every 12 hours UTC | Fetches cards/corners/shots stats |
+| Learning loop | Daily at 03:00 UTC | Generates narratives, retrains model |
+
+## Risk Management
+
+- **Circuit breakers**: Daily and weekly loss limits halt the agent automatically
+- **Bankroll floor**: Agent stops at minimum bankroll (£200 default)
+- **Cold market filtering**: Skips markets with insufficient volume
+- **Hot-streak detection**: Adjusts confidence scoring based on recent performance
+- **Diversity rules**: Prevents concentration risk across leagues/markets
+
+## Dashboard (artifacts/dashboard)
+
+React + Vite SPA at `/dashboard/`:
+
+- **Overview** — Bankroll, P&L, ROI, win rate, cumulative chart
+- **Bet History** — Paginated bet log with odds source badges (Bet365/Bwin/1xBet/Synthetic), status, edge, score
+- **Performance** — Daily P&L charts, market breakdowns
+- **Viability** — Opportunity pipeline, upcoming markets
+- **Learning & Model** — Model accuracy, narratives, feature importances
+- **Compliance** — Audit trail
+- **Sidebar** — API Budget progress bar (0/90 requests), agent controls, bankroll
 
 ## Data Sources
 
-The system supports two data sources, controlled by the `data_source` key in `agent_config`:
-
 | Value | Description |
 |-------|-------------|
-| `football_data_fallback` | Uses football-data.org API (default — works from any region) |
-| `betfair` | Uses Betfair Exchange Delayed API (requires UK/EU IP — geo-blocked on Replit) |
+| `football_data_fallback` | Uses football-data.org API (default) |
+| `betfair` | Uses Betfair Exchange Delayed API (geo-blocked on Replit) |
 
-When `data_source=betfair`, the system tries Betfair first and automatically falls back to football-data.org if a geographic error occurs.
-
-### football-data.org Service (`src/services/footballData.ts`)
-- Tracks 11 competitions: PL, BL1, SA, PD, FL1, CL, EL, EC, WC, PPL, BSA
-- Fetches matches for next 7 days
-- Maps odds (where available) to `MATCH_ODDS` market snapshots
-- Guards against TBD matches (null team objects from upcoming fixtures)
-- Event IDs prefixed with `fd_` to avoid collision with Betfair IDs
-
-### Betfair Service (`src/services/betfair.ts`)
-- Rate-limited to 5 req/s
-- Session auto-refreshes on 401/403
-- 7 market types: MATCH_ODDS, OVER_UNDER_25/15/35, BTTS, CORRECT_SCORE, ASIAN_HANDICAP
+Real odds for value scoring come from API-Football v3 (key: `API_FOOTBALL_KEY` secret).
 
 ## Startup
 

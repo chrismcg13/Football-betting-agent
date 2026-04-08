@@ -33,6 +33,10 @@ import {
   runTradingCycle,
   getSchedulerStatus,
 } from "../services/scheduler";
+import {
+  getApiBudgetStatus,
+  fetchAndStoreOddsForAllUpcoming,
+} from "../services/apiFootball";
 
 const router = Router();
 
@@ -411,6 +415,7 @@ router.get("/dashboard/bets", async (req, res) => {
         settlementPnl: paperBetsTable.settlementPnl,
         placedAt: paperBetsTable.placedAt,
         settledAt: paperBetsTable.settledAt,
+        oddsSource: paperBetsTable.oddsSource,
       })
       .from(paperBetsTable)
       .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
@@ -946,6 +951,28 @@ router.post("/trading/run", async (req, res) => {
     });
   } catch (err) {
     logger.error({ err }, "Manual trading cycle failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/api-budget
+// ─────────────────────────────────────────────
+router.get("/dashboard/api-budget", async (_req, res) => {
+  const budget = await getApiBudgetStatus();
+  res.json(budget);
+});
+
+// ─────────────────────────────────────────────
+// POST /api/odds/fetch — trigger API-Football odds ingestion
+// ─────────────────────────────────────────────
+router.post("/odds/fetch", async (_req, res) => {
+  logger.info("Manual API-Football odds ingestion triggered");
+  try {
+    const result = await fetchAndStoreOddsForAllUpcoming();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "API-Football odds ingestion failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });

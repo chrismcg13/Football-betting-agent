@@ -1,7 +1,7 @@
 import { Link, useLocation } from "wouter";
-import { useSummary, useAgentControl } from "@/hooks/use-dashboard";
+import { useSummary, useAgentControl, useApiBudget } from "@/hooks/use-dashboard";
 import {
-  BarChart2, BookOpen, Brain, FileText, Play, Pause, Shield, Square, Target, Zap,
+  BarChart2, BookOpen, Brain, FileText, Play, Pause, Shield, Square, Target, Zap, Database,
 } from "lucide-react";
 import { formatCurrency } from "@/lib/format";
 import { Button } from "@/components/ui/button";
@@ -37,6 +37,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const [location] = useLocation();
   const { data: summary } = useSummary();
   const agentControl = useAgentControl();
+  const { data: budget } = useApiBudget();
 
   const navItems = [
     { href: "/", label: "Overview", icon: Target },
@@ -84,6 +85,30 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 {pnl >= 0 ? "+" : ""}{formatCurrency(pnl)} total P&amp;L
               </p>
             )}
+          </div>
+        </div>
+
+        {/* API Budget pill */}
+        <div className="px-4 py-2.5 border-b" style={{ borderColor: "#334155" }}>
+          <div className="flex items-center gap-2">
+            <Database className="w-3 h-3 text-slate-500 shrink-0" />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-[9px] uppercase tracking-wider text-slate-500 font-semibold">API Budget</p>
+                <p className="text-[10px] font-mono text-slate-500">
+                  {budget ? `${budget.used}/${budget.cap}` : "—/90"}
+                </p>
+              </div>
+              <div className="w-full rounded-full h-1 bg-slate-800">
+                <div
+                  className="h-1 rounded-full transition-all"
+                  style={{
+                    width: budget ? `${Math.min(100, (budget.used / budget.cap) * 100)}%` : "0%",
+                    background: budget && budget.used > 80 ? "#ef4444" : budget && budget.used > 60 ? "#f59e0b" : "#10b981",
+                  }}
+                />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -211,6 +236,42 @@ export function Layout({ children }: { children: React.ReactNode }) {
         </div>
       </main>
     </div>
+  );
+}
+
+export function OddsSourceBadge({ source }: { source?: string | null }) {
+  if (!source || source === "synthetic") {
+    return (
+      <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700 font-mono">
+        Synthetic
+      </span>
+    );
+  }
+  if (source.toLowerCase().includes("bet365")) {
+    return (
+      <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800 font-mono">
+        Bet365
+      </span>
+    );
+  }
+  if (source.toLowerCase().includes("bwin")) {
+    return (
+      <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-950 text-blue-400 border border-blue-800 font-mono">
+        Bwin
+      </span>
+    );
+  }
+  if (source.toLowerCase().includes("1xbet")) {
+    return (
+      <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-950 text-purple-400 border border-purple-800 font-mono">
+        1xBet
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700 font-mono">
+      {source}
+    </span>
   );
 }
 

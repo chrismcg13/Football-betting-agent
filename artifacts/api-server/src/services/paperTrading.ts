@@ -77,11 +77,17 @@ export async function getAgentStatus(): Promise<string> {
 
 // ===================== Dynamic stake sizing =====================
 
-function kellyFractionForScore(opportunityScore: number): number {
-  if (opportunityScore >= 90) return 0.5;
-  if (opportunityScore >= 80) return 0.375;
-  if (opportunityScore >= 70) return 0.25;
-  return 0.125; // 60-70
+const NEW_MARKET_TYPES = new Set(["TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_CORNERS_95", "TOTAL_CORNERS_105"]);
+
+function kellyFractionForScore(opportunityScore: number, marketType?: string): number {
+  let fraction: number;
+  if (opportunityScore >= 88) fraction = 0.5;
+  else if (opportunityScore >= 80) fraction = 0.375;
+  else if (opportunityScore >= 72) fraction = 0.25;
+  else fraction = 0.125; // 65-72
+  // 0.7x multiplier for new unproven market types
+  if (marketType && NEW_MARKET_TYPES.has(marketType)) fraction *= 0.7;
+  return fraction;
 }
 
 function calculateDynamicKellyStake(
@@ -90,10 +96,11 @@ function calculateDynamicKellyStake(
   backOdds: number,
   maxStakePct: number,
   opportunityScore: number,
+  marketType?: string,
 ): number {
   if (edge <= 0 || backOdds <= 1) return 0;
 
-  const fraction = kellyFractionForScore(opportunityScore);
+  const fraction = kellyFractionForScore(opportunityScore, marketType);
   const kellyFull = edge / (backOdds - 1);
   let stake = bankroll * kellyFull * fraction;
 
@@ -121,6 +128,7 @@ export async function placePaperBet(
   edge: number,
   modelVersion?: string | null,
   opportunityScore?: number,
+  oddsSource?: string,
 ): Promise<BetPlacementResult> {
   const score = opportunityScore ?? 65;
 
@@ -199,6 +207,7 @@ export async function placePaperBet(
     backOdds,
     maxStakePct,
     score,
+    marketType,
   );
 
   if (stake < 2) {
@@ -224,6 +233,7 @@ export async function placePaperBet(
       calculatedEdge: String(edge),
       opportunityScore: String(score),
       modelVersion: modelVersion ?? null,
+      oddsSource: oddsSource ?? "synthetic",
       status: "pending",
     })
     .returning();

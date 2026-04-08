@@ -385,6 +385,37 @@ export async function computeFeaturesForMatch(
   const awayXg = computeXgProxy(awayMatches, awayTeamId, "away", 10);
   const xgDiff = homeXg - awayXg;
 
+  // ─── Read any API-Football enriched features already stored ─────────────────
+  const storedFeatures = await db
+    .select({ featureName: featuresTable.featureName, featureValue: featuresTable.featureValue })
+    .from(featuresTable)
+    .where(eq(featuresTable.matchId, matchId));
+
+  const stored: Record<string, number> = {};
+  for (const f of storedFeatures) {
+    stored[f.featureName] = Number(f.featureValue);
+  }
+
+  // ─── Derived features using AF team stats if available ───────────────────────
+  const homeYellowCards = stored["home_yellow_cards_avg"] ?? 1.8;
+  const awayYellowCards = stored["away_yellow_cards_avg"] ?? 1.6;
+  const combinedCardsPrediction = homeYellowCards + awayYellowCards;
+
+  // Shots proxy: ~5 shots per goal (league average conversion ≈ 20%)
+  const homeShotsOnTargetAvg = stored["home_shots_on_target_avg"] ?? (homeXg * 5);
+  const awayShotsOnTargetAvg = stored["away_shots_on_target_avg"] ?? (awayXg * 5);
+  const homeConversionRate = homeShotsOnTargetAvg > 0 ? homeGoals.scored / homeShotsOnTargetAvg : 0.2;
+  const awayConversionRate = awayShotsOnTargetAvg > 0 ? awayGoals.scored / awayShotsOnTargetAvg : 0.2;
+
+  // Corners proxy: ~3.5 corners per xG unit (attacking volume → corners)
+  const homeCornersAvg = stored["home_corners_avg"] ?? Math.round(homeXg * 3.5 * 10) / 10;
+  const awayCornersAvg = stored["away_corners_avg"] ?? Math.round(awayXg * 3.0 * 10) / 10;
+  const combinedCornersPrediction = homeCornersAvg + awayCornersAvg;
+
+  // Goal momentum (last3 vs last10 ratio) — use form+trajectory as proxy
+  const homeGoalMomentum = 0.5 + homePointsTraj * 2; // rising trajectory → > 0.5
+  const awayGoalMomentum = 0.5 + awayPointsTraj * 2;
+
   const features: Array<[string, number]> = [
     // Classic
     ["home_form_last5", homeForm5],
@@ -399,7 +430,7 @@ export async function computeFeaturesForMatch(
     ["away_btts_rate", awayBtts],
     ["home_over25_rate", homeOver25],
     ["away_over25_rate", awayOver25],
-    // New
+    // Extended
     ["home_clean_sheet_rate", homeCleanSheets],
     ["away_clean_sheet_rate", awayCleanSheets],
     ["home_points_trajectory", homePointsTraj],
@@ -409,6 +440,19 @@ export async function computeFeaturesForMatch(
     ["home_xg_proxy", homeXg],
     ["away_xg_proxy", awayXg],
     ["xg_diff", xgDiff],
+    // API-Football enriched (or proxied defaults)
+    ["home_yellow_cards_avg", homeYellowCards],
+    ["away_yellow_cards_avg", awayYellowCards],
+    ["combined_cards_prediction", combinedCardsPrediction],
+    ["home_shots_on_target_avg", homeShotsOnTargetAvg],
+    ["away_shots_on_target_avg", awayShotsOnTargetAvg],
+    ["home_shot_conversion_rate", Math.min(homeConversionRate, 1)],
+    ["away_shot_conversion_rate", Math.min(awayConversionRate, 1)],
+    ["home_corners_avg", homeCornersAvg],
+    ["away_corners_avg", awayCornersAvg],
+    ["combined_corners_prediction", combinedCornersPrediction],
+    ["home_goals_last3_vs_last10", Math.max(0, homeGoalMomentum)],
+    ["away_goals_last3_vs_last10", Math.max(0, awayGoalMomentum)],
   ];
 
   for (const [name, value] of features) {

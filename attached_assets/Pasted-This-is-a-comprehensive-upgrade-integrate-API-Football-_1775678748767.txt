@@ -1,0 +1,203 @@
+This is a comprehensive upgrade: integrate API-Football as a premium data source, improve strategy optimisation, and place fresh bets for this weekend using real bookmaker odds. Implement everything in this single prompt.
+
+=== PART 1: API-FOOTBALL DATA INTEGRATION ===
+
+Create src/services/apiFootball.ts:
+
+Base URL: https://v3.football.api-sports.io/
+Headers: { "x-apisports-key": process.env.API_FOOTBALL_KEY }
+
+The free tier allows 100 requests per day. We must cache aggressively.
+
+1. REAL BOOKMAKER ODDS (highest priority — this changes everything):
+   - Endpoint: /odds?fixture={fixtureId}&bookmaker=8 (Bet365 as primary)
+   - Also fetch bookmaker 6 (Bwin) and bookmaker 11 (1xBet) for odds comparison
+   - Get pre-match odds for: Match Winner (1X2), Goals Over/Under (1.5, 2.5, 3.5), Both Teams Score, Asian Handicap, Exact Score, Total Cards Over/Under, Total Corners Over/Under
+   - Cache odds per fixture — only refetch if older than 6 hours
+   - Store in odds_snapshots with source "api_football_real" to distinguish from synthetic Poisson
+   - Map API-Football fixture IDs to our matches table by matching team names and dates
+
+2. TEAM STATISTICS (per league season):
+   - Endpoint: /teams/statistics?team={teamId}&season=2025&league={leagueId}
+   - Get: goals for/against home/away, clean sheets, yellow/red cards per game, corners, penalties, form string
+   - Cache per team per day — only fetch teams playing in the next 7 days
+   - Smart batching: calculate which teams need fetching, do them all in one cron run
+
+3. FIXTURE STATISTICS (for settled matches — training data):
+   - Endpoint: /fixtures/statistics?fixture={fixtureId}
+   - Get: shots on target, total shots, corners, fouls, yellow cards, red cards, possession, passes
+   - Fetch after match completes for model retraining
+   - Cache permanently (historical data doesn't change)
+
+4. PLAYER STATISTICS:
+   - Endpoint: /players?team={teamId}&season=2025&league={leagueId}&page=1
+   - Get: goals, assists, cards, fouls committed, minutes played for each player
+   - Cache per team per week
+   - Calculate team aggregates: avg cards/game, avg fouls/game, top scorer dependency (% of team goals)
+
+5. LINEUPS (when available, ~60 mins before kickoff):
+   - Endpoint: /fixtures/lineups?fixture={fixtureId}
+   - Check 90 minutes before each fixture that has a pending bet
+   - Calculate "squad strength score" — if total minutes played by starting XI is below 70% of the team's strongest available XI, flag as risk_event
+   - Log narrative: "Lineup alert: [team] missing [X] key players for [match]. Reviewing bet exposure."
+
+6. REQUEST BUDGET MANAGEMENT:
+   - New table: api_usage (id, date, endpoint, request_count, created_at)
+   - Hard cap at 90 requests per day (leave 10 for emergencies and lineups)
+   - Priority order when budget is tight: odds first → fixture results → team stats → players → lineups
+   - If budget exhausted, fall back to football-data.org (existing system continues working)
+   - Log daily budget status to compliance_logs
+   - Show "API Budget: X/100 used today" on the dashboard footer
+
+CRON SCHEDULE for API-Football data:
+   - Every 8 hours: fetch/refresh odds for fixtures in next 4 days (biggest budget item — ~30 requests)
+   - Every 12 hours: fetch team statistics for teams playing in next 7 days (~20 requests)
+   - After each match settles: fetch fixture statistics (~5-10 requests per day)
+   - 90 mins before fixture with pending bet: check lineups (~5 requests)
+   - Weekly on Monday: refresh player statistics (~15 requests)
+   - Total estimated daily usage: 50-70 of 90 cap
+
+=== PART 2: NEW FEATURES FOR MODELS ===
+
+Add to the feature engine for every match:
+
+Cards and discipline:
+- home_yellow_cards_avg (last 10 games from API-Football team stats)
+- away_yellow_cards_avg
+- home_fouls_avg
+- away_fouls_avg
+- combined_cards_prediction (home_cards + away_cards averages)
+
+Corners:
+- home_corners_avg
+- away_corners_avg
+- combined_corners_prediction
+
+Shot quality:
+- home_shots_on_target_avg
+- away_shots_on_target_avg
+- home_shot_conversion_rate (goals / shots on target)
+- away_shot_conversion_rate
+
+Form momentum:
+- home_goals_last3_vs_last10 (ratio showing recent acceleration/deceleration)
+- away_goals_last3_vs_last10
+
+Key player dependency:
+- home_top_scorer_goal_share (top scorer goals / team total goals — higher = more risky)
+- away_top_scorer_goal_share
+
+All feature name → readable label mappings for dashboard:
+  home_yellow_cards_avg → "Yellow Cards/Game (Home)"
+  away_fouls_avg → "Fouls/Game (Away)"
+  combined_cards_prediction → "Predicted Total Cards"
+  combined_corners_prediction → "Predicted Total Corners"
+  home_shots_on_target_avg → "Shots on Target/Game (Home)"
+  home_shot_conversion_rate → "Shot Conversion (Home)"
+  home_goals_last3_vs_last10 → "Goal Momentum (Home)"
+  home_top_scorer_goal_share → "Star Player Dependency (Home)"
+
+=== PART 3: NEW PREDICTION MODELS ===
+
+Add new models alongside the existing three:
+
+1. TOTAL CARDS model:
+   - Targets: over/under 3.5 total cards, over/under 4.5 total cards
+   - Features: both teams' card averages, foul averages, league average cards, is_derby flag
+   - Compare predictions to real bookmaker cards odds from API-Football
+   - Only active when we have real bookmaker cards odds available
+
+2. TOTAL CORNERS model:
+   - Targets: over/under 9.5 corners, over/under 10.5 corners
+   - Features: corner averages, possession %, shots on target (more shots = more corners from saves)
+   - Compare to real bookmaker corner odds
+
+3. ENHANCED MATCH RESULT model:
+   - Keep existing model but add new features: shots on target, conversion rate, form momentum, key player dependency
+   - The richer features should produce more varied predictions across home/draw/away
+
+4. ENHANCED OVER/UNDER models:
+   - Add separate models for O/U 1.5, O/U 2.5, O/U 3.5 goals
+   - Features: xG proxy (shots on target × conversion rate), form momentum, clean sheet rate
+
+=== PART 4: STRATEGY OPTIMISATION — HIGH ROI, CAPITAL PROTECTED ===
+
+Update the opportunity scoring and betting strategy:
+
+1. OPPORTUNITY SCORE (0-100) — revised formula:
+   - Edge size: (edge / 0.15) × 25, capped at 25 points
+   - Model confidence: abs(model_prob - 0.5) × 50, capped at 25 points
+   - Historical segment ROI: if this league/market combo has positive past ROI, add up to 20 points scaled by ROI%
+   - Sample reliability: min(segment_bet_count / 20, 1) × 15 points
+   - Odds sweet spot: odds 1.9–3.2 get 15 points, odds 1.5–1.9 or 3.2–4.5 get 8 points, outside get 0
+   - MINIMUM THRESHOLD: 65 (raised from 60 — only take higher quality picks)
+
+2. REAL ODDS REQUIREMENT:
+   - If a fixture only has synthetic Poisson odds (no real bookmaker odds from API-Football), cap its opportunity score at 55
+   - This effectively prevents betting on synthetic-only markets (55 < 65 threshold)
+   - This is the key fix for the "all bets look the same" problem
+
+3. DYNAMIC STAKE SIZING — revised tiers:
+   - Score 65-72: 1/8 Kelly (cautious — borderline opportunity)
+   - Score 72-80: 1/4 Kelly (standard)
+   - Score 80-88: 3/8 Kelly (confident)
+   - Score 88+: 1/2 Kelly (high confidence, proven market segment)
+   - Max stake still capped at 2% of bankroll
+   - NEW: For cards and corners models (new, unproven), apply 0.7x multiplier to Kelly fraction until 20+ bets settled in that market. This protects capital while the model calibrates on new markets.
+
+4. DIVERSITY RULES (prevents overconcentration):
+   - Maximum 5 bets per trading cycle (down from 10 — fewer but better)
+   - Maximum 2 bets per league per cycle
+   - Maximum 2 bets of the same market type per cycle
+   - This forces diversification across leagues AND market types
+
+5. COLD MARKET FILTER:
+   - If 10+ bets in a league/market combo with ROI below -10%, auto-exclude for 14 days
+   - Log narrative: "Pausing [league] [market] after [N] bets at [ROI]% ROI. Reassessing in 2 weeks."
+
+6. HOT STREAK DETECTOR:
+   - If a league/market combo has positive ROI for 3+ consecutive weeks with 5+ bets/week, add 15 bonus points
+   - Log narrative: "Hot streak: [league] [market] profitable for [N] consecutive weeks."
+
+7. ODDS SOURCE PRIORITY for value detection:
+   Priority 1: API-Football real bookmaker odds (Bet365 primary, cross-reference Bwin and 1xBet)
+   Priority 2: Betfair delayed API (when UK IP resolved)
+   Priority 3: Football-data.org odds
+   Priority 4: Synthetic Poisson (capped at 55 score — effectively disabled for betting)
+   Log which source was used for every decision in compliance_logs.
+
+Add to agent_config with defaults:
+   min_opportunity_score=65, max_bets_per_cycle=5, max_bets_per_league=2, max_bets_per_market=2, new_market_kelly_multiplier=0.7, new_market_min_bets_for_full_kelly=20, cold_market_threshold=-10, cold_market_min_bets=10, cold_market_cooldown_days=14, hot_streak_weeks=3, hot_streak_bonus=15
+
+=== PART 5: FRESH WEEKEND BETS ===
+
+After all the above is integrated:
+
+1. Cancel/void all existing pending paper bets — they were placed using synthetic Poisson odds which we now know produce unreliable edge calculations. Log this to compliance: "Voided [N] synthetic-odds bets. Replacing with real-bookmaker-odds bets."
+
+2. Run the full API-Football data ingestion: fetch odds, team stats, and player data for all fixtures in the next 4 days
+
+3. Recompute features for all upcoming matches using the enriched data
+
+4. Run the value detection engine with the new models, new features, and real bookmaker odds
+
+5. Execute a full trading cycle: apply opportunity scoring (min 65), diversity rules, dynamic staking, and place the best bets
+
+6. Show me the complete output:
+   - How many fixtures scanned
+   - How many had real bookmaker odds vs synthetic only
+   - How many value opportunities found per market type (match result, BTTS, O/U, cards, corners)
+   - Which bets were placed: match, league, market type, selection, real bookmaker odds, model probability, edge, opportunity score, stake amount
+   - Total staked and average opportunity score
+
+=== PART 6: DASHBOARD UPDATES ===
+
+- Add "Cards O/U" and "Corners O/U" as market types in all filters and performance breakdowns
+- Performance page: new markets appear in ROI by Market Type chart
+- Bet History: show new market types with readable labels ("Over 3.5 Cards", "Over 9.5 Corners")
+- Learning narratives: include insights about cards and corners markets
+- Feature importance chart: include all new features with readable labels
+- Add subtle "API Budget: X/100" indicator in dashboard footer
+- Add "Odds Source" badge on each bet in bet history: "Bet365" or "Bwin" or "Synthetic" — so you can see which bets used real vs synthetic odds
+
+Make sure the existing football-data.org integration continues as a fallback. The system should gracefully handle API-Football being unavailable or budget-exhausted without breaking anything.

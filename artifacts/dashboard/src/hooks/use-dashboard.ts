@@ -90,6 +90,14 @@ export const useComplianceStats = () => {
   });
 };
 
+export const useApiBudget = () => {
+  return useQuery({
+    queryKey: ["dashboard", "api-budget"],
+    queryFn: () => fetcher("/api/dashboard/api-budget"),
+    refetchInterval: 300000,
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

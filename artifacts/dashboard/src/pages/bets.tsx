@@ -1,7 +1,7 @@
 import { Fragment, useState, useMemo } from "react";
 import { useBets, useBetsByLeague, useBetsByMarket } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime } from "@/lib/format";
-import { BetStatusBadge } from "@/components/layout";
+import { BetStatusBadge, OddsSourceBadge } from "@/components/layout";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp } from "lucide-react";
@@ -349,8 +349,11 @@ export default function Bets() {
                         </span>
                       </td>
                       <td className="py-3 px-3 text-slate-200">{bet.selectionName}</td>
-                      <td className="py-3 px-3 text-right font-mono text-slate-200">
-                        {bet.oddsAtPlacement.toFixed(2)}
+                      <td className="py-3 px-3 text-right">
+                        <div className="flex items-center justify-end gap-1.5">
+                          <OddsSourceBadge source={bet.oddsSource} />
+                          <span className="font-mono text-slate-200">{bet.oddsAtPlacement.toFixed(2)}</span>
+                        </div>
                       </td>
                       <td className="py-3 px-3 text-right font-mono text-slate-200">
                         {formatCurrency(bet.stake)}
