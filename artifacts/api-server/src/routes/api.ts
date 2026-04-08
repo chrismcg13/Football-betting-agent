@@ -621,11 +621,22 @@ router.get("/compliance/logs", async (req, res) => {
     500,
   );
   const actionTypeFilter = String(req.query["action_type"] ?? "all");
+  const dateFrom = req.query["date_from"] ? new Date(String(req.query["date_from"])) : null;
+  const dateTo = req.query["date_to"] ? new Date(String(req.query["date_to"])) : null;
 
-  const condition =
-    actionTypeFilter === "all" || !actionTypeFilter
-      ? undefined
-      : eq(complianceLogsTable.actionType, actionTypeFilter);
+  const conditions = [];
+  if (actionTypeFilter !== "all" && actionTypeFilter) {
+    conditions.push(eq(complianceLogsTable.actionType, actionTypeFilter));
+  }
+  if (dateFrom && !isNaN(dateFrom.getTime())) {
+    conditions.push(gte(complianceLogsTable.timestamp, dateFrom));
+  }
+  if (dateTo && !isNaN(dateTo.getTime())) {
+    const endOfDay = new Date(dateTo);
+    endOfDay.setHours(23, 59, 59, 999);
+    conditions.push(lte(complianceLogsTable.timestamp, endOfDay));
+  }
+  const condition = conditions.length > 0 ? and(...conditions) : undefined;
 
   const [logs, countResult] = await Promise.all([
     db
@@ -647,6 +658,32 @@ router.get("/compliance/logs", async (req, res) => {
     total: countResult[0]?.count ?? 0,
     totalPages: Math.ceil((countResult[0]?.count ?? 0) / limit),
     logs,
+  });
+});
+
+// ─────────────────────────────────────────────
+// GET /api/compliance/stats
+// ─────────────────────────────────────────────
+router.get("/compliance/stats", async (_req, res) => {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const [totalResult, todayResult, riskResult] = await Promise.all([
+    db.select({ count: sql<number>`count(*)::int` }).from(complianceLogsTable),
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(complianceLogsTable)
+      .where(gte(complianceLogsTable.timestamp, todayStart)),
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(complianceLogsTable)
+      .where(eq(complianceLogsTable.actionType, "risk_event")),
+  ]);
+
+  res.json({
+    totalEvents: totalResult[0]?.count ?? 0,
+    eventsToday: todayResult[0]?.count ?? 0,
+    circuitBreakerActivations: riskResult[0]?.count ?? 0,
   });
 });
 

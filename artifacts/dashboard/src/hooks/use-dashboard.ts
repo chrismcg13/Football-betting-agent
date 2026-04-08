@@ -66,10 +66,27 @@ export const useModel = () => {
   });
 };
 
-export const useComplianceLogs = (page = 1, limit = 20, actionType = "all") => {
+export const useComplianceLogs = (
+  page = 1,
+  limit = 20,
+  actionType = "all",
+  dateFrom?: string,
+  dateTo?: string,
+) => {
+  const params = new URLSearchParams({ page: String(page), limit: String(limit), action_type: actionType });
+  if (dateFrom) params.set("date_from", dateFrom);
+  if (dateTo) params.set("date_to", dateTo);
   return useQuery({
-    queryKey: ["compliance", "logs", { page, limit, actionType }],
-    queryFn: () => fetcher(`/api/compliance/logs?page=${page}&limit=${limit}&action_type=${actionType}`),
+    queryKey: ["compliance", "logs", { page, limit, actionType, dateFrom, dateTo }],
+    queryFn: () => fetcher(`/api/compliance/logs?${params}`),
+  });
+};
+
+export const useComplianceStats = () => {
+  return useQuery({
+    queryKey: ["compliance", "stats"],
+    queryFn: () => fetcher("/api/compliance/stats"),
+    refetchInterval: 30000,
   });
 };
 
