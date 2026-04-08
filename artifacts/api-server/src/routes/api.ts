@@ -67,12 +67,16 @@ async function getSettledBetsStats() {
 // GET /api/dashboard/summary
 // ─────────────────────────────────────────────
 router.get("/dashboard/summary", async (req, res) => {
-  const [bankroll, agentStatus, allSettled, activeBets] = await Promise.all([
+  const [bankroll, agentStatus, allSettled, allPending] = await Promise.all([
     getBankroll(),
     getAgentStatus(),
     getSettledBetsStats(),
     db
-      .select({ id: paperBetsTable.id })
+      .select({
+        id: paperBetsTable.id,
+        stake: paperBetsTable.stake,
+        opportunityScore: paperBetsTable.opportunityScore,
+      })
       .from(paperBetsTable)
       .where(eq(paperBetsTable.status, "pending")),
   ]);
@@ -80,7 +84,10 @@ router.get("/dashboard/summary", async (req, res) => {
   const wins = allSettled.filter((b) => b.status === "won").length;
   const losses = allSettled.filter((b) => b.status === "lost").length;
   const voids = allSettled.filter((b) => b.status === "void").length;
-  const total = wins + losses + voids;
+  const settledTotal = wins + losses + voids;
+  // totalBets counts all bets (settled + pending)
+  const total = settledTotal + allPending.length;
+
   const totalPnl = allSettled.reduce(
     (sum, b) => sum + Number(b.settlementPnl ?? 0),
     0,
@@ -102,20 +109,21 @@ router.get("/dashboard/summary", async (req, res) => {
     .filter((b) => b.settledAt && new Date(b.settledAt) >= weekStart)
     .reduce((sum, b) => sum + Number(b.settlementPnl ?? 0), 0);
 
-  const totalStake = allSettled.reduce(
-    (sum, b) => sum + Number(b.stake),
-    0,
-  );
+  const totalStake = allSettled.reduce((sum, b) => sum + Number(b.stake), 0);
 
-  const betsWithScore = allSettled.filter((b) => b.opportunityScore != null);
+  // avgOpportunityScore across ALL bets (settled + pending)
+  const allBetsWithScore = [
+    ...allSettled.filter((b) => b.opportunityScore != null),
+    ...allPending.filter((b) => b.opportunityScore != null),
+  ];
   const avgOpportunityScore =
-    betsWithScore.length > 0
+    allBetsWithScore.length > 0
       ? Math.round(
-          (betsWithScore.reduce(
+          (allBetsWithScore.reduce(
             (sum, b) => sum + Number(b.opportunityScore ?? 0),
             0,
           ) /
-            betsWithScore.length) *
+            allBetsWithScore.length) *
             10,
         ) / 10
       : null;
@@ -133,6 +141,7 @@ router.get("/dashboard/summary", async (req, res) => {
     wins,
     losses,
     voids,
+    pending: allPending.length,
     winPercentage:
       wins + losses > 0
         ? Math.round((wins / (wins + losses)) * 10000) / 100
@@ -143,7 +152,7 @@ router.get("/dashboard/summary", async (req, res) => {
         : 0,
     todayPnl: Math.round(todayPnl * 100) / 100,
     thisWeekPnl: Math.round(weekPnl * 100) / 100,
-    activeBetsCount: activeBets.length,
+    activeBetsCount: allPending.length,
     avgOpportunityScore,
   });
 });

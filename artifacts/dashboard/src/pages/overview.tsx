@@ -179,7 +179,7 @@ export default function Overview() {
           value={loadingSummary ? "—" : (summary?.totalBets ?? 0)}
           sub={
             !loadingSummary && summary
-              ? `${summary.wins ?? 0}W — ${summary.losses ?? 0}L`
+              ? `${summary.wins ?? 0}W · ${summary.losses ?? 0}L · ${summary.pending ?? 0} pending`
               : undefined
           }
         />
