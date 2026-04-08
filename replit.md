@@ -66,6 +66,29 @@ All routes are under `/api/`:
 - `GET/POST /compliance-logs` — compliance audit trail
 - `GET /healthz` — health check
 
+## Data Sources
+
+The system supports two data sources, controlled by the `data_source` key in `agent_config`:
+
+| Value | Description |
+|-------|-------------|
+| `football_data_fallback` | Uses football-data.org API (default — works from any region) |
+| `betfair` | Uses Betfair Exchange Delayed API (requires UK/EU IP — geo-blocked on Replit) |
+
+When `data_source=betfair`, the system tries Betfair first and automatically falls back to football-data.org if a geographic error occurs.
+
+### football-data.org Service (`src/services/footballData.ts`)
+- Tracks 11 competitions: PL, BL1, SA, PD, FL1, CL, EL, EC, WC, PPL, BSA
+- Fetches matches for next 7 days
+- Maps odds (where available) to `MATCH_ODDS` market snapshots
+- Guards against TBD matches (null team objects from upcoming fixtures)
+- Event IDs prefixed with `fd_` to avoid collision with Betfair IDs
+
+### Betfair Service (`src/services/betfair.ts`)
+- Rate-limited to 5 req/s
+- Session auto-refreshes on 401/403
+- 7 market types: MATCH_ODDS, OVER_UNDER_25/15/35, BTTS, CORRECT_SCORE, ASIAN_HANDICAP
+
 ## Startup
 
 On startup (`src/index.ts`), the server runs `runMigrations()` (idempotent `CREATE TABLE IF NOT EXISTS`) before starting Express. Agent config is seeded with `ON CONFLICT (key) DO NOTHING` so defaults are only written once.
