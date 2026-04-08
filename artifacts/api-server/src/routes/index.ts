@@ -8,6 +8,7 @@ import complianceLogsRouter from "./complianceLogs";
 import learningNarrativesRouter from "./learningNarratives";
 import modelStateRouter from "./modelState";
 import featuresRouter from "./features";
+import ingestionRouter from "./ingestion";
 
 const router: IRouter = Router();
 
@@ -20,5 +21,6 @@ router.use(complianceLogsRouter);
 router.use(learningNarrativesRouter);
 router.use(modelStateRouter);
 router.use(featuresRouter);
+router.use(ingestionRouter);
 
 export default router;

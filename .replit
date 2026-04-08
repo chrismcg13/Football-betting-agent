@@ -29,3 +29,10 @@ externalPort = 80
 
 [nix]
 channel = "stable-25_05"
+
+[userenv]
+
+[userenv.shared]
+BETFAIR_APP_KEY = "gvmq5SPkvllrPmlo"
+BETFAIR_USERNAME = "chris.mcg@hotmail.co.uk"
+BETFAIR_PASSWORD = "3Roxborough!"

@@ -1,6 +1,7 @@
 import app from "./app";
 import { logger } from "./lib/logger";
 import { runMigrations } from "./lib/migrate";
+import { startScheduler } from "./services/scheduler";
 
 const rawPort = process.env["PORT"];
 
@@ -18,6 +19,8 @@ if (Number.isNaN(port) || port <= 0) {
 
 async function main() {
   await runMigrations();
+
+  startScheduler();
 
   app.listen(port, (err) => {
     if (err) {
