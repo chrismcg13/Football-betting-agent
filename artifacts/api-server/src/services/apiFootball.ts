@@ -184,6 +184,8 @@ interface FixtureMatch {
 }
 
 export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
+  // Get upcoming + very-soon matches from our DB (broader window: 3 days ago → 7 days ahead)
+  // so recently-started matches can still be settled and upcoming ones can be pre-mapped.
   const now = new Date();
   const upcoming = await db
     .select()
@@ -191,92 +193,93 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
     .where(
       and(
         eq(matchesTable.status, "scheduled"),
-        gte(matchesTable.kickoffTime, now),
-        lte(matchesTable.kickoffTime, new Date(now.getTime() + 4 * 24 * 60 * 60 * 1000)),
+        gte(matchesTable.kickoffTime, new Date(now.getTime() - 3 * 60 * 60 * 1000)), // 3 hours ago (in-play buffer)
+        lte(matchesTable.kickoffTime, new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)),
       ),
     );
 
-  if (upcoming.length === 0) return [];
-
-  // Group by date
-  const dateGroups = new Map<string, typeof upcoming>();
-  for (const m of upcoming) {
-    const d = m.kickoffTime.toISOString().slice(0, 10);
-    if (!dateGroups.has(d)) dateGroups.set(d, []);
-    dateGroups.get(d)!.push(m);
+  if (upcoming.length === 0) {
+    logger.info("No upcoming scheduled matches in DB — skipping fixture discovery");
+    return [];
   }
+
+  // The API-Football free plan only reliably serves fixtures for yesterday/today/tomorrow.
+  // Fetch ALL fixtures across that window and match our DB entries against the combined pool.
+  const allApiFixtures: ApiFixture[] = [];
+  const offsets = [-1, 0, 1, 2]; // yesterday, today, tomorrow, day-after (max free coverage)
+
+  for (const offset of offsets) {
+    if (!(await canMakeRequest())) break;
+    const d = new Date(now);
+    d.setUTCDate(d.getUTCDate() + offset);
+    const dateStr = d.toISOString().slice(0, 10);
+    const fixtures = await getFixturesForDate(dateStr);
+    if (fixtures.length > 0) {
+      logger.info({ date: dateStr, count: fixtures.length }, "API-Football fixtures fetched");
+      allApiFixtures.push(...fixtures);
+    }
+  }
+
+  logger.info({ totalApiFixtures: allApiFixtures.length, dbMatches: upcoming.length }, "Starting fixture matching");
 
   const mappings: FixtureMatch[] = [];
 
-  for (const [date, matches] of dateGroups) {
-    if (!(await canMakeRequest())) break;
+  for (const match of upcoming) {
+    // Return cached fixture ID if already stored
+    const cached = await db
+      .select({ featureValue: featuresTable.featureValue })
+      .from(featuresTable)
+      .where(and(eq(featuresTable.matchId, match.id), eq(featuresTable.featureName, "_af_fixture_id")))
+      .limit(1);
 
-    const fixtures = await getFixturesForDate(date);
-    if (!fixtures.length) continue;
-
-    for (const match of matches) {
-      // Check if we already stored a fixture ID for this match
-      const existing = await db
-        .select({ featureValue: featuresTable.featureValue })
-        .from(featuresTable)
-        .where(
-          and(
-            eq(featuresTable.matchId, match.id),
-            eq(featuresTable.featureName, "_af_fixture_id"),
-          ),
-        )
-        .limit(1);
-
-      if (existing[0]?.featureValue) {
-        const fid = parseInt(existing[0].featureValue, 10);
-        if (!isNaN(fid)) {
-          mappings.push({ matchId: match.id, fixtureId: fid, homeTeam: match.homeTeam, awayTeam: match.awayTeam });
-          continue;
-        }
-      }
-
-      // Try to find matching fixture from API response
-      const matched = fixtures.find((f) =>
-        teamNameMatch(match.homeTeam, f.teams.home.name) &&
-        teamNameMatch(match.awayTeam, f.teams.away.name),
-      );
-
-      if (matched) {
-        // Store fixture ID as hidden feature
-        const rid = `_af_fixture_id`;
-        const existing2 = await db
-          .select({ id: featuresTable.id })
-          .from(featuresTable)
-          .where(and(eq(featuresTable.matchId, match.id), eq(featuresTable.featureName, rid)))
-          .limit(1);
-
-        if (existing2.length > 0 && existing2[0]) {
-          await db
-            .update(featuresTable)
-            .set({ featureValue: String(matched.fixture.id), computedAt: new Date() })
-            .where(eq(featuresTable.id, existing2[0].id));
-        } else {
-          await db.insert(featuresTable).values({
-            matchId: match.id,
-            featureName: rid,
-            featureValue: String(matched.fixture.id),
-            computedAt: new Date(),
-          });
-        }
-
-        mappings.push({
-          matchId: match.id,
-          fixtureId: matched.fixture.id,
-          homeTeam: match.homeTeam,
-          awayTeam: match.awayTeam,
-        });
-
-        logger.info(
-          { matchId: match.id, fixtureId: matched.fixture.id, home: match.homeTeam, away: match.awayTeam },
-          "API-Football fixture mapped",
-        );
+    if (cached[0]?.featureValue) {
+      const fid = parseInt(cached[0].featureValue, 10);
+      if (!isNaN(fid)) {
+        mappings.push({ matchId: match.id, fixtureId: fid, homeTeam: match.homeTeam, awayTeam: match.awayTeam });
+        continue;
       }
     }
+
+    // Try to match against the combined API fixture pool
+    const matched = allApiFixtures.find((f) =>
+      teamNameMatch(match.homeTeam, f.teams.home.name) &&
+      teamNameMatch(match.awayTeam, f.teams.away.name),
+    );
+
+    if (!matched) continue;
+
+    // Persist the mapping as a hidden feature so we don't need to re-discover later
+    const existing2 = await db
+      .select({ id: featuresTable.id })
+      .from(featuresTable)
+      .where(and(eq(featuresTable.matchId, match.id), eq(featuresTable.featureName, "_af_fixture_id")))
+      .limit(1);
+
+    if (existing2.length > 0 && existing2[0]) {
+      await db
+        .update(featuresTable)
+        .set({ featureValue: String(matched.fixture.id), computedAt: new Date() })
+        .where(eq(featuresTable.id, existing2[0].id));
+    } else {
+      await db.insert(featuresTable).values({
+        matchId: match.id,
+        featureName: "_af_fixture_id",
+        featureValue: String(matched.fixture.id),
+        computedAt: new Date(),
+      });
+    }
+
+    mappings.push({
+      matchId: match.id,
+      fixtureId: matched.fixture.id,
+      homeTeam: match.homeTeam,
+      awayTeam: match.awayTeam,
+    });
+
+    logger.info(
+      { matchId: match.id, fixtureId: matched.fixture.id, home: match.homeTeam, away: match.awayTeam },
+      "API-Football fixture mapped",
+    );
   }
 
   return mappings;
