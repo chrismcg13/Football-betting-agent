@@ -48,11 +48,23 @@ router.post("/trading/resume", async (req, res) => {
   res.json({ agentStatus: status });
 });
 
-// POST /trading/cycle — manually trigger a full trading cycle
+// POST /trading/cycle — manually trigger a full trading cycle (fire-and-forget)
 router.post("/trading/cycle", async (req, res) => {
   logger.info("Manual trading cycle triggered via API");
   res.json({ message: "Trading cycle started" });
   void runTradingCycle();
+});
+
+// POST /trading/run — manually trigger and AWAIT a full trading cycle
+router.post("/trading/run", async (req, res) => {
+  logger.info("Manual trading cycle triggered via API — awaiting completion");
+  try {
+    const result = await runTradingCycle();
+    res.json({ success: true, message: "Trading cycle complete", result });
+  } catch (err) {
+    logger.error({ err }, "Manual trading cycle failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
 });
 
 // GET /trading/history — recent settled bets with P&L summary

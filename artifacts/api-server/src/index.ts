@@ -76,7 +76,15 @@ async function bootstrapDataIfEmpty(): Promise<void> {
       await runFeaturesNow();
       logger.info("Initial data bootstrap complete");
     } else {
-      logger.info({ matchCount }, "Database already has data — skipping initial bootstrap");
+      // DB has data — still run features on startup so upcoming matches have fresh
+      // feature vectors available for the trading cycle
+      logger.info({ matchCount }, "Database has data — running startup feature computation for upcoming matches");
+      try {
+        await runFeaturesNow();
+        logger.info("Startup feature computation complete");
+      } catch (featureErr) {
+        logger.warn({ err: featureErr }, "Startup feature computation failed — will retry on next scheduled run");
+      }
     }
   } catch (err) {
     logger.warn({ err }, "Initial data bootstrap failed — will retry on first scheduled run");

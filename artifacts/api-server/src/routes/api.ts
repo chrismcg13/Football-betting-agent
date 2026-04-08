@@ -27,6 +27,12 @@ import {
   getBankroll,
   getAgentStatus,
 } from "../services/paperTrading";
+import {
+  runIngestionNow,
+  runFeaturesNow,
+  runTradingCycle,
+  getSchedulerStatus,
+} from "../services/scheduler";
 
 const router = Router();
 
@@ -859,6 +865,80 @@ router.post("/agent/config", async (req, res) => {
     changed,
     rejected: rejected.length > 0 ? rejected : undefined,
   });
+});
+
+// ─────────────────────────────────────────────
+// POST /api/ingestion/run  — manual trigger
+// ─────────────────────────────────────────────
+router.post("/ingestion/run", async (req, res) => {
+  const before = getSchedulerStatus();
+  if (before["ingestion"]?.isRunning) {
+    res.status(409).json({ success: false, message: "Ingestion already in progress" });
+    return;
+  }
+  logger.info("Manual ingestion triggered via API");
+  try {
+    await runIngestionNow();
+    const after = getSchedulerStatus();
+    res.json({
+      success: true,
+      message: "Ingestion complete",
+      job: after["ingestion"],
+    });
+  } catch (err) {
+    logger.error({ err }, "Manual ingestion failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/features/run  — manual trigger
+// ─────────────────────────────────────────────
+router.post("/features/run", async (req, res) => {
+  const before = getSchedulerStatus();
+  if (before["features"]?.isRunning) {
+    res.status(409).json({ success: false, message: "Feature computation already in progress" });
+    return;
+  }
+  logger.info("Manual feature computation triggered via API");
+  try {
+    const result = await runFeaturesNow();
+    const after = getSchedulerStatus();
+    res.json({
+      success: true,
+      message: "Feature computation complete",
+      result,
+      job: after["features"],
+    });
+  } catch (err) {
+    logger.error({ err }, "Manual feature computation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/trading/run  — manual trigger
+// ─────────────────────────────────────────────
+router.post("/trading/run", async (req, res) => {
+  const before = getSchedulerStatus();
+  if (before["trading"]?.isRunning) {
+    res.status(409).json({ success: false, message: "Trading cycle already in progress" });
+    return;
+  }
+  logger.info("Manual trading cycle triggered via API");
+  try {
+    const result = await runTradingCycle();
+    const after = getSchedulerStatus();
+    res.json({
+      success: true,
+      message: "Trading cycle complete",
+      result,
+      job: after["trading"],
+    });
+  } catch (err) {
+    logger.error({ err }, "Manual trading cycle failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
 });
 
 export default router;

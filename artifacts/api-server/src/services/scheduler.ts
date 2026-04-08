@@ -61,6 +61,9 @@ async function safeRunIngestion(): Promise<void> {
   try {
     await runDataIngestion();
     markRun("ingestion", "success");
+    // Always recompute features right after ingestion so upcoming match vectors
+    // are fresh for the next trading cycle
+    void safeRunFeatures();
   } catch (err) {
     logger.error({ err }, "Scheduled data ingestion run failed");
     markRun("ingestion", "error");

@@ -44,4 +44,15 @@ router.post("/features/compute", async (req, res) => {
   void runFeaturesNow();
 });
 
+router.post("/features/run", async (req, res) => {
+  logger.info("Manual feature computation triggered via API — awaiting completion");
+  try {
+    const result = await runFeaturesNow();
+    res.json({ success: true, message: "Feature computation complete", result });
+  } catch (err) {
+    logger.error({ err }, "Manual feature computation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 export default router;
