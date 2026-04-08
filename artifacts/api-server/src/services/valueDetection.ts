@@ -34,6 +34,9 @@ export interface ValueBet {
   modelVersion: string | null;
   opportunityScore: number;
   oddsSource: string;
+  segmentBetCount: number;
+  segmentRoi: number;
+  hotStreakBonus: number;
 }
 
 export interface EvaluationSummary {
@@ -362,6 +365,92 @@ function getModelProbability(
   return null;
 }
 
+// ─── Enhanced opportunity scoring (OddsPapi-validated bets) ──────────────────
+
+export interface EnhancedScoringParams {
+  edge: number;
+  modelProbability: number;
+  backOdds: number;
+  segmentBetCount: number;
+  segmentRoi: number;
+  hotStreakBonus: number;
+  pinnacleImplied: number | null;
+  sharpSoftSpread: number | null;
+  oddsUpliftPct: number | null;
+}
+
+export interface EnhancedScoringResult {
+  score: number;
+  isContrarian: boolean;
+  pinnacleAligned: boolean;
+}
+
+export function computeEnhancedOpportunityScore(params: EnhancedScoringParams): EnhancedScoringResult {
+  const { edge, modelProbability, backOdds, segmentBetCount, segmentRoi, hotStreakBonus,
+          pinnacleImplied, sharpSoftSpread, oddsUpliftPct } = params;
+
+  // 1. Edge size using BEST available odds: (edge / 0.12) × 20, cap 20
+  const edgeScore = Math.min((edge / 0.12) * 20, 20);
+
+  // 2. Model confidence: abs(prob - 0.5) × 50, cap 18
+  const confidenceScore = Math.min(Math.abs(modelProbability - 0.5) * 50, 18);
+
+  // 3. Pinnacle alignment
+  let pinnacleScore = 0;
+  let isContrarian = false;
+  let pinnacleAligned = false;
+
+  if (pinnacleImplied !== null) {
+    const diff = modelProbability - pinnacleImplied;
+    // Positive diff = model more optimistic than Pinnacle (contrarian lean)
+    // Negative diff = Pinnacle more bullish than model (Pinnacle-backed)
+    if (diff < 0) {
+      // Pinnacle is more bullish — sharp line agrees our selection has value
+      pinnacleAligned = true;
+      pinnacleScore = 15;
+    } else if (Math.abs(diff) <= 0.03) {
+      // Very close — within 3%, effectively aligned
+      pinnacleAligned = true;
+      pinnacleScore = 10;
+    } else if (diff > 0.08) {
+      // Model well above Pinnacle — contrarian bet
+      isContrarian = true;
+      pinnacleScore = -10;
+    }
+    // 3-8% divergence: neutral (0 points)
+  }
+
+  // 4. Sharp-soft spread: min(spread × 200, 12)
+  const spreadScore = sharpSoftSpread !== null ? Math.min(sharpSoftSpread * 200, 12) : 0;
+
+  // 5. Best-odds uplift
+  let upliftScore = 0;
+  if (oddsUpliftPct !== null) {
+    if (oddsUpliftPct >= 10) upliftScore = 12;
+    else if (oddsUpliftPct >= 5) upliftScore = 8;
+  }
+
+  // 6. Historical segment ROI: if positive history, up to +13
+  let segmentScore = 0;
+  if (segmentBetCount >= 3 && segmentRoi > 0) {
+    segmentScore = Math.min(segmentRoi * 0.65, 13);
+  }
+
+  // 7. Odds sweet spot: 1.9–3.2 → +10, 1.5–1.9 or 3.2–4.5 → +5
+  let oddsScore = 0;
+  if (backOdds >= 1.9 && backOdds <= 3.2) oddsScore = 10;
+  else if ((backOdds >= 1.5 && backOdds < 1.9) || (backOdds > 3.2 && backOdds <= 4.5)) oddsScore = 5;
+
+  // 8. Sample reliability: min(count/20, 1) × 8
+  const reliabilityScore = Math.min(segmentBetCount / 20, 1) * 8;
+
+  const raw = edgeScore + confidenceScore + pinnacleScore + spreadScore + upliftScore +
+              segmentScore + oddsScore + reliabilityScore + hotStreakBonus;
+  const score = Math.max(0, Math.min(Math.round(raw * 100) / 100, 100));
+
+  return { score, isContrarian, pinnacleAligned };
+}
+
 // ─── Main detection function ──────────────────────────────────────────────────
 
 export async function detectValueBets(): Promise<EvaluationSummary> {
@@ -521,6 +610,9 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
           modelVersion,
           opportunityScore,
           oddsSource: oddsSourceLabel,
+          segmentBetCount: segmentStats.betCount,
+          segmentRoi: segmentStats.roi,
+          hotStreakBonus: streakBonus,
         });
       }
     }

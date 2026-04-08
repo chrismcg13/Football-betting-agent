@@ -4,6 +4,7 @@ import {
   paperBetsTable,
   matchesTable,
   complianceLogsTable,
+  oddsSnapshotsTable,
 } from "@workspace/db";
 import { eq, and, gte, lt, inArray, desc, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -119,6 +120,20 @@ export interface BetPlacementResult {
   reason?: string;
 }
 
+export interface PaperBetOptions {
+  modelVersion?: string | null;
+  opportunityScore?: number;
+  oddsSource?: string;
+  enhancedOpportunityScore?: number | null;
+  pinnacleOdds?: number | null;
+  pinnacleImplied?: number | null;
+  bestOdds?: number | null;
+  bestBookmaker?: string | null;
+  betThesis?: string | null;
+  isContrarian?: boolean;
+  stakeMultiplier?: number;
+}
+
 export async function placePaperBet(
   matchId: number,
   marketType: string,
@@ -126,10 +141,21 @@ export async function placePaperBet(
   backOdds: number,
   modelProbability: number,
   edge: number,
-  modelVersion?: string | null,
-  opportunityScore?: number,
-  oddsSource?: string,
+  options: PaperBetOptions = {},
 ): Promise<BetPlacementResult> {
+  const {
+    modelVersion,
+    opportunityScore,
+    oddsSource,
+    enhancedOpportunityScore,
+    pinnacleOdds,
+    pinnacleImplied,
+    bestOdds,
+    bestBookmaker,
+    betThesis,
+    isContrarian = false,
+    stakeMultiplier = 1.0,
+  } = options;
   const score = opportunityScore ?? 65;
 
   const logReject = async (reason: string) => {
@@ -201,7 +227,7 @@ export async function placePaperBet(
   const maxStakePct = Number(
     (await getConfigValue("max_stake_pct")) ?? "0.02",
   );
-  const stake = calculateDynamicKellyStake(
+  let stake = calculateDynamicKellyStake(
     bankroll,
     edge,
     backOdds,
@@ -209,6 +235,10 @@ export async function placePaperBet(
     score,
     marketType,
   );
+
+  // Apply contrarian and correlation multipliers
+  if (isContrarian) stake = Math.round(stake * 0.6 * 100) / 100;
+  if (stakeMultiplier !== 1.0) stake = Math.round(stake * stakeMultiplier * 100) / 100;
 
   if (stake < 2) {
     return logReject(`Calculated stake £${stake} is below minimum £2`);
@@ -234,6 +264,13 @@ export async function placePaperBet(
       opportunityScore: String(score),
       modelVersion: modelVersion ?? null,
       oddsSource: oddsSource ?? "synthetic",
+      enhancedOpportunityScore: enhancedOpportunityScore != null ? String(enhancedOpportunityScore) : null,
+      pinnacleOdds: pinnacleOdds != null ? String(pinnacleOdds) : null,
+      pinnacleImplied: pinnacleImplied != null ? String(pinnacleImplied) : null,
+      bestOdds: bestOdds != null ? String(bestOdds) : null,
+      bestBookmaker: bestBookmaker ?? null,
+      betThesis: betThesis ?? null,
+      isContrarian: String(isContrarian),
       status: "pending",
     })
     .returning();
@@ -371,12 +408,41 @@ export async function settleBets(): Promise<SettlementResult> {
     const newStatus = betWon ? "won" : "lost";
     const now = new Date();
 
+    // ── CLV: compare placement odds vs closing odds proxy ──────────────
+    let closingOddsProxy: number | null = null;
+    let clvPct: number | null = null;
+    try {
+      const latestSnapshot = await db
+        .select({ odds: oddsSnapshotsTable.odds })
+        .from(oddsSnapshotsTable)
+        .where(
+          and(
+            eq(oddsSnapshotsTable.matchId, bet.matchId),
+            eq(oddsSnapshotsTable.marketType, bet.marketType),
+            eq(oddsSnapshotsTable.selectionName, bet.selectionName),
+          ),
+        )
+        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+        .limit(1);
+      if (latestSnapshot[0]) {
+        closingOddsProxy = Number(latestSnapshot[0].odds);
+        if (closingOddsProxy > 1) {
+          clvPct = ((odds - closingOddsProxy) / closingOddsProxy) * 100;
+          clvPct = Math.round(clvPct * 1000) / 1000;
+        }
+      }
+    } catch (_err) {
+      // CLV is best-effort; don't block settlement
+    }
+
     await db
       .update(paperBetsTable)
       .set({
         status: newStatus,
         settlementPnl: String(settlementPnl),
         settledAt: now,
+        closingOddsProxy: closingOddsProxy != null ? String(closingOddsProxy) : null,
+        clvPct: clvPct != null ? String(clvPct) : null,
       })
       .where(eq(paperBetsTable.id, bet.id));
 

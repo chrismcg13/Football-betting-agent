@@ -1,0 +1,193 @@
+Integrate OddsPapi as a sharp-line validation and best-odds layer. API key is in Replit secret ODDSPAPI_KEY. Free tier: 250 requests/month. Every request must count.
+
+=== BUDGET STRATEGY: 250 REQUESTS/MONTH ===
+
+Daily budget: 7 requests/day (210/month), reserving 40 for month-end buffer.
+
+Allocation per day:
+- 1 request: bulk fixture search (GET /v4/fixtures?sportId=10&from=today&to=+4days) — returns all upcoming football fixtures. Cache ALL fixture IDs from this single call. Reuse cached IDs for the rest of the day.
+- 5 requests: odds validation for top 5 candidates from the trading cycle
+- 1 request: spare — use on next-day fixture if available, or save for month-end
+
+Track in api_usage table with source "oddspapi": daily_count, monthly_count, last_reset_date.
+Hard stops: never exceed 7/day, never exceed 240/month.
+Dashboard footer: "OddsPapi: X/7 today | X/250 month"
+
+=== CORE INTEGRATION ===
+
+Create src/services/oddsPapi.ts:
+
+Base URL: https://api.oddspapi.io/v4
+Auth: query parameter apiKey={process.env.ODDSPAPI_KEY}
+
+1. DAILY FIXTURE MAPPING (1 request/day, run at 6am UTC):
+   GET /v4/fixtures?apiKey={key}&sportId=10&from={today}&to={today+4days}
+   - Parse ALL fixtures from response
+   - Match to our database by team names + date (fuzzy match on team names — handle "Man City" vs "Manchester City" etc.)
+   - Cache all fixture ID mappings in a new table: oddspapi_fixture_map (our_match_id, oddspapi_fixture_id, cached_at)
+   - This single request maps potentially 50-100 fixtures. Reuse all day.
+
+2. ODDS VALIDATION (up to 5 requests/day, during trading cycle):
+   GET /v4/fixtures/{fixtureId}/odds?apiKey={key}&marketId={marketId}
+   
+   OddsPapi market ID mapping (store as a constant):
+   - 101 = Full Time Result (1X2) — maps to our MATCH_ODDS
+   - 102 = Over/Under Goals — maps to our OVER_UNDER_25 (look for the 2.5 line in response)
+   - 103 = Both Teams To Score — maps to our BTTS
+   - 104 = Asian Handicap — maps to our ASIAN_HANDICAP
+   - 112 = Total Booking Points / Cards — maps to our CARDS
+   - 113 = Total Corners — maps to our CORNERS
+   
+   If a market ID doesn't exist in the response, that market isn't available from OddsPapi for this fixture — fall back to API-Football odds only.
+
+   From each response, extract:
+   
+   a) PINNACLE LINE:
+      Look for bookmaker slug "pinnacle" in bookmakerOdds
+      Extract odds for the specific selection we're evaluating
+      Convert to implied probability: pinnacle_implied = 1/pinnacle_odds
+      Store: pinnacle_odds, pinnacle_implied in odds_snapshots with source "oddspapi_pinnacle"
+   
+   b) BEST AVAILABLE ODDS:
+      Scan ALL bookmakers in response, find highest odds for our selection
+      Store: best_odds, best_bookmaker_slug, best_bookmaker_name
+      Calculate odds_uplift_pct = (best_odds - api_football_odds) / api_football_odds × 100
+   
+   c) SHARP-SOFT SPREAD:
+      Average odds from sharp bookmakers: pinnacle, singbet, sbobet (whichever are present)
+      Average odds from soft bookmakers: bet365, williamhill, ladbrokes, bwin, unibet (whichever present)
+      sharp_soft_spread = (soft_avg_implied - sharp_avg_implied) — positive means soft books are offering more value
+   
+   d) MARKET CONSENSUS:
+      Count bookmakers where our selection's implied probability > 50% (i.e. they consider it likely)
+      consensus_pct = count / total_bookmakers × 100
+
+=== ENHANCED OPPORTUNITY SCORING ===
+
+For the top 5 candidates that get OddsPapi validation, calculate an enhanced score:
+
+Enhanced Opportunity Score (0-100):
+- Edge size using BEST available odds: (edge / 0.12) × 20, capped at 20
+- Model confidence: abs(model_prob - 0.5) × 50, capped at 18
+- Pinnacle alignment: 
+    If model and Pinnacle agree on direction (same side favoured): +15
+    If model and Pinnacle within 3% of each other: +10
+    If model disagrees with Pinnacle by 3-8%: +0 (neutral, not penalised)
+    If model disagrees with Pinnacle by >8%: -10 AND flag as "contrarian" — still allowed but requires score 75+ to proceed
+- Sharp-soft spread: min(sharp_soft_spread × 200, 12) — larger spread = more opportunity, cap 12
+- Best-odds uplift: if best_odds > API-Football odds by 5%+, add +8. By 10%+, add +12. Cap 12
+- Historical segment ROI: if positive history, up to +13 scaled by ROI%
+- Odds sweet spot: 1.9-3.2 = +10, 1.5-1.9 or 3.2-4.5 = +5, outside = 0
+- Sample reliability: min(segment_bets/20, 1) × 8
+
+Threshold: 65 for Pinnacle-aligned bets. 75 for contrarian bets (going against Pinnacle).
+Store enhanced_opportunity_score separately from the preliminary score so we can compare them on the dashboard.
+
+=== DYNAMIC STAKING (revised) ===
+
+For OddsPapi-validated bets, use enhanced score for stake sizing:
+- Score 65-72: 1/8 Kelly (cautious)
+- Score 72-80: 1/4 Kelly (standard)  
+- Score 80-88: 3/8 Kelly (confident)
+- Score 88+: 1/2 Kelly (high confidence)
+- Contrarian bets (against Pinnacle): multiply Kelly fraction by 0.6 regardless of score — respect the sharp line
+- New market types (cards, corners) with <20 settled bets: multiply by 0.7
+- Max stake always capped at 2% of bankroll
+
+=== CORRELATED BET DETECTION ===
+
+Create src/services/correlationDetector.ts:
+
+After selecting bets for placement, check for correlations:
+
+1. COMPLEMENTARY (reinforce same thesis):
+   - Home Win + Under 2.5 in same match = "dominant low-scoring home win" thesis
+   - BTTS Yes + Over 2.5 in same match = "open, high-scoring game" thesis
+   - Away Win + Over 2.5 in same match = "away team attacking dominance" thesis
+   If detected: reduce each bet's stake by 20% (they're correlated — if the thesis is wrong, both lose)
+   Log narrative: "Complementary bets on [match]: [bet1] + [bet2] share the thesis '[thesis]'. Stakes reduced 20% to manage correlated risk."
+
+2. CONFLICTING (cancel each other out):
+   - Home Win + Draw in same match
+   - Over 2.5 + Under 2.5 in same match
+   - BTTS Yes + Under 1.5 in same match
+   If detected: keep only the one with higher enhanced opportunity score, cancel the other
+   Log narrative: "Conflicting bets detected on [match]: [bet1] vs [bet2]. Kept [winner] (score: X) and cancelled [loser] (score: Y)."
+
+3. OVEREXPOSURE CHECK:
+   - If total staked on a single match across multiple bets exceeds 4% of bankroll, reduce stakes proportionally to bring it under 4%
+   Log narrative: "Exposure cap hit on [match]. Total exposure reduced from £X to £Y."
+
+=== CLOSING LINE VALUE (CLV) — BUDGET-FREE ===
+
+Do NOT use OddsPapi requests for closing line checks. Instead:
+
+1. Record odds_at_placement when bet is placed (already stored)
+2. The last API-Football odds fetch before kickoff becomes the closing_odds_proxy (API-Football refreshes every 8 hours — free)
+3. Calculate CLV: clv_pct = (odds_at_placement - closing_odds_proxy) / closing_odds_proxy × 100
+4. Positive CLV = we got better odds than the market closed at = genuine edge indicator
+5. Store clv_pct in paper_bets table, computed during settlement
+
+CLV Dashboard:
+- Add "Avg CLV" stat card on overview (only shows after 10+ bets with CLV data)
+- Add CLV column to bet history table (green if positive, red if negative)
+- Add CLV trend line chart on performance page
+- Narrative trigger at 30+ bets: if avg CLV > 0 → "CLV is positive at +X% — strong indicator of genuine edge"
+- Narrative trigger: if avg CLV < -1% → "CLV is negative — model may be behind the market. Consider feature review."
+
+=== VIABILITY CALCULATOR UPDATES ===
+
+Add to supporting criteria checklist:
+- "Closing Line Value" — green tick if avg CLV > 0% over 20+ bets, red cross if negative, grey if insufficient data
+- "Pinnacle Alignment" — green tick if >55% of OddsPapi-validated bets align with Pinnacle direction, red if <40%
+- "Odds Uplift" — green tick if average best-odds uplift > 3% vs Bet365 baseline (shows we're finding better prices)
+
+=== DASHBOARD UPDATES ===
+
+- Footer: "OddsPapi: X/7 today | X/250 month" next to existing API-Football budget
+- Bet History table: add columns "Best Odds" (with bookmaker name badge), "Pinnacle" (odds), "CLV%"  
+- Bet detail expansion: show full thesis: "Backing [selection] at [best_odds] from [bookmaker]. Model: [prob]%, Pinnacle implies: [pinnacle_implied]%. Edge: [edge]% using best available price. Sharp-soft spread: [X]%. [Pinnacle-aligned / Contrarian]."
+- Performance page: CLV trend chart, Edge Source breakdown (% Pinnacle-aligned vs contrarian in profitable bets)
+- Overview: 7th stat card "Avg CLV" when data available
+- All new data points flow into learning narratives with readable descriptions
+
+=== MODIFIED TRADING CYCLE (15-minute cron) ===
+
+Updated flow:
+1. Settle finished bets, calculate CLV using last API-Football odds as closing proxy
+2. Run risk checks (existing)
+3. Scan ALL fixtures using API-Football odds for preliminary value detection
+4. Rank by preliminary opportunity score
+5. If OddsPapi daily budget allows: take top 5 candidates (must have oddspapi_fixture_map entry)
+6. Fetch OddsPapi odds for those 5 (5 requests)
+7. Recalculate enhanced opportunity scores with Pinnacle validation, best-odds, sharp-soft spread
+8. Run correlation detection across all candidates
+9. Apply diversity rules: max 5 bets, max 2 per league, max 2 per market type
+10. Place bets using best available odds for edge calculation, dynamic staking based on enhanced score
+11. Generate bet thesis for each placed bet
+12. Log everything to compliance_logs
+
+Daily at 6am UTC: run OddsPapi fixture mapping (1 request)
+Daily at midnight: log budget usage summary to compliance_logs
+
+=== FALLBACK BEHAVIOUR ===
+
+If ODDSPAPI_KEY is not set or budget is exhausted:
+- Skip steps 5-7 entirely
+- Use API-Football odds for opportunity scoring (existing behaviour)
+- CLV still works via API-Football closing proxy
+- Log: "OddsPapi unavailable/exhausted. Using API-Football odds only for this cycle."
+- System continues functioning exactly as before — OddsPapi is pure upside, never a dependency
+
+If API-Football is ALSO unavailable:
+- Fall back to football-data.org + synthetic Poisson (existing behaviour, synthetic capped at 55)
+- Log degraded state
+
+All three data tiers operate independently. Losing any one tier degrades quality but never breaks the system.
+
+=== IMMEDIATE ACTIONS AFTER INTEGRATION ===
+
+1. Run the 6am fixture mapping job immediately (even if it's not 6am)
+2. Run a full enhanced trading cycle with OddsPapi validation
+3. Show me the complete output: how many fixtures mapped, how many got OddsPapi odds, Pinnacle alignment for each candidate, best-odds found, enhanced scores, which bets were placed with full thesis, any correlation detections
+4. Ensure all dashboard pages render the new data correctly

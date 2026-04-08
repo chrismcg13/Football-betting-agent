@@ -7,3 +7,4 @@ export * from "./learningNarratives";
 export * from "./complianceLogs";
 export * from "./agentConfig";
 export * from "./apiUsage";
+export * from "./oddspapiFixtureMap";

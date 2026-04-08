@@ -98,6 +98,22 @@ export const useApiBudget = () => {
   });
 };
 
+export const useOddspapiBudget = () => {
+  return useQuery({
+    queryKey: ["dashboard", "oddspapi-budget"],
+    queryFn: () => fetcher("/api/dashboard/oddspapi-budget"),
+    refetchInterval: 300000,
+  });
+};
+
+export const useClvStats = () => {
+  return useQuery({
+    queryKey: ["dashboard", "clv-stats"],
+    queryFn: () => fetcher("/api/dashboard/clv-stats"),
+    refetchInterval: 120000,
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

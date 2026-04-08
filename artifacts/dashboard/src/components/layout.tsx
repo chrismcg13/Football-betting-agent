@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { useSummary, useAgentControl, useApiBudget } from "@/hooks/use-dashboard";
+import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget } from "@/hooks/use-dashboard";
 import {
   BarChart2, BookOpen, Brain, FileText, Play, Pause, Shield, Square, Target, Zap, Database,
 } from "lucide-react";
@@ -38,6 +38,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const { data: summary } = useSummary();
   const agentControl = useAgentControl();
   const { data: budget } = useApiBudget();
+  const { data: oddsBudget } = useOddspapiBudget();
 
   const navItems = [
     { href: "/", label: "Overview", icon: Target },
@@ -108,6 +109,40 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   }}
                 />
               </div>
+            </div>
+          </div>
+        </div>
+
+        {/* OddsPapi (Pinnacle) budget pill */}
+        <div className="px-4 py-2 border-b" style={{ borderColor: "#334155" }}>
+          <div className="flex items-center gap-2">
+            <Database className="w-3 h-3 text-violet-500 shrink-0" />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-[9px] uppercase tracking-wider text-violet-400 font-semibold">Pinnacle</p>
+                <p className="text-[10px] font-mono text-slate-500">
+                  {oddsBudget ? `${oddsBudget.todayCount ?? 0}/${oddsBudget.dailyCap ?? 7}/d` : "—/7/d"}
+                </p>
+              </div>
+              <div className="w-full rounded-full h-1 bg-slate-800">
+                <div
+                  className="h-1 rounded-full transition-all"
+                  style={{
+                    width: oddsBudget
+                      ? `${Math.min(100, ((oddsBudget.monthCount ?? 0) / (oddsBudget.monthlyCap ?? 240)) * 100)}%`
+                      : "0%",
+                    background:
+                      oddsBudget && (oddsBudget.monthCount ?? 0) > 200
+                        ? "#ef4444"
+                        : oddsBudget && (oddsBudget.monthCount ?? 0) > 150
+                        ? "#f59e0b"
+                        : "#7c3aed",
+                  }}
+                />
+              </div>
+              <p className="text-[9px] text-slate-600 mt-0.5">
+                {oddsBudget ? `${oddsBudget.monthCount ?? 0}/${oddsBudget.monthlyCap ?? 240} this month` : "—/240 this month"}
+              </p>
             </div>
           </div>
         </div>

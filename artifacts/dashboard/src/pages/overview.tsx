@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useSummary, useBets, useNarratives, usePerformance } from "@/hooks/use-dashboard";
+import { useSummary, useBets, useNarratives, usePerformance, useClvStats } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime } from "@/lib/format";
 import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
@@ -113,6 +113,7 @@ const TOOLTIP_STYLE = {
 
 export default function Overview() {
   const { data: summary, isLoading: loadingSummary } = useSummary();
+  const { data: clvStats } = useClvStats();
   const { data: allBetsData, isLoading: loadingBets } = useBets(1, 50, "all");
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
@@ -199,6 +200,28 @@ export default function Overview() {
           sub={!loadingSummary ? "total return on stakes" : undefined}
           color={!loadingSummary ? (roi >= 0 ? "green" : "red") : "default"}
         />
+        {(clvStats as any)?.count > 0 && (
+          <StatCard
+            label="Avg CLV"
+            value={
+              (clvStats as any)?.avgClv != null
+                ? `${(clvStats as any).avgClv >= 0 ? "+" : ""}${Number((clvStats as any).avgClv).toFixed(2)}%`
+                : "—"
+            }
+            sub={
+              (clvStats as any)?.count != null
+                ? `over ${(clvStats as any).count} settled bets`
+                : "no data yet"
+            }
+            color={
+              (clvStats as any)?.avgClv != null
+                ? Number((clvStats as any).avgClv) >= 3 ? "green"
+                  : Number((clvStats as any).avgClv) >= 0 ? "amber"
+                  : "red"
+                : "default"
+            }
+          />
+        )}
         <StatCard
           label="Avg Opportunity Score"
           value={

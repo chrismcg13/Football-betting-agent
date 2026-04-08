@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useViability, useModel, useBetsByLeague, useBetsByMarket } from "@/hooks/use-dashboard";
+import { useViability, useModel, useBetsByLeague, useBetsByMarket, useClvStats } from "@/hooks/use-dashboard";
 import { formatCurrency } from "@/lib/format";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CheckCircle2, XCircle } from "lucide-react";
@@ -231,6 +231,7 @@ export default function Viability() {
   const { data: model } = useModel();
   const { data: byLeague } = useBetsByLeague();
   const { data: byMarket } = useBetsByMarket();
+  const { data: clvStats } = useClvStats();
 
   const accuracyTrend = useMemo(() => {
     const h = (model?.accuracyHistory as any[]) ?? [];
@@ -372,6 +373,22 @@ export default function Viability() {
               note="≥ 2 segments"
             />
             <CriteriaRow label="Agent active" value={days > 0 ? "Active" : "Inactive"} pass={days > 0} note="Must be running" />
+            {(clvStats as any)?.count > 0 && (
+              <>
+                <CriteriaRow
+                  label="Avg Closing Line Value (CLV)"
+                  value={(clvStats as any)?.avgClv != null ? `${Number((clvStats as any).avgClv) >= 0 ? "+" : ""}${Number((clvStats as any).avgClv).toFixed(2)}%` : "—"}
+                  pass={(clvStats as any)?.avgClv != null && Number((clvStats as any).avgClv) >= 0}
+                  note="Must be ≥ 0% (beating close)"
+                />
+                <CriteriaRow
+                  label="Pinnacle-validated bets"
+                  value={(clvStats as any)?.pinnacleCount > 0 ? `${(clvStats as any).pinnacleCount} bets` : "None yet"}
+                  pass={(clvStats as any)?.pinnacleCount > 0}
+                  note="≥ 1 sharp-line verified"
+                />
+              </>
+            )}
           </tbody>
         </table>
       </div>

@@ -66,7 +66,12 @@ export async function getApiUsageToday(): Promise<number> {
   const rows = await db
     .select({ total: sql<number>`sum(${apiUsageTable.requestCount})::int` })
     .from(apiUsageTable)
-    .where(eq(apiUsageTable.date, today));
+    .where(
+      and(
+        eq(apiUsageTable.date, today),
+        sql`${apiUsageTable.endpoint} NOT LIKE 'oddspapi_%'`,
+      ),
+    );
   return Number(rows[0]?.total ?? 0);
 }
 

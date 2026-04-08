@@ -30,6 +30,26 @@ function kellyLabel(score: number | null): string {
   return "1/8 Kelly (conservative)";
 }
 
+function ClvBadge({ clv }: { clv: number | null }) {
+  if (clv == null) return <span className="text-slate-600 font-mono text-xs">—</span>;
+  const color = clv >= 5 ? "#10b981" : clv >= 0 ? "#3b82f6" : clv >= -5 ? "#f59e0b" : "#ef4444";
+  return (
+    <span className="font-mono font-semibold text-xs" style={{ color }} title="Closing Line Value">
+      {clv >= 0 ? "+" : ""}{clv.toFixed(2)}%
+    </span>
+  );
+}
+
+function SharpBadge({ pinnacleAligned, isContrarian }: { pinnacleAligned?: boolean; isContrarian?: boolean }) {
+  if (isContrarian) {
+    return <span className="text-[10px] px-1.5 py-0.5 rounded font-semibold" style={{ background: "#7c1d1d", color: "#fca5a5" }}>CONTRARIAN</span>;
+  }
+  if (pinnacleAligned) {
+    return <span className="text-[10px] px-1.5 py-0.5 rounded font-semibold" style={{ background: "#1e3a5f", color: "#93c5fd" }}>♙ Aligned</span>;
+  }
+  return null;
+}
+
 function ExpandedReasoning({ bet }: { bet: any }) {
   const modelProb = bet.modelProbability != null ? (bet.modelProbability * 100).toFixed(1) : null;
   const impliedProb = bet.betfairImpliedProbability != null
@@ -39,11 +59,14 @@ function ExpandedReasoning({ bet }: { bet: any }) {
 
   return (
     <tr>
-      <td colSpan={12} className="pb-2 px-4">
+      <td colSpan={15} className="pb-2 px-4">
         <div
           className="rounded-lg border px-5 py-4 text-sm"
           style={{ background: "#0f172a", borderColor: "#334155" }}
         >
+          {bet.betThesis ? (
+            <p className="text-slate-300 mb-3 leading-relaxed italic">{bet.betThesis}</p>
+          ) : null}
           <p className="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">
             Reasoning
           </p>
@@ -306,6 +329,9 @@ export default function Bets() {
                   <th className="py-3 px-3 text-left text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Market</th>
                   <th className="py-3 px-3 text-left text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Selection</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Odds</th>
+                  <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-violet-500 font-semibold" title="Best odds from any bookmaker (OddsPapi)">Best</th>
+                  <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-violet-500 font-semibold" title="Pinnacle sharp-line odds">Pinnacle</th>
+                  <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-violet-500 font-semibold" title="Closing Line Value %">CLV%</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Stake</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Edge</th>
                   <th className="py-3 px-3 text-right text-[11px] uppercase tracking-wider text-slate-500 font-semibold" title="Opportunity Score /100">Score</th>
@@ -354,6 +380,24 @@ export default function Bets() {
                           <OddsSourceBadge source={bet.oddsSource} />
                           <span className="font-mono text-slate-200">{bet.oddsAtPlacement.toFixed(2)}</span>
                         </div>
+                      </td>
+                      <td className="py-3 px-3 text-right">
+                        {bet.bestOdds != null ? (
+                          <div>
+                            <span className="font-mono font-semibold text-violet-300">{Number(bet.bestOdds).toFixed(2)}</span>
+                            {bet.bestBookmaker && (
+                              <div className="text-[10px] text-slate-500 mt-0.5 truncate max-w-[80px] text-right">{bet.bestBookmaker}</div>
+                            )}
+                          </div>
+                        ) : <span className="text-slate-700 font-mono text-xs">—</span>}
+                      </td>
+                      <td className="py-3 px-3 text-right">
+                        {bet.pinnacleOdds != null ? (
+                          <span className="font-mono text-blue-300 font-semibold text-xs">{Number(bet.pinnacleOdds).toFixed(2)}</span>
+                        ) : <span className="text-slate-700 font-mono text-xs">—</span>}
+                      </td>
+                      <td className="py-3 px-3 text-right">
+                        <ClvBadge clv={bet.clvPct != null ? Number(bet.clvPct) : null} />
                       </td>
                       <td className="py-3 px-3 text-right font-mono text-slate-200">
                         {formatCurrency(bet.stake)}

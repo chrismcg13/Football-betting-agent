@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { usePerformance, useBetsByLeague, useBetsByMarket, useModel, useBets } from "@/hooks/use-dashboard";
+import { usePerformance, useBetsByLeague, useBetsByMarket, useModel, useBets, useClvStats } from "@/hooks/use-dashboard";
 import { formatCurrency } from "@/lib/format";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
@@ -114,6 +114,7 @@ export default function Performance() {
   const { data: byMarket, isLoading: marketLoading } = useBetsByMarket();
   const { data: modelData, isLoading: modelLoading } = useModel();
   const { data: allBetsData } = useBets(1, 200, "all");
+  const { data: clvData } = useClvStats();
 
   const chartData = useMemo(() => {
     const arr = (perfData?.cumulativeProfit as any[]) ?? [];
@@ -543,6 +544,47 @@ export default function Performance() {
           )}
         </div>
       </Card>
+
+      {/* CLV Trend Chart */}
+      {((clvData as any)?.trend ?? []).length >= 2 && (
+        <Card>
+          <CardHead
+            title="Closing Line Value (CLV) Trend"
+            sub={`Avg CLV: ${Number((clvData as any).avgClv) >= 0 ? "+" : ""}${Number((clvData as any).avgClv ?? 0).toFixed(2)}% over ${(clvData as any).count} bets`}
+          />
+          <div className="p-5">
+            <div className="h-48">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={(clvData as any).trend} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                  <CartesianGrid {...GRID} />
+                  <XAxis dataKey="date" {...AXIS} tick={{ fill: "#475569", fontSize: 10 }} />
+                  <YAxis {...AXIS} tick={{ fill: "#475569", fontSize: 10 }} tickFormatter={(v) => `${v > 0 ? "+" : ""}${v.toFixed(1)}%`} />
+                  <Tooltip
+                    {...TT}
+                    formatter={(v: number) => [`${v >= 0 ? "+" : ""}${v.toFixed(2)}%`, "CLV"]}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="clv"
+                    stroke="#7c3aed"
+                    strokeWidth={2}
+                    dot={false}
+                    activeDot={{ r: 4, fill: "#7c3aed" }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="mt-3 flex gap-6 text-xs text-slate-500">
+              <span>
+                <span className="font-semibold text-violet-400">{(clvData as any)?.pinnacleCount ?? 0}</span> Pinnacle-validated bets
+              </span>
+              <span>
+                <span className="font-semibold text-red-400">{(clvData as any)?.contrarianCount ?? 0}</span> contrarian bets
+              </span>
+            </div>
+          </div>
+        </Card>
+      )}
     </div>
   );
 }

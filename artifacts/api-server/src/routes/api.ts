@@ -32,7 +32,11 @@ import {
   runFeaturesNow,
   runTradingCycle,
   getSchedulerStatus,
+  runOddspapiMappingNow,
 } from "../services/scheduler";
+import {
+  getOddspapiStatus,
+} from "../services/oddsPapi";
 import {
   getApiBudgetStatus,
   fetchAndStoreOddsForAllUpcoming,
@@ -973,6 +977,85 @@ router.post("/odds/fetch", async (_req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     logger.error({ err }, "API-Football odds ingestion failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/clv-stats
+// ─────────────────────────────────────────────
+router.get("/dashboard/clv-stats", async (_req, res) => {
+  try {
+    const rows = await db
+      .select({
+        clvPct: paperBetsTable.clvPct,
+        placedAt: paperBetsTable.placedAt,
+        marketType: paperBetsTable.marketType,
+        status: paperBetsTable.status,
+        pinnacleOdds: paperBetsTable.pinnacleOdds,
+        isContrarian: paperBetsTable.isContrarian,
+      })
+      .from(paperBetsTable)
+      .where(
+        and(
+          sql`${paperBetsTable.clvPct} IS NOT NULL`,
+          sql`${paperBetsTable.status} IN ('won','lost')`,
+        ),
+      )
+      .orderBy(asc(paperBetsTable.placedAt))
+      .limit(200);
+
+    if (rows.length === 0) {
+      return res.json({ count: 0, avgClv: null, trend: [] });
+    }
+
+    const clvValues = rows.map((r) => Number(r.clvPct));
+    const avgClv = clvValues.reduce((a, b) => a + b, 0) / clvValues.length;
+    const pinnacleCount = rows.filter((r) => r.pinnacleOdds != null).length;
+    const contrarianCount = rows.filter((r) => r.isContrarian === "true").length;
+
+    const trend = rows.map((r) => ({
+      date: new Date(r.placedAt).toISOString().slice(0, 10),
+      clv: Number(r.clvPct),
+      market: r.marketType,
+    }));
+
+    res.json({
+      count: rows.length,
+      avgClv: Math.round(avgClv * 1000) / 1000,
+      pinnacleCount,
+      contrarianCount,
+      trend,
+    });
+  } catch (err) {
+    logger.error({ err }, "CLV stats query failed");
+    res.status(500).json({ error: "Failed to compute CLV stats" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/oddspapi-budget
+// ─────────────────────────────────────────────
+router.get("/dashboard/oddspapi-budget", async (_req, res) => {
+  try {
+    const status = await getOddspapiStatus();
+    res.json(status);
+  } catch (err) {
+    logger.error({ err }, "Failed to get OddsPapi budget status");
+    res.status(500).json({ error: "Failed to retrieve OddsPapi budget status" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/oddspapi/map-fixtures — manually trigger fixture mapping
+// ─────────────────────────────────────────────
+router.post("/oddspapi/map-fixtures", async (_req, res) => {
+  logger.info("Manual OddsPapi fixture mapping triggered");
+  try {
+    const result = await runOddspapiMappingNow();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "OddsPapi fixture mapping failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });
