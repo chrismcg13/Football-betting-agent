@@ -3,8 +3,7 @@ import { logger } from "../lib/logger";
 
 const BASE_URL = "https://api.football-data.org/v4";
 
-const MAX_RPS = 10;
-const REQUEST_INTERVAL_MS = Math.ceil(1000 / MAX_RPS);
+const REQUEST_INTERVAL_MS = 6100;
 
 let lastRequestAt = 0;
 
@@ -64,7 +63,36 @@ export interface FDMatch {
   };
 }
 
-const TRACKED_COMPETITIONS = [
+export interface FDStandingEntry {
+  position: number;
+  team: FDTeam;
+  playedGames: number;
+  won: number;
+  draw: number;
+  lost: number;
+  points: number;
+  goalsFor: number;
+  goalsAgainst: number;
+  goalDifference: number;
+}
+
+export interface FDStandings {
+  competition: FDCompetition;
+  standings: Array<{
+    stage: string;
+    type: string;
+    table: FDStandingEntry[];
+  }>;
+}
+
+export interface FDHeadToHead {
+  numberOfMatches: number;
+  homeTeam: { wins: number; draws: number; losses: number };
+  awayTeam: { wins: number; draws: number; losses: number };
+  matches: FDMatch[];
+}
+
+const INGESTION_COMPETITIONS = [
   "PL",
   "BL1",
   "SA",
@@ -78,6 +106,88 @@ const TRACKED_COMPETITIONS = [
   "BSA",
 ];
 
+export const FEATURE_COMPETITIONS = [
+  "PL",
+  "BL1",
+  "PD",
+  "SA",
+  "FL1",
+  "ELC",
+  "DED",
+  "PPL",
+];
+
+export async function getCompetitions(): Promise<FDCompetition[]> {
+  const client = getClient();
+  await throttle();
+  const response = await client.get<{ competitions: FDCompetition[] }>(
+    "/competitions",
+  );
+  return response.data.competitions ?? [];
+}
+
+export async function getStandings(
+  competitionCode: string,
+): Promise<FDStandingEntry[]> {
+  const client = getClient();
+  await throttle();
+  try {
+    const response = await client.get<FDStandings>(
+      `/competitions/${competitionCode}/standings`,
+    );
+    const total = response.data.standings.find((s) => s.type === "TOTAL");
+    return total?.table ?? [];
+  } catch (err) {
+    if (axios.isAxiosError(err) && (err.response?.status === 403 || err.response?.status === 404)) {
+      logger.debug({ competitionCode }, "Standings not available in current plan");
+      return [];
+    }
+    throw err;
+  }
+}
+
+export async function getTeamMatches(
+  teamId: number,
+  limit = 20,
+): Promise<FDMatch[]> {
+  const client = getClient();
+  await throttle();
+  try {
+    const response = await client.get<{ matches: FDMatch[] }>(
+      `/teams/${teamId}/matches`,
+      {
+        params: {
+          status: "FINISHED",
+          limit,
+        },
+      },
+    );
+    return response.data.matches ?? [];
+  } catch (err) {
+    if (axios.isAxiosError(err) && err.response?.status === 404) {
+      return [];
+    }
+    throw err;
+  }
+}
+
+export async function getHeadToHead(matchId: number): Promise<FDHeadToHead | null> {
+  const client = getClient();
+  await throttle();
+  try {
+    const response = await client.get<{ head2head: FDHeadToHead }>(
+      `/matches/${matchId}/head2head`,
+      { params: { limit: 20 } },
+    );
+    return response.data.head2head ?? null;
+  } catch (err) {
+    if (axios.isAxiosError(err) && (err.response?.status === 404 || err.response?.status === 403)) {
+      return null;
+    }
+    throw err;
+  }
+}
+
 export async function listUpcomingMatches(daysAhead = 7): Promise<FDMatch[]> {
   const client = getClient();
   const from = new Date();
@@ -89,7 +199,7 @@ export async function listUpcomingMatches(daysAhead = 7): Promise<FDMatch[]> {
 
   const allMatches: FDMatch[] = [];
 
-  for (const competitionCode of TRACKED_COMPETITIONS) {
+  for (const competitionCode of INGESTION_COMPETITIONS) {
     try {
       await throttle();
       const response = await client.get<{
@@ -106,10 +216,7 @@ export async function listUpcomingMatches(daysAhead = 7): Promise<FDMatch[]> {
       if (response.data.matches?.length > 0) {
         allMatches.push(...response.data.matches);
         logger.info(
-          {
-            competition: competitionCode,
-            count: response.data.matches.length,
-          },
+          { competition: competitionCode, count: response.data.matches.length },
           "Fetched matches from football-data.org",
         );
       }

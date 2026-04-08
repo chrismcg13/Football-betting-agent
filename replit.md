@@ -60,11 +60,47 @@ All routes are under `/api/`:
 - `GET/POST/PATCH /matches` — match management
 - `GET/POST /paper-bets`, `PATCH /paper-bets/:id/settle` — bet placement and settlement
 - `GET/POST /odds-snapshots` — odds data ingestion
-- `GET/POST /features` — ML feature storage
+- `GET/POST /features` — ML feature storage (metadata features prefixed `_` are hidden from GET)
+- `POST /features/compute` — manually trigger feature computation for all upcoming matches
 - `GET/POST /model-state`, `GET /model-state/latest` — model versioning
 - `GET/POST /learning-narratives` — agent learning log
 - `GET/POST /compliance-logs` — compliance audit trail
+- `POST /ingestion/run` — manually trigger data ingestion
 - `GET /healthz` — health check
+
+## Scheduler
+
+Two scheduled jobs run automatically:
+
+| Job | Schedule | Description |
+|-----|----------|-------------|
+| Data ingestion | Every 30 min, 06:00–23:30 UTC | Fetches matches from football-data.org (or Betfair) |
+| Feature computation | Every 6 hours UTC | Computes all 12 ML features for upcoming matches |
+
+Both jobs are guarded against concurrent runs (skip-if-busy).
+
+## Feature Engine (`src/services/featureEngine.ts`)
+
+Computes 12 ML features per upcoming match using football-data.org team history APIs:
+
+| Feature | Description |
+|---------|-------------|
+| `home_form_last5` | Home team win rate over last 5 home games |
+| `away_form_last5` | Away team win rate over last 5 away games |
+| `home_goals_scored_avg` | Home team avg goals scored (last 10 home) |
+| `home_goals_conceded_avg` | Home team avg goals conceded (last 10 home) |
+| `away_goals_scored_avg` | Away team avg goals scored (last 10 away) |
+| `away_goals_conceded_avg` | Away team avg goals conceded (last 10 away) |
+| `home_btts_rate` | Both-teams-to-score rate in home team's last 10 home matches |
+| `away_btts_rate` | Both-teams-to-score rate in away team's last 10 away matches |
+| `home_over25_rate` | Over 2.5 goals rate in home team's last 10 home matches |
+| `away_over25_rate` | Over 2.5 goals rate in away team's last 10 away matches |
+| `h2h_home_win_rate` | Home win rate in last 5 H2H meetings |
+| `league_position_diff` | (away rank − home rank) / total teams, normalised |
+
+Prerequisites: Ingestion must run at least once so team IDs are stored (as `_home_team_id` / `_away_team_id` metadata features) before the feature engine can run.
+
+API calls are sequential (not parallel) to respect the 10 req/min rate limit.
 
 ## Data Sources
 

@@ -3,8 +3,9 @@ import {
   matchesTable,
   oddsSnapshotsTable,
   complianceLogsTable,
+  featuresTable,
 } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
   listUpcomingMatches,
@@ -27,6 +28,32 @@ async function logCompliance(
   }
 }
 
+async function upsertTeamIdFeature(
+  matchId: number,
+  featureName: string,
+  teamId: number,
+): Promise<void> {
+  const existing = await db
+    .select({ id: featuresTable.id })
+    .from(featuresTable)
+    .where(
+      and(
+        eq(featuresTable.matchId, matchId),
+        eq(featuresTable.featureName, featureName),
+      ),
+    )
+    .limit(1);
+
+  if (existing.length === 0) {
+    await db.insert(featuresTable).values({
+      matchId,
+      featureName,
+      featureValue: String(teamId),
+      computedAt: new Date(),
+    });
+  }
+}
+
 export async function runFallbackIngestion(): Promise<void> {
   const startedAt = new Date();
   logger.info("Starting football-data.org fallback ingestion run");
@@ -39,7 +66,10 @@ export async function runFallbackIngestion(): Promise<void> {
 
   try {
     const matches = await listUpcomingMatches(7);
-    logger.info({ count: matches.length }, "Fetched matches from football-data.org");
+    logger.info(
+      { count: matches.length },
+      "Fetched matches from football-data.org",
+    );
 
     let newMatches = 0;
     let updatedMatches = 0;
@@ -56,23 +86,38 @@ export async function runFallbackIngestion(): Promise<void> {
         .where(eq(matchesTable.betfairEventId, `fd_${fdId}`))
         .limit(1);
 
+      let dbMatchId: number;
+
       if (existing.length === 0) {
-        await db.insert(matchesTable).values({
-          homeTeam: match.homeTeam.name,
-          awayTeam: match.awayTeam.name,
-          league: match.competition.name,
-          country: match.competition.area?.name ?? "Unknown",
-          kickoffTime: new Date(match.utcDate),
-          status,
-          betfairEventId: `fd_${fdId}`,
-        });
+        const [inserted] = await db
+          .insert(matchesTable)
+          .values({
+            homeTeam: match.homeTeam.name,
+            awayTeam: match.awayTeam.name,
+            league: match.competition.name,
+            country: match.competition.area?.name ?? "Unknown",
+            kickoffTime: new Date(match.utcDate),
+            status,
+            betfairEventId: `fd_${fdId}`,
+          })
+          .returning({ id: matchesTable.id });
+
+        dbMatchId = inserted!.id;
         newMatches++;
       } else {
+        dbMatchId = existing[0]!.id;
         await db
           .update(matchesTable)
           .set({ status })
           .where(eq(matchesTable.betfairEventId, `fd_${fdId}`));
         updatedMatches++;
+      }
+
+      if (match.homeTeam.id) {
+        await upsertTeamIdFeature(dbMatchId, "_home_team_id", match.homeTeam.id);
+      }
+      if (match.awayTeam.id) {
+        await upsertTeamIdFeature(dbMatchId, "_away_team_id", match.awayTeam.id);
       }
     }
 
@@ -82,6 +127,8 @@ export async function runFallbackIngestion(): Promise<void> {
     let snapshotCount = 0;
 
     for (const match of matches) {
+      if (!match.homeTeam?.name || !match.awayTeam?.name) continue;
+
       const fdId = `fd_${String(match.id)}`;
       const dbMatch = await db
         .select({ id: matchesTable.id })
@@ -96,18 +143,16 @@ export async function runFallbackIngestion(): Promise<void> {
       if (!odds) continue;
 
       const runners: Array<{ name: string; odds: number | null }> = [
-        { name: match.homeTeam?.name ?? "Home", odds: odds.homeWin },
+        { name: match.homeTeam.name, odds: odds.homeWin },
         { name: "Draw", odds: odds.draw },
-        { name: match.awayTeam?.name ?? "Away", odds: odds.awayWin },
+        { name: match.awayTeam.name, odds: odds.awayWin },
       ];
 
       for (const runner of runners) {
         if (runner.odds === null) continue;
 
         const backOdds = String(runner.odds);
-        const layOdds = String(
-          Math.round(runner.odds * 1.02 * 100) / 100,
-        );
+        const layOdds = String(Math.round(runner.odds * 1.02 * 100) / 100);
 
         await db.insert(oddsSnapshotsTable).values({
           matchId,
