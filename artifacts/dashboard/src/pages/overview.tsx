@@ -114,7 +114,7 @@ const TOOLTIP_STYLE = {
 export default function Overview() {
   const { data: summary, isLoading: loadingSummary } = useSummary();
   const { data: clvStats } = useClvStats();
-  const { data: allBetsData, isLoading: loadingBets } = useBets(1, 50, "all");
+  const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 50, "all");
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
 
@@ -338,12 +338,17 @@ export default function Overview() {
                   <div key={i} className="h-12 rounded animate-pulse" style={{ background: "#0f172a" }} />
                 ))}
               </div>
+            ) : betsError ? (
+              <div className="px-5 py-10 text-center">
+                <p className="text-sm text-red-400">Could not load bets — retrying…</p>
+                <p className="text-xs text-slate-600 mt-1">Check API server connection.</p>
+              </div>
             ) : upcomingBets.length === 0 ? (
               <div className="px-5 py-10 text-center">
                 <p className="text-sm text-slate-500">
-                  Agent is analysing upcoming fixtures.
+                  No pending bets yet.
                 </p>
-                <p className="text-xs text-slate-600 mt-1">Next scan in ~15 minutes.</p>
+                <p className="text-xs text-slate-600 mt-1">Agent scans for value every 15 minutes.</p>
               </div>
             ) : (
               upcomingBets.map((bet: any) => (

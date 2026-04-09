@@ -13,7 +13,7 @@ export const useSummary = () => {
   return useQuery({
     queryKey: ["dashboard", "summary"],
     queryFn: () => fetcher("/api/dashboard/summary"),
-    refetchInterval: 60000,
+    refetchInterval: 30000,
   });
 };
 
@@ -21,6 +21,7 @@ export const usePerformance = () => {
   return useQuery({
     queryKey: ["dashboard", "performance"],
     queryFn: () => fetcher("/api/dashboard/performance"),
+    refetchInterval: 60000,
   });
 };
 
@@ -31,6 +32,9 @@ export const useBets = (page = 1, limit = 20, status = "all") => {
     staleTime: 0,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
+    refetchInterval: 30000,
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
   });
 };
 
@@ -38,6 +42,7 @@ export const useBetsByLeague = () => {
   return useQuery({
     queryKey: ["dashboard", "bets", "by-league"],
     queryFn: () => fetcher("/api/dashboard/bets/by-league"),
+    refetchInterval: 60000,
   });
 };
 
@@ -45,6 +50,7 @@ export const useBetsByMarket = () => {
   return useQuery({
     queryKey: ["dashboard", "bets", "by-market"],
     queryFn: () => fetcher("/api/dashboard/bets/by-market"),
+    refetchInterval: 60000,
   });
 };
 
@@ -52,6 +58,7 @@ export const useViability = () => {
   return useQuery({
     queryKey: ["dashboard", "viability"],
     queryFn: () => fetcher("/api/dashboard/viability"),
+    refetchInterval: 120000,
   });
 };
 
@@ -59,6 +66,7 @@ export const useNarratives = () => {
   return useQuery({
     queryKey: ["dashboard", "narratives"],
     queryFn: () => fetcher("/api/dashboard/narratives"),
+    refetchInterval: 120000,
   });
 };
 
@@ -66,6 +74,7 @@ export const useModel = () => {
   return useQuery({
     queryKey: ["dashboard", "model"],
     queryFn: () => fetcher("/api/dashboard/model"),
+    refetchInterval: 120000,
   });
 };
 
@@ -136,6 +145,7 @@ export const useAgentControl = () => {
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["dashboard", "summary"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard", "bets"] });
       queryClient.invalidateQueries({ queryKey: ["compliance", "logs"] });
     },
   });
