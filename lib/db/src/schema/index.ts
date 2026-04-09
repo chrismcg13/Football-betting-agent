@@ -8,3 +8,5 @@ export * from "./complianceLogs";
 export * from "./agentConfig";
 export * from "./apiUsage";
 export * from "./oddspapiFixtureMap";
+export * from "./leagueEdgeScores";
+export * from "./oddspapiLeagueCoverage";

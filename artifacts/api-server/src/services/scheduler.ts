@@ -3,7 +3,6 @@ import { logger } from "../lib/logger";
 import { runDataIngestion } from "./dataIngestion";
 import { runFeatureEngineForUpcomingMatches } from "./featureEngine";
 import { detectValueBets } from "./valueDetection";
-import { computeEnhancedOpportunityScore } from "./valueDetection";
 import { placePaperBet, settleBets, getAgentStatus, getBankroll } from "./paperTrading";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
@@ -21,7 +20,7 @@ import {
   logDailyBudgetSummary,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { db, agentConfigTable } from "@workspace/db";
+import { db, agentConfigTable, leagueEdgeScoresTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 
 // ===================== Status tracking =====================
@@ -201,17 +200,31 @@ export async function runTradingCycle(): Promise<{
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
-    // 6. OddsPapi enhancement for top 5 candidates
-    // Score-sort the timely bets and enrich the top 5 with Pinnacle validation
+    // 6. OddsPapi validation — Pinnacle +5 bonus scoring
+    // Sort by base opportunity score; try to get Pinnacle data for top candidates
     const sorted = [...timely].sort((a, b) => b.opportunityScore - a.opportunityScore);
-    const top5 = sorted.slice(0, 5);
-    const rest = sorted.slice(5);
+
+    // Load league edge scores for dynamic allocation ranking
+    const leagueEdgeRows = await db
+      .select({ league: leagueEdgeScoresTable.league, confidenceScore: leagueEdgeScoresTable.confidenceScore })
+      .from(leagueEdgeScoresTable);
+    const leagueEdgeMap = new Map(leagueEdgeRows.map((r) => [r.league, r.confidenceScore]));
+
+    // Rank by league_edge_score × opportunity_score for OddsPapi budget allocation
+    const rankedForOddsPapi = [...sorted].sort((a, b) => {
+      const sa = (leagueEdgeMap.get(a.league) ?? 50) * a.opportunityScore;
+      const sb = (leagueEdgeMap.get(b.league) ?? 50) * b.opportunityScore;
+      return sb - sa;
+    });
+    const top5 = rankedForOddsPapi.slice(0, 5);
+    const rest = rankedForOddsPapi.slice(5);
+
+    type OddsValidation = Awaited<ReturnType<typeof getOddspapiValidation>>;
 
     const enhancedCandidates = await Promise.all(
       top5.map(async (bet) => {
         try {
-          // Check pre-fetch cache first (zero budget cost); fall back to live call for non-MATCH_ODDS
-          let validation: Awaited<ReturnType<typeof getOddspapiValidation>> | null = null;
+          let validation: OddsValidation | null = null;
 
           const cachedMatch = oddsPapiCache.get(bet.matchId);
           if (cachedMatch) {
@@ -223,7 +236,7 @@ export async function runTradingCycle(): Promise<{
 
           if (!validation) {
             const oddspapiId = await getOddspapiFixtureId(bet.matchId);
-            if (!oddspapiId) return { bet, validation: null, enhancedScore: null };
+            if (!oddspapiId) return { bet, validation: null, effectiveScore: bet.opportunityScore };
 
             validation = await getOddspapiValidation(
               oddspapiId,
@@ -233,32 +246,16 @@ export async function runTradingCycle(): Promise<{
             );
           }
 
-          // Only enhance when Pinnacle data is available — no-data runs reduce score by ~10 pts
-          if (!validation.hasPinnacleData) {
-            logger.info(
-              {
-                match: `${bet.homeTeam} vs ${bet.awayTeam}`,
-                market: bet.marketType,
-                selection: bet.selectionName,
-                baseScore: bet.opportunityScore,
-                reason: "no Pinnacle data — keeping base score",
-              },
-              "OddsPapi: skipping enhancement (no data)",
-            );
-            return { bet, validation, enhancedScore: null };
+          // Simplified Pinnacle scoring (Part 6):
+          // +5 flat bonus for any Pinnacle data
+          // +10 additional if Pinnacle-aligned (sharp money agrees)
+          // -10 if contrarian (model disagrees with sharp — higher risk)
+          let effectiveScore = bet.opportunityScore;
+          if (validation.hasPinnacleData) {
+            effectiveScore = bet.opportunityScore + 5;
+            if (validation.pinnacleAligned) effectiveScore += 10;
+            else if (validation.isContrarian) effectiveScore -= 10;
           }
-
-          const enhanced = computeEnhancedOpportunityScore({
-            edge: bet.edge,
-            modelProbability: bet.modelProbability,
-            backOdds: validation.bestOdds ?? bet.backOdds,
-            segmentBetCount: bet.segmentBetCount,
-            segmentRoi: bet.segmentRoi,
-            hotStreakBonus: bet.hotStreakBonus,
-            pinnacleImplied: validation.pinnacleImplied,
-            sharpSoftSpread: validation.sharpSoftSpread,
-            oddsUpliftPct: validation.oddsUpliftPct,
-          });
 
           logger.info(
             {
@@ -266,18 +263,18 @@ export async function runTradingCycle(): Promise<{
               market: bet.marketType,
               selection: bet.selectionName,
               baseScore: bet.opportunityScore,
-              enhancedScore: enhanced.score,
-              pinnacleAligned: enhanced.pinnacleAligned,
-              isContrarian: enhanced.isContrarian,
+              effectiveScore,
               hasPinnacleData: validation.hasPinnacleData,
+              pinnacleAligned: validation.pinnacleAligned,
+              isContrarian: validation.isContrarian,
             },
-            "OddsPapi enhanced scoring",
+            "OddsPapi validation scoring",
           );
 
-          return { bet, validation, enhancedScore: enhanced };
+          return { bet, validation, effectiveScore };
         } catch (err) {
-          logger.warn({ err, matchId: bet.matchId }, "OddsPapi enhancement failed for bet — using base score");
-          return { bet, validation: null, enhancedScore: null };
+          logger.warn({ err, matchId: bet.matchId }, "OddsPapi validation failed — using base score");
+          return { bet, validation: null, effectiveScore: bet.opportunityScore };
         }
       }),
     );
@@ -286,22 +283,19 @@ export async function runTradingCycle(): Promise<{
     type BetEntry = {
       bet: typeof timely[number];
       effectiveScore: number;
-      enhancedScore: ReturnType<typeof computeEnhancedOpportunityScore> | null;
-      validation: Awaited<ReturnType<typeof getOddspapiValidation>> | null;
+      validation: OddsValidation | null;
     };
 
     const allEntries: BetEntry[] = [
-      ...enhancedCandidates.map(({ bet, validation, enhancedScore }) => ({
+      ...enhancedCandidates.map(({ bet, validation, effectiveScore }) => ({
         bet,
-        effectiveScore: enhancedScore?.score ?? bet.opportunityScore,
-        enhancedScore: enhancedScore ?? null,
+        effectiveScore,
         validation: validation ?? null,
       })),
       ...rest.map((bet) => ({
         bet,
         effectiveScore: bet.opportunityScore,
-        enhancedScore: null as ReturnType<typeof computeEnhancedOpportunityScore> | null,
-        validation: null as Awaited<ReturnType<typeof getOddspapiValidation>> | null,
+        validation: null as OddsValidation | null,
       })),
     ].sort((a, b) => b.effectiveScore - a.effectiveScore);
 
@@ -323,8 +317,8 @@ export async function runTradingCycle(): Promise<{
     for (const entry of allEntries) {
       if (preCorrelation.length >= maxPerCycle) break;
 
-      const { bet, effectiveScore, enhancedScore, validation } = entry;
-      const isContrarian = enhancedScore?.isContrarian ?? false;
+      const { bet, effectiveScore, validation } = entry;
+      const isContrarian = validation?.isContrarian ?? false;
       const scoreThreshold = isContrarian ? contrarinaThreshold : minScore;
 
       if (effectiveScore < scoreThreshold) {
@@ -343,13 +337,17 @@ export async function runTradingCycle(): Promise<{
 
       // Generate thesis
       const backOdds = validation?.bestOdds ?? bet.backOdds;
+      const pinnacleAligned = validation?.pinnacleAligned ?? false;
+      const leagueEdgeScore = leagueEdgeMap.get(bet.league) ?? 50;
+      const leagueBonusStr = leagueEdgeScore !== 50 ? ` League edge score: ${leagueEdgeScore.toFixed(0)}.` : "";
       const thesis = validation?.hasPinnacleData
         ? `Backing ${bet.selectionName} at ${backOdds.toFixed(2)} from ${validation.bestBookmaker ?? "best available"}. ` +
           `Model: ${(bet.modelProbability * 100).toFixed(1)}%, Pinnacle implies: ${((validation.pinnacleImplied ?? 0) * 100).toFixed(1)}%. ` +
           `Edge: ${(bet.edge * 100).toFixed(1)}% using best available price. ` +
           (validation.sharpSoftSpread ? `Sharp-soft spread: ${(validation.sharpSoftSpread * 100).toFixed(1)}%. ` : "") +
-          (isContrarian ? "CONTRARIAN — stake reduced 60%." : enhancedScore?.pinnacleAligned ? "Pinnacle-aligned." : "")
-        : `Backing ${bet.selectionName} at ${bet.backOdds.toFixed(2)}. Model: ${(bet.modelProbability * 100).toFixed(1)}%, Edge: ${(bet.edge * 100).toFixed(1)}%.`;
+          (isContrarian ? "CONTRARIAN — stake reduced 60%." : pinnacleAligned ? "Pinnacle-aligned." : "") +
+          leagueBonusStr
+        : `Backing ${bet.selectionName} at ${bet.backOdds.toFixed(2)}. Model: ${(bet.modelProbability * 100).toFixed(1)}%, Edge: ${(bet.edge * 100).toFixed(1)}%.${leagueBonusStr}`;
 
       // Estimate Kelly stake for correlation check
       const kellyFraction = Math.min(0.02 * (effectiveScore / 65), 0.05);
@@ -359,10 +357,9 @@ export async function runTradingCycle(): Promise<{
         ...bet,
         stakeMultiplier: 1.0,
         estimatedStake,
-        enhanced: !!enhancedScore,
+        enhanced: !!(validation?.hasPinnacleData),
         // Store extra data for placement
         _validation: validation,
-        _enhancedScore: enhancedScore,
         _thesis: thesis,
         _backOdds: backOdds,
         _effectiveScore: effectiveScore,
@@ -386,7 +383,6 @@ export async function runTradingCycle(): Promise<{
     for (const candidate of selectedBets) {
       const extra = candidate as BetCandidate & Record<string, unknown>;
       const validation = extra._validation as Awaited<ReturnType<typeof getOddspapiValidation>> | null;
-      const enhancedScore = extra._enhancedScore as ReturnType<typeof computeEnhancedOpportunityScore> | null;
       const isContrarian = (extra._isContrarian as boolean | undefined) ?? false;
       const backOdds = (extra._backOdds as number | undefined) ?? candidate.backOdds;
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
@@ -403,7 +399,7 @@ export async function runTradingCycle(): Promise<{
           modelVersion: modelVersion ?? undefined,
           opportunityScore: effectiveScore,
           oddsSource: candidate.oddsSource,
-          enhancedOpportunityScore: enhancedScore?.score ?? null,
+          enhancedOpportunityScore: validation?.hasPinnacleData ? effectiveScore : null,
           pinnacleOdds: validation?.pinnacleOdds ?? null,
           pinnacleImplied: validation?.pinnacleImplied ?? null,
           bestOdds: validation?.bestOdds ?? null,
@@ -429,7 +425,7 @@ export async function runTradingCycle(): Promise<{
             oddsSource: candidate.oddsSource,
             opportunityScore: effectiveScore,
             enhanced: candidate.enhanced,
-            pinnacleAligned: enhancedScore?.pinnacleAligned,
+            pinnacleAligned: validation?.pinnacleAligned ?? false,
             isContrarian,
             stakeMultiplier: candidate.stakeMultiplier,
           },

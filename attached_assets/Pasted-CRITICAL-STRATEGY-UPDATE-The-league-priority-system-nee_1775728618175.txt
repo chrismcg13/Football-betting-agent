@@ -1,0 +1,107 @@
+CRITICAL STRATEGY UPDATE: The league priority system needs to be completely redesigned. Instead of hardcoding a fixed priority, the model should learn where the edge is and allocate resources dynamically.
+
+=== PART 1: REMOVE HARDCODED LEAGUE PRIORITY ===
+
+Delete any fixed league ordering. Replace with a dynamic "League Edge Score" system:
+
+1. Create a new table: league_edge_scores (id, league, market_type, total_bets, wins, losses, roi_pct, avg_clv, avg_edge, confidence_score, last_updated)
+
+2. For the INITIAL seeding (before we have our own data), set starting confidence_scores based on market efficiency theory — less scrutinised leagues get higher starting scores:
+   - Championship: 80 (huge data availability, second-tier = softer odds)
+   - Eredivisie: 78 (good data, less betting volume)
+   - Primeira Liga: 75 (good data, significantly less scrutiny)
+   - Ligue 1: 72 (top 5 league but least modelled of the big 5)
+   - Serie A: 65 (popular but secondary markets are soft)
+   - Bundesliga: 63 (similar to Serie A)
+   - La Liga: 55 (heavily scrutinised)
+   - Premier League: 45 (most efficient market in football)
+   - Champions League: 40 (most scrutinised competition on earth)
+
+3. These are STARTING points only. After 10+ bets in any league, the model replaces the seed score with actual performance data: real ROI, real CLV, real edge accuracy.
+
+=== PART 2: DYNAMIC RESOURCE ALLOCATION ===
+
+When the trading cycle runs and needs to decide which fixtures to spend OddsPapi budget on:
+
+1. Score every fixture using: league_edge_score × preliminary_opportunity_score
+2. Sort by this combined score DESCENDING
+3. Spend OddsPapi requests on the top 5 fixtures regardless of which league they're from
+4. This means if Championship and Eredivisie fixtures have higher combined scores than EPL fixtures, they get the OddsPapi budget first — automatically
+
+For API-Football (100 req/day, much more generous):
+- Fetch odds for ALL leagues — no rationing needed
+- The model uses API-Football Bet365/Bwin odds as the primary odds source for ALL leagues
+- OddsPapi Pinnacle validation is a bonus layer, not a requirement
+
+=== PART 3: SELF-LEARNING LEAGUE ALLOCATION ===
+
+After each model retraining cycle (daily at 3am):
+
+1. Recalculate league_edge_scores from actual performance data:
+   - roi_pct: actual ROI in this league/market combo
+   - avg_clv: average closing line value (positive = we're beating the market)
+   - avg_edge: average calculated edge at time of bet placement
+   - confidence_score: weighted formula = (roi_pct × 0.3) + (avg_clv × 30) + (win_rate × 0.2) + (sample_reliability × 0.2)
+   - sample_reliability = min(total_bets / 20, 1) — need 20+ bets for full confidence
+
+2. The model should INCREASE allocation to leagues where:
+   - CLV is consistently positive (we're beating the closing line)
+   - ROI is positive over 15+ bets
+   - The edge between our model and bookmaker odds is largest
+
+3. The model should DECREASE allocation to leagues where:
+   - CLV is consistently negative (market is sharper than us)
+   - ROI is negative over 15+ bets despite positive predicted edge (our model is miscalibrated for this league)
+
+4. Generate narratives:
+   - "League focus shifting: [league] promoted to priority — [ROI]% ROI and +[CLV]% CLV over [N] bets. Allocating more OddsPapi budget here."
+   - "League deprioritised: [league] demoted — negative CLV of [X]% suggests bookmaker odds are already efficient. Reducing exposure."
+   - "New discovery: [league] [market_type] showing [edge]% average edge over [N] bets. This is the model's current strongest opportunity."
+
+=== PART 4: OddsPapi BUDGET ALLOCATION ===
+
+Redesign the OddsPapi budget spending:
+
+1. Daily fixture mapping: 1 request (unchanged)
+2. Remaining 6 requests: allocated to fixtures with HIGHEST (league_edge_score × preliminary_opportunity_score)
+3. If a league has no OddsPapi coverage (hasOdds: false), that's fine — use API-Football odds. Don't waste budget retrying leagues that OddsPapi doesn't cover. Track which leagues OddsPapi covers in a cache: oddspapi_league_coverage (league, has_odds, last_checked). Only spend requests on leagues we KNOW have OddsPapi odds.
+4. For leagues without OddsPapi coverage, API-Football real odds (Bet365, Bwin, 1xBet) are still excellent for value detection. The model should NOT refuse to bet just because Pinnacle validation isn't available — API-Football odds are real bookmaker prices.
+
+=== PART 5: UPDATED OPPORTUNITY SCORING ===
+
+Modify the opportunity score to factor in league edge:
+
+Enhanced Opportunity Score:
+- All existing factors (edge size, model confidence, odds sweet spot, etc.) remain
+- ADD: league_edge_bonus = (league_edge_score - 50) / 5, capped at +/-10 points
+  This gives Championship (+6 bonus), Eredivisie (+5.6), Primeira Liga (+5), EPL (-1), Champions League (-2)
+- After 20+ bets in a league, use ACTUAL performance data instead of seed values
+- The model literally learns which leagues to prioritise from its own results
+
+=== PART 6: BETTING RULES UPDATE ===
+
+- Bets using API-Football real odds (Bet365/Bwin/1xBet) are FULLY VALID — minimum opportunity score stays at 65
+- Bets with OddsPapi Pinnacle validation get a +5 bonus to their score (validation is valuable but not required)
+- Synthetic Poisson odds remain capped at 55 (effectively blocked)
+- The diversity rules stay: max 5 bets per cycle, max 2 per league, max 2 per market type
+
+=== PART 7: TEMPORARY BUDGET OVERRIDE FOR THIS WEEKEND ===
+
+Override today's OddsPapi daily budget to 15 (one-time). Tomorrow reset to 7.
+Run the full trading cycle NOW:
+1. Fetch fixture mapping for next 4 days
+2. Use API-Football to get Bet365/Bwin odds for ALL upcoming fixtures across ALL 9 leagues
+3. Run value detection across everything — prioritising by (league_edge_score × opportunity_score)
+4. Spend up to 15 OddsPapi requests on the top candidates that have OddsPapi coverage
+5. For candidates without OddsPapi coverage, use API-Football odds directly
+6. Apply diversity rules and place up to 5 bets
+7. Show me: every fixture evaluated, which leagues had real odds, which bets were placed with full details including league_edge_score, odds source, and thesis
+
+=== PART 8: DASHBOARD UPDATES ===
+
+- Add "League Performance" section to Performance page: table showing each league's edge score, total bets, ROI, CLV, and whether it's trending up or down
+- On the Learning page: show league allocation changes in the narrative feed
+- On bet detail expansion: show the league_edge_score and explain why this league was selected
+- Add "Edge Map" visual: simple heatmap or ranked list showing which leagues the model currently sees as most profitable
+
+Log all league scoring and allocation decisions to compliance_logs.

@@ -13,6 +13,8 @@ import {
   oddsSnapshotsTable,
   complianceLogsTable,
   learningNarrativesTable,
+  leagueEdgeScoresTable,
+  oddspapiLeagueCoverageTable,
 } from "@workspace/db";
 import { eq, and, gte, lte, sql, like } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -635,19 +637,22 @@ export async function prefetchAndStoreOddsPapiOdds(
 
   const limit = Math.min(maxFetches, remaining - 1);
 
-  // League priority — top tier markets most likely to have real OddsPapi coverage
-  const LEAGUE_PRIORITY: Record<string, number> = {
-    "UEFA Champions League": 0,
-    "UEFA Europa League": 1,
-    "Premier League": 2,
-    "Primera Division": 3,
-    "Bundesliga": 4,
-    "Serie A": 5,
-    "Ligue 1": 6,
-    "Primeira Liga": 7,
-  };
+  // Dynamic league scoring: load edge scores from DB and coverage cache
+  // Higher edge_score = less-scrutinised league = better OddsPapi budget allocation
+  const [edgeRows, coverageRows] = await Promise.all([
+    db
+      .select({ league: leagueEdgeScoresTable.league, confidenceScore: leagueEdgeScoresTable.confidenceScore })
+      .from(leagueEdgeScoresTable),
+    db
+      .select({ league: oddspapiLeagueCoverageTable.league, hasOdds: oddspapiLeagueCoverageTable.hasOdds, lastChecked: oddspapiLeagueCoverageTable.lastChecked })
+      .from(oddspapiLeagueCoverageTable),
+  ]);
 
-  // Fetch all mapped matches in the window, then sort by league priority
+  const edgeScoreMap = new Map(edgeRows.map((r) => [r.league, r.confidenceScore]));
+  // If a league is marked hasOdds=0 and was checked in the last 6h, skip it
+  const coverageMap = new Map(coverageRows.map((r) => [r.league, r]));
+
+  // Fetch all mapped matches in the window
   const allRows = await db
     .select({
       matchId: oddspapiFixtureMapTable.matchId,
@@ -667,12 +672,21 @@ export async function prefetchAndStoreOddsPapiOdds(
       ),
     );
 
-  // Sort: top-priority leagues first, then earliest kickoff within same tier
+  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+
+  // Sort: highest league_edge_score first (dynamic); ties broken by earliest kickoff
   const mappedRows = allRows
+    .filter((r) => {
+      const cov = coverageMap.get(r.league ?? "");
+      if (!cov) return true; // unknown — try it
+      if (cov.hasOdds === 1) return true; // known good
+      // hasOdds=0 and checked recently — skip to avoid wasting budget
+      return cov.lastChecked < sixHoursAgo;
+    })
     .sort((a, b) => {
-      const pa = LEAGUE_PRIORITY[a.league ?? ""] ?? 99;
-      const pb = LEAGUE_PRIORITY[b.league ?? ""] ?? 99;
-      if (pa !== pb) return pa - pb;
+      const sa = edgeScoreMap.get(a.league ?? "") ?? 50;
+      const sb = edgeScoreMap.get(b.league ?? "") ?? 50;
+      if (sa !== sb) return sb - sa; // higher edge score first
       return (a.kickoffTime?.getTime() ?? 0) - (b.kickoffTime?.getTime() ?? 0);
     })
     .slice(0, limit);
@@ -701,7 +715,33 @@ export async function prefetchAndStoreOddsPapiOdds(
     if (!rawData) continue;
 
     const bookmakers = extractBookmakers(rawData as RawOddsResponse);
-    if (!bookmakers.length) continue;
+    if (!bookmakers.length) {
+      // Record that this league has no OddsPapi coverage so we stop wasting budget on it
+      const league = row.league ?? "";
+      if (league) {
+        await db
+          .insert(oddspapiLeagueCoverageTable)
+          .values({ league, hasOdds: 0, lastChecked: new Date() })
+          .onConflictDoUpdate({
+            target: oddspapiLeagueCoverageTable.league,
+            set: { hasOdds: 0, lastChecked: new Date() },
+          });
+        logger.info({ league }, "OddsPapi: no bookmakers for league — marked as no-coverage");
+      }
+      continue;
+    }
+
+    // Mark this league as having OddsPapi coverage
+    const leagueForCov = row.league ?? "";
+    if (leagueForCov) {
+      await db
+        .insert(oddspapiLeagueCoverageTable)
+        .values({ league: leagueForCov, hasOdds: 1, lastChecked: new Date() })
+        .onConflictDoUpdate({
+          target: oddspapiLeagueCoverageTable.league,
+          set: { hasOdds: 1, lastChecked: new Date() },
+        });
+    }
 
     // Build per-selection best-odds map
     const selectionOdds: Record<string, { best: number; bookmaker: string; pinnacle: number | null; sharp: number[]; soft: number[] }> = {

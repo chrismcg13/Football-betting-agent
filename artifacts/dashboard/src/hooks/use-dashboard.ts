@@ -114,6 +114,14 @@ export const useClvStats = () => {
   });
 };
 
+export const useLeagueEdgeScores = () => {
+  return useQuery({
+    queryKey: ["leagues", "edge-scores"],
+    queryFn: () => fetcher("/api/leagues/edge-scores"),
+    refetchInterval: 5 * 60 * 1000,
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

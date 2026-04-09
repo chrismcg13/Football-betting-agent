@@ -7,6 +7,8 @@ import {
   learningNarrativesTable,
   modelStateTable,
   agentConfigTable,
+  leagueEdgeScoresTable,
+  oddspapiLeagueCoverageTable,
 } from "@workspace/db";
 import {
   eq,
@@ -1043,6 +1045,50 @@ router.get("/dashboard/oddspapi-budget", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "Failed to get OddsPapi budget status");
     res.status(500).json({ error: "Failed to retrieve OddsPapi budget status" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/leagues/edge-scores — league edge scores with coverage info
+// ─────────────────────────────────────────────
+router.get("/leagues/edge-scores", async (_req, res) => {
+  try {
+    const [edgeRows, coverageRows] = await Promise.all([
+      db
+        .select()
+        .from(leagueEdgeScoresTable)
+        .orderBy(desc(leagueEdgeScoresTable.confidenceScore)),
+      db
+        .select()
+        .from(oddspapiLeagueCoverageTable),
+    ]);
+
+    const coverageMap = new Map(coverageRows.map((r) => [r.league, r]));
+
+    const rows = edgeRows.map((r) => {
+      const cov = coverageMap.get(r.league);
+      const leagueBonus = Math.max(-10, Math.min(10, (r.confidenceScore - 50) / 5));
+      return {
+        league: r.league,
+        marketType: r.marketType,
+        confidenceScore: r.confidenceScore,
+        leagueBonus: Math.round(leagueBonus * 10) / 10,
+        totalBets: r.totalBets,
+        wins: r.wins,
+        losses: r.losses,
+        roiPct: r.roiPct,
+        avgClv: r.avgClv,
+        avgEdge: r.avgEdge,
+        isSeedData: r.isSeedData === 1,
+        lastUpdated: r.lastUpdated,
+        oddsPapiCoverage: cov ? (cov.hasOdds === 1 ? "covered" : "no-coverage") : "unknown",
+      };
+    });
+
+    res.json({ rows, count: rows.length });
+  } catch (err) {
+    logger.error({ err }, "Failed to fetch league edge scores");
+    res.status(500).json({ error: "Failed to retrieve league edge scores" });
   }
 });
 

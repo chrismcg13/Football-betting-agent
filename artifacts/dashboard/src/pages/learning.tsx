@@ -112,6 +112,27 @@ const NARRATIVE_CONFIG: Record<
     border: "rgba(16,185,129,0.2)",
     badge: "bg-emerald-950 text-emerald-400 border-emerald-800",
   },
+  league_allocation: {
+    label: "League Reallocation",
+    icon: <TrendingUp className="h-4 w-4 text-yellow-400" />,
+    bg: "rgba(234,179,8,0.06)",
+    border: "rgba(234,179,8,0.2)",
+    badge: "bg-yellow-950 text-yellow-400 border-yellow-800",
+  },
+  league_discovery: {
+    label: "New League Discovery",
+    icon: <Zap className="h-4 w-4 text-yellow-400" />,
+    bg: "rgba(234,179,8,0.06)",
+    border: "rgba(234,179,8,0.2)",
+    badge: "bg-yellow-950 text-yellow-400 border-yellow-800",
+  },
+  strategy_shift: {
+    label: "Strategy Shift",
+    icon: <Activity className="h-4 w-4 text-orange-400" />,
+    bg: "rgba(249,115,22,0.06)",
+    border: "rgba(249,115,22,0.2)",
+    badge: "bg-orange-950 text-orange-400 border-orange-800",
+  },
 };
 
 function getNarrativeConfig(type: string) {

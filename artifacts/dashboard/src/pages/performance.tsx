@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { usePerformance, useBetsByLeague, useBetsByMarket, useModel, useBets, useClvStats } from "@/hooks/use-dashboard";
+import { usePerformance, useBetsByLeague, useBetsByMarket, useModel, useBets, useClvStats, useLeagueEdgeScores } from "@/hooks/use-dashboard";
 import { formatCurrency } from "@/lib/format";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
@@ -115,6 +115,7 @@ export default function Performance() {
   const { data: modelData, isLoading: modelLoading } = useModel();
   const { data: allBetsData } = useBets(1, 200, "all");
   const { data: clvData } = useClvStats();
+  const { data: leagueEdgeData } = useLeagueEdgeScores();
 
   const chartData = useMemo(() => {
     const arr = (perfData?.cumulativeProfit as any[]) ?? [];
@@ -582,6 +583,100 @@ export default function Performance() {
                 <span className="font-semibold text-red-400">{(clvData as any)?.contrarianCount ?? 0}</span> contrarian bets
               </span>
             </div>
+          </div>
+        </Card>
+      )}
+
+      {/* League Performance & Edge Map */}
+      {(leagueEdgeData as any)?.rows?.length > 0 && (
+        <Card>
+          <CardHead
+            title="League Performance & Edge Map"
+            sub="Dynamic league prioritisation — higher edge scores get more OddsPapi budget"
+          />
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b" style={{ borderColor: "#1e3a5f" }}>
+                  {["League", "Edge Score", "Bonus", "Bets", "W/L", "ROI", "Avg CLV", "OddsPapi", "Source"].map((h) => (
+                    <th key={h} className="px-4 py-3 text-left font-medium text-slate-400">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {((leagueEdgeData as any).rows as any[]).map((row: any, i: number) => {
+                  const isTop = i < 3;
+                  const roiColor = row.roiPct > 0 ? "#10b981" : row.roiPct < 0 ? "#ef4444" : "#94a3b8";
+                  const clvColor = row.avgClv > 0 ? "#10b981" : row.avgClv < 0 ? "#ef4444" : "#94a3b8";
+                  const bonusColor = row.leagueBonus > 0 ? "#10b981" : row.leagueBonus < 0 ? "#ef4444" : "#94a3b8";
+                  const coverageBadge =
+                    row.oddsPapiCoverage === "covered"
+                      ? { label: "Covered", bg: "#10b98122", color: "#10b981" }
+                      : row.oddsPapiCoverage === "no-coverage"
+                      ? { label: "No data", bg: "#ef444422", color: "#ef4444" }
+                      : { label: "Unknown", bg: "#33415533", color: "#64748b" };
+                  return (
+                    <tr
+                      key={`${row.league}-${i}`}
+                      className="border-b hover:bg-slate-800/30 transition-colors"
+                      style={{ borderColor: "#1e293b" }}
+                    >
+                      <td className="px-4 py-3 font-medium" style={{ color: isTop ? "#fbbf24" : "#e2e8f0" }}>
+                        {isTop && <span className="mr-1.5">★</span>}{row.league}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <div className="w-16 h-1.5 rounded-full bg-slate-700">
+                            <div
+                              className="h-1.5 rounded-full"
+                              style={{ width: `${row.confidenceScore}%`, background: isTop ? "#fbbf24" : "#3b82f6" }}
+                            />
+                          </div>
+                          <span className="text-white font-semibold">{row.confidenceScore.toFixed(0)}</span>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 font-semibold tabular-nums" style={{ color: bonusColor }}>
+                        {row.leagueBonus > 0 ? `+${row.leagueBonus}` : row.leagueBonus}
+                      </td>
+                      <td className="px-4 py-3 text-slate-300 tabular-nums">{row.totalBets}</td>
+                      <td className="px-4 py-3 text-slate-300 tabular-nums">
+                        {row.totalBets > 0 ? `${row.wins}W / ${row.losses}L` : "—"}
+                      </td>
+                      <td className="px-4 py-3 font-semibold tabular-nums" style={{ color: roiColor }}>
+                        {row.totalBets > 0 ? `${row.roiPct >= 0 ? "+" : ""}${row.roiPct.toFixed(1)}%` : "—"}
+                      </td>
+                      <td className="px-4 py-3 font-medium tabular-nums" style={{ color: clvColor }}>
+                        {row.avgClv !== 0 ? `${row.avgClv >= 0 ? "+" : ""}${row.avgClv.toFixed(2)}%` : "—"}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className="px-2 py-0.5 rounded-full text-xs font-medium"
+                          style={{ background: coverageBadge.bg, color: coverageBadge.color }}
+                        >
+                          {coverageBadge.label}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className="px-2 py-0.5 rounded text-xs"
+                          style={{
+                            background: row.isSeedData ? "#33415533" : "#7c3aed22",
+                            color: row.isSeedData ? "#64748b" : "#a78bfa",
+                          }}
+                        >
+                          {row.isSeedData ? "Seeded" : "Live"}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="px-5 py-3 border-t text-xs text-slate-500" style={{ borderColor: "#334155" }}>
+            <span className="text-yellow-500 mr-1">★</span> Top 3 leagues get priority OddsPapi budget.
+            After 20 settled bets, edge scores switch from seeded to live performance data.
+            Scores above 65 give a positive opportunity bonus; below 50 gives a penalty.
           </div>
         </Card>
       )}

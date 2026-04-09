@@ -3,6 +3,9 @@ import {
   paperBetsTable,
   matchesTable,
   modelStateTable,
+  leagueEdgeScoresTable,
+  learningNarrativesTable,
+  complianceLogsTable,
 } from "@workspace/db";
 import {
   inArray,
@@ -111,6 +114,196 @@ export async function calculateStrategyPerformance(): Promise<StrategyPerformanc
   };
 }
 
+// ===================== League edge score self-learning =====================
+
+export async function updateLeagueEdgeScores(): Promise<void> {
+  // Load all settled bets with league data
+  const settledBets = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      stake: paperBetsTable.stake,
+      settlementPnl: paperBetsTable.settlementPnl,
+      calculatedEdge: paperBetsTable.calculatedEdge,
+      clvPct: paperBetsTable.clvPct,
+      status: paperBetsTable.status,
+    })
+    .from(paperBetsTable)
+    .where(inArray(paperBetsTable.status, ["won", "lost"]));
+
+  if (settledBets.length === 0) {
+    logger.info("updateLeagueEdgeScores: no settled bets — using seed data only");
+    return;
+  }
+
+  const uniqueMatchIds = [...new Set(settledBets.map((b) => b.matchId))];
+  const matchRows = await db
+    .select({ id: matchesTable.id, league: matchesTable.league })
+    .from(matchesTable)
+    .where(inArray(matchesTable.id, uniqueMatchIds));
+  const leagueMap = new Map(matchRows.map((m) => [m.id, m.league]));
+
+  // Group by league (ALL market type for aggregate)
+  const groups = new Map<string, {
+    league: string;
+    bets: number;
+    wins: number;
+    totalStake: number;
+    totalPnl: number;
+    edgeSum: number;
+    clvSum: number;
+    clvCount: number;
+  }>();
+
+  for (const bet of settledBets) {
+    const league = leagueMap.get(bet.matchId) ?? null;
+    if (!league) continue;
+
+    const existing = groups.get(league) ?? {
+      league,
+      bets: 0,
+      wins: 0,
+      totalStake: 0,
+      totalPnl: 0,
+      edgeSum: 0,
+      clvSum: 0,
+      clvCount: 0,
+    };
+
+    existing.bets++;
+    if (bet.status === "won") existing.wins++;
+    existing.totalStake += Number(bet.stake);
+    existing.totalPnl += Number(bet.settlementPnl ?? 0);
+    existing.edgeSum += Number(bet.calculatedEdge ?? 0);
+    if (bet.clvPct !== null && bet.clvPct !== undefined) {
+      existing.clvSum += Number(bet.clvPct);
+      existing.clvCount++;
+    }
+    groups.set(league, existing);
+  }
+
+  // Load seed confidence scores for blending
+  const seedRows = await db
+    .select({ league: leagueEdgeScoresTable.league, confidenceScore: leagueEdgeScoresTable.confidenceScore })
+    .from(leagueEdgeScoresTable);
+  const seedScoreMap = new Map(seedRows.map((r) => [r.league, r.confidenceScore]));
+
+  for (const [league, g] of groups.entries()) {
+    if (g.bets < 3) continue; // Need at least 3 bets to start updating
+
+    const roi = g.totalStake > 0 ? (g.totalPnl / g.totalStake) * 100 : 0;
+    const winRate = g.bets > 0 ? g.wins / g.bets : 0;
+    const avgEdge = g.bets > 0 ? (g.edgeSum / g.bets) * 100 : 0;
+    const avgClv = g.clvCount > 0 ? g.clvSum / g.clvCount : 0;
+
+    // Sample reliability: 0 → 1 as bets grow from 0 → 20+
+    const sampleReliability = Math.min(g.bets / 20, 1);
+
+    // Actual performance score: 50 baseline + adjustments for ROI, CLV, win rate
+    // roi: each % of ROI adds/subtracts 2 pts
+    // avgClv: each % of CLV adds/subtracts 3 pts
+    // winRate: 50% = neutral, 60% = +2, 40% = -2
+    const actualScore = Math.max(0, Math.min(100,
+      50 +
+      (roi * 2) +
+      (avgClv * 3) +
+      ((winRate - 0.5) * 20)
+    ));
+
+    // Blend: seed score fades out as sample grows; actual score fades in
+    const seedScore = seedScoreMap.get(league) ?? 50;
+    const confidenceScore = seedScore * (1 - sampleReliability) + actualScore * sampleReliability;
+
+    const prevScore = seedScoreMap.get(league) ?? 50;
+    const scoreDelta = confidenceScore - prevScore;
+
+    // Update the DB
+    await db
+      .insert(leagueEdgeScoresTable)
+      .values({
+        league,
+        marketType: "ALL",
+        totalBets: g.bets,
+        wins: g.wins,
+        losses: g.bets - g.wins,
+        roiPct: Math.round(roi * 100) / 100,
+        avgClv: Math.round(avgClv * 100) / 100,
+        avgEdge: Math.round(avgEdge * 100) / 100,
+        confidenceScore: Math.round(confidenceScore * 10) / 10,
+        isSeedData: 0,
+        lastUpdated: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [leagueEdgeScoresTable.league, leagueEdgeScoresTable.marketType],
+        set: {
+          totalBets: g.bets,
+          wins: g.wins,
+          losses: g.bets - g.wins,
+          roiPct: Math.round(roi * 100) / 100,
+          avgClv: Math.round(avgClv * 100) / 100,
+          avgEdge: Math.round(avgEdge * 100) / 100,
+          confidenceScore: Math.round(confidenceScore * 10) / 10,
+          isSeedData: 0,
+          lastUpdated: new Date(),
+        },
+      });
+
+    // Generate narrative if score changed significantly
+    if (Math.abs(scoreDelta) >= 3 && g.bets >= 5) {
+      const direction = scoreDelta > 0 ? "promoted" : "demoted";
+      const clvStr = avgClv > 0 ? `+${avgClv.toFixed(1)}%` : `${avgClv.toFixed(1)}%`;
+      let narrativeText: string;
+
+      if (scoreDelta > 0) {
+        narrativeText = `League focus shifting: ${league} ${direction} — ${roi.toFixed(1)}% ROI and ${clvStr} CLV over ${g.bets} bets. Edge score: ${prevScore.toFixed(0)} → ${confidenceScore.toFixed(0)}. Allocating more OddsPapi budget here.`;
+      } else if (avgClv < 0) {
+        narrativeText = `League deprioritised: ${league} ${direction} — negative CLV of ${clvStr} suggests bookmaker odds are already efficient. Edge score: ${prevScore.toFixed(0)} → ${confidenceScore.toFixed(0)}. Reducing exposure.`;
+      } else {
+        narrativeText = `${league} edge score adjusted to ${confidenceScore.toFixed(0)} based on ${g.bets} settled bets (${roi.toFixed(1)}% ROI, ${clvStr} CLV).`;
+      }
+
+      await db.insert(learningNarrativesTable).values({
+        narrativeType: "league_allocation",
+        narrativeText,
+        relatedData: { league, prevScore, newScore: confidenceScore, bets: g.bets, roi, avgClv, avgEdge, winRate },
+        createdAt: new Date(),
+      });
+
+      await db.insert(complianceLogsTable).values({
+        actionType: "league_score_update",
+        details: { league, prevScore, newScore: confidenceScore, bets: g.bets, roi, avgClv, avgEdge, sampleReliability },
+        timestamp: new Date(),
+      });
+
+      logger.info({ league, prevScore, newScore: confidenceScore, bets: g.bets, roi, avgClv }, "League edge score updated");
+    }
+
+    // New discovery narrative
+    if (g.bets >= 5 && avgEdge > 0.10 && roi > 0) {
+      const hasPriorNarrative = (await db
+        .select({ id: learningNarrativesTable.id })
+        .from(learningNarrativesTable)
+        .where(and(
+          eq(learningNarrativesTable.narrativeType, "league_discovery"),
+          eq(learningNarrativesTable.narrativeText, `NEW_DISCOVERY_${league}`),
+        ))
+        .limit(1)).length > 0;
+
+      if (!hasPriorNarrative) {
+        await db.insert(learningNarrativesTable).values({
+          narrativeType: "league_discovery",
+          narrativeText: `New discovery: ${league} showing ${avgEdge.toFixed(1)}% average edge over ${g.bets} bets. This is the model's current strongest opportunity in this league.`,
+          relatedData: { league, avgEdge, bets: g.bets, roi },
+          createdAt: new Date(),
+        });
+      }
+    }
+  }
+
+  logger.info({ leaguesUpdated: groups.size }, "League edge scores updated from actual performance data");
+}
+
 // ===================== Main learning loop =====================
 
 let learningLoopRunning = false;
@@ -186,7 +379,11 @@ export async function runLearningLoop(): Promise<LearningLoopResult> {
       })
       .where(eq(modelStateTable.modelVersion, retrainResult.version));
 
-    // 4. Generate and persist narratives
+    // 4. Update league edge scores from actual performance data
+    logger.info("Updating league edge scores from settled bets");
+    await updateLeagueEdgeScores();
+
+    // 5. Generate and persist narratives
     logger.info("Generating learning narratives");
     await generateNarratives(
       retrainResult,

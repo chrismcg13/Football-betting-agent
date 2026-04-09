@@ -7,6 +7,7 @@ import {
   agentConfigTable,
   paperBetsTable,
   learningNarrativesTable,
+  leagueEdgeScoresTable,
 } from "@workspace/db";
 import { eq, desc, and, gte, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -100,6 +101,25 @@ async function getSegmentStats(
   const roi = totalStake > 0 ? (totalPnl / totalStake) * 100 : 0;
 
   return { betCount: finalBets.length, wins, losses, totalPnl, roi };
+}
+
+// ─── League edge score lookup ─────────────────────────────────────────────────
+
+const leagueEdgeCache = new Map<string, { score: number; fetchedAt: number }>();
+
+export async function getLeagueEdgeScore(league: string): Promise<number> {
+  const cached = leagueEdgeCache.get(league);
+  if (cached && Date.now() - cached.fetchedAt < 10 * 60 * 1000) {
+    return cached.score;
+  }
+  const rows = await db
+    .select({ confidenceScore: leagueEdgeScoresTable.confidenceScore })
+    .from(leagueEdgeScoresTable)
+    .where(eq(leagueEdgeScoresTable.league, league))
+    .limit(1);
+  const score = rows[0]?.confidenceScore ?? 50;
+  leagueEdgeCache.set(league, { score, fetchedAt: Date.now() });
+  return score;
 }
 
 // ─── Cold-market exclusion ────────────────────────────────────────────────────
@@ -211,8 +231,9 @@ function computeOpportunityScore(params: {
   segmentStats: SegmentStats;
   hotStreakBonus: number;
   isSynthetic: boolean;
+  leagueEdgeScore?: number;
 }): number {
-  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus, isSynthetic } = params;
+  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus, isSynthetic, leagueEdgeScore } = params;
 
   // 1. Edge size: (edge / 0.15) × 25, max 25
   const edgeScore = Math.min((edge / 0.15) * 25, 25);
@@ -234,10 +255,16 @@ function computeOpportunityScore(params: {
   if (backOdds >= 1.9 && backOdds <= 3.2) oddsScore = 15;
   else if ((backOdds >= 1.5 && backOdds < 1.9) || (backOdds > 3.2 && backOdds <= 4.5)) oddsScore = 8;
 
-  const raw = edgeScore + confidenceScore + segmentScore + reliabilityScore + oddsScore + hotStreakBonus;
+  // 6. League edge bonus: (leagueEdgeScore - 50) / 5, capped at ±10
+  //    Championship (+6), Eredivisie (+5.6), Ligue 1 (+4.4), EPL (-1), UCL (-2)
+  const leagueBonus = leagueEdgeScore !== undefined
+    ? Math.max(-10, Math.min(10, (leagueEdgeScore - 50) / 5))
+    : 0;
+
+  const raw = edgeScore + confidenceScore + segmentScore + reliabilityScore + oddsScore + hotStreakBonus + leagueBonus;
   const score = Math.min(Math.round(raw * 100) / 100, 100);
 
-  // KEY FIX: Synthetic-only odds are capped at 55 — below the 65 threshold
+  // Synthetic-only odds are capped at 55 — below the 65 threshold
   // This prevents placing bets based solely on our own Poisson model
   if (isSynthetic) return Math.min(score, 55);
 
@@ -590,6 +617,7 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       if (cold) continue;
 
       const streakBonus = await getHotStreakBonus(match.league, oddsRow.marketType, hotWeeks, hotMinBets, hotBonus);
+      const leagueEdgeScore = await getLeagueEdgeScore(match.league ?? "");
 
       const opportunityScore = computeOpportunityScore({
         edge,
@@ -598,9 +626,11 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         segmentStats,
         hotStreakBonus: streakBonus,
         isSynthetic,
+        leagueEdgeScore,
       });
 
-      // Synthetic-odds bets need 56+ (impossible — cap is 55) so only real-odds bets qualify at 48
+      // Synthetic-odds bets are capped at 55 (below the 65 min score — effectively blocked)
+      // Real-odds bets must meet the configured min_opportunity_score (default 65)
       const effectiveMinScore = isSynthetic ? 56 : minOppScore;
       const decision = opportunityScore >= effectiveMinScore ? "value_bet" : "skip_low_score";
 
