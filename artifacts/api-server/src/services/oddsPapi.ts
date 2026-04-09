@@ -21,6 +21,24 @@ const BASE_URL = "https://api.oddspapi.io/v4";
 const DAILY_CAP = 7;
 const MONTHLY_CAP = 240;
 
+// DB-driven cap override — reads agent_config key "oddspapi_daily_cap_override"
+// Format: {"cap": 15, "expires": "2026-04-09"}  (expires = ISO date, inclusive)
+async function getEffectiveDailyCap(): Promise<number> {
+  try {
+    const { agentConfigTable: act } = await import("@workspace/db");
+    const rows = await db.select().from(act).where(eq(act.key, "oddspapi_daily_cap_override")).limit(1);
+    if (rows.length > 0 && rows[0]) {
+      const data = JSON.parse(rows[0].value) as { cap?: number; expires?: string };
+      const today = new Date().toISOString().slice(0, 10);
+      if (data.cap && data.expires && data.expires >= today) {
+        logger.info({ cap: data.cap, expires: data.expires }, "OddsPapi daily cap override active");
+        return data.cap;
+      }
+    }
+  } catch { /* fall through to default */ }
+  return DAILY_CAP;
+}
+
 // ─── Market ID mapping ─────────────────────────────────────────────────────────
 
 const MARKET_IDS: Record<string, number> = {
@@ -91,12 +109,13 @@ async function trackOddspapiCall(endpoint: string, count = 1): Promise<void> {
 async function canMakeOddspapiRequest(needed = 1): Promise<boolean> {
   const key = process.env.ODDSPAPI_KEY;
   if (!key) return false;
-  const [daily, monthly] = await Promise.all([
+  const [daily, monthly, effectiveCap] = await Promise.all([
     getOddspapiUsageToday(),
     getOddspapiUsageThisMonth(),
+    getEffectiveDailyCap(),
   ]);
-  if (daily + needed > DAILY_CAP) {
-    logger.warn({ daily, cap: DAILY_CAP }, "OddsPapi daily budget exhausted");
+  if (daily + needed > effectiveCap) {
+    logger.warn({ daily, cap: effectiveCap }, "OddsPapi daily budget exhausted");
     return false;
   }
   if (monthly + needed > MONTHLY_CAP) {
@@ -607,10 +626,10 @@ export async function prefetchAndStoreOddsPapiOdds(
   if (!key) return cache;
 
   // Check remaining daily budget (leave at least 1 for enhancement)
-  const daily = await getOddspapiUsageToday();
-  const remaining = DAILY_CAP - daily;
+  const [daily, effectiveCap] = await Promise.all([getOddspapiUsageToday(), getEffectiveDailyCap()]);
+  const remaining = effectiveCap - daily;
   if (remaining <= 1) {
-    logger.info({ daily, cap: DAILY_CAP }, "OddsPapi budget too low for pre-fetch — skipping");
+    logger.info({ daily, cap: effectiveCap }, "OddsPapi budget too low for pre-fetch — skipping");
     return cache;
   }
 

@@ -303,16 +303,47 @@ function generateSyntheticOdds(featureMap: Record<string, number>): SyntheticOdd
 
 // ─── Model probability dispatcher ────────────────────────────────────────────
 
+// Pre-process feature map: substitute xg_proxy for missing goal averages
+// This prevents Poisson models from using lambda=0 when goals data isn't yet loaded
+function enrichFeaturesWithXgProxy(raw: Record<string, number>): Record<string, number> {
+  const m = { ...raw };
+  if ((m["home_goals_scored_avg"] ?? 0) < 0.3) {
+    m["home_goals_scored_avg"] = m["home_xg_proxy"] ?? 1.2;
+  }
+  if ((m["away_goals_scored_avg"] ?? 0) < 0.3) {
+    m["away_goals_scored_avg"] = m["away_xg_proxy"] ?? 1.1;
+  }
+  if ((m["home_goals_conceded_avg"] ?? 0) < 0.3) {
+    m["home_goals_conceded_avg"] = m["away_xg_proxy"] ?? 1.1;
+  }
+  if ((m["away_goals_conceded_avg"] ?? 0) < 0.3) {
+    m["away_goals_conceded_avg"] = m["home_xg_proxy"] ?? 1.2;
+  }
+  // Derive over25/btts rates from xg-based lambda if still at default 0.5
+  const homeLambda = m["home_goals_scored_avg"]!;
+  const awayLambda = m["away_goals_scored_avg"]!;
+  const totalLambda = homeLambda + awayLambda;
+  // Only override if still at exactly 0.5 (unset default) — don't override real data
+  if (m["home_over25_rate"] === 0.5 && m["away_over25_rate"] === 0.5) {
+    const under25 = poissonCdf(totalLambda, 2);
+    m["home_over25_rate"] = Math.max(0.1, Math.min(0.9, 1 - under25));
+    m["away_over25_rate"] = m["home_over25_rate"];
+  }
+  return m;
+}
+
 function getModelProbability(
   marketType: string,
   selectionName: string,
   featureMap: Record<string, number>,
 ): number | null {
-  const outcomePreds = predictOutcome(featureMap);
-  const bttsPreds = predictBtts(featureMap);
-  const ouPreds = predictOverUnder(featureMap);
-  const cardsPreds = predictCards(featureMap);
-  const cornersPreds = predictCorners(featureMap);
+  // Substitute xg_proxy for zero goal averages before feeding models
+  const enriched = enrichFeaturesWithXgProxy(featureMap);
+  const outcomePreds = predictOutcome(enriched);
+  const bttsPreds = predictBtts(enriched);
+  const ouPreds = predictOverUnder(enriched);
+  const cardsPreds = predictCards(enriched);
+  const cornersPreds = predictCorners(enriched);
 
   if (marketType === "MATCH_ODDS" && outcomePreds) {
     if (selectionName === "Home") return outcomePreds.home;
@@ -328,9 +359,9 @@ function getModelProbability(
     if (selectionName.startsWith("Under")) return ouPreds.under;
   }
   if (marketType === "OVER_UNDER_15" && ouPreds) {
-    // Adjust for 1.5 line using goals averages
-    const homeGoals = featureMap["home_goals_scored_avg"] ?? 1.4;
-    const awayGoals = featureMap["away_goals_scored_avg"] ?? 1.1;
+    // enriched already has xg_proxy substituted for zero goals
+    const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
+    const awayGoals = enriched["away_goals_scored_avg"] ?? 1.1;
     const lambda = homeGoals + awayGoals;
     const p0 = Math.exp(-lambda);
     const p1 = lambda * Math.exp(-lambda);
@@ -339,8 +370,8 @@ function getModelProbability(
     if (selectionName.startsWith("Under")) return under15;
   }
   if (marketType === "OVER_UNDER_35" && ouPreds) {
-    const homeGoals = featureMap["home_goals_scored_avg"] ?? 1.4;
-    const awayGoals = featureMap["away_goals_scored_avg"] ?? 1.1;
+    const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
+    const awayGoals = enriched["away_goals_scored_avg"] ?? 1.1;
     const lambda = homeGoals + awayGoals;
     const under35 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 3)));
     if (selectionName.startsWith("Over")) return 1 - under35;
@@ -569,7 +600,9 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         isSynthetic,
       });
 
-      const decision = opportunityScore >= minOppScore ? "value_bet" : "skip_low_score";
+      // Synthetic-odds bets need 56+ (impossible — cap is 55) so only real-odds bets qualify at 48
+      const effectiveMinScore = isSynthetic ? 56 : minOppScore;
+      const decision = opportunityScore >= effectiveMinScore ? "value_bet" : "skip_low_score";
 
       await db.insert(complianceLogsTable).values({
         actionType: "value_detection_evaluation",
@@ -584,7 +617,7 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
           modelProbability: modelProb,
           calculatedEdge: edge,
           opportunityScore,
-          minOppScore,
+          minOppScore: effectiveMinScore,
           segmentStats,
           hotStreakBonus: streakBonus,
           decision,
@@ -595,7 +628,7 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         timestamp: new Date(),
       });
 
-      if (opportunityScore >= minOppScore) {
+      if (opportunityScore >= effectiveMinScore) {
         byMarketType[oddsRow.marketType] = (byMarketType[oddsRow.marketType] ?? 0) + 1;
         valueBets.push({
           matchId: match.id,

@@ -176,7 +176,7 @@ export async function runTradingCycle(): Promise<{
 
     // 5a. Pre-fetch OddsPapi Match Odds for mapped matches into odds_snapshots
     //     so value detection treats those as real (not synthetic) odds
-    const oddsPapiCache: OddsPapiValidationCache = await prefetchAndStoreOddsPapiOdds(earliest, latest, 4);
+    const oddsPapiCache: OddsPapiValidationCache = await prefetchAndStoreOddsPapiOdds(earliest, latest, 12);
     logger.info({ matchesPrefetched: oddsPapiCache.size }, "OddsPapi pre-fetch done — running value detection");
 
     const valueSummary = await detectValueBets();
@@ -231,6 +231,21 @@ export async function runTradingCycle(): Promise<{
               bet.selectionName,
               bet.backOdds,
             );
+          }
+
+          // Only enhance when Pinnacle data is available — no-data runs reduce score by ~10 pts
+          if (!validation.hasPinnacleData) {
+            logger.info(
+              {
+                match: `${bet.homeTeam} vs ${bet.awayTeam}`,
+                market: bet.marketType,
+                selection: bet.selectionName,
+                baseScore: bet.opportunityScore,
+                reason: "no Pinnacle data — keeping base score",
+              },
+              "OddsPapi: skipping enhancement (no data)",
+            );
+            return { bet, validation, enhancedScore: null };
           }
 
           const enhanced = computeEnhancedOpportunityScore({

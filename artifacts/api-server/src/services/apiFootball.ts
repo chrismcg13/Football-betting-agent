@@ -208,10 +208,10 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
     return [];
   }
 
-  // The API-Football free plan only reliably serves fixtures for yesterday/today/tomorrow.
-  // Fetch ALL fixtures across that window and match our DB entries against the combined pool.
+  // Fetch ALL fixtures across the trading window (1h-96h = today through today+4 days)
+  // to ensure weekend EPL/La Liga/Bundesliga fixtures are covered.
   const allApiFixtures: ApiFixture[] = [];
-  const offsets = [-1, 0, 1, 2]; // yesterday, today, tomorrow, day-after (max free coverage)
+  const offsets = [-1, 0, 1, 2, 3, 4]; // yesterday through today+4 days
 
   for (const offset of offsets) {
     if (!(await canMakeRequest())) break;
