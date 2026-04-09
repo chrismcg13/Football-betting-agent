@@ -616,13 +616,27 @@ export async function prefetchAndStoreOddsPapiOdds(
 
   const limit = Math.min(maxFetches, remaining - 1);
 
-  // Get upcoming mapped matches in the betting window
-  const mappedRows = await db
+  // League priority — top tier markets most likely to have real OddsPapi coverage
+  const LEAGUE_PRIORITY: Record<string, number> = {
+    "UEFA Champions League": 0,
+    "UEFA Europa League": 1,
+    "Premier League": 2,
+    "Primera Division": 3,
+    "Bundesliga": 4,
+    "Serie A": 5,
+    "Ligue 1": 6,
+    "Primeira Liga": 7,
+  };
+
+  // Fetch all mapped matches in the window, then sort by league priority
+  const allRows = await db
     .select({
       matchId: oddspapiFixtureMapTable.matchId,
       fixtureId: oddspapiFixtureMapTable.oddspapiFixtureId,
       homeTeam: matchesTable.homeTeam,
       awayTeam: matchesTable.awayTeam,
+      league: matchesTable.league,
+      kickoffTime: matchesTable.kickoffTime,
     })
     .from(oddspapiFixtureMapTable)
     .innerJoin(matchesTable, eq(oddspapiFixtureMapTable.matchId, matchesTable.id))
@@ -632,16 +646,32 @@ export async function prefetchAndStoreOddsPapiOdds(
         gte(matchesTable.kickoffTime, earliestKickoff),
         lte(matchesTable.kickoffTime, latestKickoff),
       ),
-    )
-    .limit(limit);
+    );
+
+  // Sort: top-priority leagues first, then earliest kickoff within same tier
+  const mappedRows = allRows
+    .sort((a, b) => {
+      const pa = LEAGUE_PRIORITY[a.league ?? ""] ?? 99;
+      const pb = LEAGUE_PRIORITY[b.league ?? ""] ?? 99;
+      if (pa !== pb) return pa - pb;
+      return (a.kickoffTime?.getTime() ?? 0) - (b.kickoffTime?.getTime() ?? 0);
+    })
+    .slice(0, limit);
 
   if (mappedRows.length === 0) return cache;
 
   logger.info({ count: mappedRows.length, limit }, "Pre-fetching OddsPapi Match Odds for value detection");
 
-  for (const { matchId, fixtureId, homeTeam, awayTeam } of mappedRows) {
+  for (let i = 0; i < mappedRows.length; i++) {
+    const row = mappedRows[i];
+    if (!row) break;
+    const { matchId, fixtureId, homeTeam, awayTeam } = row;
+
     const marketId = MARKET_IDS["MATCH_ODDS"];
     if (!marketId || !(await canMakeOddspapiRequest(1))) break;
+
+    // Rate-limit guard: OddsPapi enforces ~1 req/s — wait between calls
+    if (i > 0) await new Promise((r) => setTimeout(r, 1200));
 
     const rawData = await fetchOddsPapi<RawOddsResponse>(
       "/odds",
