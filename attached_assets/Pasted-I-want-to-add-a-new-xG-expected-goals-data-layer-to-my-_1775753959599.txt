@@ -1,0 +1,112 @@
+I want to add a new xG (expected goals) data layer to my existing football betting agent. 
+This is an ADDITIVE change only — do not modify any existing cron jobs, betting logic, 
+Kelly staking, CLV tracking, or existing DB tables. Only add new code.
+
+CONTEXT ABOUT EXISTING ARCHITECTURE:
+- TypeScript/Node/React on Replit
+- SQLite database with tables for fixtures, features, bets, odds, results
+- 8 existing cron jobs (ingestion, features, trading, learning, odds fetch, lineups, etc.)
+- Models: match result, BTTS, over/under goals, cards, corners
+- Betfair Delayed API for paper trading
+- The features cron runs at 6am UTC daily
+
+WHAT TO BUILD:
+
+1. NEW UTILITY: src/utils/understat.ts
+   - Function: fetchUnderstatLeagueData(league: string, year: number)
+   - Fetches https://understat.com/league/{league}/{year}
+   - Parses the embedded JavaScript variable "datesData" from the HTML 
+     using regex: /var datesData\s*=\s*JSON\.parse\('(.+?)'\)/
+   - Decodes the escaped JSON string (replace \\x sequences)
+   - Returns typed array of MatchXGData: { id, home_team, away_team, 
+     home_xG, away_xG, home_goals, away_goals, datetime, isResult }
+   - League name mapping: EPL→"EPL", Bundesliga→"Bundesliga", 
+     La Liga→"La_liga", Serie A→"Serie_A", Ligue 1→"Ligue_1"
+   - Add a 2-second delay between requests to be respectful of the site
+   - Error handling: if fetch fails, log warning and return empty array
+
+2. NEW DB MIGRATION: Add these tables if they don't exist
+   
+   CREATE TABLE IF NOT EXISTS xg_match_data (
+     id TEXT PRIMARY KEY,
+     home_team TEXT NOT NULL,
+     away_team TEXT NOT NULL,
+     league TEXT NOT NULL,
+     season TEXT NOT NULL,
+     match_date TEXT NOT NULL,
+     home_xg REAL,
+     away_xg REAL,
+     home_goals INTEGER,
+     away_goals INTEGER,
+     is_result BOOLEAN DEFAULT 0,
+     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+   );
+
+   CREATE TABLE IF NOT EXISTS team_xg_rolling (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     team_name TEXT NOT NULL,
+     league TEXT NOT NULL,
+     computed_at DATETIME NOT NULL,
+     xg_for_5 REAL,
+     xg_against_5 REAL,
+     xg_diff_5 REAL,
+     goals_vs_xg_diff REAL,
+     xg_momentum REAL,
+     matches_counted INTEGER
+   );
+   CREATE INDEX IF NOT EXISTS idx_team_xg_rolling_team 
+     ON team_xg_rolling(team_name, computed_at DESC);
+
+3. NEW SERVICE: src/services/xgIngestionService.ts
+   - Function: runXGIngestion()
+   - For each of these leagues: EPL, Bundesliga, La_liga, Serie_A, Ligue_1
+   - Fetch current season data (2024) AND previous season (2023)
+   - Upsert into xg_match_data (skip if id already exists and is_result=1)
+   - After upsert, call computeTeamXGRolling() for all teams seen
+   
+   - Function: computeTeamXGRolling()
+   - For each unique team in xg_match_data:
+     - Get last 10 completed matches (is_result=1), ordered by match_date DESC
+     - Compute for last 5 matches:
+       - xg_for_5: avg xG created
+       - xg_against_5: avg xG conceded
+       - xg_diff_5: xg_for_5 - xg_against_5
+       - goals_vs_xg_diff: (actual goals scored - xG scored) over last 5 
+         (positive = overperforming, negative = underperforming)
+       - xg_momentum: compare xg_diff_5 to xg_diff from matches 6-10 
+         (positive = improving, negative = declining)
+     - Insert new row into team_xg_rolling with current timestamp
+   
+   - Export function: getTeamXGStats(teamName: string) 
+     → returns most recent team_xg_rolling row for that team (fuzzy name match)
+
+4. NEW CRON JOB: Add to existing cron scheduler
+   - Name: "xg-ingestion"  
+   - Schedule: "0 5 * * *" (5am UTC, runs before features cron at 6am)
+   - Calls: runXGIngestion()
+   - Log start/completion with record counts
+
+5. NEW API ENDPOINT: GET /api/xg/teams
+   - Returns all teams from team_xg_rolling with their latest stats
+   - Include: team_name, league, xg_for_5, xg_against_5, xg_diff_5, 
+     goals_vs_xg_diff, xg_momentum, computed_at
+   - Sort by abs(goals_vs_xg_diff) DESC to surface the biggest 
+     over/underperformers first (these are the most interesting for betting)
+
+6. NEW DASHBOARD WIDGET: Add to existing React frontend
+   - Small table or card grid titled "xG Intelligence"
+   - Show top 10 teams by biggest gap between actual form and xG form
+   - Columns: Team | League | xG Diff (5) | Goals vs xG | Momentum
+   - Colour code: red for overperforming (regression risk), green for 
+     underperforming (value opportunity)
+   - Add a small info tooltip: "Underperforming xG = value bet territory"
+
+IMPORTANT CONSTRAINTS:
+- Do not modify any existing files except to add the new cron job registration 
+  and the dashboard widget to the frontend
+- Do not change any existing DB table schemas
+- Add proper TypeScript types for all new code
+- The xG ingestion should fail gracefully — if Understat is unreachable, 
+  log a warning and exit cleanly without crashing the process
+- Add a manual trigger endpoint POST /api/xg/refresh so you can trigger 
+  ingestion manually without waiting for the cron

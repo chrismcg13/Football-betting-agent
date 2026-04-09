@@ -11,6 +11,7 @@ import {
   fetchAndStoreOddsForAllUpcoming,
   fetchTeamStatsForUpcomingMatches,
 } from "./apiFootball";
+import { runXGIngestion } from "./xgIngestionService";
 import {
   runOddspapiFixtureMapping,
   getOddspapiFixtureId,
@@ -524,12 +525,30 @@ export function startScheduler(): void {
       });
   }, { timezone: "UTC" });
   logger.info("Learning loop scheduler active — daily at 03:00 UTC");
+
+  // xG ingestion: daily at 05:00 UTC (runs before feature cron at 06:00)
+  cron.schedule("0 5 * * *", () => {
+    logger.info("xG ingestion triggered by scheduler");
+    void runXGIngestion()
+      .then(({ inserted, updated }) => {
+        logger.info({ inserted, updated }, "Scheduled xG ingestion complete");
+      })
+      .catch((err) => {
+        logger.warn({ err }, "Scheduled xG ingestion failed — non-fatal, continuing");
+      });
+  }, { timezone: "UTC" });
+  logger.info("xG ingestion scheduler active — daily at 05:00 UTC");
 }
 
 // ===================== Manual triggers (for API routes) =====================
 
 export async function runIngestionNow(): Promise<void> {
   return safeRunIngestion();
+}
+
+export async function runXGIngestionNow(): Promise<{ inserted: number; updated: number }> {
+  logger.info("Manual xG ingestion triggered");
+  return runXGIngestion();
 }
 
 export async function runFeaturesNow(): Promise<

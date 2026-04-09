@@ -179,6 +179,44 @@ export async function runMigrations() {
       ON CONFLICT (key) DO UPDATE SET value = '50', updated_at = NOW()
     `);
 
+    // ── xG data layer tables (additive — do not modify existing tables)
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS xg_match_data (
+        id TEXT PRIMARY KEY,
+        home_team TEXT NOT NULL,
+        away_team TEXT NOT NULL,
+        league TEXT NOT NULL,
+        season TEXT NOT NULL,
+        match_date TEXT NOT NULL,
+        home_xg REAL,
+        away_xg REAL,
+        home_goals INTEGER,
+        away_goals INTEGER,
+        is_result BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS team_xg_rolling (
+        id SERIAL PRIMARY KEY,
+        team_name TEXT NOT NULL,
+        league TEXT NOT NULL,
+        computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        xg_for_5 REAL,
+        xg_against_5 REAL,
+        xg_diff_5 REAL,
+        goals_vs_xg_diff REAL,
+        xg_momentum REAL,
+        matches_counted INTEGER
+      )
+    `);
+
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_team_xg_rolling_team
+        ON team_xg_rolling(team_name, computed_at DESC)
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

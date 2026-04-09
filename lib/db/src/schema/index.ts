@@ -10,3 +10,5 @@ export * from "./apiUsage";
 export * from "./oddspapiFixtureMap";
 export * from "./leagueEdgeScores";
 export * from "./oddspapiLeagueCoverage";
+export * from "./xgMatchData";
+export * from "./teamXgRolling";

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useSummary, useBets, useNarratives, usePerformance, useClvStats } from "@/hooks/use-dashboard";
+import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useXGTeams } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime } from "@/lib/format";
 import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
@@ -117,6 +117,7 @@ export default function Overview() {
   const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 50, "all");
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
+  const { data: xgData, isLoading: loadingXg } = useXGTeams();
 
   const upcomingBets = useMemo(() => {
     const bets = (allBetsData?.bets as any[]) ?? [];
@@ -501,6 +502,128 @@ export default function Overview() {
             })}
           </div>
         )}
+      </div>
+
+      {/* xG Intelligence */}
+      <div>
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <h3 className="text-base font-semibold text-white">xG Intelligence</h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Teams whose actual goals diverge most from expected goals (xG) over last 5 matches
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-400 font-medium">
+              ● Underperforming = value territory
+            </span>
+            <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-red-950 text-red-400 font-medium">
+              ● Overperforming = regression risk
+            </span>
+          </div>
+        </div>
+
+        <div
+          className="rounded-xl border overflow-hidden"
+          style={{ background: "#1e293b", borderColor: "#334155" }}
+        >
+          {loadingXg ? (
+            <div className="p-5 space-y-2">
+              {[...Array(5)].map((_, i) => (
+                <div key={i} className="h-10 rounded animate-pulse" style={{ background: "#0f172a" }} />
+              ))}
+            </div>
+          ) : !xgData?.teams?.length ? (
+            <div className="px-5 py-10 text-center">
+              <p className="text-sm text-slate-500">No xG data yet.</p>
+              <p className="text-xs text-slate-600 mt-1">
+                First ingestion runs daily at 05:00 UTC — or trigger manually via POST /api/xg/refresh
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b" style={{ borderColor: "#334155" }}>
+                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">Team</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">League</th>
+                    <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500 group relative">
+                      <span
+                        title="Average xG created minus xG conceded over last 5 matches. Positive = creating more chances than conceding."
+                        className="cursor-help border-b border-dotted border-slate-600"
+                      >
+                        xG Diff (5)
+                      </span>
+                    </th>
+                    <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500">
+                      <span
+                        title="Actual goals scored minus xG created over last 5 matches. Positive = overperforming (regression risk). Negative = underperforming (value opportunity)."
+                        className="cursor-help border-b border-dotted border-slate-600"
+                      >
+                        Goals vs xG
+                      </span>
+                    </th>
+                    <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500">
+                      <span
+                        title="Change in xG diff compared to the 5 matches before that. Positive = improving, negative = declining."
+                        className="cursor-help border-b border-dotted border-slate-600"
+                      >
+                        Momentum
+                      </span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(xgData.teams as any[]).slice(0, 10).map((team: any, i: number) => {
+                    const goalsVsXg = Number(team.goalsVsXgDiff ?? team.goals_vs_xg_diff ?? 0);
+                    const xgDiff = Number(team.xgDiff5 ?? team.xg_diff_5 ?? 0);
+                    const momentum = Number(team.xgMomentum ?? team.xg_momentum ?? 0);
+                    const isOverperforming = goalsVsXg > 0.1;
+                    const isUnderperforming = goalsVsXg < -0.1;
+                    return (
+                      <tr
+                        key={i}
+                        className="border-b hover:bg-slate-700/20 transition-colors"
+                        style={{ borderColor: "#1e293b" }}
+                      >
+                        <td className="px-4 py-3 font-medium text-white text-sm">
+                          {team.teamName ?? team.team_name}
+                        </td>
+                        <td className="px-4 py-3 text-slate-400 text-xs">
+                          {team.league}
+                        </td>
+                        <td className="px-4 py-3 text-right font-mono text-xs">
+                          <span className={xgDiff >= 0 ? "text-emerald-400" : "text-red-400"}>
+                            {xgDiff >= 0 ? "+" : ""}{xgDiff.toFixed(2)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <span
+                            className={cn(
+                              "inline-flex items-center gap-1 font-mono text-xs px-2 py-0.5 rounded-full font-semibold",
+                              isOverperforming
+                                ? "bg-red-950 text-red-400"
+                                : isUnderperforming
+                                ? "bg-emerald-950 text-emerald-400"
+                                : "bg-slate-800 text-slate-400",
+                            )}
+                          >
+                            {goalsVsXg >= 0 ? "+" : ""}{goalsVsXg.toFixed(2)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-right font-mono text-xs">
+                          <span className={momentum >= 0 ? "text-emerald-400" : "text-slate-500"}>
+                            {momentum >= 0 ? "↑" : "↓"} {Math.abs(momentum).toFixed(2)}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

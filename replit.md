@@ -196,6 +196,17 @@ Computes 17 ML features per upcoming match:
 | API-Football odds | Every 8 hours UTC | Ingests real odds from Bet365/Bwin/1xBet |
 | API-Football team stats | Every 12 hours UTC | Fetches cards/corners/shots stats |
 | Learning loop | Daily at 03:00 UTC | Generates narratives, retrains model |
+| xG ingestion | Daily at 05:00 UTC | Derives team xG rolling stats from internal feature engine |
+
+## xG Intelligence Layer
+
+Sourced from the **internal feature engine** (not Understat — their HTML no longer embeds data):
+- `home_xg_proxy` and `away_xg_proxy` features computed for every upcoming fixture in the `features` table
+- `xgIngestionService.ts` reads these features, populates `xg_match_data` and `team_xg_rolling`
+- Dashboard widget: sortable table of top teams by xG Diff (5-match rolling), Goals vs xG, Momentum
+- Trigger manually: `POST /api/xg/refresh`
+- View data: `GET /api/xg/teams`
+- Populated: 131+ teams across Premier League, Bundesliga, La Liga, Serie A, Ligue 1, etc.
 
 ## Risk Management
 

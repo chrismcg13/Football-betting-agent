@@ -35,7 +35,9 @@ import {
   runTradingCycle,
   getSchedulerStatus,
   runOddspapiMappingNow,
+  runXGIngestionNow,
 } from "../services/scheduler";
+import { getAllTeamXGStats } from "../services/xgIngestionService";
 import {
   getOddspapiStatus,
 } from "../services/oddsPapi";
@@ -1106,5 +1108,31 @@ router.post("/oddspapi/map-fixtures", async (_req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// GET /api/xg/teams — latest xG rolling stats for all teams
+// ─────────────────────────────────────────────
+router.get("/xg/teams", async (_req, res) => {
+  try {
+    const teams = await getAllTeamXGStats();
+    res.json({ count: teams.length, teams });
+  } catch (err) {
+    logger.error({ err }, "xG teams fetch failed");
+    res.status(500).json({ message: "Failed to fetch xG team stats" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/xg/refresh — manually trigger xG ingestion
+// ─────────────────────────────────────────────
+router.post("/xg/refresh", async (_req, res) => {
+  logger.info("Manual xG ingestion triggered via API");
+  try {
+    const result = await runXGIngestionNow();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "Manual xG ingestion failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
 
 export default router;

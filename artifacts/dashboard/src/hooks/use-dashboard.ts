@@ -134,6 +134,15 @@ export const useLeagueEdgeScores = () => {
   });
 };
 
+export const useXGTeams = () => {
+  return useQuery({
+    queryKey: ["xg", "teams"],
+    queryFn: () => fetcher("/api/xg/teams"),
+    refetchInterval: 5 * 60 * 1000,
+    retry: 2,
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({
