@@ -12,7 +12,15 @@ import Viability from "@/pages/viability";
 import Learning from "@/pages/learning";
 import Compliance from "@/pages/compliance";
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 0,
+      refetchOnMount: true,
+      refetchOnWindowFocus: true,
+    },
+  },
+});
 
 function Router() {
   return (

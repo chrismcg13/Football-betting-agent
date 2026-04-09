@@ -27,7 +27,10 @@ export const usePerformance = () => {
 export const useBets = (page = 1, limit = 20, status = "all") => {
   return useQuery({
     queryKey: ["dashboard", "bets", { page, limit, status }],
-    queryFn: () => fetcher(`/api/dashboard/bets?page=${page}&limit=${limit}&status=${status}`),
+    queryFn: () => fetcher(`/api/dashboard/bets?page=${page}&limit=${limit}&status=${status}&t=${Date.now()}`),
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
   });
 };
 
