@@ -20,7 +20,7 @@ import {
   logDailyBudgetSummary,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { db, agentConfigTable, leagueEdgeScoresTable } from "@workspace/db";
+import { db, agentConfigTable, leagueEdgeScoresTable, paperBetsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 
 // ===================== Status tracking =====================
@@ -314,10 +314,25 @@ export async function runTradingCycle(): Promise<{
     const preCorrelation: BetCandidate[] = [];
     const bankroll = await getBankroll();
 
+    // Load existing pending bets to prevent duplicates on same match+market+selection
+    const existingPending = await db
+      .select({ matchId: paperBetsTable.matchId, marketType: paperBetsTable.marketType, selectionName: paperBetsTable.selectionName })
+      .from(paperBetsTable)
+      .where(eq(paperBetsTable.status, "pending"));
+    const pendingKeys = new Set(existingPending.map((b) => `${b.matchId}|${b.marketType}|${b.selectionName}`));
+
     for (const entry of allEntries) {
       if (preCorrelation.length >= maxPerCycle) break;
 
       const { bet, effectiveScore, validation } = entry;
+
+      // Skip if we already have a pending bet on this match+market+selection
+      const dupKey = `${bet.matchId}|${bet.marketType}|${bet.selectionName}`;
+      if (pendingKeys.has(dupKey)) {
+        logger.debug({ matchId: bet.matchId, market: bet.marketType, selection: bet.selectionName }, "Skipping duplicate — pending bet already exists");
+        continue;
+      }
+
       const isContrarian = validation?.isContrarian ?? false;
       const scoreThreshold = isContrarian ? contrarinaThreshold : minScore;
 
