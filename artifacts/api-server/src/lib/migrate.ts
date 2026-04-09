@@ -148,6 +148,26 @@ export async function runMigrations() {
       `);
     }
 
+    // ── One-time cleanup: remove synthetic test bets that were generated
+    //    during early development (odds exactly 2.1721, selection "Home").
+    //    Safe to run repeatedly — no-op once already cleaned.
+    const cleaned = await db.execute(sql`
+      DELETE FROM paper_bets
+      WHERE ABS(odds_at_placement - 2.1721) < 0.0001
+        AND selection_name = 'Home'
+        AND market_type = 'MATCH_ODDS'
+    `);
+    const deletedCount = (cleaned as any).rowCount ?? 0;
+    if (deletedCount > 0) {
+      logger.info({ deletedCount }, "Startup cleanup: removed synthetic 2.1721 test bets");
+    }
+
+    // ── Ensure bankroll is set to 500 (reset if it was never updated from the default)
+    await db.execute(sql`
+      UPDATE agent_config SET value = '500', updated_at = NOW()
+      WHERE key = 'bankroll' AND value::numeric < 500
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
