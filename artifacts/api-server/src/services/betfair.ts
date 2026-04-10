@@ -2,7 +2,8 @@ import axios, { type AxiosInstance } from "axios";
 import { logger } from "../lib/logger";
 
 const IDENTITY_URL = "https://identitysso.betfair.com/api/login";
-const BETTING_BASE = "https://api.betfair.com/exchange/betting/rest/v1.0";
+const BETFAIR_PROXY_URL = process.env["BETFAIR_PROXY_URL"] ?? "https://api.betfair.com";
+const BETTING_BASE = `${BETFAIR_PROXY_URL}/exchange/betting/rest/v1.0`;
 const SOCCER_EVENT_TYPE_ID = "1";
 
 const MAX_RPS = 5;

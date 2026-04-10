@@ -41,3 +41,4 @@ channel = "stable-25_05"
 [userenv]
 
 [userenv.shared]
+BETFAIR_PROXY_URL = "http://209.38.164.154:3001"
