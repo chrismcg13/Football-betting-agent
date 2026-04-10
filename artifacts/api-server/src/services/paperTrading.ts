@@ -234,16 +234,21 @@ export async function placePaperBet(
     return logReject(`Calculated stake £${stake} is below minimum £2`);
   }
 
-  // ── Exposure-based risk gate (replaces hard concurrent-bet cap) ──────────
-  const maxExposurePct = Number(
-    (await getConfigValue("max_exposure_pct")) ?? "0.20",
-  );
-  const currentExposure = await getTotalPendingExposure();
-  const maxExposure = bankroll * maxExposurePct;
-  if (currentExposure + stake > maxExposure) {
-    return logReject(
-      `Exposure limit breached: current £${currentExposure.toFixed(2)} + new stake £${stake.toFixed(2)} = £${(currentExposure + stake).toFixed(2)} would exceed ${(maxExposurePct * 100).toFixed(0)}% of bankroll £${maxExposure.toFixed(2)}`,
+  // ── Exposure-based risk gate ─────────────────────────────────────────────
+  // In paper_mode this check is skipped to maximise data collection speed.
+  // When paper_mode=false it reinstates automatically for live trading.
+  const paperMode = (await getConfigValue("paper_mode")) === "true";
+  if (!paperMode) {
+    const maxExposurePct = Number(
+      (await getConfigValue("max_exposure_pct")) ?? "0.20",
     );
+    const currentExposure = await getTotalPendingExposure();
+    const maxExposure = bankroll * maxExposurePct;
+    if (currentExposure + stake > maxExposure) {
+      return logReject(
+        `Exposure limit breached: current £${currentExposure.toFixed(2)} + new stake £${stake.toFixed(2)} = £${(currentExposure + stake).toFixed(2)} would exceed ${(maxExposurePct * 100).toFixed(0)}% of bankroll £${maxExposure.toFixed(2)}`,
+      );
+    }
   }
 
   const potentialProfit =

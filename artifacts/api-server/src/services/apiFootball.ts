@@ -31,6 +31,8 @@ const LEAGUE_IDS: Record<string, number> = {
   "Campeonato Brasileiro Série A": 71,
   "Championship": 40,
   "Brasileirão": 71,
+  "UEFA Champions League": 2,
+  "Champions League": 2,
 };
 
 // Bookmaker IDs: 8=Bet365, 6=Bwin, 11=1xBet

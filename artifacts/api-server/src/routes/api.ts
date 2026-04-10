@@ -79,7 +79,10 @@ async function getSettledBetsStats() {
 // GET /api/dashboard/summary
 // ─────────────────────────────────────────────
 router.get("/dashboard/summary", async (req, res) => {
-  const [bankroll, agentStatus, allSettled, allPending] = await Promise.all([
+  const todayStartUtc = new Date();
+  todayStartUtc.setUTCHours(0, 0, 0, 0);
+
+  const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, paperModeRow] = await Promise.all([
     getBankroll(),
     getAgentStatus(),
     getSettledBetsStats(),
@@ -91,7 +94,19 @@ router.get("/dashboard/summary", async (req, res) => {
       })
       .from(paperBetsTable)
       .where(eq(paperBetsTable.status, "pending")),
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(paperBetsTable)
+      .where(gte(paperBetsTable.placedAt, todayStartUtc)),
+    db
+      .select({ value: agentConfigTable.value })
+      .from(agentConfigTable)
+      .where(eq(agentConfigTable.key, "paper_mode"))
+      .limit(1),
   ]);
+
+  const betsToday = betsTodayRows[0]?.count ?? 0;
+  const paperMode = paperModeRow[0]?.value === "true";
 
   const wins = allSettled.filter((b) => b.status === "won").length;
   const losses = allSettled.filter((b) => b.status === "lost").length;
@@ -150,10 +165,13 @@ router.get("/dashboard/summary", async (req, res) => {
         : 0,
     agentStatus,
     totalBets: total,
+    settledBets: wins + losses,
     wins,
     losses,
     voids,
     pending: allPending.length,
+    betsToday,
+    paperMode,
     winPercentage:
       wins + losses > 0
         ? Math.round((wins / (wins + losses)) * 10000) / 100
@@ -838,6 +856,7 @@ const ALLOWED_CONFIG_KEYS = new Set([
   "weekly_loss_limit_pct",
   "bankroll_floor",
   "max_exposure_pct",
+  "paper_mode",
 ]);
 
 router.post("/agent/config", async (req, res) => {
@@ -848,6 +867,19 @@ router.post("/agent/config", async (req, res) => {
   for (const [key, value] of Object.entries(updates)) {
     if (!ALLOWED_CONFIG_KEYS.has(key)) {
       rejected.push(key);
+      continue;
+    }
+
+    // Boolean string keys (paper_mode) don't go through numeric validation
+    if (key === "paper_mode") {
+      const strVal = String(value).toLowerCase();
+      if (strVal !== "true" && strVal !== "false") {
+        rejected.push(`${key} (must be "true" or "false")`);
+        continue;
+      }
+      const previous = await getConfigValue(key);
+      await setConfigValue(key, strVal);
+      changed[key] = { from: previous, to: strVal };
       continue;
     }
 

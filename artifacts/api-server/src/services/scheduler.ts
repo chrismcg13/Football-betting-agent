@@ -169,10 +169,10 @@ export async function runTradingCycle(): Promise<{
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
     }
 
-    // 5. Detect value bets for matches kicking off in 1h–96h
+    // 5. Detect value bets for matches kicking off in 1h–168h (full week)
     const now = new Date();
     const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);
-    const latest   = new Date(now.getTime() + 96 * 60 * 60 * 1000);
+    const latest   = new Date(now.getTime() + 168 * 60 * 60 * 1000);
 
     // 5a. Pre-fetch OddsPapi Match Odds for mapped matches into odds_snapshots
     //     so value detection treats those as real (not synthetic) odds
@@ -191,7 +191,7 @@ export async function runTradingCycle(): Promise<{
         realOdds: valueSummary.realOddsCount,
         syntheticOdds: valueSummary.syntheticOddsCount,
         byMarketType: valueSummary.byMarketType,
-        window: "1h-96h before kickoff",
+        window: "1h-168h before kickoff",
       },
       "Value detection complete for trading cycle",
     );
@@ -303,11 +303,18 @@ export async function runTradingCycle(): Promise<{
     // 8. Load config + diversity limits
     const configRows = await db.select().from(agentConfigTable);
     const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
-    const maxPerCycle = Number(cfg.max_bets_per_cycle ?? "5");
-    const maxPerLeague = Number(cfg.max_bets_per_market ?? "2"); // using market key as proxy
-    const maxPerMarket = Number(cfg.max_bets_per_market ?? "2");
-    const minScore = Number(cfg.min_opportunity_score ?? "65");
+    const paperMode = cfg.paper_mode === "true";
+    // In paper mode all diversity caps are lifted to maximise data collection.
+    // When paper_mode=false these reinstate automatically for live trading.
+    const maxPerCycle  = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_cycle  ?? "5");
+    const maxPerLeague = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_league ?? "2");
+    const maxPerMarket = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_market ?? "2");
+    const minScore = Number(cfg.min_opportunity_score ?? "50");
     const contrarinaThreshold = 75; // contrarian bets need higher bar
+
+    if (paperMode) {
+      logger.info("Paper mode ACTIVE — diversity caps removed (max bets/cycle, per-league, per-market all unlimited)");
+    }
 
     // 9. Apply diversity rules
     const leagueCounts: Record<string, number> = {};
@@ -475,9 +482,21 @@ export function startScheduler(): void {
   cron.schedule("0 */6 * * *", () => { void safeRunFeatures(); }, { timezone: "UTC" });
   logger.info("Feature scheduler active — every 6 hours UTC");
 
-  // Trading cycle: every 15 minutes
-  cron.schedule("*/15 * * * *", () => { void runTradingCycle(); }, { timezone: "UTC" });
-  logger.info("Trading cycle scheduler active — every 15 minutes");
+  // Trading cycle: every 10 minutes (increased frequency for paper data collection)
+  cron.schedule("*/10 * * * *", () => { void runTradingCycle(); }, { timezone: "UTC" });
+  logger.info("Trading cycle scheduler active — every 10 minutes");
+
+  // Dedicated settlement check: every 5 minutes — faster feedback loop
+  cron.schedule("*/5 * * * *", () => {
+    void settleBets()
+      .then((r) => {
+        if (r.settled > 0) logger.info(r, "Settlement cron: bets settled");
+      })
+      .catch((err) => {
+        logger.warn({ err }, "Settlement cron failed — non-fatal");
+      });
+  }, { timezone: "UTC" });
+  logger.info("Settlement cron active — every 5 minutes");
 
   // API-Football: fetch real odds every 8 hours (biggest budget item ~30 req)
   cron.schedule("0 */8 * * *", () => {

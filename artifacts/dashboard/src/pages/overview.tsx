@@ -150,12 +150,66 @@ export default function Overview() {
   const bankroll = summary?.currentBankroll ?? 0;
   const startingBankroll = 500;
   const bankrollDiff = bankroll - startingBankroll;
+  const settledBets = (summary as any)?.settledBets ?? 0;
+  const betsToday = (summary as any)?.betsToday ?? 0;
+  const paperMode = (summary as any)?.paperMode ?? false;
+  const SIGNIFICANCE_TARGET = 500;
+  const significancePct = Math.min((settledBets / SIGNIFICANCE_TARGET) * 100, 100);
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
-      <div>
-        <h2 className="text-2xl font-bold text-white tracking-tight">Overview</h2>
-        <p className="text-sm text-slate-500 mt-1">Mission control for the paper trading agent.</p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h2 className="text-2xl font-bold text-white tracking-tight">Overview</h2>
+          <p className="text-sm text-slate-500 mt-1">Mission control for the paper trading agent.</p>
+        </div>
+        <div className="flex items-center gap-3 flex-wrap">
+          {paperMode && (
+            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400 text-xs font-semibold tracking-wide">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+              PAPER MODE: ON
+            </span>
+          )}
+          {!loadingSummary && (
+            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-semibold">
+              {betsToday} bets placed today
+            </span>
+          )}
+          {!loadingSummary && (
+            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-semibold">
+              {(summary as any)?.pending ?? 0} open
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Bets to significance progress bar */}
+      <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-4">
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <p className="text-sm font-semibold text-white">Bets to Statistical Significance</p>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {settledBets >= SIGNIFICANCE_TARGET
+                ? "Target reached — results are statistically robust for Demo Day."
+                : `${SIGNIFICANCE_TARGET - settledBets} more settled bets needed for Demo Day (April 23).`}
+            </p>
+          </div>
+          <div className="text-right shrink-0">
+            <p className="text-lg font-mono font-bold text-white">
+              {settledBets} <span className="text-slate-500 font-normal text-sm">/ {SIGNIFICANCE_TARGET}</span>
+            </p>
+            <p className="text-xs text-slate-500">{significancePct.toFixed(1)}% complete</p>
+          </div>
+        </div>
+        <div className="h-2 w-full rounded-full bg-slate-700/60 overflow-hidden">
+          <div
+            className={cn(
+              "h-full rounded-full transition-all duration-500",
+              significancePct >= 100 ? "bg-emerald-500" : significancePct >= 50 ? "bg-amber-500" : "bg-blue-500",
+            )}
+            style={{ width: `${Math.max(significancePct, 0.5)}%` }}
+          />
+        </div>
       </div>
 
       {/* 6-Card Stats Grid */}
