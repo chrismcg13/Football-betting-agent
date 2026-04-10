@@ -16,7 +16,7 @@ run = "pnpm --filter @workspace/api-server run dev"
 deploymentTarget = "vm"
 
 [services.production.build]
-args = ["pnpm", "--filter", "@workspace/api-server", "run", "build"]
+args = ["sh", "-c", "pnpm --filter @workspace/api-server run build && pnpm --filter @workspace/dashboard run build"]
 
 [services.production.build.env]
 NODE_ENV = "production"

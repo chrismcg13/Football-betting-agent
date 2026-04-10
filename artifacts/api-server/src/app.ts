@@ -6,6 +6,9 @@ import express, {
 } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 import router from "./routes";
 import { logger } from "./lib/logger";
 import { db, complianceLogsTable } from "@workspace/db";
@@ -37,6 +40,28 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
 });
 
 app.use("/api", router);
+
+// ─── Dashboard static files ───────────────────────────────────────────────────
+// Serve the pre-built dashboard SPA at /dashboard/* — works in both autoscale
+// and always-on VM deployment modes where Replit's static handler may not fire.
+//
+// Path strategy: use import.meta.url for an absolute reference that works
+// regardless of the working directory the server was started from.
+// In the bundled dist/index.mjs:
+//   import.meta.url → .../artifacts/api-server/dist/index.mjs
+//   ../../..         → workspace root
+//   + artifacts/dashboard/dist/public → correct target
+const _serverDir = path.dirname(fileURLToPath(import.meta.url));
+const dashboardPublicDir = path.resolve(_serverDir, "../../..", "artifacts/dashboard/dist/public");
+if (fs.existsSync(dashboardPublicDir)) {
+  app.use("/dashboard", express.static(dashboardPublicDir));
+  app.get(/^\/dashboard(\/.*)?$/, (_req: Request, res: Response) => {
+    res.sendFile(path.join(dashboardPublicDir, "index.html"));
+  });
+  logger.info({ dir: dashboardPublicDir }, "Dashboard static files registered");
+} else {
+  logger.warn({ dir: dashboardPublicDir }, "Dashboard dist not found — dashboard will not be served (run dashboard build first)");
+}
 
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 app.use((_req: Request, res: Response) => {
