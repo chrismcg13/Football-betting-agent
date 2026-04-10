@@ -407,6 +407,7 @@ router.get("/dashboard/bets", async (req, res) => {
   const { page, limit, offset } = paginate(
     req.query["page"],
     req.query["limit"],
+    500,
   );
   const statusFilter = String(req.query["status"] ?? "all");
 

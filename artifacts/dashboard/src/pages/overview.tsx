@@ -114,14 +114,14 @@ const TOOLTIP_STYLE = {
 export default function Overview() {
   const { data: summary, isLoading: loadingSummary } = useSummary();
   const { data: clvStats } = useClvStats();
-  const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 200, "all");
+  const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 500, "all");
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
   const { data: xgData, isLoading: loadingXg } = useXGTeams();
 
   const upcomingBets = useMemo(() => {
     const bets = (allBetsData?.bets as any[]) ?? [];
-    return bets.filter((b: any) => b.status === "pending").slice(0, 20);
+    return bets.filter((b: any) => b.status === "pending");
   }, [allBetsData]);
 
   const recentResults = useMemo(() => {
@@ -382,11 +382,18 @@ export default function Overview() {
           className="rounded-xl border overflow-hidden"
           style={{ background: "#1e293b", borderColor: "#334155" }}
         >
-          <div className="px-5 py-4 border-b" style={{ borderColor: "#334155" }}>
-            <h3 className="text-sm font-semibold text-white">Upcoming Bets</h3>
-            <p className="text-xs text-slate-500 mt-0.5">Pending paper bets awaiting settlement</p>
+          <div className="px-5 py-4 border-b flex items-center justify-between" style={{ borderColor: "#334155" }}>
+            <div>
+              <h3 className="text-sm font-semibold text-white">Upcoming Bets</h3>
+              <p className="text-xs text-slate-500 mt-0.5">Pending paper bets awaiting settlement</p>
+            </div>
+            {upcomingBets.length > 0 && (
+              <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded-full bg-slate-700 text-slate-300">
+                {upcomingBets.length}
+              </span>
+            )}
           </div>
-          <div className="divide-y" style={{ divideColor: "#334155" }}>
+          <div className="divide-y overflow-y-auto" style={{ divideColor: "#334155", maxHeight: "480px" }}>
             {loadingBets ? (
               <div className="p-5 space-y-3">
                 {[...Array(4)].map((_, i) => (
