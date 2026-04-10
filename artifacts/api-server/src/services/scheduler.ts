@@ -538,6 +538,25 @@ export function startScheduler(): void {
       });
   }, { timezone: "UTC" });
   logger.info("xG ingestion scheduler active — daily at 05:00 UTC");
+
+  // Startup trading cycle: fire 3 minutes after server start so any restart
+  // doesn't leave the cycle dormant for up to 15 minutes.
+  // Also refresh odds first so the cycle has fresh market data.
+  setTimeout(() => {
+    logger.info("Startup odds refresh triggered (post-restart warmup)");
+    void fetchAndStoreOddsForAllUpcoming()
+      .then(() => {
+        logger.info("Startup odds refresh complete — running trading cycle");
+        return runTradingCycle();
+      })
+      .then((result) => {
+        logger.info(result, "Startup trading cycle complete");
+      })
+      .catch((err) => {
+        logger.warn({ err }, "Startup warmup sequence failed — non-fatal, cron will retry");
+      });
+  }, 3 * 60 * 1000); // 3 minutes after start
+  logger.info("Startup warmup scheduled — odds refresh + trading cycle in 3 min");
 }
 
 // ===================== Manual triggers (for API routes) =====================
