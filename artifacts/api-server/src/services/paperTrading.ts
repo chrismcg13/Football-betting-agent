@@ -37,12 +37,12 @@ export async function getBankroll(): Promise<number> {
 
 // ===================== Bet placement pre-checks =====================
 
-async function getOpenBetsCount(): Promise<number> {
+async function getTotalPendingExposure(): Promise<number> {
   const result = await db
-    .select({ count: sql<number>`count(*)::int` })
+    .select({ total: sql<number>`COALESCE(SUM(${paperBetsTable.stake}::numeric), 0)` })
     .from(paperBetsTable)
     .where(eq(paperBetsTable.status, "pending"));
-  return result[0]?.count ?? 0;
+  return Number(result[0]?.total ?? 0);
 }
 
 async function getTodaysLoss(): Promise<number> {
@@ -182,16 +182,6 @@ export async function placePaperBet(
     return logReject(`Agent is not running (status: ${status})`);
   }
 
-  const [maxConcurrent, openCount] = await Promise.all([
-    getConfigValue("max_concurrent_bets").then((v) => Number(v ?? "10")),
-    getOpenBetsCount(),
-  ]);
-  if (openCount >= maxConcurrent) {
-    return logReject(
-      `Max concurrent bets reached (${openCount}/${maxConcurrent})`,
-    );
-  }
-
   const bankroll = await getBankroll();
   const bankrollFloor = Number(
     (await getConfigValue("bankroll_floor")) ?? "200",
@@ -242,6 +232,18 @@ export async function placePaperBet(
 
   if (stake < 2) {
     return logReject(`Calculated stake £${stake} is below minimum £2`);
+  }
+
+  // ── Exposure-based risk gate (replaces hard concurrent-bet cap) ──────────
+  const maxExposurePct = Number(
+    (await getConfigValue("max_exposure_pct")) ?? "0.20",
+  );
+  const currentExposure = await getTotalPendingExposure();
+  const maxExposure = bankroll * maxExposurePct;
+  if (currentExposure + stake > maxExposure) {
+    return logReject(
+      `Exposure limit breached: current £${currentExposure.toFixed(2)} + new stake £${stake.toFixed(2)} = £${(currentExposure + stake).toFixed(2)} would exceed ${(maxExposurePct * 100).toFixed(0)}% of bankroll £${maxExposure.toFixed(2)}`,
+    );
   }
 
   const potentialProfit =
@@ -409,11 +411,17 @@ export async function settleBets(): Promise<SettlementResult> {
     const now = new Date();
 
     // ── CLV: compare placement odds vs closing odds proxy ──────────────
+    // NOTE: True CLV should use Pinnacle closing odds. The odds_snapshots table
+    // does not have a separate Pinnacle source — it stores API-Football real odds
+    // (1xBet / Bet365). We use the latest snapshot as the best available proxy.
+    // Pinnacle odds at placement time are stored in bet.pinnacleOdds but those
+    // are opening prices, not closing prices. Until a Pinnacle closing-odds fetch
+    // is added to the settlement flow, this remains a market-proxy CLV.
     let closingOddsProxy: number | null = null;
     let clvPct: number | null = null;
     try {
       const latestSnapshot = await db
-        .select({ odds: oddsSnapshotsTable.odds })
+        .select({ backOdds: oddsSnapshotsTable.backOdds })
         .from(oddsSnapshotsTable)
         .where(
           and(
@@ -424,11 +432,15 @@ export async function settleBets(): Promise<SettlementResult> {
         )
         .orderBy(desc(oddsSnapshotsTable.snapshotTime))
         .limit(1);
-      if (latestSnapshot[0]) {
-        closingOddsProxy = Number(latestSnapshot[0].odds);
+      if (latestSnapshot[0]?.backOdds) {
+        closingOddsProxy = Number(latestSnapshot[0].backOdds);
         if (closingOddsProxy > 1) {
           clvPct = ((odds - closingOddsProxy) / closingOddsProxy) * 100;
           clvPct = Math.round(clvPct * 1000) / 1000;
+          logger.info(
+            { betId: bet.id, placementOdds: odds, closingOddsProxy, clvPct },
+            "CLV calculated (proxy: latest API-Football snapshot — not Pinnacle closing odds)",
+          );
         }
       }
     } catch (_err) {

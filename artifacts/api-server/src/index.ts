@@ -169,6 +169,22 @@ async function main() {
       },
       "=== BET_AGENT_OS ready ===",
     );
+
+    // 8. Self-ping keepalive — prevents idle shutdown by calling the health
+    //    endpoint every 5 minutes. Must start inside the listen callback so
+    //    the server is guaranteed to be accepting connections first.
+    const KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
+    const keepaliveUrl = `http://localhost:${port}/api/health`;
+    setInterval(() => {
+      fetch(keepaliveUrl)
+        .then((r) => {
+          if (!r.ok) logger.warn({ status: r.status }, "Keepalive ping returned non-OK");
+        })
+        .catch((err) => {
+          logger.warn({ err }, "Keepalive ping failed — server may be under load");
+        });
+    }, KEEPALIVE_INTERVAL_MS);
+    logger.info({ intervalMs: KEEPALIVE_INTERVAL_MS }, "Keepalive ping active — GET /api/health every 5 min");
   });
 }
 

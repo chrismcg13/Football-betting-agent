@@ -114,14 +114,14 @@ const TOOLTIP_STYLE = {
 export default function Overview() {
   const { data: summary, isLoading: loadingSummary } = useSummary();
   const { data: clvStats } = useClvStats();
-  const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 50, "all");
+  const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 200, "all");
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
   const { data: xgData, isLoading: loadingXg } = useXGTeams();
 
   const upcomingBets = useMemo(() => {
     const bets = (allBetsData?.bets as any[]) ?? [];
-    return bets.filter((b: any) => b.status === "pending").slice(0, 10);
+    return bets.filter((b: any) => b.status === "pending").slice(0, 20);
   }, [allBetsData]);
 
   const recentResults = useMemo(() => {

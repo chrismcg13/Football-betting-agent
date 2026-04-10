@@ -837,7 +837,7 @@ const ALLOWED_CONFIG_KEYS = new Set([
   "daily_loss_limit_pct",
   "weekly_loss_limit_pct",
   "bankroll_floor",
-  "max_concurrent_bets",
+  "max_exposure_pct",
 ]);
 
 router.post("/agent/config", async (req, res) => {
