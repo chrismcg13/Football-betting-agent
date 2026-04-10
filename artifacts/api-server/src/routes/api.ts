@@ -305,7 +305,7 @@ router.get("/dashboard/bets/by-league", async (req, res) => {
       settlementPnl: paperBetsTable.settlementPnl,
     })
     .from(paperBetsTable)
-    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
     .where(inArray(paperBetsTable.status, ["won", "lost"]));
 
   const groups = new Map<
@@ -314,7 +314,7 @@ router.get("/dashboard/bets/by-league", async (req, res) => {
   >();
 
   for (const bet of settled) {
-    const key = bet.league;
+    const key = bet.league ?? "Unknown";
     const entry = groups.get(key) ?? {
       wins: 0,
       losses: 0,
@@ -444,7 +444,7 @@ router.get("/dashboard/bets", async (req, res) => {
         oddsSource: paperBetsTable.oddsSource,
       })
       .from(paperBetsTable)
-      .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+      .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
       .where(baseConditions)
       .orderBy(desc(paperBetsTable.placedAt))
       .limit(limit)

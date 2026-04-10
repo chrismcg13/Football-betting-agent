@@ -361,14 +361,16 @@ export default function Bets() {
                         {formatRelativeTime(bet.placedAt)}
                       </td>
                       <td className="py-3 px-3 font-medium text-white whitespace-nowrap">
-                        {bet.homeTeam} vs {bet.awayTeam}
+                        {bet.homeTeam && bet.awayTeam
+                          ? `${bet.homeTeam} vs ${bet.awayTeam}`
+                          : <span className="text-slate-500 italic">Match #{bet.matchId} (data pending)</span>}
                         {bet.homeScore != null && bet.awayScore != null && (
                           <span className="ml-2 text-xs text-slate-500 font-mono">
                             {bet.homeScore}–{bet.awayScore}
                           </span>
                         )}
                       </td>
-                      <td className="py-3 px-3 text-xs text-slate-400">{bet.league}</td>
+                      <td className="py-3 px-3 text-xs text-slate-400">{bet.league ?? "—"}</td>
                       <td className="py-3 px-3">
                         <span className="text-[11px] font-mono px-1.5 py-0.5 rounded text-slate-300" style={{ background: "#0f172a" }}>
                           {bet.marketType}
