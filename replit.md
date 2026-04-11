@@ -29,14 +29,20 @@ See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and pa
 All tables for the AI betting agent:
 
 1. **matches** — Football matches with team names, league, kickoff time, scores, Betfair event ID
-2. **odds_snapshots** — Market odds snapshots from Betfair delayed API (back/lay odds)
-3. **features** — Computed ML features per match (team form, H2H stats, API-Football extras)
+2. **odds_snapshots** — Market odds snapshots from all bookmakers (back/lay odds)
+3. **features** — Computed ML features per match (team form, H2H stats, API-Football extras, market consensus/spread)
 4. **paper_bets** — Simulated bets with edge, model probability, odds source, settlement tracking
 5. **model_state** — Versioned model snapshots with accuracy, calibration, feature importances
 6. **learning_narratives** — AI-generated narratives about strategy shifts and model improvements
-7. **compliance_logs** — Full audit trail of all agent decisions and actions
+7. **compliance_logs** — Full audit trail of all agent decisions and actions (including line movements)
 8. **agent_config** — Runtime configuration (bankroll, stake limits, edge thresholds, status, diversity rules)
-9. **api_usage** — Daily API-Football request budget tracker (cap: 90 req/day)
+9. **api_usage** — Daily API-Football request budget tracker (cap: 75,000 req/day)
+10. **oddspapi_fixture_map** — Maps internal match IDs to OddsPapi fixture IDs for Pinnacle validation
+11. **league_edge_scores** — Dynamic league+market edge confidence scores (seeded, updated by learning loop)
+12. **oddspapi_league_coverage** — Cache of which leagues OddsPapi covers (avoids wasted requests)
+13. **xg_match_data** — Expected goals data from StatsBomb/Fotmob (ingested daily)
+14. **team_xg_rolling** — Rolling xG averages per team (used as ML features)
+15. **odds_history** — Per-bookmaker odds snapshots with line movement tracking (>5% triggers compliance log)
 
 ## Agent Config Defaults (21 keys)
 
@@ -61,7 +67,7 @@ All tables for the AI betting agent:
 | odds_sweet_spot_max | 3.2 |
 | synthetic_odds_score_cap | 55 |
 | cards_corners_kelly_multiplier | 0.7 |
-| api_football_daily_budget | 90 |
+| api_football_daily_budget | 75000 |
 | data_source | football_data_fallback |
 
 ## API Routes

@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget } from "@/hooks/use-dashboard";
+import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget, useScanStats } from "@/hooks/use-dashboard";
 import {
   BarChart2, BookOpen, Brain, FileText, Play, Pause, Shield, Square, Target, Zap, Database,
 } from "lucide-react";
@@ -39,6 +39,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const agentControl = useAgentControl();
   const { data: budget } = useApiBudget();
   const { data: oddsBudget } = useOddspapiBudget();
+  const { data: scanStats } = useScanStats();
 
   const navItems = [
     { href: "/", label: "Overview", icon: Target },
@@ -97,7 +98,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
               <div className="flex items-center justify-between mb-1">
                 <p className="text-[9px] uppercase tracking-wider text-slate-500 font-semibold">API Budget</p>
                 <p className="text-[10px] font-mono text-slate-500">
-                  {budget ? `${budget.used}/${budget.cap}` : "—/90"}
+                  {budget ? `${budget.used.toLocaleString()}/${budget.cap.toLocaleString()}` : "—/75,000"}
                 </p>
               </div>
               <div className="w-full rounded-full h-1 bg-slate-800">
@@ -143,6 +144,25 @@ export function Layout({ children }: { children: React.ReactNode }) {
               <p className="text-[9px] text-slate-600 mt-0.5">
                 {oddsBudget ? `${oddsBudget.monthCount ?? 0}/${oddsBudget.monthlyCap ?? 240} this month` : "—/240 this month"}
               </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Scan stats */}
+        <div className="px-4 py-2 border-b" style={{ borderColor: "#334155" }}>
+          <p className="text-[9px] uppercase tracking-wider text-slate-500 font-semibold mb-1.5">Market Coverage</p>
+          <div className="grid grid-cols-3 gap-1">
+            <div className="text-center">
+              <p className="text-[11px] font-mono font-bold text-emerald-400">{scanStats?.leaguesActive ?? "—"}</p>
+              <p className="text-[8px] text-slate-600">Leagues</p>
+            </div>
+            <div className="text-center">
+              <p className="text-[11px] font-mono font-bold text-blue-400">{scanStats?.marketsPerFixture ?? "—"}</p>
+              <p className="text-[8px] text-slate-600">Mkts/Match</p>
+            </div>
+            <div className="text-center">
+              <p className="text-[11px] font-mono font-bold text-amber-400">{scanStats?.lineMovementsToday ?? "—"}</p>
+              <p className="text-[8px] text-slate-600">Movements</p>
             </div>
           </div>
         </div>

@@ -134,6 +134,22 @@ export const useLeagueEdgeScores = () => {
   });
 };
 
+export const useScanStats = () => {
+  return useQuery({
+    queryKey: ["dashboard", "scan-stats"],
+    queryFn: () => fetcher("/api/dashboard/scan-stats"),
+    refetchInterval: 2 * 60 * 1000,
+  });
+};
+
+export const useLineMovements = () => {
+  return useQuery({
+    queryKey: ["dashboard", "line-movements"],
+    queryFn: () => fetcher("/api/dashboard/line-movements"),
+    refetchInterval: 5 * 60 * 1000,
+  });
+};
+
 export const useXGTeams = () => {
   return useQuery({
     queryKey: ["xg", "teams"],

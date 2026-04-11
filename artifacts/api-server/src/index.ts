@@ -3,7 +3,7 @@ import { logger } from "./lib/logger";
 import { runMigrations } from "./lib/migrate";
 import { startScheduler, runIngestionNow, runFeaturesNow } from "./services/scheduler";
 import { loadLatestModel, bootstrapModels } from "./services/predictionEngine";
-import { db, complianceLogsTable, matchesTable } from "@workspace/db";
+import { db, complianceLogsTable, matchesTable, leagueEdgeScoresTable } from "@workspace/db";
 import { sql, count } from "drizzle-orm";
 
 const rawPort = process.env["PORT"];
@@ -111,6 +111,84 @@ async function logAgentStarted(details: Record<string, unknown>): Promise<void> 
   }
 }
 
+// ─── League edge score seeding ────────────────────────────────────────────────
+// Seeds initial edge scores for leagues not yet in the DB.
+// The learning loop will refine these dynamically as bets settle.
+
+const INITIAL_LEAGUE_EDGE_SCORES: Record<string, number> = {
+  // Tier 1 — heavily scrutinised, lower edge
+  "Premier League": 60,
+  "Bundesliga": 62,
+  "La Liga": 62,
+  "Primera Division": 62,
+  "Serie A": 63,
+  "Ligue 1": 65,
+  "Eredivisie": 68,
+  "Primeira Liga": 69,
+  "Campeonato Brasileiro Série A": 72,
+  "Brasileirão": 72,
+  "Championship": 70,
+  "EFL Championship": 70,
+  "UEFA Champions League": 55,
+  "Champions League": 55,
+  "Europa League": 60,
+  "UEFA Europa League": 60,
+  // Tier 2 — less scrutinised, higher edge opportunity
+  "Ligue 2": 82,
+  "2. Bundesliga": 82,
+  "Serie B": 82,
+  "Segunda División": 82,
+  "La Liga 2": 82,
+  "Segunda Division": 82,
+  // Tier 3 — smaller top flights
+  "Scottish Premiership": 78,
+  "Belgian Pro League": 70,
+  "Swiss Super League": 70,
+  "Austrian Football Bundesliga": 70,
+  "Danish Superliga": 70,
+  "Norwegian Eliteserien": 70,
+  "Swedish Allsvenskan": 70,
+  "Süper Lig": 72,
+  "Super League Greece": 72,
+  "Super League 1": 72,
+};
+
+async function seedLeagueEdgeScores(): Promise<void> {
+  try {
+    const existing = await db
+      .select({ league: leagueEdgeScoresTable.league })
+      .from(leagueEdgeScoresTable);
+    const existingLeagues = new Set(existing.map((r) => r.league));
+
+    const toSeed = Object.entries(INITIAL_LEAGUE_EDGE_SCORES).filter(
+      ([league]) => !existingLeagues.has(league),
+    );
+
+    if (toSeed.length > 0) {
+      await db.insert(leagueEdgeScoresTable).values(
+        toSeed.map(([league, score]) => ({
+          league,
+          marketType: "ALL",
+          totalBets: 0,
+          wins: 0,
+          losses: 0,
+          roiPct: 0,
+          avgClv: 0,
+          avgEdge: 0,
+          confidenceScore: score,
+          isSeedData: 1,
+          lastUpdated: new Date(),
+        })),
+      );
+      logger.info({ count: toSeed.length, leagues: toSeed.map(([l]) => l) }, "Seeded league edge scores for new leagues");
+    } else {
+      logger.debug("All league edge scores already present — no seeding needed");
+    }
+  } catch (err) {
+    logger.warn({ err }, "League edge score seeding failed — non-fatal");
+  }
+}
+
 // ─── Main startup sequence ────────────────────────────────────────────────────
 
 async function main() {
@@ -131,10 +209,13 @@ async function main() {
     process.exit(1);
   }
 
-  // 3. Start all cron jobs
+  // 3. Seed league edge scores for expanded league coverage
+  await seedLeagueEdgeScores();
+
+  // 4. Start all cron jobs
   startScheduler();
 
-  // 4. Load or bootstrap the ML model
+  // 5. Load or bootstrap the ML model
   const modelLoaded = await loadLatestModel();
   if (!modelLoaded) {
     logger.info("No existing model found — triggering bootstrap training in background");

@@ -232,8 +232,10 @@ function computeOpportunityScore(params: {
   hotStreakBonus: number;
   isSynthetic: boolean;
   leagueEdgeScore?: number;
+  marketSpread?: number;
+  bookmakerCount?: number;
 }): number {
-  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus, isSynthetic, leagueEdgeScore } = params;
+  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus, isSynthetic, leagueEdgeScore, marketSpread, bookmakerCount } = params;
 
   // 1. Edge size: (edge / 0.15) × 25, max 25
   const edgeScore = Math.min((edge / 0.15) * 25, 25);
@@ -256,16 +258,23 @@ function computeOpportunityScore(params: {
   else if ((backOdds >= 1.5 && backOdds < 1.9) || (backOdds > 3.2 && backOdds <= 4.5)) oddsScore = 8;
 
   // 6. League edge bonus: (leagueEdgeScore - 50) / 5, capped at ±10
-  //    Championship (+6), Eredivisie (+5.6), Ligue 1 (+4.4), EPL (-1), UCL (-2)
   const leagueBonus = leagueEdgeScore !== undefined
     ? Math.max(-10, Math.min(10, (leagueEdgeScore - 50) / 5))
     : 0;
 
-  const raw = edgeScore + confidenceScore + segmentScore + reliabilityScore + oddsScore + hotStreakBonus + leagueBonus;
+  // 7. Market spread bonus — bookmaker disagreement = inefficient market = edge opportunity
+  //    Large spread (>5%) means bookmakers disagree significantly → bonus up to 8pts
+  //    Scaled by bookmaker count (more bookmakers = more reliable spread)
+  let marketSpreadBonus = 0;
+  if (marketSpread !== undefined && marketSpread > 0) {
+    const bmFactor = Math.min((bookmakerCount ?? 3) / 5, 1); // scale with bookmaker count
+    marketSpreadBonus = Math.min(marketSpread * 80 * bmFactor, 8);
+  }
+
+  const raw = edgeScore + confidenceScore + segmentScore + reliabilityScore + oddsScore + hotStreakBonus + leagueBonus + marketSpreadBonus;
   const score = Math.min(Math.round(raw * 100) / 100, 100);
 
-  // Synthetic-only odds are capped at 55 — below the 65 threshold
-  // This prevents placing bets based solely on our own Poisson model
+  // Synthetic-only odds are capped at 55 — below the default 50 min score
   if (isSynthetic) return Math.min(score, 55);
 
   return score;
@@ -419,6 +428,81 @@ function getModelProbability(
   if (marketType === "TOTAL_CORNERS_105" && cornersPreds) {
     if (selectionName.startsWith("Over")) return cornersPreds.over105;
     if (selectionName.startsWith("Under")) return cornersPreds.under105;
+  }
+  if (marketType === "TOTAL_CORNERS_85" && cornersPreds) {
+    const lambda = (enriched["home_corners_avg"] ?? 5.0) + (enriched["away_corners_avg"] ?? 4.5);
+    const under85 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 8)));
+    if (selectionName.startsWith("Over")) return 1 - under85;
+    if (selectionName.startsWith("Under")) return under85;
+  }
+  if (marketType === "TOTAL_CORNERS_115" && cornersPreds) {
+    const lambda = (enriched["home_corners_avg"] ?? 5.0) + (enriched["away_corners_avg"] ?? 4.5);
+    const under115 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 11)));
+    if (selectionName.startsWith("Over")) return 1 - under115;
+    if (selectionName.startsWith("Under")) return under115;
+  }
+  // Over/Under 0.5 goals
+  if (marketType === "OVER_UNDER_05") {
+    const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
+    const awayGoals = enriched["away_goals_scored_avg"] ?? 1.1;
+    const lambda = homeGoals + awayGoals;
+    const under05 = Math.max(0.01, Math.min(0.99, Math.exp(-lambda))); // P(0 goals)
+    if (selectionName.startsWith("Over")) return 1 - under05;
+    if (selectionName.startsWith("Under")) return under05;
+  }
+  // Over/Under 4.5 goals
+  if (marketType === "OVER_UNDER_45") {
+    const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
+    const awayGoals = enriched["away_goals_scored_avg"] ?? 1.1;
+    const lambda = homeGoals + awayGoals;
+    const under45 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 4)));
+    if (selectionName.startsWith("Over")) return 1 - under45;
+    if (selectionName.startsWith("Under")) return under45;
+  }
+  // Double Chance — derived from match winner probabilities
+  if (marketType === "DOUBLE_CHANCE" && outcomePreds) {
+    if (selectionName === "1X") return Math.min(0.98, outcomePreds.home + outcomePreds.draw);
+    if (selectionName === "X2") return Math.min(0.98, outcomePreds.draw + outcomePreds.away);
+    if (selectionName === "12") return Math.min(0.98, outcomePreds.home + outcomePreds.away);
+  }
+  // First Half Result — scaled from full-match outcome (halves closer to 50/50)
+  if (marketType === "FIRST_HALF_RESULT" && outcomePreds) {
+    const scale = 0.7; // first half probabilities converge toward uniform
+    const mean = 1 / 3;
+    if (selectionName === "Home") return Math.max(0.05, Math.min(0.85, mean + (outcomePreds.home - mean) * scale));
+    if (selectionName === "Draw") return Math.max(0.15, Math.min(0.75, mean + (outcomePreds.draw - mean) * scale));
+    if (selectionName === "Away") return Math.max(0.05, Math.min(0.85, mean + (outcomePreds.away - mean) * scale));
+  }
+  // First Half O/U 0.5 goals
+  if (marketType === "FIRST_HALF_OU_05") {
+    const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
+    const awayGoals = enriched["away_goals_scored_avg"] ?? 1.1;
+    const halfLambda = (homeGoals + awayGoals) * 0.45; // roughly 45% of goals in first half
+    const under05 = Math.max(0.01, Math.min(0.99, Math.exp(-halfLambda)));
+    if (selectionName.startsWith("Over")) return 1 - under05;
+    if (selectionName.startsWith("Under")) return under05;
+  }
+  // First Half O/U 1.5 goals
+  if (marketType === "FIRST_HALF_OU_15") {
+    const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
+    const awayGoals = enriched["away_goals_scored_avg"] ?? 1.1;
+    const halfLambda = (homeGoals + awayGoals) * 0.45;
+    const under15 = Math.max(0.01, Math.min(0.99, poissonCdf(halfLambda, 1)));
+    if (selectionName.startsWith("Over")) return 1 - under15;
+    if (selectionName.startsWith("Under")) return under15;
+  }
+  // Cards 2.5 and 5.5
+  if (marketType === "TOTAL_CARDS_25" && cardsPreds) {
+    const lambda = (enriched["home_yellow_cards_avg"] ?? 2.0) + (enriched["away_yellow_cards_avg"] ?? 2.0);
+    const under25 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 2)));
+    if (selectionName.startsWith("Over")) return 1 - under25;
+    if (selectionName.startsWith("Under")) return under25;
+  }
+  if (marketType === "TOTAL_CARDS_55" && cardsPreds) {
+    const lambda = (enriched["home_yellow_cards_avg"] ?? 2.0) + (enriched["away_yellow_cards_avg"] ?? 2.0);
+    const under55 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 5)));
+    if (selectionName.startsWith("Over")) return 1 - under55;
+    if (selectionName.startsWith("Under")) return under55;
   }
   return null;
 }
@@ -619,6 +703,10 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       const streakBonus = await getHotStreakBonus(match.league, oddsRow.marketType, hotWeeks, hotMinBets, hotBonus);
       const leagueEdgeScore = await getLeagueEdgeScore(match.league ?? "");
 
+      // Pull market spread features (computed from all-bookmaker odds)
+      const marketSpread = featureMap["avg_market_spread"] ?? featureMap["market_spread_home"] ?? undefined;
+      const bookmakerCount = featureMap["bookmaker_count_home"] ? Math.round(featureMap["bookmaker_count_home"]) : undefined;
+
       const opportunityScore = computeOpportunityScore({
         edge,
         modelProbability: modelProb,
@@ -627,6 +715,8 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         hotStreakBonus: streakBonus,
         isSynthetic,
         leagueEdgeScore,
+        marketSpread,
+        bookmakerCount,
       });
 
       // Synthetic-odds bets are capped at 55 (below the 65 min score — effectively blocked)

@@ -217,8 +217,18 @@ export async function runTradingCycle(): Promise<{
       const sb = (leagueEdgeMap.get(b.league) ?? 50) * b.opportunityScore;
       return sb - sa;
     });
-    const top5 = rankedForOddsPapi.slice(0, 5);
-    const rest = rankedForOddsPapi.slice(5);
+    // Skip fixtures > 48h out for OddsPapi (not covered yet / budget efficiency)
+    // Also skip second-division leagues (not typically on OddsPapi)
+    const SECOND_DIV_LEAGUES = new Set(["Ligue 2", "2. Bundesliga", "Serie B", "Segunda División", "La Liga 2", "Segunda Division"]);
+    const oddspapiEligible = rankedForOddsPapi.filter((bet) => {
+      const hoursOut = (new Date(bet.kickoffTime).getTime() - Date.now()) / (1000 * 60 * 60);
+      return hoursOut <= 48 && !SECOND_DIV_LEAGUES.has(bet.league ?? "");
+    });
+    const top5 = oddspapiEligible.slice(0, 8);
+    const rest = [
+      ...oddspapiEligible.slice(8),
+      ...rankedForOddsPapi.filter((bet) => !oddspapiEligible.includes(bet)),
+    ];
 
     type OddsValidation = Awaited<ReturnType<typeof getOddspapiValidation>>;
 
@@ -247,13 +257,12 @@ export async function runTradingCycle(): Promise<{
             );
           }
 
-          // Simplified Pinnacle scoring (Part 6):
-          // +5 flat bonus for any Pinnacle data
-          // +10 additional if Pinnacle-aligned (sharp money agrees)
-          // -10 if contrarian (model disagrees with sharp — higher risk)
+          // Pinnacle scoring (enhanced):
+          // +10 if Pinnacle-aligned (sharp money agrees with our model)
+          // -10 if contrarian (Pinnacle strongly disagrees — higher risk)
+          // No flat bonus for just having Pinnacle data — focus on alignment quality
           let effectiveScore = bet.opportunityScore;
           if (validation.hasPinnacleData) {
-            effectiveScore = bet.opportunityScore + 5;
             if (validation.pinnacleAligned) effectiveScore += 10;
             else if (validation.isContrarian) effectiveScore -= 10;
           }
@@ -474,9 +483,9 @@ export async function runTradingCycle(): Promise<{
 export function startScheduler(): void {
   logger.info("Starting schedulers");
 
-  // Data ingestion: every 30 min, 06:00–23:30 UTC
-  cron.schedule("*/30 6-23 * * *", () => { void safeRunIngestion(); }, { timezone: "UTC" });
-  logger.info("Ingestion scheduler active — every 30 min, 06:00–23:30 UTC");
+  // Data ingestion: every 30 min, 24/7 (matches scheduled globally at all hours)
+  cron.schedule("*/30 * * * *", () => { void safeRunIngestion(); }, { timezone: "UTC" });
+  logger.info("Ingestion scheduler active — every 30 min, 24/7");
 
   // Feature computation: every 6 hours
   cron.schedule("0 */6 * * *", () => { void safeRunFeatures(); }, { timezone: "UTC" });
@@ -498,14 +507,15 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Settlement cron active — every 5 minutes");
 
-  // API-Football: fetch real odds every 8 hours (biggest budget item ~30 req)
-  cron.schedule("0 */8 * * *", () => {
+  // API-Football: fetch real odds every 2 hours — fresh odds for every trading cycle
+  // With 75,000 req/day budget, each scan uses ~30-50 reqs, plenty of headroom
+  cron.schedule("0 */2 * * *", () => {
     logger.info("API-Football odds refresh triggered by scheduler");
     void fetchAndStoreOddsForAllUpcoming().catch((err) => {
       logger.error({ err }, "API-Football odds refresh failed");
     });
   }, { timezone: "UTC" });
-  logger.info("API-Football odds scheduler active — every 8 hours UTC");
+  logger.info("API-Football odds scheduler active — every 2 hours UTC");
 
   // API-Football: fetch team stats every 12 hours (~20 req)
   cron.schedule("0 */12 * * *", () => {

@@ -44,7 +44,9 @@ import {
 import {
   getApiBudgetStatus,
   fetchAndStoreOddsForAllUpcoming,
+  getScanStats,
 } from "../services/apiFootball";
+import { getTodayLineMovements } from "../services/lineMovement";
 
 const router = Router();
 
@@ -1165,6 +1167,32 @@ router.post("/xg/refresh", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "Manual xG ingestion failed");
     res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/scan-stats — league, fixture, market coverage stats
+// ─────────────────────────────────────────────
+router.get("/dashboard/scan-stats", async (_req, res) => {
+  try {
+    const stats = await getScanStats();
+    res.json(stats);
+  } catch (err) {
+    logger.error({ err }, "Scan stats query failed");
+    res.status(500).json({ error: "Failed to retrieve scan stats" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/line-movements — line movements detected today
+// ─────────────────────────────────────────────
+router.get("/dashboard/line-movements", async (_req, res) => {
+  try {
+    const movements = await getTodayLineMovements();
+    res.json({ count: movements.length, movements });
+  } catch (err) {
+    logger.error({ err }, "Line movements query failed");
+    res.status(500).json({ error: "Failed to retrieve line movements" });
   }
 });
 

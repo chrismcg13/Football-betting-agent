@@ -12,3 +12,4 @@ export * from "./leagueEdgeScores";
 export * from "./oddspapiLeagueCoverage";
 export * from "./xgMatchData";
 export * from "./teamXgRolling";
+export * from "./oddsHistory";

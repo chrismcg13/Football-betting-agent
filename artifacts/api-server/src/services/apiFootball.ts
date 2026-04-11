@@ -1,8 +1,8 @@
 /**
  * API-Football v3 Integration
  * Base: https://v3.football.api-sports.io/
- * Free tier: 100 requests/day. Hard cap: 90 (leave 10 for emergencies).
- * Priority: odds → fixture stats → team stats → players → lineups
+ * Upgraded plan: 75,000 requests/day — no rationing needed.
+ * Priority: odds (all bookmakers) → fixture stats → team stats
  */
 
 import {
@@ -12,52 +12,180 @@ import {
   featuresTable,
   complianceLogsTable,
   apiUsageTable,
+  oddsHistoryTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, sql } from "drizzle-orm";
+import { eq, and, gte, lte, desc, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://v3.football.api-sports.io";
-const DAILY_CAP = 90;
+const DAILY_CAP = 75_000;
 
-// ─── League ID mapping ────────────────────────────────────────────────────────
-const LEAGUE_IDS: Record<string, number> = {
+// ─── Comprehensive league ID mapping ─────────────────────────────────────────
+// Tier 1 — Top flights
+// Tier 2 — Second divisions (edge_score 82 — less scrutinised)
+// Tier 3 — Smaller top flights (edge_score 70)
+export const LEAGUE_IDS: Record<string, number> = {
+  // Tier 1 — Already active
   "Premier League": 39,
   "Bundesliga": 78,
   "Primera Division": 140,
+  "La Liga": 140,
   "Serie A": 135,
   "Ligue 1": 61,
   "Eredivisie": 88,
   "Primeira Liga": 94,
   "Campeonato Brasileiro Série A": 71,
-  "Championship": 40,
   "Brasileirão": 71,
+  "Championship": 40,
   "UEFA Champions League": 2,
   "Champions League": 2,
+  "Europa League": 3,
+  "UEFA Europa League": 3,
+
+  // Tier 2 — Second divisions (high edge)
+  "Ligue 2": 62,
+  "2. Bundesliga": 79,
+  "Serie B": 136,
+  "Segunda División": 141,
+  "La Liga 2": 141,
+  "Segunda Division": 141,
+  "EFL Championship": 40,
+
+  // Tier 3 — Smaller top flights
+  "Scottish Premiership": 179,
+  "Belgian Pro League": 144,
+  "Swiss Super League": 207,
+  "Austrian Football Bundesliga": 218,
+  "Danish Superliga": 119,
+  "Norwegian Eliteserien": 103,
+  "Swedish Allsvenskan": 113,
+  "Süper Lig": 203,
+  "Super League Greece": 197,
+  "Super League 1": 197,
 };
 
-// Bookmaker IDs: 8=Bet365, 6=Bwin, 11=1xBet
-const BOOKMAKER_IDS = [8, 6, 11];
+// All league IDs we scan (used for fixture discovery by league)
+export const ALL_LEAGUE_IDS: number[] = [
+  // Tier 1
+  39, 78, 140, 135, 61, 88, 94, 71, 40, 2, 3,
+  // Tier 2 (second divisions)
+  62, 79, 136, 141,
+  // Tier 3 (smaller top flights)
+  179, 144, 207, 218, 119, 103, 113, 203, 197,
+];
 
-// API-Football market name → our marketType
-const MARKET_MAP: Record<string, string> = {
-  "Match Winner": "MATCH_ODDS",
-  "Goals Over/Under": "OVER_UNDER",
-  "Both Teams Score": "BTTS",
-  "Asian Handicap": "ASIAN_HANDICAP",
-  "Cards Over/Under": "TOTAL_CARDS",
-  "Corners Over/Under": "TOTAL_CORNERS",
-  "Total - Cards": "TOTAL_CARDS",
-  "Corners - Match": "TOTAL_CORNERS",
-};
+// Second-division leagues — higher edge, no OddsPapi (not covered)
+export const SECOND_DIVISION_LEAGUES = new Set<string>([
+  "Ligue 2", "2. Bundesliga", "Serie B", "Segunda División", "La Liga 2", "Segunda Division",
+]);
 
-// Goals OU line → our marketType suffix
+// ─── Market parsing ───────────────────────────────────────────────────────────
+
 const GOALS_OU_LINES: Record<string, string> = {
+  "0.5": "OVER_UNDER_05",
   "1.5": "OVER_UNDER_15",
   "2.5": "OVER_UNDER_25",
   "3.5": "OVER_UNDER_35",
+  "4.5": "OVER_UNDER_45",
 };
 
-// ─── Budget tracking ───────────────────────────────────────────────────────────
+const CORNERS_LINES: Record<string, string> = {
+  "7.5": "TOTAL_CORNERS_75",
+  "8.5": "TOTAL_CORNERS_85",
+  "9.5": "TOTAL_CORNERS_95",
+  "10.5": "TOTAL_CORNERS_105",
+  "11.5": "TOTAL_CORNERS_115",
+};
+
+const CARDS_LINES: Record<string, string> = {
+  "2.5": "TOTAL_CARDS_25",
+  "3.5": "TOTAL_CARDS_35",
+  "4.5": "TOTAL_CARDS_45",
+  "5.5": "TOTAL_CARDS_55",
+};
+
+function mapOddsToMarket(
+  betName: string,
+  value: string,
+  odd: string,
+): { marketType: string; selectionName: string; backOdds: number } | null {
+  const o = parseFloat(odd);
+  if (isNaN(o) || o <= 1.0) return null;
+
+  const norm = betName.toLowerCase();
+
+  if (norm.includes("match winner") || norm === "result" || norm === "1x2") {
+    if (value === "Home") return { marketType: "MATCH_ODDS", selectionName: "Home", backOdds: o };
+    if (value === "Draw") return { marketType: "MATCH_ODDS", selectionName: "Draw", backOdds: o };
+    if (value === "Away") return { marketType: "MATCH_ODDS", selectionName: "Away", backOdds: o };
+  }
+
+  if (norm.includes("both teams score") || norm === "btts" || norm === "both teams to score") {
+    if (value === "Yes") return { marketType: "BTTS", selectionName: "Yes", backOdds: o };
+    if (value === "No") return { marketType: "BTTS", selectionName: "No", backOdds: o };
+  }
+
+  if (norm.includes("goals over/under") || norm.includes("total goals") || norm === "goals") {
+    const line = value.replace("Over", "").replace("Under", "").trim();
+    const marketSuffix = GOALS_OU_LINES[line];
+    if (marketSuffix) {
+      const sel = value.startsWith("Over") ? `Over ${line} Goals` : `Under ${line} Goals`;
+      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
+    }
+  }
+
+  if (norm.includes("double chance")) {
+    if (value === "Home/Draw" || value === "1X") return { marketType: "DOUBLE_CHANCE", selectionName: "1X", backOdds: o };
+    if (value === "Draw/Away" || value === "X2") return { marketType: "DOUBLE_CHANCE", selectionName: "X2", backOdds: o };
+    if (value === "Home/Away" || value === "12") return { marketType: "DOUBLE_CHANCE", selectionName: "12", backOdds: o };
+  }
+
+  if (norm.includes("first half winner") || norm === "half time result" || norm.includes("halftime result")) {
+    if (value === "Home") return { marketType: "FIRST_HALF_RESULT", selectionName: "Home", backOdds: o };
+    if (value === "Draw") return { marketType: "FIRST_HALF_RESULT", selectionName: "Draw", backOdds: o };
+    if (value === "Away") return { marketType: "FIRST_HALF_RESULT", selectionName: "Away", backOdds: o };
+  }
+
+  if (norm.includes("first half") && norm.includes("goal")) {
+    const line = value.replace("Over", "").replace("Under", "").trim();
+    if (line === "0.5") {
+      const sel = value.startsWith("Over") ? "Over 0.5 First Half Goals" : "Under 0.5 First Half Goals";
+      return { marketType: "FIRST_HALF_OU_05", selectionName: sel, backOdds: o };
+    }
+    if (line === "1.5") {
+      const sel = value.startsWith("Over") ? "Over 1.5 First Half Goals" : "Under 1.5 First Half Goals";
+      return { marketType: "FIRST_HALF_OU_15", selectionName: sel, backOdds: o };
+    }
+  }
+
+  if ((norm.includes("card") || norm.includes("yellow")) && (norm.includes("over") || norm.includes("under") || norm.includes("total"))) {
+    const line = value.replace("Over", "").replace("Under", "").trim();
+    const marketSuffix = CARDS_LINES[line];
+    if (marketSuffix) {
+      const sel = value.startsWith("Over") ? `Over ${line} Cards` : `Under ${line} Cards`;
+      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
+    }
+  }
+
+  if (norm.includes("corner") && (norm.includes("over") || norm.includes("under") || norm.includes("total"))) {
+    const line = value.replace("Over", "").replace("Under", "").trim();
+    const marketSuffix = CORNERS_LINES[line];
+    if (marketSuffix) {
+      const sel = value.startsWith("Over") ? `Over ${line} Corners` : `Under ${line} Corners`;
+      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
+    }
+  }
+
+  if (norm.includes("asian handicap")) {
+    const line = value.replace("Home", "").replace("Away", "").trim();
+    if (value.startsWith("Home")) return { marketType: "ASIAN_HANDICAP", selectionName: `Home ${line}`, backOdds: o };
+    if (value.startsWith("Away")) return { marketType: "ASIAN_HANDICAP", selectionName: `Away ${line}`, backOdds: o };
+  }
+
+  return null;
+}
+
+// ─── Budget tracking ──────────────────────────────────────────────────────────
 
 function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
@@ -100,7 +228,7 @@ export async function getApiBudgetStatus(): Promise<{
   return { used, cap: DAILY_CAP, remaining: Math.max(0, DAILY_CAP - used), date: todayStr() };
 }
 
-// ─── Core fetch function ──────────────────────────────────────────────────────
+// ─── Core fetch ───────────────────────────────────────────────────────────────
 
 async function fetchApiFootball<T = unknown>(
   path: string,
@@ -114,11 +242,6 @@ async function fetchApiFootball<T = unknown>(
 
   if (!(await canMakeRequest())) {
     logger.warn({ path, used: await getApiUsageToday() }, "API-Football daily budget exhausted");
-    await db.insert(complianceLogsTable).values({
-      actionType: "api_budget",
-      details: { message: "API-Football daily budget exhausted", path },
-      timestamp: new Date(),
-    });
     return null;
   }
 
@@ -147,7 +270,7 @@ async function fetchApiFootball<T = unknown>(
   }
 }
 
-// ─── Fixture discovery and matching ──────────────────────────────────────────
+// ─── Fixture discovery ────────────────────────────────────────────────────────
 
 interface ApiFixture {
   fixture: { id: number; date: string; status: { short: string } };
@@ -168,14 +291,13 @@ function normalizeTeamName(name: string): string {
 }
 
 function teamNameMatch(dbName: string, apiName: string): boolean {
-  const db = normalizeTeamName(dbName);
-  const api = normalizeTeamName(apiName);
-  if (db === api) return true;
-  if (db.includes(api) || api.includes(db)) return true;
-  // Check if first word matches (e.g. "Arsenal" in "Arsenal FC")
-  const dbFirst = db.split(" ")[0] ?? "";
-  const apiFirst = api.split(" ")[0] ?? "";
-  return dbFirst.length > 3 && dbFirst === apiFirst;
+  const d = normalizeTeamName(dbName);
+  const a = normalizeTeamName(apiName);
+  if (d === a) return true;
+  if (d.includes(a) || a.includes(d)) return true;
+  const dFirst = d.split(" ")[0] ?? "";
+  const aFirst = a.split(" ")[0] ?? "";
+  return dFirst.length > 3 && dFirst === aFirst;
 }
 
 async function getFixturesForDate(date: string): Promise<ApiFixture[]> {
@@ -188,11 +310,11 @@ interface FixtureMatch {
   fixtureId: number;
   homeTeam: string;
   awayTeam: string;
+  league: string;
+  kickoffTime: Date;
 }
 
 export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
-  // Get upcoming + very-soon matches from our DB (broader window: 3 days ago → 7 days ahead)
-  // so recently-started matches can still be settled and upcoming ones can be pre-mapped.
   const now = new Date();
   const upcoming = await db
     .select()
@@ -200,7 +322,7 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
     .where(
       and(
         eq(matchesTable.status, "scheduled"),
-        gte(matchesTable.kickoffTime, new Date(now.getTime() - 3 * 60 * 60 * 1000)), // 3 hours ago (in-play buffer)
+        gte(matchesTable.kickoffTime, new Date(now.getTime() - 3 * 60 * 60 * 1000)),
         lte(matchesTable.kickoffTime, new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)),
       ),
     );
@@ -210,10 +332,9 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
     return [];
   }
 
-  // Fetch ALL fixtures across the trading window (1h-96h = today through today+4 days)
-  // to ensure weekend EPL/La Liga/Bundesliga fixtures are covered.
+  // Fetch fixtures for the full 7-day window (yesterday through today+7)
   const allApiFixtures: ApiFixture[] = [];
-  const offsets = [-1, 0, 1, 2, 3, 4]; // yesterday through today+4 days
+  const offsets = [-1, 0, 1, 2, 3, 4, 5, 6, 7];
 
   for (const offset of offsets) {
     if (!(await canMakeRequest())) break;
@@ -222,7 +343,7 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
     const dateStr = d.toISOString().slice(0, 10);
     const fixtures = await getFixturesForDate(dateStr);
     if (fixtures.length > 0) {
-      logger.info({ date: dateStr, count: fixtures.length }, "API-Football fixtures fetched");
+      logger.debug({ date: dateStr, count: fixtures.length }, "API-Football fixtures fetched");
       allApiFixtures.push(...fixtures);
     }
   }
@@ -232,7 +353,6 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
   const mappings: FixtureMatch[] = [];
 
   for (const match of upcoming) {
-    // Return cached fixture ID if already stored
     const cached = await db
       .select({ featureValue: featuresTable.featureValue })
       .from(featuresTable)
@@ -242,12 +362,11 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
     if (cached[0]?.featureValue) {
       const fid = parseInt(cached[0].featureValue, 10);
       if (!isNaN(fid)) {
-        mappings.push({ matchId: match.id, fixtureId: fid, homeTeam: match.homeTeam, awayTeam: match.awayTeam });
+        mappings.push({ matchId: match.id, fixtureId: fid, homeTeam: match.homeTeam, awayTeam: match.awayTeam, league: match.league, kickoffTime: match.kickoffTime });
         continue;
       }
     }
 
-    // Try to match against the combined API fixture pool
     const matched = allApiFixtures.find((f) =>
       teamNameMatch(match.homeTeam, f.teams.home.name) &&
       teamNameMatch(match.awayTeam, f.teams.away.name),
@@ -255,7 +374,6 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
 
     if (!matched) continue;
 
-    // Persist the mapping as a hidden feature so we don't need to re-discover later
     const existing2 = await db
       .select({ id: featuresTable.id })
       .from(featuresTable)
@@ -281,9 +399,11 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
       fixtureId: matched.fixture.id,
       homeTeam: match.homeTeam,
       awayTeam: match.awayTeam,
+      league: match.league,
+      kickoffTime: match.kickoffTime,
     });
 
-    logger.info(
+    logger.debug(
       { matchId: match.id, fixtureId: matched.fixture.id, home: match.homeTeam, away: match.awayTeam },
       "API-Football fixture mapped",
     );
@@ -292,7 +412,7 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
   return mappings;
 }
 
-// ─── Odds fetching ────────────────────────────────────────────────────────────
+// ─── Odds fetching — ALL bookmakers in one call ───────────────────────────────
 
 interface ApiOddsBookmaker {
   id: number;
@@ -309,65 +429,126 @@ interface ApiOddsFixture {
   bookmakers: ApiOddsBookmaker[];
 }
 
-function mapOddsToMarket(
-  betName: string,
-  value: string,
-  odd: string,
-): { marketType: string; selectionName: string; backOdds: number } | null {
-  const o = parseFloat(odd);
-  if (isNaN(o) || o <= 1.0) return null;
+interface MarketConsensus {
+  marketType: string;
+  selectionName: string;
+  bestOdds: number;
+  worstOdds: number;
+  avgOdds: number;
+  bookmakerCount: number;
+  marketSpread: number;
+  consensusImpliedProb: number;
+}
 
-  const norm = betName.toLowerCase();
+async function upsertFeature(matchId: number, name: string, value: number): Promise<void> {
+  const rounded = String(Math.round(value * 1_000_000) / 1_000_000);
+  const existing = await db
+    .select({ id: featuresTable.id })
+    .from(featuresTable)
+    .where(and(eq(featuresTable.matchId, matchId), eq(featuresTable.featureName, name)))
+    .limit(1);
 
-  // Match Winner / 1X2
-  if (norm.includes("match winner") || norm === "result") {
-    if (value === "Home") return { marketType: "MATCH_ODDS", selectionName: "Home", backOdds: o };
-    if (value === "Draw") return { marketType: "MATCH_ODDS", selectionName: "Draw", backOdds: o };
-    if (value === "Away") return { marketType: "MATCH_ODDS", selectionName: "Away", backOdds: o };
+  if (existing.length > 0 && existing[0]) {
+    await db
+      .update(featuresTable)
+      .set({ featureValue: rounded, computedAt: new Date() })
+      .where(eq(featuresTable.id, existing[0].id));
+  } else {
+    await db.insert(featuresTable).values({
+      matchId,
+      featureName: name,
+      featureValue: rounded,
+      computedAt: new Date(),
+    });
   }
+}
 
-  // BTTS
-  if (norm.includes("both teams score")) {
-    if (value === "Yes") return { marketType: "BTTS", selectionName: "Yes", backOdds: o };
-    if (value === "No") return { marketType: "BTTS", selectionName: "No", backOdds: o };
-  }
+// Detect line movements — compare to previous snapshot and log if > 5%
+async function detectAndLogLineMovement(
+  matchId: number,
+  marketType: string,
+  selectionName: string,
+  bookmaker: string,
+  currentOdds: number,
+  kickoffTime: Date,
+): Promise<void> {
+  try {
+    // Get most recent history entry for this selection
+    const prev = await db
+      .select({ odds: oddsHistoryTable.odds, snapshotTime: oddsHistoryTable.snapshotTime })
+      .from(oddsHistoryTable)
+      .where(
+        and(
+          eq(oddsHistoryTable.matchId, matchId),
+          eq(oddsHistoryTable.marketType, marketType),
+          eq(oddsHistoryTable.selectionName, selectionName),
+          eq(oddsHistoryTable.bookmaker, bookmaker),
+        ),
+      )
+      .orderBy(desc(oddsHistoryTable.snapshotTime))
+      .limit(1);
 
-  // Goals Over/Under
-  if (norm.includes("goals over/under")) {
-    const line = value.replace("Over", "").replace("Under", "").trim();
-    const marketSuffix = GOALS_OU_LINES[line];
-    if (marketSuffix) {
-      const sel = value.startsWith("Over") ? `Over ${line} Goals` : `Under ${line} Goals`;
-      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
+    const prevOdds = prev[0] ? Number(prev[0].odds) : null;
+    const now = new Date();
+    const hoursToKickoff = (kickoffTime.getTime() - now.getTime()) / (1000 * 60 * 60);
+
+    let oddsChangePct: number | null = null;
+    let direction: string | null = null;
+
+    if (prevOdds && prevOdds > 0) {
+      oddsChangePct = ((currentOdds - prevOdds) / prevOdds) * 100;
+      if (Math.abs(oddsChangePct) < 0.5) {
+        direction = "stable";
+      } else if (currentOdds < prevOdds) {
+        direction = "shortening"; // odds getting shorter = selection more likely
+      } else {
+        direction = "drifting"; // odds getting longer = selection less likely
+      }
+
+      // Log significant line movements (> 5%)
+      if (Math.abs(oddsChangePct) >= 5) {
+        logger.info(
+          {
+            matchId, marketType, selectionName, bookmaker,
+            prevOdds, currentOdds, oddsChangePct: oddsChangePct.toFixed(1), direction, hoursToKickoff: hoursToKickoff.toFixed(1),
+          },
+          "Significant line movement detected",
+        );
+        await db.insert(complianceLogsTable).values({
+          actionType: "line_movement",
+          details: {
+            matchId, marketType, selectionName, bookmaker,
+            prevOdds, currentOdds, oddsChangePct, direction, hoursToKickoff,
+          },
+          timestamp: now,
+        });
+      }
     }
-  }
 
-  // Cards Over/Under
-  if (norm.includes("card") && norm.includes("over")) {
-    const line = value.replace("Over", "").replace("Under", "").trim();
-    const sel = value.startsWith("Over") ? `Over ${line} Cards` : `Under ${line} Cards`;
-    if (line === "3.5") return { marketType: "TOTAL_CARDS_35", selectionName: sel, backOdds: o };
-    if (line === "4.5") return { marketType: "TOTAL_CARDS_45", selectionName: sel, backOdds: o };
+    await db.insert(oddsHistoryTable).values({
+      matchId,
+      marketType,
+      selectionName,
+      bookmaker,
+      odds: String(currentOdds),
+      snapshotTime: now,
+      previousOdds: prevOdds ? String(prevOdds) : null,
+      oddsChangePct: oddsChangePct !== null ? String(Math.round(oddsChangePct * 100) / 100) : null,
+      direction,
+      hoursToKickoff: String(Math.round(hoursToKickoff * 100) / 100),
+    });
+  } catch (err) {
+    logger.debug({ err, matchId, marketType }, "Line movement tracking error — non-fatal");
   }
-
-  // Corners Over/Under
-  if (norm.includes("corner") && (norm.includes("over") || norm.includes("under"))) {
-    const line = value.replace("Over", "").replace("Under", "").trim();
-    const sel = value.startsWith("Over") ? `Over ${line} Corners` : `Under ${line} Corners`;
-    if (line === "9.5") return { marketType: "TOTAL_CORNERS_95", selectionName: sel, backOdds: o };
-    if (line === "10.5") return { marketType: "TOTAL_CORNERS_105", selectionName: sel, backOdds: o };
-    if (line === "8.5") return { marketType: "TOTAL_CORNERS_85", selectionName: sel, backOdds: o };
-  }
-
-  return null;
 }
 
 export async function fetchAndStoreOddsForFixture(
   matchId: number,
   fixtureId: number,
+  kickoffTime?: Date,
 ): Promise<number> {
-  // Check if we already have fresh odds (< 6 hours old)
-  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+  // Check if we already have fresh odds (< 2 hours old)
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
   const existingReal = await db
     .select({ id: oddsSnapshotsTable.id })
     .from(oddsSnapshotsTable)
@@ -375,55 +556,101 @@ export async function fetchAndStoreOddsForFixture(
       and(
         eq(oddsSnapshotsTable.matchId, matchId),
         eq(oddsSnapshotsTable.source, "api_football_real"),
-        gte(oddsSnapshotsTable.snapshotTime, sixHoursAgo),
+        gte(oddsSnapshotsTable.snapshotTime, twoHoursAgo),
       ),
     )
     .limit(1);
 
   if (existingReal.length > 0) {
-    logger.debug({ matchId, fixtureId }, "Real odds already fresh — skipping fetch");
+    logger.debug({ matchId, fixtureId }, "Real odds already fresh (< 2h) — skipping");
     return 0;
   }
 
+  if (!(await canMakeRequest())) {
+    logger.warn({ matchId }, "API-Football budget exhausted — skipping odds fetch");
+    return 0;
+  }
+
+  // Fetch ALL bookmakers in a single call (no bookmaker filter = all returned)
+  const result = await fetchApiFootball<ApiOddsFixture[]>("/odds", {
+    fixture: fixtureId,
+  });
+
+  if (!result || result.length === 0) return 0;
+
+  const fixture = result[0];
+  if (!fixture?.bookmakers?.length) return 0;
+
   let storedCount = 0;
+  const snapshotTime = new Date();
 
-  for (const bookmakerId of BOOKMAKER_IDS) {
-    if (!(await canMakeRequest())) break;
+  // Track odds per market+selection across all bookmakers for consensus calc
+  const marketOddsMap = new Map<string, number[]>();
 
-    const result = await fetchApiFootball<ApiOddsFixture[]>("/odds", {
-      fixture: fixtureId,
-      bookmaker: bookmakerId,
-    });
+  for (const bm of fixture.bookmakers) {
+    const bookmakerName = bm.name ?? `bm_${bm.id}`;
 
-    if (!result || result.length === 0) continue;
+    for (const bet of bm.bets) {
+      for (const val of bet.values) {
+        const mapped = mapOddsToMarket(bet.name, val.value, val.odd);
+        if (!mapped) continue;
 
-    const fixture = result[0];
-    if (!fixture?.bookmakers?.length) continue;
+        const key = `${mapped.marketType}:${mapped.selectionName}`;
+        const existing = marketOddsMap.get(key) ?? [];
+        existing.push(mapped.backOdds);
+        marketOddsMap.set(key, existing);
 
-    const bookmakerName = bookmakerId === 8 ? "Bet365" : bookmakerId === 6 ? "Bwin" : "1xBet";
-    const source = `api_football_${bookmakerName.toLowerCase().replace("365", "365")}`;
+        await db.insert(oddsSnapshotsTable).values({
+          matchId,
+          marketType: mapped.marketType,
+          selectionName: mapped.selectionName,
+          backOdds: String(mapped.backOdds),
+          source: `api_football_real:${bookmakerName}`,
+          snapshotTime,
+        });
+        storedCount++;
 
-    for (const bm of fixture.bookmakers) {
-      for (const bet of bm.bets) {
-        for (const val of bet.values) {
-          const mapped = mapOddsToMarket(bet.name, val.value, val.odd);
-          if (!mapped) continue;
-
-          await db.insert(oddsSnapshotsTable).values({
-            matchId,
-            marketType: mapped.marketType,
-            selectionName: mapped.selectionName,
-            backOdds: String(mapped.backOdds),
-            source: `api_football_real:${bookmakerName}`,
-            snapshotTime: new Date(),
-          });
-          storedCount++;
+        // Track line movement for best-available bookmaker (Bet365 or first found)
+        if (kickoffTime && (bookmakerName === "Bet365" || bookmakerName === "Pinnacle" || bookmakerName === "1xBet")) {
+          void detectAndLogLineMovement(matchId, mapped.marketType, mapped.selectionName, bookmakerName, mapped.backOdds, kickoffTime);
         }
       }
     }
-
-    logger.info({ matchId, fixtureId, bookmakerName, storedCount }, "Odds stored from API-Football");
   }
+
+  // Compute market consensus + spread and store as match features
+  const consensusData: MarketConsensus[] = [];
+  for (const [key, oddsArr] of marketOddsMap.entries()) {
+    if (oddsArr.length < 2) continue;
+    const [marketType, selectionName] = key.split(":") as [string, string];
+    const bestOdds = Math.max(...oddsArr);
+    const worstOdds = Math.min(...oddsArr);
+    const avgOdds = oddsArr.reduce((a, b) => a + b, 0) / oddsArr.length;
+    const marketSpread = worstOdds > 0 ? (bestOdds - worstOdds) / worstOdds : 0;
+    const consensusImpliedProb = 1 / avgOdds;
+    consensusData.push({ marketType, selectionName, bestOdds, worstOdds, avgOdds, bookmakerCount: oddsArr.length, marketSpread, consensusImpliedProb });
+  }
+
+  if (kickoffTime) {
+    const matchOddsData = consensusData.filter((c) => c.marketType === "MATCH_ODDS");
+    if (matchOddsData.length > 0) {
+      const homeData = matchOddsData.find((c) => c.selectionName === "Home");
+      const awayData = matchOddsData.find((c) => c.selectionName === "Away");
+      if (homeData) {
+        await upsertFeature(matchId, "market_consensus_home", homeData.consensusImpliedProb);
+        await upsertFeature(matchId, "market_spread_home", homeData.marketSpread);
+        await upsertFeature(matchId, "bookmaker_count_home", homeData.bookmakerCount);
+      }
+      if (awayData) {
+        await upsertFeature(matchId, "market_consensus_away", awayData.consensusImpliedProb);
+        await upsertFeature(matchId, "market_spread_away", awayData.marketSpread);
+      }
+      const avgSpread = matchOddsData.reduce((a, c) => a + c.marketSpread, 0) / matchOddsData.length;
+      await upsertFeature(matchId, "avg_market_spread", avgSpread);
+    }
+  }
+
+  logger.info({ matchId, fixtureId, bookmakerCount: fixture.bookmakers.length, storedCount, marketTypes: marketOddsMap.size }, "Odds stored from API-Football (all bookmakers)");
 
   return storedCount;
 }
@@ -432,6 +659,7 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   fixturesProcessed: number;
   oddsStored: number;
   mappings: number;
+  leaguesScanned: Set<string>;
 }> {
   logger.info("Starting API-Football odds ingestion for upcoming fixtures");
 
@@ -439,13 +667,25 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   logger.info({ count: mappings.length }, "Fixture mappings discovered");
 
   let oddsStored = 0;
+  const leaguesScanned = new Set<string>();
+
   for (const m of mappings) {
-    if (!(await canMakeRequest(2))) {
-      logger.warn("Budget too low for more odds fetching — stopping");
+    if (!(await canMakeRequest())) {
+      logger.warn("Budget exhausted — stopping odds ingestion");
       break;
     }
-    oddsStored += await fetchAndStoreOddsForFixture(m.matchId, m.fixtureId);
+    const count = await fetchAndStoreOddsForFixture(m.matchId, m.fixtureId, m.kickoffTime);
+    oddsStored += count;
+    leaguesScanned.add(m.league);
   }
+
+  logger.info({
+    fixturesProcessed: mappings.length,
+    oddsStored,
+    leaguesScanned: leaguesScanned.size,
+    leagues: [...leaguesScanned],
+    budgetUsed: await getApiUsageToday(),
+  }, "API-Football odds ingestion complete");
 
   await db.insert(complianceLogsTable).values({
     actionType: "api_football_ingestion",
@@ -453,12 +693,13 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
       action: "odds_ingestion",
       fixturesProcessed: mappings.length,
       oddsStored,
+      leaguesScanned: [...leaguesScanned],
       budgetUsed: await getApiUsageToday(),
     },
     timestamp: new Date(),
   });
 
-  return { fixturesProcessed: mappings.length, oddsStored, mappings: mappings.length };
+  return { fixturesProcessed: mappings.length, oddsStored, mappings: mappings.length, leaguesScanned };
 }
 
 // ─── Team Statistics ──────────────────────────────────────────────────────────
@@ -491,27 +732,15 @@ function extractFormRatio(form: string, last = 10): number {
   return pts / (recent.length * 3);
 }
 
-async function upsertFeature(matchId: number, name: string, value: number): Promise<void> {
-  const rounded = String(Math.round(value * 1_000_000) / 1_000_000);
-  const existing = await db
-    .select({ id: featuresTable.id })
+async function getStoredFeature(matchId: number, featureName: string): Promise<number | null> {
+  const rows = await db
+    .select({ featureValue: featuresTable.featureValue })
     .from(featuresTable)
-    .where(and(eq(featuresTable.matchId, matchId), eq(featuresTable.featureName, name)))
+    .where(and(eq(featuresTable.matchId, matchId), eq(featuresTable.featureName, featureName)))
     .limit(1);
-
-  if (existing.length > 0 && existing[0]) {
-    await db
-      .update(featuresTable)
-      .set({ featureValue: rounded, computedAt: new Date() })
-      .where(eq(featuresTable.id, existing[0].id));
-  } else {
-    await db.insert(featuresTable).values({
-      matchId,
-      featureName: name,
-      featureValue: rounded,
-      computedAt: new Date(),
-    });
-  }
+  if (!rows[0]?.featureValue) return null;
+  const v = parseInt(rows[0].featureValue, 10);
+  return isNaN(v) ? null : v;
 }
 
 export async function fetchAndStoreTeamStats(
@@ -533,26 +762,22 @@ export async function fetchAndStoreTeamStats(
 
   const prefix = venue === "home" ? "home" : "away";
 
-  // Goals
   const goalsForAvg = parseFloat(result.goals.for.average[venue]) || 1.4;
   const goalsAgainstAvg = parseFloat(result.goals.against.average[venue]) || 1.1;
   await upsertFeature(matchId, `${prefix}_af_goals_scored_avg`, goalsForAvg);
   await upsertFeature(matchId, `${prefix}_af_goals_conceded_avg`, goalsAgainstAvg);
 
-  // Form
   const formRatio = extractFormRatio(result.form ?? "", 10);
   await upsertFeature(matchId, `${prefix}_af_form_last10`, formRatio);
 
-  // Yellow cards per game
   const gamesPlayed = result.fixtures.played[venue] || 1;
   let totalYellows = 0;
   for (const v of Object.values(result.cards.yellow)) {
     totalYellows += v.total ?? 0;
   }
-  const yellowCardsAvg = totalYellows / gamesPlayed;
-  await upsertFeature(matchId, `${prefix}_yellow_cards_avg`, yellowCardsAvg);
+  await upsertFeature(matchId, `${prefix}_yellow_cards_avg`, totalYellows / gamesPlayed);
 
-  logger.debug({ matchId, teamId, venue, goalsForAvg, yellowCardsAvg }, "Team stats stored from API-Football");
+  logger.debug({ matchId, teamId, venue, goalsForAvg }, "Team stats stored from API-Football");
   return true;
 }
 
@@ -583,7 +808,6 @@ export async function fetchTeamStatsForUpcomingMatches(): Promise<{
     const leagueId = LEAGUE_IDS[match.league];
     if (!leagueId) continue;
 
-    // Get stored AF team IDs if available
     const homeAfId = await getStoredFeature(match.id, "_af_home_team_id");
     const awayAfId = await getStoredFeature(match.id, "_af_away_team_id");
 
@@ -599,18 +823,7 @@ export async function fetchTeamStatsForUpcomingMatches(): Promise<{
   return { matchesProcessed, teamsUpdated };
 }
 
-async function getStoredFeature(matchId: number, featureName: string): Promise<number | null> {
-  const rows = await db
-    .select({ featureValue: featuresTable.featureValue })
-    .from(featuresTable)
-    .where(and(eq(featuresTable.matchId, matchId), eq(featuresTable.featureName, featureName)))
-    .limit(1);
-  if (!rows[0]?.featureValue) return null;
-  const v = parseInt(rows[0].featureValue, 10);
-  return isNaN(v) ? null : v;
-}
-
-// ─── Fixture Statistics (after match for training data) ──────────────────────
+// ─── Fixture statistics (post-match for training data) ───────────────────────
 
 interface ApiFixtureStats {
   team: { id: number };
@@ -637,30 +850,19 @@ export async function fetchAndStoreFixtureStats(
   const [homeStats, awayStats] = result;
   if (!homeStats || !awayStats) return false;
 
-  const homeShotsOnTarget = getStat(homeStats.statistics, "Shots on Goal");
-  const awayShotsOnTarget = getStat(awayStats.statistics, "Shots on Goal");
-  const homeTotalShots = getStat(homeStats.statistics, "Total Shots") || 1;
-  const awayTotalShots = getStat(awayStats.statistics, "Total Shots") || 1;
-  const homeCorners = getStat(homeStats.statistics, "Corner Kicks");
-  const awayCorners = getStat(awayStats.statistics, "Corner Kicks");
-  const homeYellows = getStat(homeStats.statistics, "Yellow Cards");
-  const awayYellows = getStat(awayStats.statistics, "Yellow Cards");
-  const homeFouls = getStat(homeStats.statistics, "Fouls");
-  const awayFouls = getStat(awayStats.statistics, "Fouls");
-
   const features: Array<[string, number]> = [
-    ["home_shots_on_target", homeShotsOnTarget],
-    ["away_shots_on_target", awayShotsOnTarget],
-    ["home_total_shots", homeTotalShots],
-    ["away_total_shots", awayTotalShots],
-    ["home_corners", homeCorners],
-    ["away_corners", awayCorners],
-    ["home_yellow_cards", homeYellows],
-    ["away_yellow_cards", awayYellows],
-    ["home_fouls", homeFouls],
-    ["away_fouls", awayFouls],
-    ["total_corners", homeCorners + awayCorners],
-    ["total_yellow_cards", homeYellows + awayYellows],
+    ["home_shots_on_target", getStat(homeStats.statistics, "Shots on Goal")],
+    ["away_shots_on_target", getStat(awayStats.statistics, "Shots on Goal")],
+    ["home_total_shots", getStat(homeStats.statistics, "Total Shots") || 1],
+    ["away_total_shots", getStat(awayStats.statistics, "Total Shots") || 1],
+    ["home_corners", getStat(homeStats.statistics, "Corner Kicks")],
+    ["away_corners", getStat(awayStats.statistics, "Corner Kicks")],
+    ["home_yellow_cards", getStat(homeStats.statistics, "Yellow Cards")],
+    ["away_yellow_cards", getStat(awayStats.statistics, "Yellow Cards")],
+    ["home_fouls", getStat(homeStats.statistics, "Fouls")],
+    ["away_fouls", getStat(awayStats.statistics, "Fouls")],
+    ["total_corners", getStat(homeStats.statistics, "Corner Kicks") + getStat(awayStats.statistics, "Corner Kicks")],
+    ["total_yellow_cards", getStat(homeStats.statistics, "Yellow Cards") + getStat(awayStats.statistics, "Yellow Cards")],
   ];
 
   for (const [name, value] of features) {
@@ -670,34 +872,62 @@ export async function fetchAndStoreFixtureStats(
   return true;
 }
 
-// ─── Lineup monitoring ────────────────────────────────────────────────────────
+// ─── Line movement stats for dashboard ───────────────────────────────────────
 
-interface ApiLineup {
-  team: { id: number; name: string };
-  startXI: Array<{ player: { id: number; name: string; number: number; pos: string } }>;
+export async function getLineMovementsToday(): Promise<number> {
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+
+  const rows = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(complianceLogsTable)
+    .where(
+      and(
+        eq(complianceLogsTable.actionType, "line_movement"),
+        gte(complianceLogsTable.timestamp, todayStart),
+      ),
+    );
+
+  return rows[0]?.count ?? 0;
 }
 
-export async function checkLineupAndFlag(
-  matchId: number,
-  fixtureId: number,
-): Promise<{ available: boolean; flagged: boolean; narrative: string }> {
-  if (!(await canMakeRequest())) {
-    return { available: false, flagged: false, narrative: "Budget exhausted" };
-  }
+// ─── Scan statistics for dashboard ───────────────────────────────────────────
 
-  const result = await fetchApiFootball<ApiLineup[]>("/fixtures/lineups", {
-    fixture: fixtureId,
-  });
+export async function getScanStats(): Promise<{
+  leaguesActive: number;
+  fixturesUpcoming: number;
+  marketsPerFixture: number;
+  lineMovementsToday: number;
+  budgetUsedToday: number;
+  budgetCap: number;
+}> {
+  const now = new Date();
+  const weekOut = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-  if (!result || result.length < 2) {
-    return { available: false, flagged: false, narrative: "Lineup not yet published" };
-  }
+  const [fixtureRows, oddsRows, budgetStatus, lineMovements] = await Promise.all([
+    db
+      .select({ count: sql<number>`count(distinct ${matchesTable.id})::int`, leagueCount: sql<number>`count(distinct ${matchesTable.league})::int` })
+      .from(matchesTable)
+      .where(and(eq(matchesTable.status, "scheduled"), gte(matchesTable.kickoffTime, now), lte(matchesTable.kickoffTime, weekOut))),
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(oddsSnapshotsTable)
+      .where(gte(oddsSnapshotsTable.snapshotTime, new Date(now.getTime() - 2 * 60 * 60 * 1000))),
+    getApiBudgetStatus(),
+    getLineMovementsToday(),
+  ]);
 
-  const [home, away] = result;
-  const homeStarters = home?.startXI?.length ?? 0;
-  const awayStarters = away?.startXI?.length ?? 0;
+  const fixtureCount = fixtureRows[0]?.count ?? 0;
+  const leagueCount = fixtureRows[0]?.leagueCount ?? 0;
+  const recentOdds = oddsRows[0]?.count ?? 0;
+  const marketsPerFixture = fixtureCount > 0 ? Math.round(recentOdds / fixtureCount) : 0;
 
-  const narrative = `Lineups confirmed: ${home?.team?.name} (${homeStarters} starters) vs ${away?.team?.name} (${awayStarters} starters)`;
-
-  return { available: true, flagged: false, narrative };
+  return {
+    leaguesActive: leagueCount,
+    fixturesUpcoming: fixtureCount,
+    marketsPerFixture,
+    lineMovementsToday: lineMovements,
+    budgetUsedToday: budgetStatus.used,
+    budgetCap: budgetStatus.cap,
+  };
 }

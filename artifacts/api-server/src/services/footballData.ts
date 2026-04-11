@@ -3,7 +3,9 @@ import { logger } from "../lib/logger";
 
 const BASE_URL = "https://api.football-data.org/v4";
 
-const REQUEST_INTERVAL_MS = 6100;
+// Reduced throttle — was 6100ms (10/min limit on old plan)
+// Keep a small delay to be respectful; football-data.org secondary source
+const REQUEST_INTERVAL_MS = 1000;
 
 let lastRequestAt = 0;
 
@@ -92,30 +94,34 @@ export interface FDHeadToHead {
   matches: FDMatch[];
 }
 
-const INGESTION_COMPETITIONS = [
-  "PL",
-  "BL1",
-  "SA",
-  "PD",
-  "FL1",
-  "CL",
-  "EL",
-  "EC",
-  "WC",
-  "PPL",
-  "BSA",
+// Tier 1 competitions (usually available on most plans)
+const TIER1_COMPETITIONS = [
+  "PL",   // Premier League
+  "BL1",  // Bundesliga
+  "SA",   // Serie A
+  "PD",   // Primera Division
+  "FL1",  // Ligue 1
+  "CL",   // Champions League
+  "EL",   // Europa League
+  "PPL",  // Primeira Liga
+  "BSA",  // Brasileirão
 ];
 
-export const FEATURE_COMPETITIONS = [
-  "PL",
-  "BL1",
-  "PD",
-  "SA",
-  "FL1",
-  "ELC",
-  "DED",
-  "PPL",
+// Tier 2 competitions (may 403 on free plan — handled gracefully)
+const TIER2_COMPETITIONS = [
+  "ELC",  // Championship
+  "DED",  // Eredivisie
+  "FL2",  // Ligue 2
+  "BL2",  // 2. Bundesliga
+  "SB",   // Serie B
+  "SD",   // Segunda División
+  "SPL",  // Scottish Premier League
+  "PPL2", // Primeira Liga 2
 ];
+
+export const INGESTION_COMPETITIONS = [...TIER1_COMPETITIONS, ...TIER2_COMPETITIONS];
+
+export const FEATURE_COMPETITIONS = [...TIER1_COMPETITIONS, "ELC", "DED"];
 
 export async function getCompetitions(): Promise<FDCompetition[]> {
   const client = getClient();
