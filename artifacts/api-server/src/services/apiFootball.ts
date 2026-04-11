@@ -106,80 +106,81 @@ const CARDS_LINES: Record<string, string> = {
 
 function mapOddsToMarket(
   betName: string,
-  value: string,
-  odd: string,
+  value: unknown,
+  odd: unknown,
 ): { marketType: string; selectionName: string; backOdds: number } | null {
-  const o = parseFloat(odd);
+  const o = parseFloat(String(odd));
   if (isNaN(o) || o <= 1.0) return null;
 
+  const v = String(value ?? "");
   const norm = betName.toLowerCase();
 
   if (norm.includes("match winner") || norm === "result" || norm === "1x2") {
-    if (value === "Home") return { marketType: "MATCH_ODDS", selectionName: "Home", backOdds: o };
-    if (value === "Draw") return { marketType: "MATCH_ODDS", selectionName: "Draw", backOdds: o };
-    if (value === "Away") return { marketType: "MATCH_ODDS", selectionName: "Away", backOdds: o };
+    if (v === "Home") return { marketType: "MATCH_ODDS", selectionName: "Home", backOdds: o };
+    if (v === "Draw") return { marketType: "MATCH_ODDS", selectionName: "Draw", backOdds: o };
+    if (v === "Away") return { marketType: "MATCH_ODDS", selectionName: "Away", backOdds: o };
   }
 
   if (norm.includes("both teams score") || norm === "btts" || norm === "both teams to score") {
-    if (value === "Yes") return { marketType: "BTTS", selectionName: "Yes", backOdds: o };
-    if (value === "No") return { marketType: "BTTS", selectionName: "No", backOdds: o };
+    if (v === "Yes") return { marketType: "BTTS", selectionName: "Yes", backOdds: o };
+    if (v === "No") return { marketType: "BTTS", selectionName: "No", backOdds: o };
   }
 
   if (norm.includes("goals over/under") || norm.includes("total goals") || norm === "goals") {
-    const line = value.replace("Over", "").replace("Under", "").trim();
+    const line = v.replace("Over", "").replace("Under", "").trim();
     const marketSuffix = GOALS_OU_LINES[line];
     if (marketSuffix) {
-      const sel = value.startsWith("Over") ? `Over ${line} Goals` : `Under ${line} Goals`;
+      const sel = v.startsWith("Over") ? `Over ${line} Goals` : `Under ${line} Goals`;
       return { marketType: marketSuffix, selectionName: sel, backOdds: o };
     }
   }
 
   if (norm.includes("double chance")) {
-    if (value === "Home/Draw" || value === "1X") return { marketType: "DOUBLE_CHANCE", selectionName: "1X", backOdds: o };
-    if (value === "Draw/Away" || value === "X2") return { marketType: "DOUBLE_CHANCE", selectionName: "X2", backOdds: o };
-    if (value === "Home/Away" || value === "12") return { marketType: "DOUBLE_CHANCE", selectionName: "12", backOdds: o };
+    if (v === "Home/Draw" || v === "1X") return { marketType: "DOUBLE_CHANCE", selectionName: "1X", backOdds: o };
+    if (v === "Draw/Away" || v === "X2") return { marketType: "DOUBLE_CHANCE", selectionName: "X2", backOdds: o };
+    if (v === "Home/Away" || v === "12") return { marketType: "DOUBLE_CHANCE", selectionName: "12", backOdds: o };
   }
 
   if (norm.includes("first half winner") || norm === "half time result" || norm.includes("halftime result")) {
-    if (value === "Home") return { marketType: "FIRST_HALF_RESULT", selectionName: "Home", backOdds: o };
-    if (value === "Draw") return { marketType: "FIRST_HALF_RESULT", selectionName: "Draw", backOdds: o };
-    if (value === "Away") return { marketType: "FIRST_HALF_RESULT", selectionName: "Away", backOdds: o };
+    if (v === "Home") return { marketType: "FIRST_HALF_RESULT", selectionName: "Home", backOdds: o };
+    if (v === "Draw") return { marketType: "FIRST_HALF_RESULT", selectionName: "Draw", backOdds: o };
+    if (v === "Away") return { marketType: "FIRST_HALF_RESULT", selectionName: "Away", backOdds: o };
   }
 
   if (norm.includes("first half") && norm.includes("goal")) {
-    const line = value.replace("Over", "").replace("Under", "").trim();
+    const line = v.replace("Over", "").replace("Under", "").trim();
     if (line === "0.5") {
-      const sel = value.startsWith("Over") ? "Over 0.5 First Half Goals" : "Under 0.5 First Half Goals";
+      const sel = v.startsWith("Over") ? "Over 0.5 First Half Goals" : "Under 0.5 First Half Goals";
       return { marketType: "FIRST_HALF_OU_05", selectionName: sel, backOdds: o };
     }
     if (line === "1.5") {
-      const sel = value.startsWith("Over") ? "Over 1.5 First Half Goals" : "Under 1.5 First Half Goals";
+      const sel = v.startsWith("Over") ? "Over 1.5 First Half Goals" : "Under 1.5 First Half Goals";
       return { marketType: "FIRST_HALF_OU_15", selectionName: sel, backOdds: o };
     }
   }
 
   if ((norm.includes("card") || norm.includes("yellow")) && (norm.includes("over") || norm.includes("under") || norm.includes("total"))) {
-    const line = value.replace("Over", "").replace("Under", "").trim();
+    const line = v.replace("Over", "").replace("Under", "").trim();
     const marketSuffix = CARDS_LINES[line];
     if (marketSuffix) {
-      const sel = value.startsWith("Over") ? `Over ${line} Cards` : `Under ${line} Cards`;
+      const sel = v.startsWith("Over") ? `Over ${line} Cards` : `Under ${line} Cards`;
       return { marketType: marketSuffix, selectionName: sel, backOdds: o };
     }
   }
 
   if (norm.includes("corner") && (norm.includes("over") || norm.includes("under") || norm.includes("total"))) {
-    const line = value.replace("Over", "").replace("Under", "").trim();
+    const line = v.replace("Over", "").replace("Under", "").trim();
     const marketSuffix = CORNERS_LINES[line];
     if (marketSuffix) {
-      const sel = value.startsWith("Over") ? `Over ${line} Corners` : `Under ${line} Corners`;
+      const sel = v.startsWith("Over") ? `Over ${line} Corners` : `Under ${line} Corners`;
       return { marketType: marketSuffix, selectionName: sel, backOdds: o };
     }
   }
 
   if (norm.includes("asian handicap")) {
-    const line = value.replace("Home", "").replace("Away", "").trim();
-    if (value.startsWith("Home")) return { marketType: "ASIAN_HANDICAP", selectionName: `Home ${line}`, backOdds: o };
-    if (value.startsWith("Away")) return { marketType: "ASIAN_HANDICAP", selectionName: `Away ${line}`, backOdds: o };
+    const line = v.replace("Home", "").replace("Away", "").trim();
+    if (v.startsWith("Home")) return { marketType: "ASIAN_HANDICAP", selectionName: `Home ${line}`, backOdds: o };
+    if (v.startsWith("Away")) return { marketType: "ASIAN_HANDICAP", selectionName: `Away ${line}`, backOdds: o };
   }
 
   return null;

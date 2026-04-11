@@ -5,7 +5,11 @@ const BASE_URL = "https://api.football-data.org/v4";
 
 // Reduced throttle — was 6100ms (10/min limit on old plan)
 // Keep a small delay to be respectful; football-data.org secondary source
-const REQUEST_INTERVAL_MS = 1000;
+const REQUEST_INTERVAL_MS = 1200; // slightly more conservative to avoid 429s
+
+// Persistent module-level standings cache — TTL 4 hours (standings rarely change mid-day)
+const STANDINGS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const standingsCacheStore: Map<string, { data: FDStandingEntry[]; cachedAt: number }> = new Map();
 
 let lastRequestAt = 0;
 
@@ -135,6 +139,12 @@ export async function getCompetitions(): Promise<FDCompetition[]> {
 export async function getStandings(
   competitionCode: string,
 ): Promise<FDStandingEntry[]> {
+  // Check persistent module-level cache first (TTL 4 hours)
+  const cached = standingsCacheStore.get(competitionCode);
+  if (cached && Date.now() - cached.cachedAt < STANDINGS_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   const client = getClient();
   await throttle();
   try {
@@ -142,11 +152,18 @@ export async function getStandings(
       `/competitions/${competitionCode}/standings`,
     );
     const total = response.data.standings.find((s) => s.type === "TOTAL");
-    return total?.table ?? [];
+    const data = total?.table ?? [];
+    standingsCacheStore.set(competitionCode, { data, cachedAt: Date.now() });
+    return data;
   } catch (err) {
     if (axios.isAxiosError(err) && (err.response?.status === 403 || err.response?.status === 404)) {
       logger.debug({ competitionCode }, "Standings not available in current plan");
+      standingsCacheStore.set(competitionCode, { data: [], cachedAt: Date.now() });
       return [];
+    }
+    if (axios.isAxiosError(err) && err.response?.status === 429) {
+      logger.warn({ competitionCode }, "Standings rate-limited (429) — returning cached or empty");
+      return cached?.data ?? [];
     }
     throw err;
   }
@@ -170,7 +187,7 @@ export async function getTeamMatches(
     );
     return response.data.matches ?? [];
   } catch (err) {
-    if (axios.isAxiosError(err) && err.response?.status === 404) {
+    if (axios.isAxiosError(err) && (err.response?.status === 404 || err.response?.status === 429)) {
       return [];
     }
     throw err;
@@ -187,7 +204,7 @@ export async function getHeadToHead(matchId: number): Promise<FDHeadToHead | nul
     );
     return response.data.head2head ?? null;
   } catch (err) {
-    if (axios.isAxiosError(err) && (err.response?.status === 404 || err.response?.status === 403)) {
+    if (axios.isAxiosError(err) && (err.response?.status === 404 || err.response?.status === 403 || err.response?.status === 429)) {
       return null;
     }
     throw err;

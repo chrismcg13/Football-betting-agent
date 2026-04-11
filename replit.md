@@ -108,11 +108,24 @@ All routes are under `/api/`:
 |--------|-------------|-------|
 | MATCH_ODDS | 1X2 outcome | Logistic Regression |
 | BTTS | Both teams to score | Logistic Regression |
+| OVER_UNDER_05 | Over/under 0.5 goals | Poisson |
+| OVER_UNDER_15 | Over/under 1.5 goals | Poisson |
 | OVER_UNDER_25 | Over/under 2.5 goals | Logistic Regression |
+| OVER_UNDER_35 | Over/under 3.5 goals | Poisson |
+| OVER_UNDER_45 | Over/under 4.5 goals | Poisson |
+| DOUBLE_CHANCE | 1X / X2 / 12 | Derived from outcome probs |
+| FIRST_HALF_RESULT | HT 1X2 | Scaled from full-match probs |
+| FIRST_HALF_OU_05 | HT over/under 0.5 | Poisson (half-lambda) |
+| FIRST_HALF_OU_15 | HT over/under 1.5 | Poisson (half-lambda) |
+| ASIAN_HANDICAP | AH lines | Pass-through (real odds only) |
 | TOTAL_CARDS_35 | Total cards > 3.5 | Poisson heuristic |
 | TOTAL_CARDS_45 | Total cards > 4.5 | Poisson heuristic |
+| TOTAL_CARDS_25 | Total cards > 2.5 | Poisson heuristic |
+| TOTAL_CARDS_55 | Total cards > 5.5 | Poisson heuristic |
+| TOTAL_CORNERS_85 | Total corners > 8.5 | Poisson heuristic |
 | TOTAL_CORNERS_95 | Total corners > 9.5 | Poisson heuristic |
 | TOTAL_CORNERS_105 | Total corners > 10.5 | Poisson heuristic |
+| TOTAL_CORNERS_115 | Total corners > 11.5 | Poisson heuristic |
 
 Cards/corners models use a 0.7× Kelly multiplier until sufficient settled data accumulates.
 
@@ -162,11 +175,13 @@ Three logistic regression models trained via one-vs-all, bootstrapped from histo
 
 ## API-Football Integration (src/services/apiFootball.ts)
 
-- **Budget**: 90 req/day hard cap tracked in `api_usage` table
-- **Fixture mapping**: Discovers upcoming matches and fuzzy-matches team names
-- **Real odds**: Ingests Bet365, Bwin, 1xBet odds for upcoming fixtures (every 8h)
+- **Budget**: 75,000 req/day cap tracked in `api_usage` table (previously 90/day)
+- **Fixture mapping**: Discovers upcoming matches (7-day window) and fuzzy-matches team names
+- **Real odds**: Fetches ALL bookmakers (20+) for upcoming fixtures in a single API call every 2h
 - **Team stats**: Fetches yellow cards avg, corners avg, shots stats (every 12h)
-- **Budget endpoint**: `GET /api/dashboard/api-budget` → `{used, cap, remaining, date}`
+- **Budget endpoint**: `GET /api/dashboard/api-budget` → `{used, cap:75000, remaining, date}`
+- **Freshness**: 2-hour odds freshness window (skip if fetched within 2h)
+- **Source format**: `api_football_real:${bookmakerName}` (e.g. `api_football_real:Bet365`)
 
 ## Feature Engine (src/services/featureEngine.ts)
 
@@ -196,13 +211,44 @@ Computes 17 ML features per upcoming match:
 
 | Job | Schedule | Description |
 |-----|----------|-------------|
-| Data ingestion | Every 30 min, 06:00–23:30 UTC | Fetches matches from football-data.org |
+| Data ingestion | Every 30 min, 24/7 | Fetches matches from football-data.org (7-day window) |
 | Feature computation | Every 6 hours UTC | Computes all ML features |
-| Trading cycle | Every 15 minutes | Detects value bets, places paper bets |
-| API-Football odds | Every 8 hours UTC | Ingests real odds from Bet365/Bwin/1xBet |
+| Trading cycle | Every 10 minutes | Detects value bets, places paper bets |
+| API-Football odds | Every 2 hours, 24/7 | ALL bookmakers (20+) in single call, 2h freshness window |
+| OddsPapi Pinnacle | Every 10 min (trading) | Top-8 fixtures ≤48h only, skips 2nd-div leagues, capped 7/day |
 | API-Football team stats | Every 12 hours UTC | Fetches cards/corners/shots stats |
 | Learning loop | Daily at 03:00 UTC | Generates narratives, retrains model |
 | xG ingestion | Daily at 05:00 UTC | Derives team xG rolling stats from internal feature engine |
+
+## Line Movement Tracking (src/services/lineMovement.ts)
+
+- Detects significant odds changes (>5% threshold) per bookmaker per selection
+- Stores history in `odds_history` table (per-bookmaker snapshots)
+- Categorizes as "shortening" (odds decreasing) or "drifting" (odds increasing)
+- Hours to kickoff recorded for each movement
+- Dashboard: `GET /api/dashboard/line-movements` → last 50 significant movements
+- Compliance log: `line_movement` action type for every significant shift
+
+## League Edge Scores (src/services/valueDetection.ts)
+
+18 leagues seeded with edge scores in `league_edge_scores` table:
+
+| Tier | Score | Leagues |
+|------|-------|---------|
+| 85 | Premier League, Bundesliga, La Liga, Serie A, Ligue 1 | Top-5 |
+| 82 | Ligue 2, 2. Bundesliga, Scottish Premiership | Tier 2 |
+| 80 | Primeira Liga | |
+| 75 | Championship | |
+| 72 | Belgian Pro League, Swiss Super League | |
+| 70 | Eredivisie, MLS, Nordic leagues | |
+| 65 | J-League, K League | |
+
+Bonus in opportunity score: `(leagueEdgeScore - 50) / 5`, capped ±10 points.
+
+## New Dashboard Endpoints
+
+- `GET /api/dashboard/scan-stats` — `{leaguesActive, fixturesUpcoming, marketsPerFixture, lineMovementsToday, budgetUsedToday, budgetCap}`
+- `GET /api/dashboard/line-movements` — Last 50 significant line movements with direction and hours to KO
 
 ## xG Intelligence Layer
 
