@@ -544,12 +544,10 @@ router.get("/dashboard/viability", async (req, res) => {
   const avgRoiPerBet = overallRoi; // net of 2% Betfair commission (already deducted in settlement)
   const betsPerWeek = totalSettledBets / (paperTradingDays / 7);
 
-  // Weekly volume at current stake
-  const weeklyVolume = avgStake * betsPerWeek;
-
-  // Projected monthly profits (4 weeks)
-  const monthlyProfitOptimistic =
-    (weeklyVolume * (avgRoiPerBet / 100)) * 4;
+  // Average profit per bet and monthly projection
+  // Monthly profit = avgProfitPerBet × betsPerWeek × 4.3 (average weeks per month)
+  const avgProfitPerBet = totalSettledBets > 0 ? totalPnl / totalSettledBets : 0;
+  const monthlyProfitOptimistic = avgProfitPerBet * betsPerWeek * 4.3;
   const monthlyProfitModerate = monthlyProfitOptimistic * 0.75;
   const monthlyProfitConservative = monthlyProfitOptimistic * 0.5;
 

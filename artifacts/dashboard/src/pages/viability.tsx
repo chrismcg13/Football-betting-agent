@@ -276,9 +276,9 @@ export default function Viability() {
   return (
     <div className="space-y-8 max-w-4xl mx-auto">
       <div>
-        <h2 className="text-2xl font-bold text-white tracking-tight">Viability Assessment</h2>
+        <h2 className="text-2xl font-bold text-white tracking-tight">Go Live Calculator</h2>
         <p className="text-sm text-slate-500 mt-1">
-          Evidence-based decision framework for the £499 system cost.
+          Evidence-based decision framework for the £499 go-live investment.
         </p>
       </div>
 

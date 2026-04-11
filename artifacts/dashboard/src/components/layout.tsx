@@ -44,10 +44,10 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const navItems = [
     { href: "/", label: "Overview", icon: Target },
     { href: "/bets", label: "Bet History", icon: BookOpen },
-    { href: "/performance", label: "Performance", icon: BarChart2 },
-    { href: "/viability", label: "Viability", icon: Zap },
-    { href: "/learning", label: "Learning & Model", icon: Brain },
-    { href: "/compliance", label: "Compliance", icon: Shield },
+    { href: "/performance", label: "Performance & Analysis", icon: BarChart2 },
+    { href: "/viability", label: "Go Live Calculator", icon: Zap },
+    { href: "/learning", label: "Agent Brain", icon: Brain },
+    { href: "/compliance", label: "Audit Trail", icon: Shield },
   ];
 
   const pnl = summary?.totalPnl ?? 0;

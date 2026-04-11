@@ -1,42 +1,36 @@
-import { useMemo } from "react";
-import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useXGTeams } from "@/hooks/use-dashboard";
-import { formatCurrency, formatRelativeTime } from "@/lib/format";
+import { useMemo, useState } from "react";
+import { useSummary, useBets, useNarratives, usePerformance, useClvStats } from "@/hooks/use-dashboard";
+import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
+import { Info } from "lucide-react";
 import {
-  Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip as RechartsTooltip,
+  XAxis, YAxis, ReferenceLine,
 } from "recharts";
+
+// ─── Market type label ────────────────────────────────────────────────────────
+
+// (formatMarketType is imported from format.ts)
 
 // ─── Narrative helpers ────────────────────────────────────────────────────────
 
 function getNarrativeEmoji(type: string): string {
   const map: Record<string, string> = {
-    risk_circuit_breaker: "🛡️",
-    sustained_positive_edge: "📈",
-    strategy_best_segment: "🎯",
-    strategy_worst_segment: "🔄",
-    feature_importance_shift: "💡",
-    feature_importance_change: "💡",
+    risk_circuit_breaker: "⚠️",
+    sustained_positive_edge: "🎯",
+    strategy_best_segment: "⭐",
+    strategy_worst_segment: "📉",
+    feature_importance_shift: "🧠",
+    feature_importance_change: "🧠",
     accuracy_change: "📈",
+    model_accuracy_improvement: "📈",
     calibration_change: "🔄",
-    model_retrain: "💡",
+    model_retrain: "📈",
+    league_allocation: "🌍",
+    league_discovery: "🔍",
   };
   return map[type] ?? "📊";
-}
-
-function translateNarrativeType(type: string): string {
-  const map: Record<string, string> = {
-    risk_circuit_breaker: "Risk Control",
-    sustained_positive_edge: "Positive Edge",
-    strategy_best_segment: "Best Strategy",
-    strategy_worst_segment: "Weak Spot",
-    feature_importance_shift: "Feature Discovery",
-    feature_importance_change: "Feature Discovery",
-    accuracy_change: "Model Update",
-    calibration_change: "Calibration",
-    model_retrain: "Model Retrained",
-  };
-  return map[type] ?? type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function generateNarrativeText(n: any): string {
@@ -45,28 +39,103 @@ function generateNarrativeText(n: any): string {
   const d = n.relatedData ?? {};
   switch (n.narrativeType) {
     case "risk_circuit_breaker":
-      return `Risk control activated: ${d.reason ?? "loss limit reached"}. Agent paused to protect bankroll.`;
+      return `Risk control activated: ${d.reason ?? "loss limit reached"}. Agent paused to protect the bankroll.`;
     case "sustained_positive_edge":
       return `Consistent edge found in ${d.league ?? "—"} ${d.market ?? ""}${d.roi != null ? ` — ${Number(d.roi).toFixed(1)}% ROI` : ""}${d.count != null ? ` over ${d.count} bets` : ""}.`;
     case "strategy_best_segment":
-      return `Best performing strategy: ${d.league ?? d.segment ?? "—"} ${d.market ?? ""} with ${d.roi != null ? Number(d.roi).toFixed(1) : "?"}% return.`;
+      return `Top strategy: ${d.league ?? d.segment ?? "—"} ${d.market ?? ""} returning ${d.roi != null ? Number(d.roi).toFixed(1) : "?"}% ROI.`;
     case "strategy_worst_segment":
-      return `Weak spot identified: ${d.league ?? d.segment ?? "—"} ${d.market ?? ""} at ${d.roi != null ? Number(d.roi).toFixed(1) : "?"}% — agent reducing exposure.`;
+      return `Weak spot: ${d.league ?? d.segment ?? "—"} ${d.market ?? ""} at ${d.roi != null ? Number(d.roi).toFixed(1) : "?"}% ROI. Reducing exposure.`;
     case "feature_importance_shift":
     case "feature_importance_change":
-      return `Model update: ${d.feature ?? "a feature"} is now the #${d.rank ?? "?"} most important predictor.`;
+      return `Model insight: ${d.feature ?? "a feature"} has become the #${d.rank ?? "?"} most important predictor.`;
     case "accuracy_change":
-      return `Model accuracy ${(d.delta ?? 0) >= 0 ? "improved" : "decreased"} to ${d.newAccuracy != null ? (Number(d.newAccuracy) * 100).toFixed(1) : "?"}%.`;
+    case "model_accuracy_improvement":
+      return `Model accuracy ${(d.delta ?? 0) >= 0 ? "improved" : "decreased"} from ${d.oldAccuracy != null ? (Number(d.oldAccuracy) * 100).toFixed(1) : "?"}% to ${d.newAccuracy != null ? (Number(d.newAccuracy) * 100).toFixed(1) : "?"}%${d.count != null ? ` after learning from ${d.count} bets` : ""}.`;
     case "model_retrain":
-      return `Model retrained on ${d.trainedOn ?? "?"} bets.${d.accuracy != null ? ` New accuracy: ${(Number(d.accuracy) * 100).toFixed(1)}%.` : ""}`;
+      return `Model retrained on ${d.trainedOn ?? d.count ?? "?"} bets.${d.accuracy != null ? ` New accuracy: ${(Number(d.accuracy) * 100).toFixed(1)}%.` : ""}`;
+    case "league_allocation":
+      return `League focus: ${d.league ?? "—"} ${d.direction === "up" ? "promoted" : "demoted"} based on ${d.reason ?? "recent performance"}.`;
+    case "league_discovery":
+      return `New opportunity: ${d.league ?? "—"} ${d.market ?? ""} showing ${d.edge != null ? Number(d.edge).toFixed(1) : "?"}% average edge.`;
     default:
-      return n.title ?? translateNarrativeType(n.narrativeType);
+      return n.title ?? (n.narrativeType ?? "").replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
   }
 }
 
-// ─── Stat Card ────────────────────────────────────────────────────────────────
+// ─── CLV Info Tooltip ─────────────────────────────────────────────────────────
 
-function StatCard({
+function ClvInfoIcon() {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="relative inline-flex ml-1.5 align-middle">
+      <button
+        type="button"
+        className="text-slate-500 hover:text-slate-300 transition-colors focus:outline-none"
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        aria-label="CLV explanation"
+      >
+        <Info className="w-3.5 h-3.5" />
+      </button>
+      {open && (
+        <div
+          className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 rounded-xl border p-3 text-xs text-slate-300 leading-relaxed shadow-2xl"
+          style={{ background: "#0f172a", borderColor: "#334155", width: "260px" }}
+        >
+          <p className="font-semibold text-white mb-1">What is CLV?</p>
+          CLV measures whether the agent gets better odds than the closing market price. Positive CLV = the agent is beating the market. Professional bettors consider +2% CLV elite. This is the single best predictor of long-term profitability.
+          <div
+            className="absolute top-full left-1/2 -translate-x-1/2 w-2 h-2 rotate-45 border-r border-b"
+            style={{ background: "#0f172a", borderColor: "#334155" }}
+          />
+        </div>
+      )}
+    </span>
+  );
+}
+
+// ─── Primary Stat Card ────────────────────────────────────────────────────────
+
+function PrimaryCard({
+  label,
+  value,
+  sub,
+  color,
+  labelSuffix,
+}: {
+  label: string;
+  value: React.ReactNode;
+  sub?: React.ReactNode;
+  color?: "green" | "red" | "amber" | "default";
+  labelSuffix?: React.ReactNode;
+}) {
+  const valueColor =
+    color === "green" ? "text-emerald-400"
+    : color === "red" ? "text-red-400"
+    : color === "amber" ? "text-amber-400"
+    : "text-white";
+
+  return (
+    <div
+      className="rounded-xl p-5 border flex flex-col gap-2.5"
+      style={{ background: "#1e293b", borderColor: "#334155" }}
+    >
+      <p className="text-[11px] font-semibold uppercase tracking-widest text-slate-500 flex items-center">
+        {label}
+        {labelSuffix}
+      </p>
+      <p className={cn("text-4xl font-bold font-mono leading-none", valueColor)}>{value}</p>
+      {sub && <p className="text-xs text-slate-500 leading-snug">{sub}</p>}
+    </div>
+  );
+}
+
+// ─── Secondary Stat Card ──────────────────────────────────────────────────────
+
+function SecondaryCard({
   label,
   value,
   sub,
@@ -85,17 +154,17 @@ function StatCard({
 
   return (
     <div
-      className="rounded-xl p-5 border flex flex-col gap-2"
-      style={{ background: "#1e293b", borderColor: "#334155" }}
+      className="rounded-xl p-4 border flex flex-col gap-1.5"
+      style={{ background: "#172033", borderColor: "#334155" }}
     >
-      <p className="text-[11px] font-semibold uppercase tracking-widest text-slate-500">{label}</p>
-      <p className={cn("text-3xl font-bold font-mono leading-none", valueColor)}>{value}</p>
+      <p className="text-[10px] font-semibold uppercase tracking-widest text-slate-600">{label}</p>
+      <p className={cn("text-2xl font-bold font-mono leading-none", valueColor)}>{value}</p>
       {sub && <p className="text-xs text-slate-500 leading-snug">{sub}</p>}
     </div>
   );
 }
 
-// ─── Chart tooltip ────────────────────────────────────────────────────────────
+// ─── Chart Tooltip ────────────────────────────────────────────────────────────
 
 const TOOLTIP_STYLE = {
   contentStyle: {
@@ -111,230 +180,249 @@ const TOOLTIP_STYLE = {
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
+const DEMO_DAY = new Date("2026-04-23T23:59:59Z");
+const SETTLED_TARGET = 500;
+
 export default function Overview() {
   const { data: summary, isLoading: loadingSummary } = useSummary();
   const { data: clvStats } = useClvStats();
   const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 500, "all");
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
-  const { data: xgData, isLoading: loadingXg } = useXGTeams();
 
+  // ── Derived values ──────────────────────────────────────────────────────────
+  const pnl = summary?.totalPnl ?? 0;
+  const roi = summary?.overallRoiPct ?? 0;
+  const bankroll = summary?.currentBankroll ?? 0;
+  const wins = summary?.wins ?? 0;
+  const losses = summary?.losses ?? 0;
+  const voids = (summary as any)?.voids ?? 0;
+  const pending = summary?.pending ?? 0;
+  const settledBets = (summary as any)?.settledBets ?? 0;
+  const winPercentage = summary?.winPercentage ?? 0;
+  const avgScore = summary?.avgOpportunityScore ?? null;
+  const paperMode = (summary as any)?.paperMode ?? false;
+  const betsToday = (summary as any)?.betsToday ?? 0;
+
+  const avgClv: number | null = (clvStats as any)?.count > 0 ? Number((clvStats as any).avgClv) : null;
+
+  // ── Demo Day countdown ──────────────────────────────────────────────────────
+  const daysRemaining = useMemo(() => {
+    const now = new Date();
+    const diff = DEMO_DAY.getTime() - now.getTime();
+    return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
+  }, []);
+
+  const progressPct = Math.min((settledBets / SETTLED_TARGET) * 100, 100);
+  const demoDayPositive =
+    avgClv != null && avgClv > 0 && pnl > 0 && settledBets >= 30;
+
+  // ── Bet splits ──────────────────────────────────────────────────────────────
   const upcomingBets = useMemo(() => {
     const bets = (allBetsData?.bets as any[]) ?? [];
-    return bets.filter((b: any) => b.status === "pending");
+    return bets
+      .filter((b: any) => b.status === "pending")
+      .sort((a: any, b: any) => {
+        const ta = a.kickoffTime ? new Date(a.kickoffTime).getTime() : Infinity;
+        const tb = b.kickoffTime ? new Date(b.kickoffTime).getTime() : Infinity;
+        return ta - tb;
+      });
   }, [allBetsData]);
 
   const recentResults = useMemo(() => {
     const bets = (allBetsData?.bets as any[]) ?? [];
-    return bets.filter((b: any) => b.status === "won" || b.status === "lost").slice(0, 10);
+    return bets
+      .filter((b: any) => b.status === "won" || b.status === "lost" || b.status === "void")
+      .slice(0, 20);
   }, [allBetsData]);
 
+  // ── Narratives ──────────────────────────────────────────────────────────────
   const narratives = useMemo(
     () => ((narrativesData?.narratives as any[]) ?? []).slice(0, 5),
     [narrativesData],
   );
 
+  // ── Chart data ──────────────────────────────────────────────────────────────
   const chartData = useMemo(() => {
     const arr = (perfData?.cumulativeProfit as any[]) ?? [];
-    return arr.slice(-30);
+    const sliced = arr.slice(-60);
+    if (sliced.length === 0) return [];
+    const first = sliced[0];
+    const zeroPoint = { date: first.date, cumPnl: 0, _zero: true };
+    return [zeroPoint, ...sliced];
   }, [perfData]);
 
-  const isProfit = useMemo(() => {
-    if (chartData.length === 0) return true;
-    return (chartData[chartData.length - 1]?.cumPnl ?? 0) >= 0;
-  }, [chartData]);
+  const currentPnl = chartData.length > 1 ? (chartData[chartData.length - 1]?.cumPnl ?? 0) : 0;
+  const isChartPositive = currentPnl >= 0;
 
-  const pnl = summary?.totalPnl ?? 0;
-  const todayPnl = summary?.todayPnl ?? 0;
-  const roi = summary?.overallRoiPct ?? 0;
-  const bankroll = summary?.currentBankroll ?? 0;
-  const startingBankroll = 500;
-  const bankrollDiff = bankroll - startingBankroll;
-  const settledBets = (summary as any)?.settledBets ?? 0;
-  const betsToday = (summary as any)?.betsToday ?? 0;
-  const paperMode = (summary as any)?.paperMode ?? false;
-  const SIGNIFICANCE_TARGET = 500;
-  const significancePct = Math.min((settledBets / SIGNIFICANCE_TARGET) * 100, 100);
+  // ── CLV color ───────────────────────────────────────────────────────────────
+  const clvColor =
+    avgClv == null ? "default"
+    : avgClv >= 2 ? "green"
+    : avgClv >= 0 ? "amber"
+    : "red";
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
+
+      {/* Page header */}
+      <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
           <h2 className="text-2xl font-bold text-white tracking-tight">Overview</h2>
           <p className="text-sm text-slate-500 mt-1">Mission control for the paper trading agent.</p>
         </div>
-        <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
           {paperMode && (
             <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400 text-xs font-semibold tracking-wide">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-              PAPER MODE: ON
+              PAPER MODE
             </span>
           )}
           {!loadingSummary && (
             <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-semibold">
-              {betsToday} bets placed today
-            </span>
-          )}
-          {!loadingSummary && (
-            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-semibold">
-              {(summary as any)?.pending ?? 0} open
+              {betsToday} placed today · {pending} open
             </span>
           )}
         </div>
       </div>
 
-      {/* Bets to significance progress bar */}
-      <div className="rounded-xl border border-slate-700/60 bg-slate-800/40 p-4">
-        <div className="flex items-center justify-between mb-2">
-          <div>
-            <p className="text-sm font-semibold text-white">Bets to Statistical Significance</p>
-            <p className="text-xs text-slate-500 mt-0.5">
-              {settledBets >= SIGNIFICANCE_TARGET
-                ? "Target reached — results are statistically robust for Demo Day."
-                : `${SIGNIFICANCE_TARGET - settledBets} more settled bets needed for Demo Day (April 23).`}
-            </p>
-          </div>
-          <div className="text-right shrink-0">
-            <p className="text-lg font-mono font-bold text-white">
-              {settledBets} <span className="text-slate-500 font-normal text-sm">/ {SIGNIFICANCE_TARGET}</span>
-            </p>
-            <p className="text-xs text-slate-500">{significancePct.toFixed(1)}% complete</p>
-          </div>
-        </div>
-        <div className="h-2 w-full rounded-full bg-slate-700/60 overflow-hidden">
-          <div
-            className={cn(
-              "h-full rounded-full transition-all duration-500",
-              significancePct >= 100 ? "bg-emerald-500" : significancePct >= 50 ? "bg-amber-500" : "bg-blue-500",
-            )}
-            style={{ width: `${Math.max(significancePct, 0.5)}%` }}
-          />
-        </div>
-      </div>
-
-      {/* 6-Card Stats Grid */}
-      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-        <StatCard
-          label="Simulated Bankroll"
-          value={loadingSummary ? "—" : formatCurrency(bankroll)}
-          sub={
-            !loadingSummary && summary
-              ? `${bankrollDiff >= 0 ? "+" : ""}${formatCurrency(bankrollDiff)} from £500 paper start`
-              : undefined
-          }
-          color={!loadingSummary ? (bankrollDiff >= 0 ? "green" : "red") : "default"}
-        />
-        <StatCard
-          label="Total P&L"
+      {/* ── PRIMARY METRICS ─────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <PrimaryCard
+          label="Profit"
           value={loadingSummary ? "—" : formatCurrency(pnl)}
-          sub={!loadingSummary && summary ? `${roi >= 0 ? "+" : ""}${roi.toFixed(2)}% overall ROI` : undefined}
+          sub="Net profit from paper trading"
           color={!loadingSummary ? (pnl >= 0 ? "green" : "red") : "default"}
         />
-        <StatCard
-          label="Total Bets"
-          value={loadingSummary ? "—" : (summary?.totalBets ?? 0)}
-          sub={
-            !loadingSummary && summary
-              ? `${summary.wins ?? 0}W · ${summary.losses ?? 0}L · ${summary.pending ?? 0} pending`
-              : undefined
-          }
-        />
-        <StatCard
-          label="Win Rate"
-          value={loadingSummary ? "—" : `${(summary?.winPercentage ?? 0).toFixed(1)}%`}
-          sub={!loadingSummary ? "of settled bets" : undefined}
-          color={
-            !loadingSummary
-              ? (summary?.winPercentage ?? 0) >= 50 ? "green" : "red"
-              : "default"
-          }
-        />
-        <StatCard
+        <PrimaryCard
           label="ROI"
           value={loadingSummary ? "—" : `${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`}
-          sub={!loadingSummary ? "total return on stakes" : undefined}
+          sub="Return on every £1 staked"
           color={!loadingSummary ? (roi >= 0 ? "green" : "red") : "default"}
         />
-        {(clvStats as any)?.count > 0 && (
-          <StatCard
-            label="Avg CLV"
-            value={
-              (clvStats as any)?.avgClv != null
-                ? `${(clvStats as any).avgClv >= 0 ? "+" : ""}${Number((clvStats as any).avgClv).toFixed(2)}%`
-                : "—"
-            }
-            sub={
-              (clvStats as any)?.count != null
-                ? `over ${(clvStats as any).count} settled bets`
-                : "no data yet"
-            }
-            color={
-              (clvStats as any)?.avgClv != null
-                ? Number((clvStats as any).avgClv) >= 3 ? "green"
-                  : Number((clvStats as any).avgClv) >= 0 ? "amber"
-                  : "red"
-                : "default"
-            }
-          />
-        )}
-        <StatCard
-          label="Avg Opportunity Score"
+        <PrimaryCard
+          label="Win Rate"
+          value={loadingSummary ? "—" : `${winPercentage.toFixed(1)}%`}
+          sub={!loadingSummary ? `${wins} won from ${wins + losses} settled bets` : undefined}
+          color={!loadingSummary ? (winPercentage >= 50 ? "green" : "amber") : "default"}
+        />
+        <PrimaryCard
+          label="CLV"
+          labelSuffix={<ClvInfoIcon />}
           value={
-            loadingSummary
-              ? "—"
-              : summary?.avgOpportunityScore != null
-                ? `${summary.avgOpportunityScore.toFixed(1)}`
-                : "—"
+            loadingSummary ? "—"
+            : avgClv == null ? "No data yet"
+            : `${avgClv >= 0 ? "+" : ""}${avgClv.toFixed(2)}%`
           }
-          sub={
-            !loadingSummary
-              ? summary?.avgOpportunityScore != null
-                ? summary.avgOpportunityScore >= 80
-                  ? "Strong signal quality"
-                  : summary.avgOpportunityScore >= 70
-                    ? "Good signal quality"
-                    : "Moderate signal quality"
-                : "No scored bets yet"
-              : undefined
-          }
+          sub="How much better our odds are vs the market"
+          color={!loadingSummary ? clvColor : "default"}
+        />
+      </div>
+
+      {/* ── SECONDARY METRICS ───────────────────────────────────────────────── */}
+      <div className="grid grid-cols-3 gap-4">
+        <SecondaryCard
+          label="Bankroll"
+          value={loadingSummary ? "—" : formatCurrency(bankroll)}
+          sub="Simulated trading balance (started £500)"
+          color={!loadingSummary ? (bankroll >= 500 ? "green" : "red") : "default"}
+        />
+        <SecondaryCard
+          label="Bets Record"
+          value={loadingSummary ? "—" : `${wins}W – ${losses}L – ${voids}V`}
+          sub={!loadingSummary ? `Won – Lost – Voided (${pending} pending)` : undefined}
+        />
+        <SecondaryCard
+          label="Avg Opportunity Score"
+          value={loadingSummary ? "—" : avgScore != null ? `${avgScore.toFixed(1)} / 100` : "—"}
+          sub="Quality of bets selected (higher = more confident)"
           color={
-            !loadingSummary && summary?.avgOpportunityScore != null
-              ? summary.avgOpportunityScore >= 80
-                ? "green"
-                : summary.avgOpportunityScore >= 70
-                  ? "amber"
-                  : "default"
+            !loadingSummary && avgScore != null
+              ? avgScore >= 80 ? "green" : avgScore >= 70 ? "amber" : "default"
               : "default"
           }
         />
       </div>
 
-      {/* Cumulative P&L Chart */}
+      {/* ── DEMO DAY PROGRESS ───────────────────────────────────────────────── */}
+      <div
+        className="rounded-xl border p-5"
+        style={{ background: "#1e293b", borderColor: "#334155" }}
+      >
+        <div className="flex items-start justify-between gap-4 mb-3 flex-wrap">
+          <div>
+            <p className="text-sm font-semibold text-white">Journey to Demo Day</p>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Settled bets needed for statistical confidence. Demo Day: <span className="text-slate-300 font-medium">April 23, 2026</span>
+            </p>
+          </div>
+          <div className="text-right shrink-0 flex items-center gap-4">
+            <div>
+              <p className="text-2xl font-mono font-bold text-white">
+                {settledBets} <span className="text-slate-500 text-base font-normal">/ {SETTLED_TARGET}</span>
+              </p>
+              <p className="text-xs text-slate-500">{progressPct.toFixed(1)}% complete</p>
+            </div>
+            <div
+              className="rounded-lg px-3 py-2 text-center border"
+              style={{ background: "#0f172a", borderColor: "#334155" }}
+            >
+              <p className="text-2xl font-bold font-mono text-blue-400">{daysRemaining}</p>
+              <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">days left</p>
+            </div>
+          </div>
+        </div>
+        <div className="h-2.5 w-full rounded-full bg-slate-700/60 overflow-hidden mb-3">
+          <div
+            className={cn(
+              "h-full rounded-full transition-all duration-700",
+              progressPct >= 100 ? "bg-emerald-500" : progressPct >= 50 ? "bg-amber-500" : "bg-blue-500",
+            )}
+            style={{ width: `${Math.max(progressPct, 0.5)}%` }}
+          />
+        </div>
+        {demoDayPositive ? (
+          <p className="text-xs font-medium text-emerald-400">
+            ✓ Early indicators are positive. Model is beating the market.
+          </p>
+        ) : (
+          <p className="text-xs font-medium text-amber-400">
+            ⏳ More data needed. The model is still learning.
+          </p>
+        )}
+      </div>
+
+      {/* ── PROFIT CHART ────────────────────────────────────────────────────── */}
       <div
         className="rounded-xl border p-5"
         style={{ background: "#1e293b", borderColor: "#334155" }}
       >
         <div className="mb-4">
-          <h3 className="text-sm font-semibold text-white">Cumulative P&L</h3>
-          <p className="text-xs text-slate-500 mt-0.5">Net profit over the last 30 data points</p>
+          <h3 className="text-sm font-semibold text-white">Profit Over Time</h3>
+          <p className="text-xs text-slate-500 mt-0.5">Cumulative net profit from all settled bets</p>
         </div>
         {loadingPerf ? (
-          <div className="h-48 rounded-lg animate-pulse" style={{ background: "#0f172a" }} />
+          <div className="h-52 rounded-lg animate-pulse" style={{ background: "#0f172a" }} />
         ) : chartData.length < 2 ? (
-          <div className="h-48 flex items-center justify-center text-sm text-slate-500">
-            Not enough data yet — bets will appear here after settlement.
+          <div className="h-52 flex items-center justify-center text-sm text-slate-500">
+            No settled bets yet — the profit line will appear here after first settlement.
           </div>
         ) : (
-          <div className="h-48">
+          <div className="h-52">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+              <AreaChart data={chartData} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
                 <defs>
-                  <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.3} />
-                    <stop offset="95%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.02} />
+                  <linearGradient id="profitGradPos" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.35} />
+                    <stop offset="95%" stopColor="#10b981" stopOpacity={0.03} />
+                  </linearGradient>
+                  <linearGradient id="profitGradNeg" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#ef4444" stopOpacity={0.03} />
+                    <stop offset="95%" stopColor="#ef4444" stopOpacity={0.35} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" vertical={false} />
+                <ReferenceLine y={0} stroke="#475569" strokeDasharray="4 4" />
                 <XAxis
                   dataKey="date"
                   stroke="#475569"
@@ -353,9 +441,9 @@ export default function Overview() {
                   tickFormatter={(v) => `£${v}`}
                   width={45}
                 />
-                <Tooltip
+                <RechartsTooltip
                   {...TOOLTIP_STYLE}
-                  formatter={(v: number) => [formatCurrency(v), "P&L"]}
+                  formatter={(v: number) => [formatCurrency(v), "Profit"]}
                   labelFormatter={(l) =>
                     new Date(l).toLocaleDateString("en-GB", { dateStyle: "long" })
                   }
@@ -363,11 +451,11 @@ export default function Overview() {
                 <Area
                   type="monotone"
                   dataKey="cumPnl"
-                  stroke={isProfit ? "#10b981" : "#ef4444"}
+                  stroke={isChartPositive ? "#10b981" : "#ef4444"}
                   strokeWidth={2}
-                  fill="url(#pnlGrad)"
+                  fill={isChartPositive ? "url(#profitGradPos)" : "url(#profitGradNeg)"}
                   dot={false}
-                  activeDot={{ r: 4, fill: isProfit ? "#10b981" : "#ef4444" }}
+                  activeDot={{ r: 4, fill: isChartPositive ? "#10b981" : "#ef4444" }}
                 />
               </AreaChart>
             </ResponsiveContainer>
@@ -375,97 +463,106 @@ export default function Overview() {
         )}
       </div>
 
-      {/* Two-column: Upcoming + Recent */}
+      {/* ── TWO COLUMNS ─────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
         {/* Upcoming Bets */}
         <div
-          className="rounded-xl border overflow-hidden"
+          className="rounded-xl border overflow-hidden flex flex-col"
           style={{ background: "#1e293b", borderColor: "#334155" }}
         >
-          <div className="px-5 py-4 border-b flex items-center justify-between" style={{ borderColor: "#334155" }}>
+          <div className="px-5 py-4 border-b flex items-center justify-between shrink-0" style={{ borderColor: "#334155" }}>
             <div>
               <h3 className="text-sm font-semibold text-white">Upcoming Bets</h3>
-              <p className="text-xs text-slate-500 mt-0.5">Pending paper bets awaiting settlement</p>
+              <p className="text-xs text-slate-500 mt-0.5">Bets placed, waiting for matches to finish</p>
             </div>
             {upcomingBets.length > 0 && (
-              <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded-full bg-slate-700 text-slate-300">
+              <span className="text-xs font-mono font-semibold px-2.5 py-1 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/25">
                 {upcomingBets.length}
               </span>
             )}
           </div>
-          <div className="divide-y overflow-y-auto" style={{ divideColor: "#334155", maxHeight: "480px" }}>
+          <div className="overflow-y-auto flex-1 divide-y" style={{ divideColor: "#334155", maxHeight: "520px" }}>
             {loadingBets ? (
               <div className="p-5 space-y-3">
                 {[...Array(4)].map((_, i) => (
-                  <div key={i} className="h-12 rounded animate-pulse" style={{ background: "#0f172a" }} />
+                  <div key={i} className="h-14 rounded animate-pulse" style={{ background: "#0f172a" }} />
                 ))}
               </div>
             ) : betsError ? (
               <div className="px-5 py-10 text-center">
                 <p className="text-sm text-red-400">Could not load bets — retrying…</p>
-                <p className="text-xs text-slate-600 mt-1">Check API server connection.</p>
               </div>
             ) : upcomingBets.length === 0 ? (
               <div className="px-5 py-10 text-center">
-                <p className="text-sm text-slate-500">
-                  No pending bets yet.
-                </p>
-                <p className="text-xs text-slate-600 mt-1">Agent scans for value every 15 minutes.</p>
+                <p className="text-sm text-slate-500">No pending bets.</p>
+                <p className="text-xs text-slate-600 mt-1">Agent scans for value every 10 minutes.</p>
               </div>
             ) : (
-              upcomingBets.map((bet: any) => (
-                <div key={bet.id} className="px-5 py-3 hover:bg-slate-700/20 transition-colors">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-white truncate">
-                        {bet.homeTeam} vs {bet.awayTeam}
-                      </p>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        {bet.league} · {bet.selectionName} · {bet.marketType}
-                      </p>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <p className="text-sm font-mono font-semibold text-white">
-                        {bet.oddsAtPlacement.toFixed(2)}
-                      </p>
-                      <p className="text-xs text-slate-500 font-mono">{formatCurrency(bet.stake)}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between mt-2">
-                    <span className="text-[10px] text-slate-600">{formatRelativeTime(bet.placedAt)}</span>
-                    {bet.calculatedEdge != null && (
-                      <span
-                        className={cn(
-                          "text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded",
-                          bet.calculatedEdge >= 0
-                            ? "bg-emerald-950 text-emerald-400"
-                            : "bg-red-950 text-red-400",
+              upcomingBets.map((bet: any) => {
+                const ko = bet.kickoffTime ? new Date(bet.kickoffTime) : null;
+                return (
+                  <div key={bet.id} className="px-5 py-3.5 hover:bg-slate-700/20 transition-colors">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium text-white truncate">
+                          {bet.homeTeam} vs {bet.awayTeam}
+                        </p>
+                        <p className="text-[11px] text-slate-500 mt-0.5 truncate">
+                          {bet.league}
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          <span className="text-blue-400">{formatMarketType(bet.marketType)}</span>
+                          {" · "}{bet.selectionName}
+                        </p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="text-sm font-mono font-bold text-white">
+                          {bet.oddsAtPlacement?.toFixed(2)}
+                        </p>
+                        <p className="text-xs text-slate-400 font-mono">{formatCurrency(bet.stake)}</p>
+                        {bet.calculatedEdge != null && (
+                          <span
+                            className={cn(
+                              "text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded mt-1 inline-block",
+                              bet.calculatedEdge >= 0
+                                ? "bg-emerald-950 text-emerald-400"
+                                : "bg-red-950 text-red-400",
+                            )}
+                          >
+                            {(bet.calculatedEdge * 100).toFixed(1)}% edge
+                          </span>
                         )}
-                      >
-                        Edge {(bet.calculatedEdge * 100).toFixed(1)}%
-                      </span>
+                      </div>
+                    </div>
+                    {ko && (
+                      <p className="text-[10px] text-slate-600 mt-1.5">
+                        KO:{" "}
+                        {ko.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}{" "}
+                        {ko.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}
+                      </p>
                     )}
                   </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         </div>
 
         {/* Recent Results */}
         <div
-          className="rounded-xl border overflow-hidden"
+          className="rounded-xl border overflow-hidden flex flex-col"
           style={{ background: "#1e293b", borderColor: "#334155" }}
         >
-          <div className="px-5 py-4 border-b" style={{ borderColor: "#334155" }}>
+          <div className="px-5 py-4 border-b shrink-0" style={{ borderColor: "#334155" }}>
             <h3 className="text-sm font-semibold text-white">Recent Results</h3>
-            <p className="text-xs text-slate-500 mt-0.5">Last settled bets</p>
+            <p className="text-xs text-slate-500 mt-0.5">Latest settled bets</p>
           </div>
-          <div>
+          <div className="overflow-y-auto flex-1 divide-y" style={{ divideColor: "#334155", maxHeight: "520px" }}>
             {loadingBets ? (
               <div className="p-5 space-y-3">
                 {[...Array(5)].map((_, i) => (
-                  <div key={i} className="h-12 rounded animate-pulse" style={{ background: "#0f172a" }} />
+                  <div key={i} className="h-14 rounded animate-pulse" style={{ background: "#0f172a" }} />
                 ))}
               </div>
             ) : recentResults.length === 0 ? (
@@ -473,53 +570,56 @@ export default function Overview() {
                 <p className="text-sm text-slate-500">No settled bets yet.</p>
               </div>
             ) : (
-              <div className="divide-y" style={{ divideColor: "#334155" }}>
-                {recentResults.map((bet: any) => (
-                  <div
-                    key={bet.id}
-                    className={cn(
-                      "px-5 py-3 flex items-center gap-3 border-l-[3px] transition-colors",
-                      bet.status === "won"
-                        ? "border-l-emerald-500 hover:bg-emerald-950/20"
-                        : "border-l-red-500 hover:bg-red-950/20",
-                    )}
-                  >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <p className="text-sm font-medium text-white truncate">
-                          {bet.homeTeam} vs {bet.awayTeam}
-                        </p>
-                        <BetStatusBadge status={bet.status} />
-                      </div>
-                      <p className="text-xs text-slate-500 mt-0.5 truncate">
-                        {bet.selectionName} @ {bet.oddsAtPlacement.toFixed(2)} · {formatCurrency(bet.stake)}
+              recentResults.map((bet: any) => (
+                <div
+                  key={bet.id}
+                  className={cn(
+                    "px-5 py-3.5 flex items-center gap-3 border-l-[3px] transition-colors",
+                    bet.status === "won"
+                      ? "border-l-emerald-500 hover:bg-emerald-950/20"
+                      : bet.status === "lost"
+                        ? "border-l-red-500 hover:bg-red-950/20"
+                        : "border-l-slate-600 hover:bg-slate-700/10",
+                  )}
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-sm font-medium text-white truncate">
+                        {bet.homeTeam} vs {bet.awayTeam}
                       </p>
+                      <BetStatusBadge status={bet.status} />
                     </div>
-                    {bet.settlementPnl != null && (
-                      <p
-                        className={cn(
-                          "text-sm font-bold font-mono shrink-0",
-                          bet.settlementPnl >= 0 ? "text-emerald-400" : "text-red-400",
-                        )}
-                      >
-                        {bet.settlementPnl >= 0 ? "+" : ""}
-                        {formatCurrency(bet.settlementPnl)}
-                      </p>
-                    )}
+                    <p className="text-[11px] text-slate-500 mt-0.5 truncate">
+                      {formatMarketType(bet.marketType)} · {bet.selectionName} @ {bet.oddsAtPlacement?.toFixed(2)}
+                    </p>
+                    <p className="text-[10px] text-slate-600 mt-0.5">{formatRelativeTime(bet.placedAt)}</p>
                   </div>
-                ))}
-              </div>
+                  {bet.settlementPnl != null && (
+                    <p
+                      className={cn(
+                        "text-sm font-bold font-mono shrink-0",
+                        bet.settlementPnl > 0 ? "text-emerald-400"
+                        : bet.settlementPnl < 0 ? "text-red-400"
+                        : "text-slate-500",
+                      )}
+                    >
+                      {bet.settlementPnl > 0 ? "+" : ""}
+                      {formatCurrency(bet.settlementPnl)}
+                    </p>
+                  )}
+                </div>
+              ))
             )}
           </div>
         </div>
       </div>
 
-      {/* What the Agent Has Learned */}
+      {/* ── AGENT INTELLIGENCE ──────────────────────────────────────────────── */}
       <div>
         <div className="mb-4">
-          <h3 className="text-base font-semibold text-white">What the Agent Has Learned</h3>
+          <h3 className="text-base font-semibold text-white">Agent Intelligence</h3>
           <p className="text-xs text-slate-500 mt-0.5">
-            Intelligence signals generated by the learning engine
+            What the model has discovered from its results
           </p>
         </div>
 
@@ -534,28 +634,24 @@ export default function Overview() {
             className="rounded-xl border p-10 text-center text-sm text-slate-500"
             style={{ background: "#1e293b", borderColor: "#334155" }}
           >
-            No learning signals yet. They appear after the first retraining cycle.
+            No learning signals yet. They appear after the first retraining cycle (daily at 03:00 UTC).
           </div>
         ) : (
           <div className="space-y-3">
             {narratives.map((n: any) => {
               const text = generateNarrativeText(n);
               const emoji = getNarrativeEmoji(n.narrativeType);
-              const label = translateNarrativeType(n.narrativeType);
               return (
                 <div
                   key={n.id}
                   className="rounded-xl border flex items-start gap-4 px-5 py-4"
                   style={{ background: "#1e293b", borderColor: "#334155" }}
                 >
-                  <span className="text-2xl leading-none mt-0.5 shrink-0">{emoji}</span>
+                  <span className="text-xl leading-none mt-0.5 shrink-0">{emoji}</span>
                   <div className="flex-1 min-w-0">
-                    <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-1">
-                      {label}
-                    </p>
                     <p className="text-sm text-slate-200 leading-relaxed">{text}</p>
                   </div>
-                  <p className="text-[11px] text-slate-600 shrink-0 pt-0.5">
+                  <p className="text-[11px] text-slate-600 shrink-0 pt-0.5 whitespace-nowrap">
                     {formatRelativeTime(n.createdAt)}
                   </p>
                 </div>
@@ -565,127 +661,6 @@ export default function Overview() {
         )}
       </div>
 
-      {/* xG Intelligence */}
-      <div>
-        <div className="mb-4 flex items-center justify-between">
-          <div>
-            <h3 className="text-base font-semibold text-white">xG Intelligence</h3>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Teams whose actual goals diverge most from expected goals (xG) over last 5 matches
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-400 font-medium">
-              ● Underperforming = value territory
-            </span>
-            <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-red-950 text-red-400 font-medium">
-              ● Overperforming = regression risk
-            </span>
-          </div>
-        </div>
-
-        <div
-          className="rounded-xl border overflow-hidden"
-          style={{ background: "#1e293b", borderColor: "#334155" }}
-        >
-          {loadingXg ? (
-            <div className="p-5 space-y-2">
-              {[...Array(5)].map((_, i) => (
-                <div key={i} className="h-10 rounded animate-pulse" style={{ background: "#0f172a" }} />
-              ))}
-            </div>
-          ) : !xgData?.teams?.length ? (
-            <div className="px-5 py-10 text-center">
-              <p className="text-sm text-slate-500">No xG data yet.</p>
-              <p className="text-xs text-slate-600 mt-1">
-                First ingestion runs daily at 05:00 UTC — or trigger manually via POST /api/xg/refresh
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b" style={{ borderColor: "#334155" }}>
-                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">Team</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">League</th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500 group relative">
-                      <span
-                        title="Average xG created minus xG conceded over last 5 matches. Positive = creating more chances than conceding."
-                        className="cursor-help border-b border-dotted border-slate-600"
-                      >
-                        xG Diff (5)
-                      </span>
-                    </th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500">
-                      <span
-                        title="Actual goals scored minus xG created over last 5 matches. Positive = overperforming (regression risk). Negative = underperforming (value opportunity)."
-                        className="cursor-help border-b border-dotted border-slate-600"
-                      >
-                        Goals vs xG
-                      </span>
-                    </th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500">
-                      <span
-                        title="Change in xG diff compared to the 5 matches before that. Positive = improving, negative = declining."
-                        className="cursor-help border-b border-dotted border-slate-600"
-                      >
-                        Momentum
-                      </span>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(xgData.teams as any[]).slice(0, 10).map((team: any, i: number) => {
-                    const goalsVsXg = Number(team.goalsVsXgDiff ?? team.goals_vs_xg_diff ?? 0);
-                    const xgDiff = Number(team.xgDiff5 ?? team.xg_diff_5 ?? 0);
-                    const momentum = Number(team.xgMomentum ?? team.xg_momentum ?? 0);
-                    const isOverperforming = goalsVsXg > 0.1;
-                    const isUnderperforming = goalsVsXg < -0.1;
-                    return (
-                      <tr
-                        key={i}
-                        className="border-b hover:bg-slate-700/20 transition-colors"
-                        style={{ borderColor: "#1e293b" }}
-                      >
-                        <td className="px-4 py-3 font-medium text-white text-sm">
-                          {team.teamName ?? team.team_name}
-                        </td>
-                        <td className="px-4 py-3 text-slate-400 text-xs">
-                          {team.league}
-                        </td>
-                        <td className="px-4 py-3 text-right font-mono text-xs">
-                          <span className={xgDiff >= 0 ? "text-emerald-400" : "text-red-400"}>
-                            {xgDiff >= 0 ? "+" : ""}{xgDiff.toFixed(2)}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          <span
-                            className={cn(
-                              "inline-flex items-center gap-1 font-mono text-xs px-2 py-0.5 rounded-full font-semibold",
-                              isOverperforming
-                                ? "bg-red-950 text-red-400"
-                                : isUnderperforming
-                                ? "bg-emerald-950 text-emerald-400"
-                                : "bg-slate-800 text-slate-400",
-                            )}
-                          >
-                            {goalsVsXg >= 0 ? "+" : ""}{goalsVsXg.toFixed(2)}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 text-right font-mono text-xs">
-                          <span className={momentum >= 0 ? "text-emerald-400" : "text-slate-500"}>
-                            {momentum >= 0 ? "↑" : "↓"} {Math.abs(momentum).toFixed(2)}
-                          </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
     </div>
   );
 }

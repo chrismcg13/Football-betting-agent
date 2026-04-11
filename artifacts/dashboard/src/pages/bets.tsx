@@ -1,6 +1,6 @@
 import { Fragment, useState, useMemo } from "react";
 import { useBets, useBetsByLeague, useBetsByMarket } from "@/hooks/use-dashboard";
-import { formatCurrency, formatRelativeTime } from "@/lib/format";
+import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge, OddsSourceBadge } from "@/components/layout";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
@@ -373,7 +373,7 @@ export default function Bets() {
                       <td className="py-3 px-3 text-xs text-slate-400">{bet.league ?? "—"}</td>
                       <td className="py-3 px-3">
                         <span className="text-[11px] font-mono px-1.5 py-0.5 rounded text-slate-300" style={{ background: "#0f172a" }}>
-                          {bet.marketType}
+                          {formatMarketType(bet.marketType)}
                         </span>
                       </td>
                       <td className="py-3 px-3 text-slate-200">{bet.selectionName}</td>

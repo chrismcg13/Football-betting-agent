@@ -1,6 +1,6 @@
 import { useState, useMemo } from "react";
 import { usePerformance, useBetsByLeague, useBetsByMarket, useModel, useBets, useClvStats, useLeagueEdgeScores } from "@/hooks/use-dashboard";
-import { formatCurrency } from "@/lib/format";
+import { formatCurrency, formatMarketType } from "@/lib/format";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import {
@@ -144,7 +144,13 @@ export default function Performance() {
   );
 
   const leagueROI = useMemo(() => [...((byLeague as any[]) ?? [])].sort((a, b) => b.roi - a.roi), [byLeague]);
-  const marketROI = useMemo(() => [...((byMarket as any[]) ?? [])].sort((a, b) => b.roi - a.roi), [byMarket]);
+  const marketROI = useMemo(
+    () => [...((byMarket as any[]) ?? [])].sort((a, b) => b.roi - a.roi).map((m: any) => ({
+      ...m,
+      marketLabel: formatMarketType(m.marketType),
+    })),
+    [byMarket],
+  );
 
   const statsTable = useMemo(() => {
     const rows: any[] = [];
@@ -158,7 +164,7 @@ export default function Performance() {
     }
     for (const m of (byMarket as any[]) ?? []) {
       rows.push({
-        segment: m.marketType, type: "Market",
+        segment: formatMarketType(m.marketType), type: "Market",
         count: m.count, wins: m.wins, losses: m.losses,
         winPct: m.wins + m.losses > 0 ? (m.wins / (m.wins + m.losses)) * 100 : 0,
         roi: m.roi, totalPnl: m.totalPnl,
@@ -278,7 +284,7 @@ export default function Performance() {
               <div className="h-56">
                 {marketROI.length === 0
                   ? <p className="h-full flex items-center justify-center text-sm text-slate-500">No data yet</p>
-                  : <HorizBarChart data={marketROI} xKey="marketType" valueKey="roi" />}
+                  : <HorizBarChart data={marketROI} xKey="marketLabel" valueKey="roi" />}
               </div>
             )}
           </div>
