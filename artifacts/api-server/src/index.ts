@@ -212,8 +212,14 @@ async function main() {
   // 3. Seed league edge scores for expanded league coverage
   await seedLeagueEdgeScores();
 
-  // 4. Start all cron jobs
-  startScheduler();
+  // 4. Start all cron jobs — production only to prevent race conditions
+  // Both dev and prod use the same DB; only the production VM should run autonomous scheduling
+  if (process.env["NODE_ENV"] === "production") {
+    startScheduler();
+    logger.info("Autonomous scheduler started (production mode)");
+  } else {
+    logger.info("Scheduler DISABLED in development — use manual API triggers (/api/trading/run, /api/ingestion/run, etc.) to avoid racing the production VM scheduler");
+  }
 
   // 5. Load or bootstrap the ML model
   const modelLoaded = await loadLatestModel();
