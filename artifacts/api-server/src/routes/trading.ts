@@ -3,7 +3,7 @@ import { db, paperBetsTable, agentConfigTable } from "@workspace/db";
 import { eq, desc } from "drizzle-orm";
 import { settleBets, placePaperBet, getAgentStatus, getBankroll } from "../services/paperTrading";
 import { runAllRiskChecks, resumeAgent } from "../services/riskManager";
-import { runTradingCycle } from "../services/scheduler";
+import { runTradingCycle, syncMatchResults } from "../services/scheduler";
 import { logger } from "../lib/logger";
 
 const router = Router();
@@ -28,11 +28,29 @@ router.get("/trading/status", async (req, res) => {
   });
 });
 
-// POST /trading/settle — manually trigger settlement of finished bets
+// POST /trading/sync-results — fetch latest match results from football-data.org and update DB
+router.post("/trading/sync-results", async (req, res) => {
+  logger.info("Manual match result sync triggered via API");
+  try {
+    const updated = await syncMatchResults();
+    res.json({ success: true, matchesUpdated: updated });
+  } catch (err) {
+    logger.error({ err }, "Manual match result sync failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// POST /trading/settle — manually trigger settlement of finished bets (syncs results first)
 router.post("/trading/settle", async (req, res) => {
   logger.info("Manual bet settlement triggered via API");
-  const result = await settleBets();
-  res.json(result);
+  try {
+    const synced = await syncMatchResults();
+    const result = await settleBets();
+    res.json({ ...result, matchesSynced: synced });
+  } catch (err) {
+    logger.error({ err }, "Manual settlement failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
 });
 
 // POST /trading/risk-check — manually run all risk checks

@@ -21,8 +21,9 @@ import {
   logDailyBudgetSummary,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { db, agentConfigTable, leagueEdgeScoresTable, paperBetsTable } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import { fetchRecentFixtureResults, teamNameMatch } from "./apiFootball";
+import { db, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
+import { eq, and, inArray, sql } from "drizzle-orm";
 
 // ===================== Status tracking =====================
 
@@ -478,6 +479,91 @@ export async function runTradingCycle(): Promise<{
   }
 }
 
+// ===================== Sync match results from football-data.org =====================
+
+export async function syncMatchResults(): Promise<number> {
+  // Fetch recently finished fixtures from API-Football (our active data source)
+  let recentFixtures: Awaited<ReturnType<typeof fetchRecentFixtureResults>>;
+  try {
+    recentFixtures = await fetchRecentFixtureResults(7);
+  } catch (err) {
+    logger.warn({ err }, "syncMatchResults: failed to fetch recent fixtures");
+    return 0;
+  }
+
+  if (recentFixtures.length === 0) {
+    logger.info("syncMatchResults: API-Football returned 0 finished fixtures");
+    return 0;
+  }
+
+  // Get all matches in DB that are still 'scheduled' and past kickoff
+  const scheduledMatches = await db
+    .select()
+    .from(matchesTable)
+    .where(
+      and(
+        eq(matchesTable.status, "scheduled"),
+        sql`${matchesTable.kickoffTime} < NOW() - INTERVAL '90 minutes'`,
+      ),
+    );
+
+  if (scheduledMatches.length === 0) {
+    logger.info("syncMatchResults: no scheduled past matches to update");
+    return 0;
+  }
+
+  let updated = 0;
+
+  for (const fixture of recentFixtures) {
+    const homeGoals = fixture.goals?.home ?? fixture.score?.fulltime?.home;
+    const awayGoals = fixture.goals?.away ?? fixture.score?.fulltime?.away;
+    if (homeGoals === null || homeGoals === undefined || awayGoals === null || awayGoals === undefined) continue;
+
+    // Find matching DB match using fuzzy team name matching
+    const dbMatch = scheduledMatches.find(
+      (m) =>
+        teamNameMatch(m.homeTeam, fixture.teams.home.name) &&
+        teamNameMatch(m.awayTeam, fixture.teams.away.name),
+    );
+    if (!dbMatch) continue;
+
+    await db
+      .update(matchesTable)
+      .set({
+        status: "finished",
+        homeScore: homeGoals,
+        awayScore: awayGoals,
+      })
+      .where(eq(matchesTable.id, dbMatch.id));
+
+    logger.info(
+      {
+        matchId: dbMatch.id,
+        homeTeam: dbMatch.homeTeam,
+        awayTeam: dbMatch.awayTeam,
+        score: `${homeGoals}-${awayGoals}`,
+        apiFixtureId: fixture.fixture.id,
+      },
+      "syncMatchResults: match updated to finished",
+    );
+
+    updated++;
+    // Mark as updated so we don't double-match
+    (dbMatch as typeof dbMatch & { _synced?: boolean })._synced = true;
+  }
+
+  if (updated > 0) {
+    logger.info({ updated }, "syncMatchResults: matches synced from API-Football");
+  } else {
+    logger.info(
+      { scheduledPastCount: scheduledMatches.length, apiFixtureCount: recentFixtures.length },
+      "syncMatchResults: no DB matches matched API-Football fixtures (possible team name mismatch)",
+    );
+  }
+
+  return updated;
+}
+
 // ===================== Scheduler =====================
 
 export function startScheduler(): void {
@@ -495,17 +581,20 @@ export function startScheduler(): void {
   cron.schedule("*/10 * * * *", () => { void runTradingCycle(); }, { timezone: "UTC" });
   logger.info("Trading cycle scheduler active — every 10 minutes");
 
-  // Dedicated settlement check: every 5 minutes — faster feedback loop
+  // Dedicated settlement check: every 5 minutes — syncs results then settles
   cron.schedule("*/5 * * * *", () => {
-    void settleBets()
-      .then((r) => {
+    void (async () => {
+      try {
+        const synced = await syncMatchResults();
+        if (synced > 0) logger.info({ synced }, "Settlement cron: match results synced");
+        const r = await settleBets();
         if (r.settled > 0) logger.info(r, "Settlement cron: bets settled");
-      })
-      .catch((err) => {
+      } catch (err) {
         logger.warn({ err }, "Settlement cron failed — non-fatal");
-      });
+      }
+    })();
   }, { timezone: "UTC" });
-  logger.info("Settlement cron active — every 5 minutes");
+  logger.info("Settlement cron active — every 5 minutes (sync + settle)");
 
   // API-Football: fetch real odds every 2 hours — fresh odds for every trading cycle
   // With 75,000 req/day budget, each scan uses ~30-50 reqs, plenty of headroom

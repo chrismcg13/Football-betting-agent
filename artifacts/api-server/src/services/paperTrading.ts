@@ -327,33 +327,99 @@ export async function placePaperBet(
 
 // ===================== Determine bet outcome from match result =====================
 
+// Returns true (won), false (lost), or null (void — data unavailable, stake refunded)
 function determineBetWon(
   marketType: string,
   selectionName: string,
   homeScore: number,
   awayScore: number,
-): boolean {
+): boolean | null {
+  const totalGoals = homeScore + awayScore;
+
   switch (marketType) {
     case "MATCH_ODDS":
       if (selectionName === "Home") return homeScore > awayScore;
       if (selectionName === "Draw") return homeScore === awayScore;
       if (selectionName === "Away") return awayScore > homeScore;
-      return false;
+      return null;
 
     case "BTTS":
       if (selectionName === "Yes") return homeScore > 0 && awayScore > 0;
       if (selectionName === "No") return !(homeScore > 0 && awayScore > 0);
-      return false;
+      return null;
+
+    case "DOUBLE_CHANCE":
+      if (selectionName === "Home or Draw" || selectionName === "1X") return homeScore >= awayScore;
+      if (selectionName === "Away or Draw" || selectionName === "X2") return awayScore >= homeScore;
+      if (selectionName === "Home or Away" || selectionName === "12") return homeScore !== awayScore;
+      return null;
+
+    case "OVER_UNDER_05":
+      if (selectionName.startsWith("Over")) return totalGoals > 0;
+      if (selectionName.startsWith("Under")) return totalGoals === 0;
+      return null;
+
+    case "OVER_UNDER_15":
+      if (selectionName.startsWith("Over")) return totalGoals > 1;
+      if (selectionName.startsWith("Under")) return totalGoals <= 1;
+      return null;
 
     case "OVER_UNDER_25":
-      if (selectionName === "Over 2.5 Goals")
-        return homeScore + awayScore > 2;
-      if (selectionName === "Under 2.5 Goals")
-        return homeScore + awayScore <= 2;
-      return false;
+      if (selectionName.startsWith("Over")) return totalGoals > 2;
+      if (selectionName.startsWith("Under")) return totalGoals <= 2;
+      return null;
+
+    case "OVER_UNDER_35":
+      if (selectionName.startsWith("Over")) return totalGoals > 3;
+      if (selectionName.startsWith("Under")) return totalGoals <= 3;
+      return null;
+
+    case "OVER_UNDER_45":
+      if (selectionName.startsWith("Over")) return totalGoals > 4;
+      if (selectionName.startsWith("Under")) return totalGoals <= 4;
+      return null;
+
+    case "ASIAN_HANDICAP": {
+      // selectionName examples: "Home -0.5", "Away +1.5", "Home -1", "Away 0"
+      const parts = selectionName.split(" ");
+      const side = parts[0]; // "Home" or "Away"
+      const handicap = parseFloat(parts[1] ?? "0");
+      const adjustedHome = homeScore + (side === "Home" ? handicap : -handicap);
+      const adjustedAway = awayScore + (side === "Away" ? handicap : -handicap);
+      if (Math.abs(handicap % 1) === 0.25) {
+        // Split bet: half each on nearest 0.5 lines
+        const lower = handicap - 0.25;
+        const upper = handicap + 0.25;
+        const adjHomeLow = homeScore + (side === "Home" ? lower : -lower);
+        const adjHomeHigh = homeScore + (side === "Home" ? upper : -upper);
+        const winLow = side === "Home" ? adjHomeLow > awayScore : adjustedAway > homeScore + lower;
+        const winHigh = side === "Home" ? adjHomeHigh > awayScore : adjustedAway > homeScore + upper;
+        if (winLow && winHigh) return true;
+        if (!winLow && !winHigh) return false;
+        return null; // half-win/half-loss treated as void for simplicity
+      }
+      if (side === "Home") return adjustedHome > awayScore;
+      if (side === "Away") return adjustedAway > homeScore;
+      return null;
+    }
+
+    // ─── Markets requiring stats not stored in DB → void (stake refunded) ───
+    case "TOTAL_CORNERS_75":
+    case "TOTAL_CORNERS_85":
+    case "TOTAL_CORNERS_95":
+    case "TOTAL_CORNERS_105":
+    case "TOTAL_CORNERS_115":
+    case "TOTAL_CARDS_25":
+    case "TOTAL_CARDS_35":
+    case "TOTAL_CARDS_45":
+    case "TOTAL_CARDS_55":
+    case "FIRST_HALF_RESULT":
+    case "FIRST_HALF_OU_05":
+    case "FIRST_HALF_OU_15":
+      return null; // void — no corner/card/HT data available
 
     default:
-      return false;
+      return null; // void unknown markets rather than forcing a loss
   }
 }
 
@@ -401,18 +467,24 @@ export async function settleBets(): Promise<SettlementResult> {
 
     const stake = Number(bet.stake);
     const odds = Number(bet.oddsAtPlacement);
-    const betWon = determineBetWon(
+    const outcome = determineBetWon(
       bet.marketType,
       bet.selectionName,
       match.homeScore,
       match.awayScore,
     );
 
-    const settlementPnl = betWon
-      ? Math.round(stake * (odds - 1) * 0.98 * 100) / 100
-      : -stake;
+    // null = void (data unavailable) — refund stake, no PnL impact
+    const isVoid = outcome === null;
+    const betWon = outcome === true;
 
-    const newStatus = betWon ? "won" : "lost";
+    const settlementPnl = isVoid
+      ? 0
+      : betWon
+        ? Math.round(stake * (odds - 1) * 0.98 * 100) / 100
+        : -stake;
+
+    const newStatus = isVoid ? "void" : betWon ? "won" : "lost";
     const now = new Date();
 
     // ── CLV: compare placement odds vs closing odds proxy ──────────────
@@ -486,8 +558,8 @@ export async function settleBets(): Promise<SettlementResult> {
       timestamp: now,
     });
 
-    if (betWon) won++;
-    else lost++;
+    if (!isVoid && betWon) won++;
+    else if (!isVoid) lost++;
     totalPnl += settlementPnl;
     settled++;
 

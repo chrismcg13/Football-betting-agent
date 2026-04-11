@@ -313,6 +313,42 @@ export async function getHistoricalCompetitionMatches(
   }
 }
 
+// ─── Fetch recently finished match results ──────────────────────────────────
+
+export async function fetchRecentResults(daysBack = 7): Promise<FDMatch[]> {
+  const client = getClient();
+  const from = new Date();
+  from.setDate(from.getDate() - daysBack);
+  const to = new Date();
+
+  const dateFrom = from.toISOString().slice(0, 10);
+  const dateTo = to.toISOString().slice(0, 10);
+  const allMatches: FDMatch[] = [];
+
+  for (const competitionCode of INGESTION_COMPETITIONS) {
+    try {
+      await throttle();
+      const response = await client.get<{ matches: FDMatch[] }>(
+        `/competitions/${competitionCode}/matches`,
+        { params: { dateFrom, dateTo, status: "FINISHED" } },
+      );
+      allMatches.push(...(response.data.matches ?? []));
+    } catch (err) {
+      if (
+        axios.isAxiosError(err) &&
+        (err.response?.status === 403 ||
+          err.response?.status === 404 ||
+          err.response?.status === 429)
+      ) {
+        continue;
+      }
+      logger.warn({ err, competitionCode }, "Error fetching recent results");
+    }
+  }
+  logger.info({ count: allMatches.length }, "Fetched recent results from football-data.org");
+  return allMatches;
+}
+
 export function mapMatchStatus(
   fdStatus: string,
 ): "scheduled" | "live" | "finished" {

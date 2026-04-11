@@ -211,9 +211,10 @@ Computes 17 ML features per upcoming match:
 
 | Job | Schedule | Description |
 |-----|----------|-------------|
-| Data ingestion | Every 30 min, 24/7 | Fetches matches from football-data.org (7-day window) |
+| Data ingestion | Every 30 min, 24/7 | Fetches upcoming matches from football-data.org (7-day window) |
 | Feature computation | Every 6 hours UTC | Computes all ML features |
 | Trading cycle | Every 10 minutes | Detects value bets, places paper bets |
+| Settlement | Every 5 minutes | Syncs match results from API-Football, then settles pending bets |
 | API-Football odds | Every 2 hours, 24/7 | ALL bookmakers (20+) in single call, 2h freshness window |
 | OddsPapi Pinnacle | Every 10 min (trading) | Top-8 fixtures ≤48h only, skips 2nd-div leagues, capped 7/day |
 | API-Football team stats | Every 12 hours UTC | Fetches cards/corners/shots stats |
@@ -284,10 +285,19 @@ React + Vite SPA at `/dashboard/`:
 
 | Value | Description |
 |-------|-------------|
-| `football_data_fallback` | Uses football-data.org API (default) |
+| `football_data_fallback` | Uses football-data.org API (DISABLED — account suspended Apr 2026) |
 | `betfair` | Uses Betfair Exchange Delayed API (geo-blocked on Replit) |
+| `api_football_real` | API-Football v3 via RapidAPI — primary source for odds + match results |
 
 Real odds for value scoring come from API-Football v3 (key: `API_FOOTBALL_KEY` secret).
+
+**Note**: football-data.org API account is disabled. Match result syncing now uses API-Football `/fixtures` endpoint. Settlement flow: `syncMatchResults()` (API-Football) → `settleBets()` (paperTrading).
+
+## Settlement Architecture
+
+- `syncMatchResults()` in `scheduler.ts`: Fetches finished fixtures from API-Football for last 7 days, matches to DB matches via fuzzy team name matching (`teamNameMatch`), updates status='finished' with scores.
+- `determineBetWon()` in `paperTrading.ts`: Handles MATCH_ODDS, BTTS, DOUBLE_CHANCE (1X/X2/12), OVER_UNDER_05/15/25/35/45, ASIAN_HANDICAP. Returns `null` (void/refund) for TOTAL_CORNERS_*, TOTAL_CARDS_*, FIRST_HALF_RESULT (data not available in match score).
+- Bankroll updated at settlement time only (not deducted at placement). Void bets = PnL 0 (stake refunded implicitly).
 
 ## Startup
 

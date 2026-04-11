@@ -274,11 +274,16 @@ async function fetchApiFootball<T = unknown>(
 // ─── Fixture discovery ────────────────────────────────────────────────────────
 
 interface ApiFixture {
-  fixture: { id: number; date: string; status: { short: string } };
+  fixture: { id: number; date: string; status: { short: string; long: string } };
   league: { id: number; name: string; country: string };
   teams: {
     home: { id: number; name: string };
     away: { id: number; name: string };
+  };
+  goals: { home: number | null; away: number | null };
+  score: {
+    halftime: { home: number | null; away: number | null };
+    fulltime: { home: number | null; away: number | null };
   };
 }
 
@@ -305,6 +310,34 @@ async function getFixturesForDate(date: string): Promise<ApiFixture[]> {
   const result = await fetchApiFootball<ApiFixture[]>("/fixtures", { date });
   return result ?? [];
 }
+
+// ─── Fetch recent finished fixtures for result syncing ─────────────────────
+
+export async function fetchRecentFixtureResults(daysBack = 7): Promise<ApiFixture[]> {
+  const dates: string[] = [];
+  for (let i = daysBack; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    dates.push(d.toISOString().slice(0, 10));
+  }
+
+  const all: ApiFixture[] = [];
+  for (const date of dates) {
+    try {
+      const fixtures = await getFixturesForDate(date);
+      const finished = fixtures.filter(
+        (f) => f.fixture.status.short === "FT" || f.fixture.status.short === "AET" || f.fixture.status.short === "PEN",
+      );
+      all.push(...finished);
+    } catch (err) {
+      logger.warn({ err, date }, "fetchRecentFixtureResults: error fetching date");
+    }
+  }
+  logger.info({ count: all.length }, "fetchRecentFixtureResults: finished fixtures fetched via API-Football");
+  return all;
+}
+
+export { teamNameMatch };
 
 interface FixtureMatch {
   matchId: number;
