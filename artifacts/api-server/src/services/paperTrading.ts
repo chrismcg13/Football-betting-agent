@@ -299,7 +299,6 @@ export async function placePaperBet(
       edge,
       opportunityScore: score,
       bankrollBefore: bankroll,
-      openBetsAfter: openCount + 1,
       kellyFraction,
       dynamicKellyFraction: kellyFraction,
       modelVersion,

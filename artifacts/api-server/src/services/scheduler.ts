@@ -513,6 +513,7 @@ export async function syncMatchResults(): Promise<number> {
   }
 
   let updated = 0;
+  const matchedDbIds = new Set<number>();
 
   for (const fixture of recentFixtures) {
     const homeGoals = fixture.goals?.home ?? fixture.score?.fulltime?.home;
@@ -522,6 +523,7 @@ export async function syncMatchResults(): Promise<number> {
     // Find matching DB match using fuzzy team name matching
     const dbMatch = scheduledMatches.find(
       (m) =>
+        !matchedDbIds.has(m.id) &&
         teamNameMatch(m.homeTeam, fixture.teams.home.name) &&
         teamNameMatch(m.awayTeam, fixture.teams.away.name),
     );
@@ -548,17 +550,22 @@ export async function syncMatchResults(): Promise<number> {
     );
 
     updated++;
-    // Mark as updated so we don't double-match
-    (dbMatch as typeof dbMatch & { _synced?: boolean })._synced = true;
+    matchedDbIds.add(dbMatch.id);
   }
 
   if (updated > 0) {
     logger.info({ updated }, "syncMatchResults: matches synced from API-Football");
-  } else {
-    logger.info(
-      { scheduledPastCount: scheduledMatches.length, apiFixtureCount: recentFixtures.length },
-      "syncMatchResults: no DB matches matched API-Football fixtures (possible team name mismatch)",
-    );
+  }
+
+  // Log any scheduled past matches that still couldn't be matched (diagnostic)
+  const unmatched = scheduledMatches.filter((m) => !matchedDbIds.has(m.id));
+  if (unmatched.length > 0) {
+    for (const m of unmatched) {
+      logger.warn(
+        { matchId: m.id, homeTeam: m.homeTeam, awayTeam: m.awayTeam, kickoff: m.kickoffTime },
+        "syncMatchResults: could not match scheduled past match to any API-Football fixture",
+      );
+    }
   }
 
   return updated;

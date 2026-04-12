@@ -290,7 +290,20 @@ interface ApiFixture {
 function normalizeTeamName(name: string): string {
   return name
     .toLowerCase()
-    .replace(/\bfc\b|\bsc\b|\bac\b|\baf\b|\bcf\b|\bfk\b|\bsk\b|\bsv\b/g, "")
+    // Transliterate accented chars → ASCII BEFORE stripping (prevents "atlético" → "atl tico")
+    .replace(/[áàâäã]/g, "a")
+    .replace(/[éèêë]/g, "e")
+    .replace(/[íìîï]/g, "i")
+    .replace(/[óòôöõ]/g, "o")
+    .replace(/[úùûü]/g, "u")
+    .replace(/[ñ]/g, "n")
+    .replace(/[ç]/g, "c")
+    .replace(/[ý]/g, "y")
+    .replace(/[ß]/g, "ss")
+    .replace(/[ø]/g, "o")
+    .replace(/[æ]/g, "ae")
+    // Strip common club abbreviations (standalone words)
+    .replace(/\b(fc|sc|ac|af|cf|fk|sk|sv|bc|ec|cd|rc|ca|cr|rj|sp|fbpa|1901|1909|1910|1912)\b/g, "")
     .replace(/[^a-z0-9 ]/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -303,7 +316,17 @@ function teamNameMatch(dbName: string, apiName: string): boolean {
   if (d.includes(a) || a.includes(d)) return true;
   const dFirst = d.split(" ")[0] ?? "";
   const aFirst = a.split(" ")[0] ?? "";
-  return dFirst.length > 3 && dFirst === aFirst;
+  if (dFirst.length > 3 && dFirst === aFirst) return true;
+  // Word-overlap: if all meaningful words in the shorter name appear in the longer
+  const dWords = d.split(" ").filter((w) => w.length > 3);
+  const aWords = a.split(" ").filter((w) => w.length > 3);
+  if (dWords.length > 0 && aWords.length > 0) {
+    const shorter = dWords.length <= aWords.length ? dWords : aWords;
+    const longer = dWords.length <= aWords.length ? aWords : dWords;
+    const overlap = shorter.filter((w) => longer.includes(w)).length;
+    if (overlap > 0 && overlap >= shorter.length) return true;
+  }
+  return false;
 }
 
 async function getFixturesForDate(date: string): Promise<ApiFixture[]> {
