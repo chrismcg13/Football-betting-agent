@@ -580,6 +580,30 @@ export async function syncMatchResults(): Promise<number> {
   return updated;
 }
 
+// ===================== Settlement cron (always-on) =====================
+
+/**
+ * Runs in BOTH development and production.
+ * Settlement is a pure DB operation — no expensive API quota consumed.
+ * syncMatchResults does call API-Football, but only for matches whose
+ * kick-off time has already passed, so it is lightweight and necessary.
+ */
+export function startSettlementCron(): void {
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const synced = await syncMatchResults();
+        if (synced > 0) logger.info({ synced }, "Settlement cron: match results synced");
+        const r = await settleBets();
+        if (r.settled > 0) logger.info(r, "Settlement cron: bets settled");
+      } catch (err) {
+        logger.warn({ err }, "Settlement cron failed — non-fatal");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Settlement cron active — every 5 minutes (sync + settle)");
+}
+
 // ===================== Scheduler =====================
 
 export function startScheduler(): void {
@@ -596,21 +620,6 @@ export function startScheduler(): void {
   // Trading cycle: every 10 minutes (increased frequency for paper data collection)
   cron.schedule("*/10 * * * *", () => { void runTradingCycle(); }, { timezone: "UTC" });
   logger.info("Trading cycle scheduler active — every 10 minutes");
-
-  // Dedicated settlement check: every 5 minutes — syncs results then settles
-  cron.schedule("*/5 * * * *", () => {
-    void (async () => {
-      try {
-        const synced = await syncMatchResults();
-        if (synced > 0) logger.info({ synced }, "Settlement cron: match results synced");
-        const r = await settleBets();
-        if (r.settled > 0) logger.info(r, "Settlement cron: bets settled");
-      } catch (err) {
-        logger.warn({ err }, "Settlement cron failed — non-fatal");
-      }
-    })();
-  }, { timezone: "UTC" });
-  logger.info("Settlement cron active — every 5 minutes (sync + settle)");
 
   // API-Football: fetch real odds every 2 hours — fresh odds for every trading cycle
   // With 75,000 req/day budget, each scan uses ~30-50 reqs, plenty of headroom
