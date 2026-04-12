@@ -314,16 +314,37 @@ export async function runTradingCycle(): Promise<{
     const configRows = await db.select().from(agentConfigTable);
     const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
     const paperMode = cfg.paper_mode === "true";
-    // In paper mode all diversity caps are lifted to maximise data collection.
-    // When paper_mode=false these reinstate automatically for live trading.
-    const maxPerCycle  = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_cycle  ?? "5");
+
+    // Fix 3: Daily bet cap — top N by opportunity score, quality over quantity
+    const maxDailyBets = paperMode
+      ? Number(cfg.max_daily_bets_paper ?? "50")
+      : Number(cfg.max_daily_bets_live ?? "15");
+
+    const todayBetRows = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(paperBetsTable)
+      .where(sql`date_trunc('day', ${paperBetsTable.placedAt} AT TIME ZONE 'UTC') = current_date AND status != 'void'`);
+    const todayCount = Number(todayBetRows[0]?.count ?? 0);
+    const dailySlotsLeft = Math.max(0, maxDailyBets - todayCount);
+
+    if (dailySlotsLeft === 0) {
+      logger.info({ maxDailyBets, todayCount }, "Daily bet cap reached — skipping placement this cycle");
+      markRun("trading", "success");
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
+    }
+
+    logger.info({ maxDailyBets, todayCount, dailySlotsLeft, paperMode }, "Daily bet budget");
+
+    // In paper mode use daily cap as the per-cycle limit (best N by score).
+    // In live mode cap both per-cycle and daily.
+    const maxPerCycle  = paperMode ? dailySlotsLeft : Math.min(Number(cfg.max_bets_per_cycle ?? "5"), dailySlotsLeft);
     const maxPerLeague = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_league ?? "2");
     const maxPerMarket = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_market ?? "2");
-    const minScore = Number(cfg.min_opportunity_score ?? "50");
+    const minScore = Number(cfg.min_opportunity_score ?? "58");
     const contrarinaThreshold = 75; // contrarian bets need higher bar
 
     if (paperMode) {
-      logger.info("Paper mode ACTIVE — diversity caps removed (max bets/cycle, per-league, per-market all unlimited)");
+      logger.info({ dailySlotsLeft, maxDailyBets }, "Paper mode ACTIVE — daily cap enforced, diversity caps removed");
     }
 
     // 9. Apply diversity rules

@@ -593,6 +593,19 @@ export function computeEnhancedOpportunityScore(params: EnhancedScoringParams): 
   return { score, isContrarian, pinnacleAligned };
 }
 
+// ─── Near-certainty market blocklist ─────────────────────────────────────────
+// Markets with base-rate win probabilities so extreme that the model cannot
+// generate genuine edge — they distort performance statistics.
+const BANNED_MARKETS = new Set([
+  "OVER_UNDER_05",     // Over 0.5 wins ~92% of the time — no edge signal
+  "OVER_UNDER_15",     // Over 1.5 wins ~75% of the time — no edge signal
+  "TOTAL_CARDS_55",    // Under 5.5 wins ~85% of the time — no edge signal
+  "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
+  "TOTAL_CORNERS_85",  // Too predictable; only 9.5/10.5 corners have genuine edge
+  "TOTAL_CORNERS_115", // Too predictable; only 9.5/10.5 corners have genuine edge
+  "FIRST_HALF_OU_05",  // Too easy; only FIRST_HALF_OU_15 retained
+]);
+
 // ─── Main detection function ──────────────────────────────────────────────────
 
 export async function detectValueBets(): Promise<EvaluationSummary> {
@@ -603,7 +616,8 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
   const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
 
   const minEdge = Number(cfg.min_edge_threshold ?? "0.03");
-  const minOppScore = Number(cfg.min_opportunity_score ?? "65");
+  const minOppScore = Number(cfg.min_opportunity_score ?? "58");
+  const minOddsThreshold = Number(cfg.min_odds_threshold ?? "1.40");
   const coldThreshold = Number(cfg.cold_market_threshold ?? "-10");
   const coldMinBets = Number(cfg.cold_market_min_bets ?? "10");
   const coldCooldownDays = Number(cfg.cold_market_cooldown_days ?? "14");
@@ -685,6 +699,13 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       if (!oddsRow.backOdds) continue;
       const backOdds = Number(oddsRow.backOdds);
       if (backOdds <= 1.01) continue;
+
+      // Fix 1: Skip banned near-certainty markets — they have no genuine edge
+      if (BANNED_MARKETS.has(oddsRow.marketType)) continue;
+
+      // Fix 2: Minimum odds floor — below this the reward doesn't justify the risk
+      if (backOdds < minOddsThreshold) continue;
+
       const impliedProb = 1 / backOdds;
 
       const modelProb = getModelProbability(oddsRow.marketType, oddsRow.selectionName, featureMap);
