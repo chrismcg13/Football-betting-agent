@@ -329,7 +329,7 @@ function teamNameMatch(dbName: string, apiName: string): boolean {
   return false;
 }
 
-async function getFixturesForDate(date: string): Promise<ApiFixture[]> {
+export async function getFixturesForDate(date: string): Promise<ApiFixture[]> {
   const result = await fetchApiFootball<ApiFixture[]>("/fixtures", { date });
   return result ?? [];
 }
@@ -890,6 +890,31 @@ interface ApiFixtureStats {
 function getStat(stats: ApiFixtureStats["statistics"], type: string): number {
   const s = stats.find((s) => s.type === type);
   return Number(s?.value ?? 0) || 0;
+}
+
+export async function fetchMatchStatsForSettlement(
+  fixtureId: number,
+): Promise<{ totalCorners: number; totalCards: number } | null> {
+  if (!(await canMakeRequest())) return null;
+
+  const result = await fetchApiFootball<ApiFixtureStats[]>("/fixtures/statistics", {
+    fixture: fixtureId,
+  });
+
+  if (!result || result.length < 2) return null;
+  const [homeStats, awayStats] = result;
+  if (!homeStats || !awayStats) return null;
+
+  const totalCorners =
+    getStat(homeStats.statistics, "Corner Kicks") +
+    getStat(awayStats.statistics, "Corner Kicks");
+  const totalCards =
+    getStat(homeStats.statistics, "Yellow Cards") +
+    getStat(awayStats.statistics, "Yellow Cards") +
+    getStat(homeStats.statistics, "Red Cards") +
+    getStat(awayStats.statistics, "Red Cards");
+
+  return { totalCorners, totalCards };
 }
 
 export async function fetchAndStoreFixtureStats(

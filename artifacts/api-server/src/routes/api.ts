@@ -28,6 +28,7 @@ import {
   setConfigValue,
   getBankroll,
   getAgentStatus,
+  backfillCornersCardsStats,
 } from "../services/paperTrading";
 import {
   runIngestionNow,
@@ -992,6 +993,22 @@ router.post("/trading/run", async (req, res) => {
     });
   } catch (err) {
     logger.error({ err }, "Manual trading cycle failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/trading/backfill-stats
+// Fetch real corners/cards stats for already-finished matches and re-settle
+// any voided bets that can now be determined
+// ─────────────────────────────────────────────
+router.post("/trading/backfill-stats", async (_req, res) => {
+  logger.info("Manual corners/cards stats backfill triggered");
+  try {
+    const result = await backfillCornersCardsStats();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "Corners/cards stats backfill failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });

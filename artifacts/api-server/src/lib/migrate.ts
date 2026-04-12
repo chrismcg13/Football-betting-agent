@@ -217,6 +217,14 @@ export async function runMigrations() {
         ON team_xg_rolling(team_name, computed_at DESC)
     `);
 
+    // ── Add API fixture ID and stats columns to matches (idempotent) ───────
+    await db.execute(sql`
+      ALTER TABLE matches
+        ADD COLUMN IF NOT EXISTS api_fixture_id INTEGER,
+        ADD COLUMN IF NOT EXISTS total_corners INTEGER,
+        ADD COLUMN IF NOT EXISTS total_cards INTEGER
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

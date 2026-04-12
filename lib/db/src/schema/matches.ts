@@ -19,6 +19,9 @@ export const matchesTable = pgTable("matches", {
   homeScore: integer("home_score"),
   awayScore: integer("away_score"),
   betfairEventId: text("betfair_event_id"),
+  apiFixtureId: integer("api_fixture_id"),
+  totalCorners: integer("total_corners"),
+  totalCards: integer("total_cards"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

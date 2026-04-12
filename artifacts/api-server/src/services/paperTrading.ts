@@ -6,9 +6,10 @@ import {
   complianceLogsTable,
   oddsSnapshotsTable,
 } from "@workspace/db";
-import { eq, and, gte, lt, inArray, desc, sql } from "drizzle-orm";
+import { eq, and, gte, lt, inArray, desc, sql, isNull, or } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { retrainIfNeeded } from "./predictionEngine";
+import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch } from "./apiFootball";
 
 // ===================== Config helpers =====================
 
@@ -332,6 +333,7 @@ function determineBetWon(
   selectionName: string,
   homeScore: number,
   awayScore: number,
+  matchStats?: { totalCorners: number | null; totalCards: number | null } | null,
 ): boolean | null {
   const totalGoals = homeScore + awayScore;
 
@@ -402,20 +404,38 @@ function determineBetWon(
       return null;
     }
 
-    // ─── Markets requiring stats not stored in DB → void (stake refunded) ───
+    // ─── Corners markets — use stored stats ───────────────────────────────────
     case "TOTAL_CORNERS_75":
     case "TOTAL_CORNERS_85":
     case "TOTAL_CORNERS_95":
     case "TOTAL_CORNERS_105":
-    case "TOTAL_CORNERS_115":
+    case "TOTAL_CORNERS_115": {
+      if (!matchStats || matchStats.totalCorners === null) return null;
+      // Parse threshold from market type: "TOTAL_CORNERS_95" → 9.5
+      const suffix = marketType.split("_").pop()!;
+      const threshold = parseInt(suffix, 10) / 10;
+      if (selectionName.startsWith("Over")) return matchStats.totalCorners > threshold;
+      if (selectionName.startsWith("Under")) return matchStats.totalCorners < threshold;
+      return null;
+    }
+
+    // ─── Cards markets — use stored stats ────────────────────────────────────
     case "TOTAL_CARDS_25":
     case "TOTAL_CARDS_35":
     case "TOTAL_CARDS_45":
-    case "TOTAL_CARDS_55":
+    case "TOTAL_CARDS_55": {
+      if (!matchStats || matchStats.totalCards === null) return null;
+      const suffix = marketType.split("_").pop()!;
+      const threshold = parseInt(suffix, 10) / 10;
+      if (selectionName.startsWith("Over")) return matchStats.totalCards > threshold;
+      if (selectionName.startsWith("Under")) return matchStats.totalCards < threshold;
+      return null;
+    }
+
     case "FIRST_HALF_RESULT":
     case "FIRST_HALF_OU_05":
     case "FIRST_HALF_OU_15":
-      return null; // void — no corner/card/HT data available
+      return null; // void — no half-time score data available
 
     default:
       return null; // void unknown markets rather than forcing a loss
@@ -471,6 +491,7 @@ export async function settleBets(): Promise<SettlementResult> {
       bet.selectionName,
       match.homeScore,
       match.awayScore,
+      { totalCorners: match.totalCorners ?? null, totalCards: match.totalCards ?? null },
     );
 
     // null = void (data unavailable) — refund stake, no PnL impact
@@ -617,4 +638,185 @@ export async function settleBets(): Promise<SettlementResult> {
   }
 
   return { settled, won, lost, totalPnl };
+}
+
+// ===================== Backfill stats for voided corners/cards bets =====================
+
+const CORNERS_CARDS_MARKETS = new Set([
+  "TOTAL_CORNERS_75", "TOTAL_CORNERS_85", "TOTAL_CORNERS_95", "TOTAL_CORNERS_105", "TOTAL_CORNERS_115",
+  "TOTAL_CARDS_25", "TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_CARDS_55",
+]);
+
+export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: number; betsResettled: number }> {
+  // 1. Find finished matches with voided corners/cards bets that have no stats yet
+  const voidedBets = await db
+    .select({ matchId: paperBetsTable.matchId, marketType: paperBetsTable.marketType })
+    .from(paperBetsTable)
+    .where(eq(paperBetsTable.status, "void"));
+
+  const relevantMatchIds = [
+    ...new Set(
+      voidedBets
+        .filter((b) => CORNERS_CARDS_MARKETS.has(b.marketType))
+        .map((b) => b.matchId),
+    ),
+  ];
+
+  if (relevantMatchIds.length === 0) {
+    return { matchesUpdated: 0, betsResettled: 0 };
+  }
+
+  const matches = await db
+    .select()
+    .from(matchesTable)
+    .where(
+      and(
+        inArray(matchesTable.id, relevantMatchIds),
+        eq(matchesTable.status, "finished"),
+        or(isNull(matchesTable.totalCorners), isNull(matchesTable.totalCards)),
+      ),
+    );
+
+  if (matches.length === 0) {
+    logger.info("backfillCornersCardsStats: no finished matches need stats backfill");
+    return { matchesUpdated: 0, betsResettled: 0 };
+  }
+
+  // 2. Group matches by date and fetch fixtures to find their API fixture IDs
+  const dateGroups = new Map<string, typeof matches>();
+  for (const m of matches) {
+    const dateStr = m.kickoffTime.toISOString().slice(0, 10);
+    if (!dateGroups.has(dateStr)) dateGroups.set(dateStr, []);
+    dateGroups.get(dateStr)!.push(m);
+  }
+
+  const matchIdToFixtureId = new Map<number, number>();
+
+  for (const [date, dateMatches] of dateGroups) {
+    const fixtures = await getFixturesForDate(date);
+    const finished = fixtures.filter(
+      (f) => f.fixture.status.short === "FT" || f.fixture.status.short === "AET" || f.fixture.status.short === "PEN",
+    );
+    for (const dbMatch of dateMatches) {
+      // If we already have an apiFixtureId stored, use it
+      if (dbMatch.apiFixtureId) {
+        matchIdToFixtureId.set(dbMatch.id, dbMatch.apiFixtureId);
+        continue;
+      }
+      const fixture = finished.find(
+        (f) =>
+          teamNameMatch(dbMatch.homeTeam, f.teams.home.name) &&
+          teamNameMatch(dbMatch.awayTeam, f.teams.away.name),
+      );
+      if (fixture) {
+        matchIdToFixtureId.set(dbMatch.id, fixture.fixture.id);
+      } else {
+        logger.warn(
+          { matchId: dbMatch.id, home: dbMatch.homeTeam, away: dbMatch.awayTeam, date },
+          "backfillCornersCardsStats: could not find API fixture",
+        );
+      }
+    }
+  }
+
+  // 3. Fetch stats and update matches
+  let matchesUpdated = 0;
+  for (const dbMatch of matches) {
+    const fixtureId = matchIdToFixtureId.get(dbMatch.id);
+    if (!fixtureId) continue;
+
+    const stats = await fetchMatchStatsForSettlement(fixtureId);
+    if (!stats) {
+      logger.warn({ matchId: dbMatch.id, fixtureId }, "backfillCornersCardsStats: no stats from API");
+      continue;
+    }
+
+    await db
+      .update(matchesTable)
+      .set({
+        apiFixtureId: fixtureId,
+        totalCorners: stats.totalCorners,
+        totalCards: stats.totalCards,
+      })
+      .where(eq(matchesTable.id, dbMatch.id));
+
+    logger.info(
+      { matchId: dbMatch.id, fixtureId, totalCorners: stats.totalCorners, totalCards: stats.totalCards },
+      "backfillCornersCardsStats: stats stored for match",
+    );
+    matchesUpdated++;
+  }
+
+  // 4. Re-settle voided corners/cards bets for matches now having stats
+  const updatedMatchIds = [...matchIdToFixtureId.keys()];
+  if (updatedMatchIds.length === 0) return { matchesUpdated, betsResettled: 0 };
+
+  const updatedMatches = await db
+    .select()
+    .from(matchesTable)
+    .where(inArray(matchesTable.id, updatedMatchIds));
+  const updatedMatchMap = new Map(updatedMatches.map((m) => [m.id, m]));
+
+  const voidedCornersCardsBets = await db
+    .select()
+    .from(paperBetsTable)
+    .where(
+      and(
+        eq(paperBetsTable.status, "void"),
+        inArray(paperBetsTable.matchId, updatedMatchIds),
+      ),
+    );
+
+  let betsResettled = 0;
+  let pnlDelta = 0;
+
+  for (const bet of voidedCornersCardsBets) {
+    if (!CORNERS_CARDS_MARKETS.has(bet.marketType)) continue;
+    const match = updatedMatchMap.get(bet.matchId);
+    if (!match || match.homeScore === null || match.awayScore === null) continue;
+    if (match.totalCorners === null && match.totalCards === null) continue;
+
+    const outcome = determineBetWon(
+      bet.marketType,
+      bet.selectionName,
+      match.homeScore,
+      match.awayScore,
+      { totalCorners: match.totalCorners ?? null, totalCards: match.totalCards ?? null },
+    );
+
+    if (outcome === null) continue; // still not determinable
+
+    const stake = Number(bet.stake);
+    const odds = Number(bet.oddsAtPlacement);
+    const betWon = outcome === true;
+    const settlementPnl = betWon ? Math.round(stake * (odds - 1) * 0.98 * 100) / 100 : -stake;
+    const newStatus = betWon ? "won" : "lost";
+
+    await db
+      .update(paperBetsTable)
+      .set({ status: newStatus, settlementPnl: String(settlementPnl) })
+      .where(eq(paperBetsTable.id, bet.id));
+
+    pnlDelta += settlementPnl;
+    betsResettled++;
+
+    logger.info(
+      { betId: bet.id, market: bet.marketType, selection: bet.selectionName, newStatus, settlementPnl },
+      "backfillCornersCardsStats: voided bet re-settled",
+    );
+  }
+
+  // 5. Update bankroll for the PnL delta
+  if (betsResettled > 0) {
+    const bankrollStr = await getConfigValue("bankroll");
+    const bankroll = parseFloat(bankrollStr ?? "500");
+    const newBankroll = Math.round((bankroll + pnlDelta) * 100) / 100;
+    await setConfigValue("bankroll", String(newBankroll));
+    logger.info(
+      { betsResettled, pnlDelta, bankroll, newBankroll },
+      "backfillCornersCardsStats: bankroll updated after re-settlement",
+    );
+  }
+
+  return { matchesUpdated, betsResettled };
 }

@@ -21,7 +21,7 @@ import {
   logDailyBudgetSummary,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { fetchRecentFixtureResults, teamNameMatch } from "./apiFootball";
+import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement } from "./apiFootball";
 import { db, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql } from "drizzle-orm";
 
@@ -529,12 +529,19 @@ export async function syncMatchResults(): Promise<number> {
     );
     if (!dbMatch) continue;
 
+    // Fetch corner/card stats while we have the fixture ID
+    const matchStats = await fetchMatchStatsForSettlement(fixture.fixture.id);
+
     await db
       .update(matchesTable)
       .set({
         status: "finished",
         homeScore: homeGoals,
         awayScore: awayGoals,
+        apiFixtureId: fixture.fixture.id,
+        ...(matchStats !== null
+          ? { totalCorners: matchStats.totalCorners, totalCards: matchStats.totalCards }
+          : {}),
       })
       .where(eq(matchesTable.id, dbMatch.id));
 
@@ -545,6 +552,8 @@ export async function syncMatchResults(): Promise<number> {
         awayTeam: dbMatch.awayTeam,
         score: `${homeGoals}-${awayGoals}`,
         apiFixtureId: fixture.fixture.id,
+        totalCorners: matchStats?.totalCorners ?? "N/A",
+        totalCards: matchStats?.totalCards ?? "N/A",
       },
       "syncMatchResults: match updated to finished",
     );
