@@ -10,6 +10,7 @@ import { eq, and, gte, lt, inArray, desc, sql, isNull, or } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { retrainIfNeeded } from "./predictionEngine";
 import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch } from "./apiFootball";
+import { getThresholdCategory } from "./correlationDetector";
 
 // ===================== Config helpers =====================
 
@@ -819,4 +820,146 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
   }
 
   return { matchesUpdated, betsResettled };
+}
+
+// ===================== Pending bet deduplication =====================
+
+// Cross-market correlated pairs: if both present on same match, remove the lower-scored one
+const CORRELATED_CROSS_MARKET: Array<{
+  market1: string; sel1Includes: string;
+  market2: string; sel2Includes: string;
+}> = [
+  { market1: "BTTS", sel1Includes: "Yes", market2: "OVER_UNDER_25", sel2Includes: "Over" },
+  { market1: "BTTS", sel1Includes: "Yes", market2: "OVER_UNDER_15", sel2Includes: "Over" },
+  { market1: "MATCH_ODDS", sel1Includes: "Home", market2: "DOUBLE_CHANCE", sel2Includes: "1X" },
+  { market1: "MATCH_ODDS", sel1Includes: "Home", market2: "DOUBLE_CHANCE", sel2Includes: "Home or Draw" },
+  { market1: "MATCH_ODDS", sel1Includes: "Away", market2: "DOUBLE_CHANCE", sel2Includes: "X2" },
+  { market1: "MATCH_ODDS", sel1Includes: "Away", market2: "DOUBLE_CHANCE", sel2Includes: "Away or Draw" },
+];
+
+export async function deduplicatePendingBets(): Promise<{
+  totalBefore: number;
+  totalRemoved: number;
+  totalAfter: number;
+  removedByReason: Record<string, number>;
+}> {
+  // 1. Fetch all pending bets with their match info and scores
+  const rows = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      stake: paperBetsTable.stake,
+      opportunityScore: paperBetsTable.opportunityScore,
+      homeTeam: matchesTable.homeTeam,
+      awayTeam: matchesTable.awayTeam,
+    })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(eq(paperBetsTable.status, "pending"));
+
+  const totalBefore = rows.length;
+  const toVoid = new Set<number>(); // bet IDs to void
+  const removedByReason: Record<string, number> = {
+    threshold_dedup: 0,
+    cross_market_dedup: 0,
+    max_per_match: 0,
+  };
+
+  // Helper to get active bets for a match (not already queued for void)
+  const activeBetsForMatch = (matchId: number) =>
+    rows.filter((b) => b.matchId === matchId && !toVoid.has(b.id));
+
+  // 2. Group by matchId
+  const matchIds = [...new Set(rows.map((r) => r.matchId))];
+
+  for (const matchId of matchIds) {
+    const matchBets = activeBetsForMatch(matchId);
+
+    // ── Step A: Threshold dedup ───────────────────────────────────────
+    const categories = [...new Set(
+      matchBets.map((b) => getThresholdCategory(b.marketType)).filter(Boolean) as string[],
+    )];
+    for (const cat of categories) {
+      const catBets = matchBets.filter((b) => getThresholdCategory(b.marketType) === cat && !toVoid.has(b.id));
+      if (catBets.length <= 1) continue;
+      catBets.sort((a, b) => (b.opportunityScore ?? 0) - (a.opportunityScore ?? 0));
+      const [keep, ...discard] = catBets;
+      const removedNames = discard.map((d) => `${d.selectionName} (${d.marketType})`).join(", ");
+      logger.info(
+        { matchId, kept: `${keep!.marketType}:${keep!.selectionName}`, removedCount: discard.length },
+        `deduplicatePendingBets [0A ${cat}]: removed ${removedNames}`,
+      );
+      for (const d of discard) {
+        toVoid.add(d.id);
+        removedByReason.threshold_dedup++;
+      }
+    }
+
+    // ── Step B: Cross-market correlation dedup ────────────────────────
+    const activeBets = activeBetsForMatch(matchId);
+    for (const rule of CORRELATED_CROSS_MARKET) {
+      const b1 = activeBets.find(
+        (b) => b.marketType === rule.market1 && b.selectionName.includes(rule.sel1Includes) && !toVoid.has(b.id),
+      );
+      const b2 = activeBets.find(
+        (b) => b.marketType === rule.market2 && b.selectionName.includes(rule.sel2Includes) && !toVoid.has(b.id),
+      );
+      if (!b1 || !b2) continue;
+      const [, cancel] = (b1.opportunityScore ?? 0) >= (b2.opportunityScore ?? 0) ? [b1, b2] : [b2, b1];
+      logger.info(
+        { matchId, cancelled: `${cancel.marketType}:${cancel.selectionName}` },
+        `deduplicatePendingBets [0B cross-market]: correlated pair removed`,
+      );
+      toVoid.add(cancel.id);
+      removedByReason.cross_market_dedup++;
+    }
+
+    // ── Step C: Max 2 bets per match ─────────────────────────────────
+    const remainingBets = activeBetsForMatch(matchId);
+    if (remainingBets.length > 2) {
+      const sorted = [...remainingBets].sort((a, b) => (b.opportunityScore ?? 0) - (a.opportunityScore ?? 0));
+      const excess = sorted.slice(2);
+      logger.info(
+        { matchId, removedCount: excess.length },
+        `deduplicatePendingBets [max-2 cap]: removing ${excess.length} excess bets`,
+      );
+      for (const e of excess) {
+        toVoid.add(e.id);
+        removedByReason.max_per_match++;
+      }
+    }
+  }
+
+  // 3. Void all marked bets in one batch
+  if (toVoid.size > 0) {
+    const idsToVoid = [...toVoid];
+    await db
+      .update(paperBetsTable)
+      .set({ status: "void", settlementPnl: "0", settledAt: new Date() })
+      .where(inArray(paperBetsTable.id, idsToVoid));
+
+    logger.info({ count: toVoid.size, removedByReason }, "deduplicatePendingBets: voided correlated duplicate pending bets");
+  }
+
+  // 4. Compliance log
+  await db.insert(complianceLogsTable).values({
+    actionType: "correlation_dedup_applied",
+    details: {
+      totalBefore,
+      totalRemoved: toVoid.size,
+      totalAfter: totalBefore - toVoid.size,
+      removedByReason,
+      note: "Correlation fix applied. Historical stats before this point may be inflated by correlated threshold bets.",
+    },
+    timestamp: new Date(),
+  });
+
+  return {
+    totalBefore,
+    totalRemoved: toVoid.size,
+    totalAfter: totalBefore - toVoid.size,
+    removedByReason,
+  };
 }

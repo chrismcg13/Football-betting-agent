@@ -29,6 +29,7 @@ import {
   getBankroll,
   getAgentStatus,
   backfillCornersCardsStats,
+  deduplicatePendingBets,
 } from "../services/paperTrading";
 import {
   runIngestionNow,
@@ -48,6 +49,7 @@ import {
   getScanStats,
 } from "../services/apiFootball";
 import { getTodayLineMovements } from "../services/lineMovement";
+import { getThresholdCategory } from "../services/correlationDetector";
 
 const router = Router();
 
@@ -1009,6 +1011,98 @@ router.post("/trading/backfill-stats", async (_req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     logger.error({ err }, "Corners/cards stats backfill failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/trading/dedup-pending
+// Remove correlated duplicate pending bets (threshold dedup + cross-market + max 2/match)
+// ─────────────────────────────────────────────
+router.post("/trading/dedup-pending", async (_req, res) => {
+  logger.info("Manual pending-bet deduplication triggered");
+  try {
+    const result = await deduplicatePendingBets();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "Pending bet deduplication failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/trading/corrected-stats
+// Compute settled-bet stats excluding correlated threshold duplicates.
+// For each match, within each market category (goals_ou / corners / cards),
+// only the bet with the highest opportunity score is counted.
+// ─────────────────────────────────────────────
+router.get("/trading/corrected-stats", async (_req, res) => {
+  try {
+    // Get all settled bets (won/lost) with opportunity scores
+    const rows = await db
+      .select({
+        id: paperBetsTable.id,
+        matchId: paperBetsTable.matchId,
+        marketType: paperBetsTable.marketType,
+        selectionName: paperBetsTable.selectionName,
+        stake: paperBetsTable.stake,
+        settlementPnl: paperBetsTable.settlementPnl,
+        status: paperBetsTable.status,
+        opportunityScore: paperBetsTable.opportunityScore,
+        oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+      })
+      .from(paperBetsTable)
+      .where(inArray(paperBetsTable.status, ["won", "lost"]));
+
+    // Group by match+category, keep highest-scored
+    const keptBetIds = new Set<number>();
+    const byMatchCategory = new Map<string, typeof rows>();
+
+    for (const bet of rows) {
+      const cat = getThresholdCategory(bet.marketType);
+      const groupKey = cat ? `${bet.matchId}:${cat}` : `${bet.matchId}:${bet.marketType}:${bet.selectionName}`;
+      const arr = byMatchCategory.get(groupKey) ?? [];
+      arr.push(bet);
+      byMatchCategory.set(groupKey, arr);
+    }
+
+    for (const [, group] of byMatchCategory) {
+      // Keep the one with the highest opportunity score
+      group.sort((a, b) => (Number(b.opportunityScore) || 0) - (Number(a.opportunityScore) || 0));
+      keptBetIds.add(group[0]!.id);
+      // For non-threshold single-bet groups, all are unique — they're already added
+      if (group.length === 1) keptBetIds.add(group[0]!.id);
+    }
+
+    const correctedBets = rows.filter((b) => keptBetIds.has(b.id));
+    const allBets = rows;
+
+    const computeStats = (bets: typeof rows) => {
+      const won = bets.filter((b) => b.status === "won").length;
+      const lost = bets.filter((b) => b.status === "lost").length;
+      const total = won + lost;
+      const winRate = total > 0 ? Math.round((won / total) * 1000) / 10 : 0;
+      const totalStake = bets.reduce((s, b) => s + Number(b.stake), 0);
+      const totalPnl = bets.reduce((s, b) => s + Number(b.settlementPnl), 0);
+      const roi = totalStake > 0 ? Math.round((totalPnl / totalStake) * 1000) / 10 : 0;
+      return { total, won, lost, winRate, totalStake: Math.round(totalStake * 100) / 100, totalPnl: Math.round(totalPnl * 100) / 100, roi };
+    };
+
+    const raw = computeStats(allBets);
+    const corrected = computeStats(correctedBets);
+
+    const removedCount = allBets.length - correctedBets.length;
+    const corruptedBetIds = allBets.filter((b) => !keptBetIds.has(b.id)).map((b) => b.id);
+
+    res.json({
+      raw,
+      corrected,
+      removedCorrelatedCount: removedCount,
+      corruptedBetIds,
+      note: "Corrected stats count only one bet per match per market category (threshold dedup). Cross-market correlation dedup not applied to historical settled bets — apply manually if needed.",
+    });
+  } catch (err) {
+    logger.error({ err }, "Corrected stats calculation failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });
