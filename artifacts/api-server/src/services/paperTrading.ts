@@ -223,6 +223,54 @@ export async function placePaperBet(
     );
   }
 
+  // ── Duplicate / per-match cap guard ─────────────────────────────────────────
+  // Enforced at placement time so duplicates never reach the DB.
+  {
+    const existingPending = await db
+      .select({
+        id: paperBetsTable.id,
+        marketType: paperBetsTable.marketType,
+        selectionName: paperBetsTable.selectionName,
+      })
+      .from(paperBetsTable)
+      .where(
+        and(
+          eq(paperBetsTable.matchId, matchId),
+          eq(paperBetsTable.status, "pending"),
+        ),
+      );
+
+    // 1. Exact duplicate — same market + selection already pending
+    const exactDup = existingPending.find(
+      (b) => b.marketType === marketType && b.selectionName === selectionName,
+    );
+    if (exactDup) {
+      return logReject(
+        `Duplicate: pending bet already exists for ${marketType}:${selectionName} on match ${matchId}`,
+      );
+    }
+
+    // 2. Threshold-category duplicate — e.g. already have a Goals OU bet → skip another Goals OU
+    const thisCat = getThresholdCategory(marketType);
+    if (thisCat) {
+      const catDup = existingPending.find(
+        (b) => getThresholdCategory(b.marketType) === thisCat,
+      );
+      if (catDup) {
+        return logReject(
+          `Threshold category "${thisCat}" already covered by pending ${catDup.marketType}:${catDup.selectionName} on match ${matchId}`,
+        );
+      }
+    }
+
+    // 3. Hard cap — max 2 bets per match
+    if (existingPending.length >= 2) {
+      return logReject(
+        `Match ${matchId} already has ${existingPending.length} pending bets (max 2) — skipping ${marketType}:${selectionName}`,
+      );
+    }
+  }
+
   const maxStakePct = Number(
     (await getConfigValue("max_stake_pct")) ?? "0.02",
   );

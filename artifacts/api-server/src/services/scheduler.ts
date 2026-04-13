@@ -3,7 +3,7 @@ import { logger } from "../lib/logger";
 import { runDataIngestion } from "./dataIngestion";
 import { runFeatureEngineForUpcomingMatches } from "./featureEngine";
 import { detectValueBets } from "./valueDetection";
-import { placePaperBet, settleBets, getAgentStatus, getBankroll } from "./paperTrading";
+import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets } from "./paperTrading";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
 import { runLearningLoop } from "./learningLoop";
@@ -639,8 +639,13 @@ export function startScheduler(): void {
   logger.info("Feature scheduler active — every 6 hours UTC");
 
   // Trading cycle: every 10 minutes (increased frequency for paper data collection)
-  cron.schedule("*/10 * * * *", () => { void runTradingCycle(); }, { timezone: "UTC" });
-  logger.info("Trading cycle scheduler active — every 10 minutes");
+  // Runs deduplication after each cycle to catch any cross-cycle duplicates.
+  cron.schedule("*/10 * * * *", () => {
+    void runTradingCycle().then(() => deduplicatePendingBets()).catch((err) => {
+      logger.warn({ err }, "Post-trading-cycle dedup failed — non-fatal");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Trading cycle scheduler active — every 10 minutes (with post-cycle dedup)");
 
   // API-Football: fetch real odds every 2 hours — fresh odds for every trading cycle
   // With 75,000 req/day budget, each scan uses ~30-50 reqs, plenty of headroom
