@@ -52,6 +52,11 @@ const KNOWN_PINNACLE_LEAGUE_IDS = new Set([
   345,  // Czech First League
   283,  // Romanian Liga I
   210,  // Croatian HNL
+  253,  // Major League Soccer
+  4,    // UEFA Conference League
+  62,   // Ligue 2
+  79,   // 2. Bundesliga
+  141,  // Segunda División
 ]);
 
 // ─── Tier classification ──────────────────────────────────────────────────────
@@ -417,9 +422,8 @@ export function getNewLeagueKellyMultiplier(leagueName: string, betsPlaced: numb
 // ─── Seed baseline leagues (idempotent, run at startup) ───────────────────────
 
 export async function seedBaselineLeagues(): Promise<void> {
-  const { LEAGUE_IDS } = await import("./apiFootball");
+  const { LEAGUE_IDS, ALL_LEAGUE_IDS } = await import("./apiFootball");
 
-  // Build list of all unique leagues from LEAGUE_IDS constant
   const leagueEntries = Object.entries(LEAGUE_IDS);
 
   for (const [name, id] of leagueEntries) {
@@ -441,7 +445,35 @@ export async function seedBaselineLeagues(): Promise<void> {
     }).onConflictDoNothing();
   }
 
-  logger.info({ count: leagueEntries.length }, "Baseline leagues seeded into discovered_leagues");
+  const nameById = new Map(leagueEntries.map(([n, id]) => [id, n]));
+  const EXTRA_LEAGUE_NAMES: Record<number, string> = {
+    98: "J1 League", 188: "A-League Men", 106: "Ekstraklasa",
+    345: "Czech First League", 283: "Liga I", 210: "HNL",
+    253: "Major League Soccer", 262: "Liga BetPlay", 4: "UEFA Europa Conference League",
+  };
+
+  for (const id of ALL_LEAGUE_IDS) {
+    if (nameById.has(id)) continue;
+    const name = EXTRA_LEAGUE_NAMES[id] || `League ${id}`;
+    const { tier, seedEdgeScore } = classifyLeague(id, name, "");
+    const hasPinnacle = KNOWN_PINNACLE_LEAGUE_IDS.has(id);
+
+    await db.insert(discoveredLeaguesTable).values({
+      leagueId: id,
+      name,
+      country: "",
+      tier,
+      fixtureCount: 0,
+      hasApiFootballOdds: true,
+      hasPinnacleOdds: hasPinnacle,
+      seedEdgeScore,
+      status: "active",
+      activatedAt: new Date(),
+      discoveryNotes: "Baseline league — seeded at startup via ALL_LEAGUE_IDS.",
+    }).onConflictDoNothing();
+  }
+
+  logger.info({ count: leagueEntries.length + ALL_LEAGUE_IDS.length }, "Baseline leagues seeded into discovered_leagues");
 }
 
 // ─── Dynamic Pinnacle coverage update ─────────────────────────────────────────

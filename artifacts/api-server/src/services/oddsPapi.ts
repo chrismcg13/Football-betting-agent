@@ -22,8 +22,8 @@ import { eq, and, gte, lte, sql, like, inArray, ne } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://api.oddspapi.io/v4";
-const DAILY_CAP = 150;
-const MONTHLY_CAP = 4800;
+const DAILY_CAP = 300;
+const MONTHLY_CAP = 5000;
 
 // DB-driven cap override — reads agent_config key "oddspapi_daily_cap_override"
 // Format: {"cap": 15, "expires": "2026-04-09"}  (expires = ISO date, inclusive)
@@ -186,36 +186,362 @@ async function fetchOddsPapi<T = unknown>(
   }
 }
 
-// ─── Team name normalisation (shared with apiFootball.ts logic) ───────────────
+// ─── Team name normalisation (comprehensive, shared with apiFootball.ts) ─────
 
 function transliterate(s: string): string {
   return s
-    .replace(/[àáâãäå]/gi, "a")
+    .replace(/[àáâãäåæ]/gi, "a")
     .replace(/[èéêë]/gi, "e")
     .replace(/[ìíîï]/gi, "i")
     .replace(/[òóôõöø]/gi, "o")
     .replace(/[ùúûü]/gi, "u")
     .replace(/[ñ]/gi, "n")
-    .replace(/[çć]/gi, "c")
+    .replace(/[çćč]/gi, "c")
     .replace(/[ýÿ]/gi, "y")
     .replace(/[žźż]/gi, "z")
-    .replace(/[šś]/gi, "s")
+    .replace(/[šśş]/gi, "s")
     .replace(/[łľ]/gi, "l")
     .replace(/[ß]/gi, "ss")
-    .replace(/[đ]/gi, "d");
+    .replace(/[đ]/gi, "d")
+    .replace(/[ğ]/gi, "g")
+    .replace(/[ř]/gi, "r")
+    .replace(/[ţť]/gi, "t")
+    .replace(/[İı]/g, "i");
 }
 
+const TEAM_ALIASES: Record<string, string> = {
+  "bodo glimt": "bodoglimt",
+  "fk bodoe glimt": "bodoglimt",
+  "fk bodo glimt": "bodoglimt",
+  "bodoe glimt": "bodoglimt",
+  "valerenga": "valerenga",
+  "vaalerengen": "valerenga",
+  "vaalerenga": "valerenga",
+  "tromso": "tromso",
+  "tromsoe": "tromso",
+  "lillestrom": "lillestrom",
+  "lillestrøm": "lillestrom",
+  "sarpsborg 08": "sarpsborg",
+  "sarpsborg 08 ff": "sarpsborg",
+  "stromsgodset": "stromsgodset",
+  "stroemsgodset": "stromsgodset",
+  "molde": "molde",
+  "molde fk": "molde",
+  "aalesund": "aalesund",
+  "aalesunds": "aalesund",
+  "start": "ik start",
+  "hodd": "hodd",
+  "hoeDD": "hodd",
+  "odd ballklubb": "odd",
+  "odds bk": "odd",
+  "asane": "asane",
+  "aasane": "asane",
+  "strommen": "strommen",
+  "stroemmen": "strommen",
+  "stabaek": "stabaek",
+  "stabek": "stabaek",
+  "bryne": "bryne",
+  "bryne fk": "bryne",
+  "sogndal": "sogndal",
+  "sogndal fotball": "sogndal",
+  "haugesund": "haugesund",
+  "fk haugesund": "haugesund",
+  "egersund": "egersund",
+  "sandnes ulf": "sandnes ulf",
+  "lyn": "lyn oslo",
+  "lyn oslo": "lyn oslo",
+  "fc st pauli 1910": "st pauli",
+  "st pauli": "st pauli",
+  "fc st pauli": "st pauli",
+  "1 fc koln": "koln",
+  "1 fc koeln": "koln",
+  "fc koln": "koln",
+  "koln": "koln",
+  "cologne": "koln",
+  "fc cologne": "koln",
+  "fc seoul": "seoul",
+  "seoul e land": "seoul",
+  "ulsan hyundai": "ulsan",
+  "ulsan hyundai fc": "ulsan",
+  "ulsan hd": "ulsan",
+  "gwangju": "gwangju",
+  "gwangju fc": "gwangju",
+  "daejeon citizen": "daejeon",
+  "daejeon citizen fc": "daejeon",
+  "gimnasia lp": "gimnasia la plata",
+  "gimnasia l p": "gimnasia la plata",
+  "gimnasia la plata": "gimnasia la plata",
+  "gimnasia y esgrima lp": "gimnasia la plata",
+  "gimnasia m": "gimnasia mendoza",
+  "gimnasia y esgrima mendoza": "gimnasia mendoza",
+  "independ rivadavia": "independiente rivadavia",
+  "independiente rivadavia": "independiente rivadavia",
+  "talleres cordoba": "talleres",
+  "talleres": "talleres",
+  "rosario central": "rosario central",
+  "barracas central": "barracas",
+  "belgrano cordoba": "belgrano",
+  "belgrano": "belgrano",
+  "sarmiento junin": "sarmiento",
+  "sarmiento": "sarmiento",
+  "defensa y justicia": "defensa justicia",
+  "deportivo riestra": "riestra",
+  "estudiantes de rio cuarto": "est rio cuarto",
+  "america de cali": "america cali",
+  "america": "america cali",
+  "millonarios": "millonarios",
+  "millonarios fc": "millonarios",
+  "liverpool montevideo": "liverpool",
+  "liverpool fc montevideo": "liverpool",
+  "club nacional": "nacional",
+  "nacional montevideo": "nacional",
+  "ca nacional": "nacional",
+  "sirius": "ik sirius",
+  "ik sirius": "ik sirius",
+  "vasteras sk fk": "vasteras",
+  "vasteras sk": "vasteras",
+  "fluminense": "fluminense",
+  "fluminense fc": "fluminense",
+  "colo colo": "colo colo",
+  "huachipato": "huachipato",
+  "palestino": "palestino",
+  "a italiano": "audax italiano",
+  "audax italiano": "audax italiano",
+  "d la serena": "deportes la serena",
+  "deportes la serena": "deportes la serena",
+  "concepcion": "concepcion",
+  "san marcos de arica": "san marcos arica",
+  "cobreloa": "cobreloa",
+  "antofagasta": "antofagasta",
+  "deportes copiapo": "copiapo",
+  "san luis": "san luis",
+  "deportes iquique": "iquique",
+  "union espanola": "union espanola",
+  "curico unido": "curico unido",
+  "magallanes": "magallanes",
+  "santiago wanderers": "santiago wanderers",
+  "rangers de talca": "rangers",
+  "recoleta": "recoleta",
+  "deportes santa cruz": "santa cruz",
+  "union san felipe": "san felipe",
+  "ifk varnamo": "varnamo",
+  "gif sundsvall": "sundsvall",
+  "varbergs bois fc": "varbergs",
+  "varbergs bois": "varbergs",
+  "landskrona bois": "landskrona",
+  "ljungskile sk": "ljungskile",
+  "norrby if": "norrby",
+  "falkenbergs ff": "falkenbergs",
+  "oddevold": "oddevold",
+  "osters if": "osters",
+  "ik brage": "brage",
+  "sandviken": "sandviken",
+  "sandvikens if": "sandviken",
+  "united nordic": "united nordic",
+  "riigas fs": "riga fc",
+  "rigas fs": "riga fc",
+  "riga": "riga fc",
+  "riga fc": "riga fc",
+  "super nova": "super nova",
+  "fk liepaja": "liepaja",
+  "liepaja": "liepaja",
+  "auda": "auda",
+  "fk auda": "auda",
+  "bfc daugavpils": "daugavpils",
+  "daugavpils": "daugavpils",
+  "fs jelgava": "jelgava",
+  "jelgava": "jelgava",
+  "tukums": "tukums",
+  "ogre united": "ogre",
+  "grobina": "grobina",
+  "alianza lima": "alianza lima",
+  "sporting cristal": "sporting cristal",
+  "universitario": "universitario",
+  "fbc melgar": "melgar",
+  "melgar": "melgar",
+  "sport huancayo": "sport huancayo",
+  "cienciano": "cienciano",
+  "ucv moquegua": "ucv moquegua",
+  "utc cajamarca": "utc cajamarca",
+  "alianza atletico": "alianza atletico",
+  "sport boys": "sport boys",
+  "adt": "adt",
+  "fc cajamarca": "cajamarca",
+  "deportivo garcilaso": "garcilaso",
+  "comerciantes unidos": "comerciantes",
+  "cusco": "cusco fc",
+  "cusco fc": "cusco fc",
+  "qpr": "queens park rangers",
+  "queens park rangers": "queens park rangers",
+  "blackburn": "blackburn rovers",
+  "blackburn rovers": "blackburn rovers",
+  "millwall": "millwall",
+  "millwall fc": "millwall",
+  "coventry": "coventry city",
+  "coventry city": "coventry city",
+  "portsmouth": "portsmouth",
+  "portsmouth fc": "portsmouth",
+  "leicester": "leicester city",
+  "leicester city": "leicester city",
+  "swansea": "swansea city",
+  "swansea city": "swansea city",
+  "southampton": "southampton",
+  "southampton fc": "southampton",
+  "ipswich": "ipswich town",
+  "ipswich town": "ipswich town",
+  "middlesbrough": "middlesbrough",
+  "middlesbrough fc": "middlesbrough",
+  "leeds": "leeds",
+  "leeds utd": "leeds",
+  "wolves": "wolverhampton",
+  "wolverhampton": "wolverhampton",
+  "wolverhampton wanderers": "wolverhampton",
+  "crystal palace": "crystal palace",
+  "crystal palace fc": "crystal palace",
+  "west ham": "west ham",
+  "west ham utd": "west ham",
+  "west ham united": "west ham",
+  "strasbourg": "strasbourg",
+  "rc strasbourg alsace": "strasbourg",
+  "rennes": "rennes",
+  "stade rennais": "rennes",
+  "lecce": "lecce",
+  "us lecce": "lecce",
+  "fiorentina": "fiorentina",
+  "acf fiorentina": "fiorentina",
+  "gaziantep fk": "gaziantep",
+  "gaziantep": "gaziantep",
+  "kayserispor": "kayserispor",
+  "fc midtjylland": "midtjylland",
+  "midtjylland": "midtjylland",
+  "aarhus": "aarhus",
+  "agf aarhus": "aarhus",
+  "agf": "aarhus",
+  "wsg wattens": "wsg tirol",
+  "wsg tirol": "wsg tirol",
+  "scr altach": "altach",
+  "altach": "altach",
+  "panetolikos": "panetolikos",
+  "panetolikos gfs": "panetolikos",
+  "panserraikos": "panserraikos",
+  "panserraikos fc": "panserraikos",
+  "boston river": "boston river",
+  "cerro largo": "cerro largo",
+  "cerro largo fc": "cerro largo",
+  "otelul galati": "otelul",
+  "otelul": "otelul",
+  "uta arad": "uta arad",
+  "uta": "uta arad",
+  "arges pitesti": "arges pitesti",
+  "fc arges": "arges pitesti",
+  "arges": "arges pitesti",
+  "cfr 1907 cluj": "cfr cluj",
+  "cfr cluj": "cfr cluj",
+  "csikszereda": "csikszereda",
+  "fk csikszereda": "csikszereda",
+  "unirea slobozia": "unirea slobozia",
+  "dinamo bucuresti": "dinamo bucuresti",
+  "dinamo bucharest": "dinamo bucuresti",
+  "universitatea cluj": "universitatea cluj",
+  "u cluj": "universitatea cluj",
+  "petrolul ploiesti": "petrolul ploiesti",
+  "petrolul": "petrolul ploiesti",
+  "afc hermannstadt": "hermannstadt",
+  "hermannstadt": "hermannstadt",
+  "fc hermannstadt": "hermannstadt",
+  "universitatea craiova": "u craiova",
+  "u craiova": "u craiova",
+  "u craiova 1948": "u craiova",
+  "rapid": "rapid bucuresti",
+  "rapid bucuresti": "rapid bucuresti",
+  "rapid bucharest": "rapid bucuresti",
+  "fc botosani": "botosani",
+  "botosani": "botosani",
+  "metaloglobus": "metaloglobus",
+  "metaloglobus bucuresti": "metaloglobus",
+  "farul constanta": "farul constanta",
+  "farul": "farul constanta",
+  "fcsb": "fcsb",
+  "steaua bucuresti": "fcsb",
+  "steaua bucharest": "fcsb",
+  "la galaxy": "la galaxy",
+  "los angeles galaxy": "la galaxy",
+  "toluca": "toluca",
+  "deportivo toluca": "toluca",
+  "seattle sounders": "seattle sounders",
+  "seattle sounders fc": "seattle sounders",
+  "tigres uanl": "tigres",
+  "club tigres": "tigres",
+  "barracas central": "barracas",
+  "barracas": "barracas",
+  "belgrano de cordoba": "belgrano",
+  "independiente": "independiente",
+  "ca independiente": "independiente",
+  "brage": "brage",
+  "norrkoping": "norrkoping",
+  "ifk norrkoping": "norrkoping",
+  "varberg": "varbergs",
+  "sandvikens if": "sandviken",
+  "sandviken": "sandviken",
+  "ljungskile": "ljungskile",
+  "ljungskile sk": "ljungskile",
+  "norrby": "norrby",
+  "norrby if": "norrby",
+  "falkenbergs": "falkenbergs",
+  "falkenbergs ff": "falkenbergs",
+  "oddevold": "oddevold",
+  "ifk goteborg": "goteborg",
+  "goteborg": "goteborg",
+  "osters if": "osters",
+  "osters": "osters",
+  "ik sirius": "sirius",
+  "sirius": "sirius",
+  "vasteras": "vasteras",
+  "vasteras sk": "vasteras",
+  "vasteras sk fk": "vasteras",
+  "orsomarso": "orsomarso",
+  "orsomarso sc": "orsomarso",
+  "leones fc": "leones",
+  "leones": "leones",
+  "envigado": "envigado",
+  "envigado fc": "envigado",
+  "patriotas": "patriotas",
+  "patriotas fc": "patriotas",
+  "tigres fc": "tigres fc col",
+  "quindio": "quindio",
+  "deportes quindio": "quindio",
+  "real cartagena": "cartagena",
+  "barranquilla": "barranquilla",
+  "bogota fc": "bogota",
+  "depor fc": "depor",
+  "union magdalena": "union magdalena",
+  "popayan": "popayan",
+  "ind yumbo": "yumbo",
+  "real soacha": "soacha",
+};
+
 function normalizeTeam(name: string): string {
-  return transliterate(name)
+  let n = transliterate(name)
     .toLowerCase()
-    // Remove leading ordinals like "1.", "2." that German/Spanish clubs use
     .replace(/^\d+\.\s*/, "")
-    // Remove common club suffixes and prefixes
     .replace(/\b(fc|sc|ac|cf|fk|sk|sv|utd|united|club|sporting|real|athletic|atletico|atlético|olympique|olympico|inter|internazionale)\b/g, "")
-    // Remove all non-ASCII after transliteration
+    .replace(/\b(1910|1899|1893|1904|1907|1908|1909|1903|1896|1898|1894|1895|1897|1900|1901|1902|1905|1906|1911|1912|1913|1914|1915|1916|1917|1918|1919|1920)\b/g, "")
+    .replace(/\bii\b/g, "")
+    .replace(/\b\d{2}\s*ff\b/g, "")
     .replace(/[^a-z0-9 ]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+
+  if (TEAM_ALIASES[n]) return TEAM_ALIASES[n]!;
+  return n;
+}
+
+function resolveAlias(name: string): string {
+  const raw = transliterate(name).toLowerCase()
+    .replace(/[^a-z0-9 ]/g, "")
+    .replace(/\s+/g, " ").trim();
+  if (TEAM_ALIASES[raw]) return TEAM_ALIASES[raw]!;
+  return normalizeTeam(name);
 }
 
 function wordOverlap(a: string, b: string): number {
@@ -227,19 +553,49 @@ function wordOverlap(a: string, b: string): number {
   return overlap / Math.min(wa.size, wb.size);
 }
 
-function teamMatch(a: string, b: string): boolean {
-  const na = normalizeTeam(a);
-  const nb = normalizeTeam(b);
-  if (na === nb) return true;
-  if (na.includes(nb) || nb.includes(na)) return true;
-  // First-word match for longer names (e.g. "leverkusen" == "leverkusen")
-  const fa = na.split(" ")[0] ?? "";
-  const fb = nb.split(" ")[0] ?? "";
-  if (fa.length > 4 && fa === fb) return true;
-  // Word-overlap ≥ 60% is a match
-  if (wordOverlap(na, nb) >= 0.6) return true;
-  return false;
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix: number[][] = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0]![j] = j;
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      const cost = b[i - 1] === a[j - 1] ? 0 : 1;
+      matrix[i]![j] = Math.min(
+        matrix[i - 1]![j]! + 1,
+        matrix[i]![j - 1]! + 1,
+        matrix[i - 1]![j - 1]! + cost,
+      );
+    }
+  }
+  return matrix[b.length]![a.length]!;
 }
+
+function teamSimilarity(a: string, b: string): number {
+  const na = resolveAlias(a);
+  const nb = resolveAlias(b);
+  if (na === nb) return 1.0;
+  if (na.includes(nb) || nb.includes(na)) return 0.95;
+  const wOvl = wordOverlap(na, nb);
+  if (wOvl >= 0.6) return 0.85 + wOvl * 0.1;
+  const maxLen = Math.max(na.length, nb.length);
+  if (maxLen === 0) return 0;
+  const lev = levenshtein(na, nb);
+  const levSim = 1 - lev / maxLen;
+  return Math.max(levSim, wOvl);
+}
+
+function teamMatch(a: string, b: string): boolean {
+  return teamSimilarity(a, b) >= 0.70;
+}
+
+function teamMatchStrict(a: string, b: string): boolean {
+  return teamSimilarity(a, b) >= 0.80;
+}
+
+export { transliterate, normalizeTeam, resolveAlias, teamSimilarity };
 
 // ─── Fixture response parsing ─────────────────────────────────────────────────
 
@@ -332,8 +688,9 @@ export async function runOddspapiFixtureMapping(): Promise<{
   const todayDate = now.toISOString().slice(0, 10);
   const plusSeven = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  logger.info({ from: todayDate, to: plusSeven }, "Running OddsPapi fixture mapping (7-day window)");
+  logger.info({ from: todayDate, to: plusSeven }, "Running OddsPapi fixture mapping (7-day window, multi-pass)");
 
+  // Primary fetch: hasOdds=true — high-quality matches with bookmaker data
   const rawFixtures = await fetchOddsPapi<RawFixture[]>("/fixtures", {
     sportId: 10,
     from: todayDate,
@@ -346,14 +703,30 @@ export async function runOddspapiFixtureMapping(): Promise<{
     return { total: 0, mapped: 0, newMappings: 0, unmatchedDb: 0, unmatchedOp: 0, perLeague: {} };
   }
 
-  logger.info({ count: rawFixtures.length }, "OddsPapi fixtures received");
+  // Secondary fetch: WITHOUT hasOdds filter — discover fixtures that may get odds later
+  // This costs 1 extra API call but can dramatically improve coverage for smaller leagues
+  let discoveryFixtures: RawFixture[] = [];
+  if (await canMakeOddspapiRequest(1)) {
+    const disc = await fetchOddsPapi<RawFixture[]>("/fixtures", {
+      sportId: 10,
+      from: todayDate,
+      to: plusSeven,
+    }, "fixtures_discovery");
+    if (disc && Array.isArray(disc)) {
+      const existingIds = new Set(rawFixtures.map((f) => extractFixtureStringId(f)).filter(Boolean));
+      discoveryFixtures = disc.filter((f) => {
+        const id = extractFixtureStringId(f);
+        return id && !existingIds.has(id);
+      });
+      logger.info(
+        { hasOddsCount: rawFixtures.length, discoveryOnlyCount: discoveryFixtures.length, totalDiscovery: disc.length },
+        "OddsPapi dual-fetch complete: hasOdds + discovery",
+      );
+    }
+  }
 
-  // Log sample of OddsPapi fixtures for name-matching diagnosis
-  const sampleOp = rawFixtures.slice(0, 10).map((f) => {
-    const t = extractTeamNames(f);
-    return { fixtureId: extractFixtureStringId(f), home: t?.home, away: t?.away, date: extractFixtureDate(f) };
-  });
-  logger.info({ sample: sampleOp }, "OddsPapi fixture sample (first 10)");
+  const allFixtures = [...rawFixtures, ...discoveryFixtures];
+  logger.info({ count: allFixtures.length, hasOdds: rawFixtures.length, discoveryOnly: discoveryFixtures.length }, "Total OddsPapi fixtures for matching");
 
   // Get upcoming matches from our DB (next 7 days + 1h back for in-progress)
   const upcoming = await db
@@ -400,20 +773,44 @@ export async function runOddspapiFixtureMapping(): Promise<{
 
     const matchDate = match.kickoffTime.toISOString().slice(0, 10);
 
-    // Pass 1: exact date + fuzzy team match
-    let found = rawFixtures.find((f) => {
+    const dayBefore = new Date(match.kickoffTime.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const dayAfter  = new Date(match.kickoffTime.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    // Pass 1: exact date + strict team match (highest confidence)
+    let found = allFixtures.find((f) => {
       const teams = extractTeamNames(f);
       if (!teams) return false;
       return extractFixtureDate(f) === matchDate
-        && teamMatch(match.homeTeam, teams.home)
-        && teamMatch(match.awayTeam, teams.away);
+        && teamMatchStrict(match.homeTeam, teams.home)
+        && teamMatchStrict(match.awayTeam, teams.away);
     });
 
-    // Pass 2: ±1 day tolerance (handles UTC vs local timezone edge cases)
+    // Pass 2: ±1 day tolerance + strict match
     if (!found) {
-      const dayBefore = new Date(match.kickoffTime.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const dayAfter  = new Date(match.kickoffTime.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      found = rawFixtures.find((f) => {
+      found = allFixtures.find((f) => {
+        const teams = extractTeamNames(f);
+        if (!teams) return false;
+        const fd = extractFixtureDate(f);
+        return (fd === dayBefore || fd === dayAfter)
+          && teamMatchStrict(match.homeTeam, teams.home)
+          && teamMatchStrict(match.awayTeam, teams.away);
+      });
+    }
+
+    // Pass 3: exact date + relaxed match (similarity >= 0.70)
+    if (!found) {
+      found = allFixtures.find((f) => {
+        const teams = extractTeamNames(f);
+        if (!teams) return false;
+        return extractFixtureDate(f) === matchDate
+          && teamMatch(match.homeTeam, teams.home)
+          && teamMatch(match.awayTeam, teams.away);
+      });
+    }
+
+    // Pass 4: ±1 day + relaxed match
+    if (!found) {
+      found = allFixtures.find((f) => {
         const teams = extractTeamNames(f);
         if (!teams) return false;
         const fd = extractFixtureDate(f);
@@ -421,6 +818,47 @@ export async function runOddspapiFixtureMapping(): Promise<{
           && teamMatch(match.homeTeam, teams.home)
           && teamMatch(match.awayTeam, teams.away);
       });
+    }
+
+    // Pass 5: home-only strong match + away similarity >= 0.55 (handles abbreviated away teams)
+    if (!found) {
+      found = allFixtures.find((f) => {
+        const teams = extractTeamNames(f);
+        if (!teams) return false;
+        const fd = extractFixtureDate(f);
+        if (fd !== matchDate && fd !== dayBefore && fd !== dayAfter) return false;
+        const homeSim = teamSimilarity(match.homeTeam, teams.home);
+        const awaySim = teamSimilarity(match.awayTeam, teams.away);
+        return homeSim >= 0.80 && awaySim >= 0.55;
+      });
+    }
+
+    // Pass 6: best-pair scoring — find the fixture with highest combined similarity
+    if (!found) {
+      let bestScore = 0;
+      let bestCandidate: RawFixture | null = null;
+      for (const f of allFixtures) {
+        const teams = extractTeamNames(f);
+        if (!teams) continue;
+        const fd = extractFixtureDate(f);
+        if (fd !== matchDate && fd !== dayBefore && fd !== dayAfter) continue;
+        const homeSim = teamSimilarity(match.homeTeam, teams.home);
+        const awaySim = teamSimilarity(match.awayTeam, teams.away);
+        const combined = (homeSim + awaySim) / 2;
+        if (combined > bestScore && combined >= 0.65 && homeSim >= 0.55 && awaySim >= 0.55) {
+          bestScore = combined;
+          bestCandidate = f;
+        }
+      }
+      if (bestCandidate) {
+        found = bestCandidate;
+        const teams = extractTeamNames(bestCandidate)!;
+        logger.info(
+          { matchId: match.id, home: match.homeTeam, away: match.awayTeam, 
+            opHome: teams.home, opAway: teams.away, score: bestScore.toFixed(3) },
+          "Matched via best-pair scoring (Pass 6)",
+        );
+      }
     }
 
     if (found) {
@@ -446,6 +884,29 @@ export async function runOddspapiFixtureMapping(): Promise<{
       newMappings++;
       perLeague[league].mappedCount++;
     } else {
+      // Find the best near-miss for diagnostic logging
+      let bestNearMiss = { opHome: "", opAway: "", homeSim: 0, awaySim: 0, combined: 0 };
+      for (const f of allFixtures) {
+        const teams = extractTeamNames(f);
+        if (!teams) continue;
+        const fd = extractFixtureDate(f);
+        if (fd !== matchDate && fd !== dayBefore && fd !== dayAfter) continue;
+        const homeSim = teamSimilarity(match.homeTeam, teams.home);
+        const awaySim = teamSimilarity(match.awayTeam, teams.away);
+        const combined = (homeSim + awaySim) / 2;
+        if (combined > bestNearMiss.combined) {
+          bestNearMiss = { opHome: teams.home, opAway: teams.away, homeSim, awaySim, combined };
+        }
+      }
+      if (bestNearMiss.combined > 0.3) {
+        logger.info(
+          { home: match.homeTeam, away: match.awayTeam, league, matchDate,
+            nearMiss: bestNearMiss.opHome + " vs " + bestNearMiss.opAway,
+            homeSim: bestNearMiss.homeSim.toFixed(2), awaySim: bestNearMiss.awaySim.toFixed(2),
+            combined: bestNearMiss.combined.toFixed(2) },
+          "UNMATCHED near-miss diagnostic",
+        );
+      }
       unmatchedDbMatches.push({ home: match.homeTeam, away: match.awayTeam, date: matchDate, league });
     }
   }
@@ -488,8 +949,101 @@ export async function runOddspapiFixtureMapping(): Promise<{
     timestamp: new Date(),
   });
 
-  logger.info({ total: rawFixtures.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount }, "OddsPapi fixture mapping complete");
-  return { total: rawFixtures.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount, perLeague: Object.fromEntries(Object.entries(perLeague)) };
+  logger.info({ total: allFixtures.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount }, "OddsPapi fixture mapping complete");
+  return { total: allFixtures.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount, perLeague: Object.fromEntries(Object.entries(perLeague)) };
+}
+
+// ─── Match Diagnostic — exhaustive near-miss analysis for unmapped fixtures ──
+
+export async function runMatchDiagnostic(): Promise<{
+  totalUnmapped: number;
+  nearMisses: Array<{
+    matchId: number; home: string; away: string; league: string; date: string;
+    bestMatch: { opHome: string; opAway: string; homeSim: number; awaySim: number; combined: number } | null;
+    reason: string;
+  }>;
+  oddspapiFixtureCount: number;
+  leagueSummary: Record<string, { total: number; mapped: number; unmapped: number; coveragePct: number }>;
+}> {
+  const key = process.env.ODDSPAPI_KEY;
+  if (!key) return { totalUnmapped: 0, nearMisses: [], oddspapiFixtureCount: 0, leagueSummary: {} };
+
+  const now = new Date();
+  const todayDate = now.toISOString().slice(0, 10);
+  const plusSeven = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  const rawFixtures = await fetchOddsPapi<RawFixture[]>("/fixtures", {
+    sportId: 10, from: todayDate, to: plusSeven, hasOdds: "true",
+  }, "fixtures_diagnostic");
+
+  if (!rawFixtures || !Array.isArray(rawFixtures)) {
+    return { totalUnmapped: 0, nearMisses: [], oddspapiFixtureCount: 0, leagueSummary: {} };
+  }
+
+  const upcoming = await db.select().from(matchesTable).where(
+    and(
+      eq(matchesTable.status, "scheduled"),
+      gte(matchesTable.kickoffTime, new Date(now.getTime() - 1 * 60 * 60 * 1000)),
+      lte(matchesTable.kickoffTime, new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)),
+    ),
+  );
+
+  const mapped = await db.select({ matchId: oddspapiFixtureMapTable.matchId }).from(oddspapiFixtureMapTable);
+  const mappedSet = new Set(mapped.map((m) => m.matchId));
+
+  const unmappedMatches = upcoming.filter((m) => !mappedSet.has(m.id));
+
+  const nearMisses = unmappedMatches.map((match) => {
+    const matchDate = match.kickoffTime.toISOString().slice(0, 10);
+    const dayBefore = new Date(match.kickoffTime.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const dayAfter  = new Date(match.kickoffTime.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    let best: { opHome: string; opAway: string; homeSim: number; awaySim: number; combined: number } | null = null;
+
+    for (const f of rawFixtures) {
+      const teams = extractTeamNames(f);
+      if (!teams) continue;
+      const fd = extractFixtureDate(f);
+      if (fd !== matchDate && fd !== dayBefore && fd !== dayAfter) continue;
+      const homeSim = teamSimilarity(match.homeTeam, teams.home);
+      const awaySim = teamSimilarity(match.awayTeam, teams.away);
+      const combined = (homeSim + awaySim) / 2;
+      if (!best || combined > best.combined) {
+        best = { opHome: teams.home, opAway: teams.away, homeSim: +homeSim.toFixed(3), awaySim: +awaySim.toFixed(3), combined: +combined.toFixed(3) };
+      }
+    }
+
+    let reason = "no_date_match";
+    if (best) {
+      if (best.combined >= 0.65) reason = "near_miss_fixable";
+      else if (best.combined >= 0.4) reason = "partial_name_match";
+      else reason = "no_team_match_on_date";
+    }
+
+    return {
+      matchId: match.id,
+      home: match.homeTeam,
+      away: match.awayTeam,
+      league: match.league ?? "Unknown",
+      date: matchDate,
+      bestMatch: best,
+      reason,
+    };
+  });
+
+  const leagueSummary: Record<string, { total: number; mapped: number; unmapped: number; coveragePct: number }> = {};
+  for (const m of upcoming) {
+    const lg = m.league ?? "Unknown";
+    if (!leagueSummary[lg]) leagueSummary[lg] = { total: 0, mapped: 0, unmapped: 0, coveragePct: 0 };
+    leagueSummary[lg].total++;
+    if (mappedSet.has(m.id)) leagueSummary[lg].mapped++;
+    else leagueSummary[lg].unmapped++;
+  }
+  for (const lg of Object.keys(leagueSummary)) {
+    leagueSummary[lg]!.coveragePct = Math.round((leagueSummary[lg]!.mapped / leagueSummary[lg]!.total) * 100);
+  }
+
+  return { totalUnmapped: unmappedMatches.length, nearMisses, oddspapiFixtureCount: rawFixtures.length, leagueSummary };
 }
 
 // ─── OddsPapi odds response parsing ──────────────────────────────────────────

@@ -49,6 +49,7 @@ import {
   getOddspapiStatus,
   prefetchAndStoreOddsPapiOdds,
   runDedicatedBulkPrefetch,
+  runMatchDiagnostic,
 } from "../services/oddsPapi";
 import {
   getApiBudgetStatus,
@@ -1435,6 +1436,17 @@ router.get("/oddspapi/coverage-report", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "OddsPapi coverage report failed");
     res.status(500).json({ error: "Failed to retrieve coverage report" });
+  }
+});
+
+// GET /api/oddspapi/match-diagnostic — deep near-miss analysis for all unmapped fixtures
+router.get("/oddspapi/match-diagnostic", async (_req, res) => {
+  try {
+    const result = await runMatchDiagnostic();
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "Match diagnostic failed");
+    res.status(500).json({ error: "Failed to run match diagnostic" });
   }
 });
 

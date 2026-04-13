@@ -67,12 +67,22 @@ export const LEAGUE_IDS: Record<string, number> = {
 
 // All league IDs we scan (used for fixture discovery by league)
 export const ALL_LEAGUE_IDS: number[] = [
-  // Tier 1
+  // Tier 1 (Top 5 + UEFA)
   39, 78, 140, 135, 61, 88, 94, 71, 40, 2, 3,
   // Tier 2 (second divisions)
   62, 79, 136, 141,
-  // Tier 3 (smaller top flights)
+  // Tier 3 (European top flights)
   179, 144, 207, 218, 119, 103, 113, 203, 197,
+  // Tier 4 (additional Pinnacle-covered leagues)
+  98,   // J1 League (Japan)
+  188,  // A-League Men (Australia)
+  106,  // Polish Ekstraklasa
+  345,  // Czech First League
+  283,  // Romanian Liga I
+  210,  // Croatian HNL
+  253,  // MLS (USA)
+  262,  // Liga BetPlay (Colombia)
+  4,    // UEFA Conference League
 ];
 
 // Second-division leagues — higher edge, no OddsPapi (not covered)
@@ -1053,11 +1063,44 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
     return { leaguesScanned: 0, fixturesInserted: 0, fixturesUpdated: 0 };
   }
 
-  const season = new Date().getFullYear();
+  const currentYear = new Date().getFullYear();
+  const currentMonth = new Date().getMonth() + 1;
   const today = new Date();
   const in7Days = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
   const fromStr = today.toISOString().slice(0, 10);
   const toStr = in7Days.toISOString().slice(0, 10);
+
+  const AUG_MAY_LEAGUES = new Set([
+    39, 40, 41, 42, 43, 44, 45, // England (PL, Championship, L1, L2, FA Cup, League Cup, Community Shield)
+    78, 79, 80, // Germany (Bundesliga, 2. BL, 3. Liga)
+    61, 62, 63, // France (L1, L2, Coupe)
+    135, 136, 137, // Italy (Serie A, B, C)
+    140, 141, 142, // Spain (La Liga, Segunda, Copa)
+    94, 95, // Portugal (Primeira, Segunda)
+    88, 89, // Netherlands (Eredivisie, Eerste)
+    144, 145, // Belgium (Pro League, First B)
+    203, 204, // Turkey (Süper Lig, 1. Lig)
+    218, 219, // Austria (Bundesliga, 2. Liga)
+    207, 208, // Switzerland (Super, Challenge)
+    197, 198, // Greece (Super League, Super League 2)
+    179, 180, // Scotland (Prem, Championship)
+    119, 120, // Denmark (Superliga, 1st Division)
+    365, // Latvia (Virsliga)
+    2, 3, 4, 848, // UCL, UEL, UECL, Nations League
+    16, 31, // CONCACAF, CONMEBOL Champions
+    106, // Polish Ekstraklasa (Jul-May)
+    345, // Czech First League (Jul-May)
+    283, // Romanian Liga I (Jul-May)
+    210, // Croatian HNL (Jul-May)
+    188, // A-League Men (Oct-May)
+  ]);
+
+  function getSeasonForLeague(leagueId: number): number {
+    if (AUG_MAY_LEAGUES.has(leagueId)) {
+      return currentMonth >= 7 ? currentYear : currentYear - 1;
+    }
+    return currentYear;
+  }
 
   let fixturesInserted = 0;
   let fixturesUpdated = 0;
@@ -1069,20 +1112,24 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
       break;
     }
 
+    const season = getSeasonForLeague(league.leagueId);
+
     try {
       const fixtures = await fetchApiFootball<ApiFixture[]>("/fixtures", {
         league: league.leagueId,
         season,
         from: fromStr,
         to: toStr,
-        status: "NS", // not started
+        status: "NS",
       });
 
       if (!fixtures || fixtures.length === 0) {
+        logger.info({ leagueId: league.leagueId, name: league.name, season, from: fromStr, to: toStr }, "No fixtures found for league");
         leaguesScanned++;
         continue;
       }
 
+      logger.info({ leagueId: league.leagueId, name: league.name, season, fixtureCount: fixtures.length }, "Fixtures found for league");
       await trackApiCall(`league_fixture_ingestion_${league.leagueId}`, 1);
 
       for (const f of fixtures) {

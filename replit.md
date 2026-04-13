@@ -232,6 +232,16 @@ Computes 17 ML features per upcoming match:
 - Dashboard: `GET /api/dashboard/line-movements` → last 50 significant movements
 - Compliance log: `line_movement` action type for every significant shift
 
+## League Coverage (ALL_LEAGUE_IDS in apiFootball.ts)
+
+34 leagues tracked across 4 tiers:
+- **Tier 1**: PL, Bundesliga, La Liga, Serie A, Ligue 1, Eredivisie, Primeira Liga, Série A (Brazil), Championship, UCL, UEL
+- **Tier 2**: Ligue 2, 2. Bundesliga, Serie B, Segunda División
+- **Tier 3**: Scottish Prem, Belgian Pro, Swiss Super, Austrian BL, Danish Superliga, Eliteserien, Allsvenskan, Süper Lig, Super League Greece
+- **Tier 4** (Pinnacle-covered additions): J1 League, A-League Men, Ekstraklasa, Czech First League, Liga I (Romania), HNL (Croatia), MLS, Liga BetPlay (Colombia), Conference League
+
+AUG_MAY_LEAGUES season logic: European/Australian leagues use `currentYear - 1` if month < July. South American/Asian leagues use `currentYear`.
+
 ## League Edge Scores (src/services/valueDetection.ts)
 
 18 leagues seeded with edge scores in `league_edge_scores` table:
