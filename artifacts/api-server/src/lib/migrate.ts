@@ -222,6 +222,30 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS total_cards INTEGER
     `);
 
+    // ── Pinnacle closing-line CLV column (added for professional-grade CLV) ──
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS closing_pinnacle_odds NUMERIC(10,4)
+    `);
+
+    // ── Pinnacle upgrade compliance log (idempotent — only logs once) ────────
+    const upgradeLogged = await db.execute(sql`
+      SELECT 1 FROM compliance_logs
+      WHERE action_type = 'pinnacle_upgrade_active'
+      LIMIT 1
+    `);
+    if (((upgradeLogged as any).rowCount ?? 0) === 0) {
+      await db.execute(sql`
+        INSERT INTO compliance_logs (action_type, details, timestamp)
+        VALUES (
+          'pinnacle_upgrade_active',
+          '{"message": "Pinnacle upgrade: full validation active, 5000 req/month, CLV now uses Pinnacle closing line. Daily cap: 150, monthly cap: 4800. All candidates validated regardless of league tier or fixture window.", "dailyCap": 150, "monthlyCap": 4800, "clvSource": "pinnacle_closing_line"}',
+          NOW()
+        )
+      `);
+      logger.info("Pinnacle upgrade compliance log written");
+    }
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

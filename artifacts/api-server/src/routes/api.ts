@@ -1158,6 +1158,7 @@ router.post("/odds/fetch", async (_req, res) => {
 // ─────────────────────────────────────────────
 router.get("/dashboard/clv-stats", async (_req, res) => {
   try {
+    // All settled bets with CLV data (proxy or Pinnacle closing line)
     const rows = await db
       .select({
         clvPct: paperBetsTable.clvPct,
@@ -1165,7 +1166,10 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
         marketType: paperBetsTable.marketType,
         status: paperBetsTable.status,
         pinnacleOdds: paperBetsTable.pinnacleOdds,
+        closingPinnacleOdds: (paperBetsTable as any).closingPinnacleOdds,
         isContrarian: paperBetsTable.isContrarian,
+        stake: paperBetsTable.stake,
+        settlementPnl: paperBetsTable.settlementPnl,
       })
       .from(paperBetsTable)
       .where(
@@ -1175,28 +1179,68 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
         ),
       )
       .orderBy(asc(paperBetsTable.placedAt))
-      .limit(200);
+      .limit(500);
 
     if (rows.length === 0) {
-      return res.json({ count: 0, avgClv: null, trend: [] });
+      return res.json({ count: 0, avgClv: null, trend: [], pinnacleCount: 0, contrarianCount: 0, pinnacleClosingCount: 0, pinnacleAlignedStats: null, contrarianStats: null, pinnacleClosingCoveragePct: 0 });
     }
 
     const clvValues = rows.map((r) => Number(r.clvPct));
     const avgClv = clvValues.reduce((a, b) => a + b, 0) / clvValues.length;
+
+    // Pinnacle data counts
     const pinnacleCount = rows.filter((r) => r.pinnacleOdds != null).length;
+    const pinnacleClosingCount = rows.filter((r) => (r as any).closingPinnacleOdds != null).length;
     const contrarianCount = rows.filter((r) => r.isContrarian === "true").length;
+
+    // Total settled (won + lost) for coverage %
+    const totalSettledRows = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(paperBetsTable)
+      .where(sql`${paperBetsTable.status} IN ('won','lost')`);
+    const totalSettled = Number(totalSettledRows[0]?.count ?? rows.length);
+    const pinnacleClosingCoveragePct = totalSettled > 0 ? Math.round((pinnacleClosingCount / totalSettled) * 100) : 0;
+
+    // Pinnacle-aligned vs contrarian win rate, ROI, avg CLV
+    const pinnacleAlignedRows = rows.filter((r) => r.isContrarian !== "true" && r.pinnacleOdds != null);
+    const contrarianRows = rows.filter((r) => r.isContrarian === "true");
+
+    function groupStats(bets: typeof rows) {
+      if (bets.length === 0) return null;
+      const won = bets.filter((b) => b.status === "won").length;
+      const lost = bets.filter((b) => b.status === "lost").length;
+      const totalStake = bets.reduce((s, b) => s + Number(b.stake), 0);
+      const totalPnl = bets.reduce((s, b) => s + Number(b.settlementPnl ?? 0), 0);
+      const clvs = bets.map((b) => Number(b.clvPct));
+      const avgClvGroup = clvs.reduce((a, b) => a + b, 0) / clvs.length;
+      return {
+        count: bets.length,
+        won,
+        lost,
+        winRatePct: Math.round((won / (won + lost)) * 1000) / 10,
+        totalPnl: Math.round(totalPnl * 100) / 100,
+        roiPct: totalStake > 0 ? Math.round((totalPnl / totalStake) * 1000) / 10 : 0,
+        avgClv: Math.round(avgClvGroup * 1000) / 1000,
+      };
+    }
 
     const trend = rows.map((r) => ({
       date: new Date(r.placedAt).toISOString().slice(0, 10),
       clv: Number(r.clvPct),
       market: r.marketType,
+      pinnacleClosing: (r as any).closingPinnacleOdds != null,
     }));
 
     res.json({
       count: rows.length,
       avgClv: Math.round(avgClv * 1000) / 1000,
       pinnacleCount,
+      pinnacleClosingCount,
       contrarianCount,
+      pinnacleClosingCoveragePct,
+      totalSettled,
+      pinnacleAlignedStats: groupStats(pinnacleAlignedRows),
+      contrarianStats: groupStats(contrarianRows),
       trend,
     });
   } catch (err) {

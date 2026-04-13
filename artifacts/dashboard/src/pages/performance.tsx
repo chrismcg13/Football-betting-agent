@@ -557,7 +557,7 @@ export default function Performance() {
         <Card>
           <CardHead
             title="Closing Line Value (CLV) Trend"
-            sub={`Avg CLV: ${Number((clvData as any).avgClv) >= 0 ? "+" : ""}${Number((clvData as any).avgClv ?? 0).toFixed(2)}% over ${(clvData as any).count} bets`}
+            sub={`Avg CLV: ${Number((clvData as any).avgClv) >= 0 ? "+" : ""}${Number((clvData as any).avgClv ?? 0).toFixed(2)}% over ${(clvData as any).count} scored bets (${(clvData as any).totalSettled ?? (clvData as any).count} settled total)`}
           />
           <div className="p-5">
             <div className="h-48">
@@ -581,14 +581,71 @@ export default function Performance() {
                 </LineChart>
               </ResponsiveContainer>
             </div>
-            <div className="mt-3 flex gap-6 text-xs text-slate-500">
+            <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-slate-500">
               <span>
                 <span className="font-semibold text-violet-400">{(clvData as any)?.pinnacleCount ?? 0}</span> Pinnacle-validated bets
               </span>
               <span>
+                <span className="font-semibold text-emerald-400">{(clvData as any)?.pinnacleClosingCount ?? 0}</span> Pinnacle closing-line CLV
+              </span>
+              <span>
                 <span className="font-semibold text-red-400">{(clvData as any)?.contrarianCount ?? 0}</span> contrarian bets
               </span>
+              {((clvData as any)?.pinnacleClosingCoveragePct ?? 0) > 0 && (
+                <span>
+                  <span className="font-semibold text-sky-400">{(clvData as any).pinnacleClosingCoveragePct}%</span> Pinnacle closing coverage
+                </span>
+              )}
             </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Pinnacle-Aligned vs Contrarian Breakdown */}
+      {((clvData as any)?.pinnacleAlignedStats || (clvData as any)?.contrarianStats) && (
+        <Card>
+          <CardHead
+            title="Pinnacle-Aligned vs Contrarian"
+            sub="Does our model have genuine edge beyond sharp-market consensus?"
+          />
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b" style={{ borderColor: "#1e3a5f" }}>
+                  {["Category", "Bets", "Win Rate", "ROI", "Avg CLV", "Total P&L"].map((h) => (
+                    <th key={h} className="px-4 py-3 text-left font-medium text-slate-400">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[
+                  { label: "Pinnacle-Aligned", color: "#10b981", data: (clvData as any)?.pinnacleAlignedStats },
+                  { label: "Contrarian", color: "#f59e0b", data: (clvData as any)?.contrarianStats },
+                ].filter((row) => row.data != null).map(({ label, color, data }) => (
+                  <tr key={label} className="border-b hover:bg-slate-800/30 transition-colors" style={{ borderColor: "#1e293b" }}>
+                    <td className="px-4 py-3">
+                      <span className="font-semibold" style={{ color }}>{label}</span>
+                    </td>
+                    <td className="px-4 py-3 tabular-nums text-slate-300">{data.count}</td>
+                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.winRatePct >= 55 ? "#10b981" : data.winRatePct >= 45 ? "#f59e0b" : "#ef4444" }}>
+                      {data.winRatePct.toFixed(1)}%
+                    </td>
+                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.roiPct > 0 ? "#10b981" : data.roiPct < 0 ? "#ef4444" : "#94a3b8" }}>
+                      {data.roiPct > 0 ? "+" : ""}{data.roiPct.toFixed(1)}%
+                    </td>
+                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.avgClv > 0 ? "#10b981" : data.avgClv < 0 ? "#ef4444" : "#94a3b8" }}>
+                      {data.avgClv > 0 ? "+" : ""}{data.avgClv.toFixed(2)}%
+                    </td>
+                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.totalPnl > 0 ? "#10b981" : data.totalPnl < 0 ? "#ef4444" : "#94a3b8" }}>
+                      {data.totalPnl > 0 ? "+" : ""}£{Math.abs(data.totalPnl).toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {!(clvData as any)?.pinnacleAlignedStats && !(clvData as any)?.contrarianStats && (
+              <p className="px-4 py-6 text-xs text-slate-500 text-center">No Pinnacle-validated settled bets yet — data builds as more bets settle.</p>
+            )}
           </div>
         </Card>
       )}

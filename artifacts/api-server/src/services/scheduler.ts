@@ -17,6 +17,7 @@ import {
   getOddspapiFixtureId,
   getOddspapiValidation,
   prefetchAndStoreOddsPapiOdds,
+  fetchAndStoreClosingLineForPendingBets,
   type OddsPapiValidationCache,
   logDailyBudgetSummary,
 } from "./oddsPapi";
@@ -177,7 +178,8 @@ export async function runTradingCycle(): Promise<{
 
     // 5a. Pre-fetch OddsPapi Match Odds for mapped matches into odds_snapshots
     //     so value detection treats those as real (not synthetic) odds
-    const oddsPapiCache: OddsPapiValidationCache = await prefetchAndStoreOddsPapiOdds(earliest, latest, 12);
+    // Pinnacle upgrade: maxFetches=80 covers ~40 fixtures × 2 market types each
+    const oddsPapiCache: OddsPapiValidationCache = await prefetchAndStoreOddsPapiOdds(earliest, latest, 80);
     logger.info({ matchesPrefetched: oddsPapiCache.size }, "OddsPapi pre-fetch done — running value detection");
 
     const valueSummary = await detectValueBets();
@@ -218,77 +220,76 @@ export async function runTradingCycle(): Promise<{
       const sb = (leagueEdgeMap.get(b.league) ?? 50) * b.opportunityScore;
       return sb - sa;
     });
-    // Skip fixtures > 48h out for OddsPapi (not covered yet / budget efficiency)
-    // Also skip second-division leagues (not typically on OddsPapi)
-    const SECOND_DIV_LEAGUES = new Set(["Ligue 2", "2. Bundesliga", "Serie B", "Segunda División", "La Liga 2", "Segunda Division"]);
-    const oddspapiEligible = rankedForOddsPapi.filter((bet) => {
-      const hoursOut = (new Date(bet.kickoffTime).getTime() - Date.now()) / (1000 * 60 * 60);
-      return hoursOut <= 48 && !SECOND_DIV_LEAGUES.has(bet.league ?? "");
-    });
-    const top5 = oddspapiEligible.slice(0, 8);
-    const rest = [
-      ...oddspapiEligible.slice(8),
-      ...rankedForOddsPapi.filter((bet) => !oddspapiEligible.includes(bet)),
-    ];
+    // Pinnacle upgrade: validate ALL candidates regardless of league tier or fixture window.
+    // Budget is now 150/day (5,000/month) — enough to cover every candidate.
+    // No top-N slice, no second-division filter, no 48h restriction.
 
     type OddsValidation = Awaited<ReturnType<typeof getOddspapiValidation>>;
 
-    const enhancedCandidates = await Promise.all(
-      top5.map(async (bet) => {
-        try {
-          let validation: OddsValidation | null = null;
+    // Pinnacle upgrade: validate ALL candidates sequentially (not parallel) to
+    // respect OddsPapi's 1 req/s rate limit. Cache hits (from pre-fetch) are free.
+    // Only cache misses trigger API calls, each gated by canMakeOddspapiRequest().
+    const enhancedCandidates: Array<{ bet: typeof rankedForOddsPapi[number]; validation: OddsValidation | null; effectiveScore: number }> = [];
+    let apiCallsThisCycle = 0;
 
-          const cachedMatch = oddsPapiCache.get(bet.matchId);
-          if (cachedMatch) {
-            const sel = bet.selectionName as keyof typeof cachedMatch;
-            if (cachedMatch[sel]) {
-              validation = { ...cachedMatch[sel], isContrarian: false, pinnacleAligned: false };
-            }
+    for (const bet of rankedForOddsPapi) {
+      try {
+        let validation: OddsValidation | null = null;
+
+        const cachedMatch = oddsPapiCache.get(bet.matchId);
+        if (cachedMatch) {
+          const sel = bet.selectionName as keyof typeof cachedMatch;
+          if (cachedMatch[sel]) {
+            validation = { ...cachedMatch[sel], isContrarian: false, pinnacleAligned: false };
           }
+        }
 
-          if (!validation) {
-            const oddspapiId = await getOddspapiFixtureId(bet.matchId);
-            if (!oddspapiId) return { bet, validation: null, effectiveScore: bet.opportunityScore };
-
+        if (!validation) {
+          const oddspapiId = await getOddspapiFixtureId(bet.matchId);
+          if (oddspapiId) {
+            // Rate-limit guard: 1.2s between API calls to avoid 429s
+            if (apiCallsThisCycle > 0) await new Promise((r) => setTimeout(r, 1200));
             validation = await getOddspapiValidation(
               oddspapiId,
               bet.marketType,
               bet.selectionName,
               bet.backOdds,
             );
+            apiCallsThisCycle++;
           }
-
-          // Pinnacle scoring (enhanced):
-          // +10 if Pinnacle-aligned (sharp money agrees with our model)
-          // -10 if contrarian (Pinnacle strongly disagrees — higher risk)
-          // No flat bonus for just having Pinnacle data — focus on alignment quality
-          let effectiveScore = bet.opportunityScore;
-          if (validation.hasPinnacleData) {
-            if (validation.pinnacleAligned) effectiveScore += 10;
-            else if (validation.isContrarian) effectiveScore -= 10;
-          }
-
-          logger.info(
-            {
-              match: `${bet.homeTeam} vs ${bet.awayTeam}`,
-              market: bet.marketType,
-              selection: bet.selectionName,
-              baseScore: bet.opportunityScore,
-              effectiveScore,
-              hasPinnacleData: validation.hasPinnacleData,
-              pinnacleAligned: validation.pinnacleAligned,
-              isContrarian: validation.isContrarian,
-            },
-            "OddsPapi validation scoring",
-          );
-
-          return { bet, validation, effectiveScore };
-        } catch (err) {
-          logger.warn({ err, matchId: bet.matchId }, "OddsPapi validation failed — using base score");
-          return { bet, validation: null, effectiveScore: bet.opportunityScore };
         }
-      }),
-    );
+
+        // Pinnacle scoring (enhanced):
+        // +10 if Pinnacle-aligned (sharp money agrees with our model)
+        // -10 if contrarian (Pinnacle strongly disagrees — higher risk)
+        // No flat bonus for just having Pinnacle data — focus on alignment quality
+        let effectiveScore = bet.opportunityScore;
+        if (validation?.hasPinnacleData) {
+          if (validation.pinnacleAligned) effectiveScore += 10;
+          else if (validation.isContrarian) effectiveScore -= 10;
+        }
+
+        logger.info(
+          {
+            match: `${bet.homeTeam} vs ${bet.awayTeam}`,
+            market: bet.marketType,
+            selection: bet.selectionName,
+            baseScore: bet.opportunityScore,
+            effectiveScore,
+            hasPinnacleData: validation?.hasPinnacleData ?? false,
+            pinnacleAligned: validation?.pinnacleAligned ?? false,
+            isContrarian: validation?.isContrarian ?? false,
+            fromCache: !!oddsPapiCache.get(bet.matchId),
+          },
+          "OddsPapi validation scoring",
+        );
+
+        enhancedCandidates.push({ bet, validation: validation ?? null, effectiveScore });
+      } catch (err) {
+        logger.warn({ err, matchId: bet.matchId }, "OddsPapi validation failed — using base score");
+        enhancedCandidates.push({ bet, validation: null, effectiveScore: bet.opportunityScore });
+      }
+    }
 
     // 7. Build final candidate list with effective scores
     type BetEntry = {
@@ -297,18 +298,30 @@ export async function runTradingCycle(): Promise<{
       validation: OddsValidation | null;
     };
 
-    const allEntries: BetEntry[] = [
-      ...enhancedCandidates.map(({ bet, validation, effectiveScore }) => ({
+    // All candidates are now enhanced (Pinnacle-validated or cache-hit).
+    // Sort by effective score so the best opportunities are placed first.
+    const allEntries: BetEntry[] = enhancedCandidates
+      .map(({ bet, validation, effectiveScore }) => ({
         bet,
         effectiveScore,
         validation: validation ?? null,
-      })),
-      ...rest.map((bet) => ({
-        bet,
-        effectiveScore: bet.opportunityScore,
-        validation: null as OddsValidation | null,
-      })),
-    ].sort((a, b) => b.effectiveScore - a.effectiveScore);
+      }))
+      .sort((a, b) => b.effectiveScore - a.effectiveScore);
+
+    // Log Pinnacle validation coverage for this cycle
+    const pinnacleValidated = enhancedCandidates.filter((e) => e.validation?.hasPinnacleData).length;
+    const pinnacleAligned = enhancedCandidates.filter((e) => e.validation?.pinnacleAligned).length;
+    const contrarianCount = enhancedCandidates.filter((e) => e.validation?.isContrarian).length;
+    logger.info(
+      {
+        totalCandidates: rankedForOddsPapi.length,
+        pinnacleValidated,
+        coveragePct: rankedForOddsPapi.length > 0 ? Math.round((pinnacleValidated / rankedForOddsPapi.length) * 100) : 0,
+        pinnacleAligned,
+        contrarian: contrarianCount,
+      },
+      "Pinnacle validation summary for trading cycle",
+    );
 
     // 8. Load config + diversity limits
     const configRows = await db.select().from(agentConfigTable);
@@ -681,6 +694,23 @@ export function startScheduler(): void {
     });
   }, { timezone: "UTC" });
   logger.info("OddsPapi budget summary scheduler active — daily at 00:01 UTC");
+
+  // Pre-kickoff CLV cron: every 30 minutes
+  // For any pending bet kicking off in the next 90 min, fetch Pinnacle closing odds
+  // and store as closing_pinnacle_odds → enables professional-grade CLV calculation
+  cron.schedule("*/30 * * * *", () => {
+    logger.info("Pre-kickoff CLV cron triggered — fetching Pinnacle closing odds");
+    void fetchAndStoreClosingLineForPendingBets()
+      .then((r) => {
+        if (r.checked > 0) {
+          logger.info(r, "Pre-kickoff CLV cron complete");
+        }
+      })
+      .catch((err) => {
+        logger.warn({ err }, "Pre-kickoff CLV cron failed — non-fatal");
+      });
+  }, { timezone: "UTC" });
+  logger.info("Pre-kickoff CLV cron active — every 30 minutes (Pinnacle closing line)");
 
   // Learning loop: daily at 03:00 UTC
   cron.schedule("0 3 * * *", () => {

@@ -314,7 +314,11 @@ export default function Overview() {
             : avgClv == null ? "No data yet"
             : `${avgClv >= 0 ? "+" : ""}${avgClv.toFixed(2)}%`
           }
-          sub="How much better our odds are vs the market"
+          sub={
+            (clvStats as any)?.count > 0
+              ? `Over ${(clvStats as any).count} scored bets (${(clvStats as any).totalSettled ?? settledBets} settled)`
+              : "How much better our odds are vs the market"
+          }
           color={!loadingSummary ? clvColor : "default"}
         />
       </div>

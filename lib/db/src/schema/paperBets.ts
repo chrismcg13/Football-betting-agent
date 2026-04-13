@@ -41,6 +41,7 @@ export const paperBetsTable = pgTable("paper_bets", {
   betThesis: text("bet_thesis"),
   isContrarian: text("is_contrarian").default("false"),
   closingOddsProxy: numeric("closing_odds_proxy", { precision: 10, scale: 4 }),
+  closingPinnacleOdds: numeric("closing_pinnacle_odds", { precision: 10, scale: 4 }),
   clvPct: numeric("clv_pct", { precision: 8, scale: 4 }),
   status: text("status").notNull().default("pending"),
   settlementPnl: numeric("settlement_pnl", { precision: 12, scale: 2 }),

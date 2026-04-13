@@ -2,12 +2,14 @@
  * OddsPapi Integration — Sharp-line validation & best-odds layer
  * Base URL: https://api.oddspapi.io/v4
  * Auth: query param apiKey={ODDSPAPI_KEY}
- * Free tier: 250 requests/month | Hard cap: 240/month, 7/day
+ * Budget: 5,000 requests/month | Cap: 4,800/month, 150/day
+ * Allocation: ~80/day pre-match validation, ~20/day closing-line CLV, ~1/day mapping
  */
 
 import {
   db,
   matchesTable,
+  paperBetsTable,
   oddspapiFixtureMapTable,
   apiUsageTable,
   oddsSnapshotsTable,
@@ -16,12 +18,12 @@ import {
   leagueEdgeScoresTable,
   oddspapiLeagueCoverageTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, sql, like } from "drizzle-orm";
+import { eq, and, gte, lte, sql, like, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://api.oddspapi.io/v4";
-const DAILY_CAP = 7;
-const MONTHLY_CAP = 240;
+const DAILY_CAP = 150;
+const MONTHLY_CAP = 4800;
 
 // DB-driven cap override — reads agent_config key "oddspapi_daily_cap_override"
 // Format: {"cap": 15, "expires": "2026-04-09"}  (expires = ISO date, inclusive)
@@ -627,15 +629,16 @@ export async function prefetchAndStoreOddsPapiOdds(
   const key = process.env.ODDSPAPI_KEY;
   if (!key) return cache;
 
-  // Check remaining daily budget (leave at least 1 for enhancement)
+  // Check remaining daily budget — reserve 10 requests for closing-line CLV fetches
   const [daily, effectiveCap] = await Promise.all([getOddspapiUsageToday(), getEffectiveDailyCap()]);
   const remaining = effectiveCap - daily;
-  if (remaining <= 1) {
-    logger.info({ daily, cap: effectiveCap }, "OddsPapi budget too low for pre-fetch — skipping");
+  if (remaining <= 10) {
+    logger.info({ daily, cap: effectiveCap }, "OddsPapi budget nearly exhausted — skipping pre-fetch, reserving for CLV");
     return cache;
   }
 
-  const limit = Math.min(maxFetches, remaining - 1);
+  // Use all remaining budget minus CLV reserve, capped by caller limit
+  const limit = Math.min(maxFetches, remaining - 10);
 
   // Dynamic league scoring: load edge scores from DB and coverage cache
   // Higher edge_score = less-scrutinised league = better OddsPapi budget allocation
@@ -672,7 +675,8 @@ export async function prefetchAndStoreOddsPapiOdds(
       ),
     );
 
-  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+  // Leagues with no Pinnacle coverage: retry once per week (7 days) in case coverage changed
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
   // Sort: highest league_edge_score first (dynamic); ties broken by earliest kickoff
   const mappedRows = allRows
@@ -680,8 +684,8 @@ export async function prefetchAndStoreOddsPapiOdds(
       const cov = coverageMap.get(r.league ?? "");
       if (!cov) return true; // unknown — try it
       if (cov.hasOdds === 1) return true; // known good
-      // hasOdds=0 and checked recently — skip to avoid wasting budget
-      return cov.lastChecked < sixHoursAgo;
+      // hasOdds=0: retry once per week to catch new league coverage
+      return cov.lastChecked < sevenDaysAgo;
     })
     .sort((a, b) => {
       const sa = edgeScoreMap.get(a.league ?? "") ?? 50;
@@ -689,7 +693,7 @@ export async function prefetchAndStoreOddsPapiOdds(
       if (sa !== sb) return sb - sa; // higher edge score first
       return (a.kickoffTime?.getTime() ?? 0) - (b.kickoffTime?.getTime() ?? 0);
     })
-    .slice(0, limit);
+    .slice(0, limit); // limit = remaining budget minus CLV reserve
 
   if (mappedRows.length === 0) return cache;
 
@@ -846,7 +850,7 @@ export async function logDailyBudgetSummary(): Promise<void> {
     timestamp: new Date(),
   });
 
-  if (month >= 200) {
+  if (month >= 4000) {
     await db.insert(learningNarrativesTable).values({
       narrativeType: "budget_alert",
       narrativeText: `OddsPapi monthly usage at ${month}/${MONTHLY_CAP} requests. Approaching limit — sharp-line validation will be throttled to protect remaining budget.`,
@@ -856,4 +860,137 @@ export async function logDailyBudgetSummary(): Promise<void> {
   }
 
   logger.info({ today, month, dailyCap: DAILY_CAP, monthlyCap: MONTHLY_CAP }, "OddsPapi daily budget summary logged");
+}
+
+// ─── Closing-line CLV fetch ───────────────────────────────────────────────────
+// Called by the pre-kickoff cron every 30 min.
+// For each pending bet kicking off in the next 90 minutes, fetch the current
+// Pinnacle odds as the TRUE closing line and store it in closing_pinnacle_odds.
+// This enables professional-grade CLV: (placement_odds - closing_odds) / closing_odds × 100.
+
+export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
+  checked: number;
+  updated: number;
+  skipped: number;
+}> {
+  const key = process.env.ODDSPAPI_KEY;
+  if (!key) return { checked: 0, updated: 0, skipped: 0 };
+
+  const now = new Date();
+  const in90min = new Date(now.getTime() + 90 * 60 * 1000);
+
+  // Find pending bets for fixtures kicking off in the next 90 minutes
+  // that don't already have a closing line stored
+  const pendingBets = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+      closingPinnacleOdds: paperBetsTable.closingPinnacleOdds,
+    })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        sql`${matchesTable.kickoffTime} >= ${now}`,
+        sql`${matchesTable.kickoffTime} <= ${in90min}`,
+        sql`${paperBetsTable.closingPinnacleOdds} IS NULL`,
+      ),
+    );
+
+  if (pendingBets.length === 0) {
+    logger.debug("Pre-kickoff CLV cron: no pending bets kicking off in next 90min");
+    return { checked: 0, updated: 0, skipped: 0 };
+  }
+
+  logger.info({ count: pendingBets.length }, "Pre-kickoff CLV cron: fetching Pinnacle closing odds");
+
+  let updated = 0;
+  let skipped = 0;
+
+  // Group by matchId to deduplicate OddsPapi requests (one request per fixture per market)
+  const byMatch = new Map<number, typeof pendingBets>();
+  for (const bet of pendingBets) {
+    const group = byMatch.get(bet.matchId) ?? [];
+    group.push(bet);
+    byMatch.set(bet.matchId, group);
+  }
+
+  for (const [matchId, bets] of byMatch) {
+    const oddspapiId = await getOddspapiFixtureId(matchId);
+    if (!oddspapiId) {
+      skipped += bets.length;
+      continue;
+    }
+
+    // Fetch MATCH_ODDS closing line (covers Home/Draw/Away bets)
+    const matchOddsMarket = bets.some((b) => b.marketType === "MATCH_ODDS") ? "MATCH_ODDS" : bets[0]?.marketType;
+    if (!matchOddsMarket) { skipped += bets.length; continue; }
+
+    if (!(await canMakeOddspapiRequest(1))) {
+      logger.warn("Pre-kickoff CLV cron: daily budget exhausted — stopping");
+      skipped += bets.length;
+      break;
+    }
+
+    const marketId = MARKET_IDS[matchOddsMarket];
+    if (!marketId) { skipped += bets.length; continue; }
+
+    // Rate-limit guard
+    await new Promise((r) => setTimeout(r, 1200));
+
+    const rawData = await fetchOddsPapi<RawOddsResponse>(
+      "/odds",
+      { fixtureId: oddspapiId, marketId },
+      "closing_line",
+    );
+
+    if (!rawData) { skipped += bets.length; continue; }
+
+    const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+    if (!bookmakers.length) { skipped += bets.length; continue; }
+
+    // Extract Pinnacle odds for each selection
+    const pinnacleBySelection: Record<string, number | null> = {};
+    for (const bm of bookmakers) {
+      const slug = getBookmakerSlug(bm);
+      if (!slug.includes("pinnacle")) continue;
+      const selections = extractSelections(bm);
+      for (const selName of ["Home", "Draw", "Away", "Yes", "No", "Over", "Under"]) {
+        const odds = getSelectionOdds(selections, matchOddsMarket, selName);
+        if (odds) pinnacleBySelection[selName] = odds;
+      }
+    }
+
+    // Store closing odds for each matching bet and compute CLV
+    for (const bet of bets) {
+      const closingOdds = pinnacleBySelection[bet.selectionName] ?? null;
+      if (!closingOdds) { skipped++; continue; }
+
+      const placementOdds = Number(bet.oddsAtPlacement);
+      const clvPct = closingOdds > 1
+        ? Math.round(((placementOdds - closingOdds) / closingOdds) * 100 * 1000) / 1000
+        : null;
+
+      await db
+        .update(paperBetsTable)
+        .set({
+          closingPinnacleOdds: String(closingOdds),
+          ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
+        })
+        .where(eq(paperBetsTable.id, bet.id));
+
+      logger.info(
+        { betId: bet.id, matchId, selection: bet.selectionName, placementOdds, closingOdds, clvPct },
+        "Pre-kickoff CLV stored (Pinnacle closing line)",
+      );
+      updated++;
+    }
+  }
+
+  logger.info({ checked: pendingBets.length, updated, skipped }, "Pre-kickoff CLV cron complete");
+  return { checked: pendingBets.length, updated, skipped };
 }
