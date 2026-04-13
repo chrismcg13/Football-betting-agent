@@ -40,10 +40,17 @@ export async function getBankroll(): Promise<number> {
 // ===================== Bet placement pre-checks =====================
 
 async function getTotalPendingExposure(): Promise<number> {
+  // Only count bets placed on or after exposure_rule_since — pre-rule bets are grandfathered
+  const sinceStr = await getConfigValue("exposure_rule_since");
+  const since = sinceStr ? new Date(sinceStr) : null;
   const result = await db
     .select({ total: sql<number>`COALESCE(SUM(${paperBetsTable.stake}::numeric), 0)` })
     .from(paperBetsTable)
-    .where(eq(paperBetsTable.status, "pending"));
+    .where(
+      since
+        ? and(eq(paperBetsTable.status, "pending"), gte(paperBetsTable.placedAt, since))
+        : eq(paperBetsTable.status, "pending"),
+    );
   return Number(result[0]?.total ?? 0);
 }
 

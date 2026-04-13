@@ -168,15 +168,12 @@ export async function runMigrations() {
       WHERE key = 'bankroll' AND value::numeric < 500
     `);
 
-    // ── Force min_opportunity_score to 50 — real-odds bets score 51–53 without
-    //    OddsPapi Pinnacle data (which adds +5/+10 bonus when available). Synthetic
-    //    bets are still fully blocked — they cap at 55.0 but face a hardcoded 56 floor
-    //    in valueDetection.ts (effectiveMinScore = isSynthetic ? 56 : minOppScore).
-    //    Raise back toward 65 once 20+ settled bets have been collected.
+    // ── Set min_opportunity_score floor — raised to 58 after 73 settled bets collected.
+    //    Only applies as default seed; manual config updates take precedence.
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)
-      VALUES ('min_opportunity_score', '50', NOW())
-      ON CONFLICT (key) DO UPDATE SET value = '50', updated_at = NOW()
+      VALUES ('min_opportunity_score', '58', NOW())
+      ON CONFLICT (key) DO UPDATE SET value = '58', updated_at = NOW()
     `);
 
     // ── xG data layer tables (additive — do not modify existing tables)

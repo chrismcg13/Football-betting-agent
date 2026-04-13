@@ -87,7 +87,7 @@ router.get("/dashboard/summary", async (req, res) => {
   const todayStartUtc = new Date();
   todayStartUtc.setUTCHours(0, 0, 0, 0);
 
-  const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, paperModeRow, maxExposurePctRow] = await Promise.all([
+  const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, paperModeRow, maxExposurePctRow, exposureRuleSinceRow] = await Promise.all([
     getBankroll(),
     getAgentStatus(),
     getSettledBetsStats(),
@@ -96,6 +96,7 @@ router.get("/dashboard/summary", async (req, res) => {
         id: paperBetsTable.id,
         stake: paperBetsTable.stake,
         opportunityScore: paperBetsTable.opportunityScore,
+        placedAt: paperBetsTable.placedAt,
       })
       .from(paperBetsTable)
       .where(eq(paperBetsTable.status, "pending")),
@@ -113,12 +114,23 @@ router.get("/dashboard/summary", async (req, res) => {
       .from(agentConfigTable)
       .where(eq(agentConfigTable.key, "max_unsettled_exposure_pct"))
       .limit(1),
+    db
+      .select({ value: agentConfigTable.value })
+      .from(agentConfigTable)
+      .where(eq(agentConfigTable.key, "exposure_rule_since"))
+      .limit(1),
   ]);
 
   const betsToday = betsTodayRows[0]?.count ?? 0;
   const paperMode = paperModeRow[0]?.value === "true";
   const maxExposurePct = Number(maxExposurePctRow[0]?.value ?? "0.40");
-  const pendingExposure = Math.round(allPending.reduce((sum, b) => sum + Number(b.stake), 0) * 100) / 100;
+  const exposureRuleSince = exposureRuleSinceRow[0]?.value ? new Date(exposureRuleSinceRow[0].value) : null;
+  // Only count bets placed after the exposure rule went live (pre-rule bets are grandfathered)
+  const pendingExposure = Math.round(
+    allPending
+      .filter((b) => !exposureRuleSince || (b.placedAt && new Date(b.placedAt) >= exposureRuleSince))
+      .reduce((sum, b) => sum + Number(b.stake), 0) * 100,
+  ) / 100;
   const maxExposure = Math.round(bankroll * maxExposurePct * 100) / 100;
   const exposurePct = maxExposure > 0 ? Math.round((pendingExposure / maxExposure) * 1000) / 10 : 0;
 
