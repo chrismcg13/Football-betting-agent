@@ -425,6 +425,24 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
       }
     }
 
+    // Fast path: matches ingested from discovered leagues already carry their
+    // API-Football fixture ID in betfairEventId as "af_{id}". Extract it directly
+    // instead of doing expensive fuzzy API matching.
+    if (match.betfairEventId?.startsWith("af_")) {
+      const fid = parseInt(match.betfairEventId.slice(3), 10);
+      if (!isNaN(fid)) {
+        await db.insert(featuresTable).values({
+          matchId: match.id,
+          featureName: "_af_fixture_id",
+          featureValue: String(fid),
+          computedAt: new Date(),
+        }).onConflictDoNothing();
+        mappings.push({ matchId: match.id, fixtureId: fid, homeTeam: match.homeTeam, awayTeam: match.awayTeam, league: match.league, kickoffTime: match.kickoffTime });
+        logger.debug({ matchId: match.id, fixtureId: fid, betfairEventId: match.betfairEventId }, "AF fixture ID extracted from betfairEventId (fast path)");
+        continue;
+      }
+    }
+
     const matched = allApiFixtures.find((f) =>
       teamNameMatch(match.homeTeam, f.teams.home.name) &&
       teamNameMatch(match.awayTeam, f.teams.away.name),

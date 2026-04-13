@@ -18,7 +18,7 @@ import {
   leagueEdgeScoresTable,
   oddspapiLeagueCoverageTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, sql, like, inArray } from "drizzle-orm";
+import { eq, and, gte, lte, sql, like, inArray, ne } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://api.oddspapi.io/v4";
@@ -993,4 +993,121 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
 
   logger.info({ checked: pendingBets.length, updated, skipped }, "Pre-kickoff CLV cron complete");
   return { checked: pendingBets.length, updated, skipped };
+}
+
+// ─── Build Pinnacle validation cache from API-Football Pinnacle odds ──────────
+// OddsPapi fixture mapping often has no bookmaker data for our leagues, but
+// API-Football already pulls Pinnacle's odds as one of the bookmakers included
+// in /odds responses (source = "api_football_real:Pinnacle").
+// This function builds the same OddsPapiValidationCache from that data source
+// so the trading cycle gets full Pinnacle alignment scoring even when OddsPapi
+// itself has no coverage.
+
+export async function buildPinnacleValidationFromApiFootball(
+  earliestKickoff: Date,
+  latestKickoff: Date,
+): Promise<OddsPapiValidationCache> {
+  const cache: OddsPapiValidationCache = new Map();
+
+  // Markets we bet on — fetch Pinnacle and all-bookmaker odds for these.
+  // Exclude ASIAN_HANDICAP (huge volume, not bet) and FIRST_HALF_ markets (rarely used).
+  const RELEVANT_MARKETS = [
+    "MATCH_ODDS",
+    "OVER_UNDER_25", "OVER_UNDER_35", "OVER_UNDER_45",
+    "TOTAL_CORNERS_75", "TOTAL_CORNERS_85", "TOTAL_CORNERS_95",
+    "TOTAL_CORNERS_105", "TOTAL_CORNERS_115",
+    "DOUBLE_CHANCE", "BTTS",
+  ];
+
+  // Fetch all relevant market snapshots for upcoming matches in the window.
+  // Pinnacle provides odds for all these markets via API-Football.
+  const rows = await db
+    .select({
+      matchId: oddsSnapshotsTable.matchId,
+      marketType: oddsSnapshotsTable.marketType,
+      selectionName: oddsSnapshotsTable.selectionName,
+      source: oddsSnapshotsTable.source,
+      backOdds: oddsSnapshotsTable.backOdds,
+    })
+    .from(oddsSnapshotsTable)
+    .innerJoin(matchesTable, eq(oddsSnapshotsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        like(oddsSnapshotsTable.source, "api_football_real%"),
+        inArray(oddsSnapshotsTable.marketType, RELEVANT_MARKETS),
+        eq(matchesTable.status, "scheduled"),
+        gte(matchesTable.kickoffTime, earliestKickoff),
+        lte(matchesTable.kickoffTime, latestKickoff),
+      ),
+    );
+
+  if (rows.length === 0) return cache;
+
+  // Group by matchId → selectionName → { pinnacle, best, bestBookmaker }
+  type SelData = { pinnacle: number | null; best: number; bestBookmaker: string };
+  const matchMap = new Map<number, Map<string, SelData>>();
+
+  for (const row of rows) {
+    const odds = parseFloat(row.backOdds ?? "0");
+    if (!odds || odds <= 1.01) continue;
+
+    const mid = row.matchId;
+    if (!matchMap.has(mid)) matchMap.set(mid, new Map());
+    const selMap = matchMap.get(mid)!;
+
+    if (!selMap.has(row.selectionName)) {
+      selMap.set(row.selectionName, { pinnacle: null, best: 0, bestBookmaker: "" });
+    }
+    const sel = selMap.get(row.selectionName)!;
+
+    // Track Pinnacle odds
+    if (row.source === "api_football_real:Pinnacle") {
+      sel.pinnacle = odds;
+    }
+
+    // Track best odds across all bookmakers
+    if (odds > sel.best) {
+      sel.best = odds;
+      sel.bestBookmaker = row.source.replace("api_football_real:", "");
+    }
+  }
+
+  // Build cache entries for matches that have Pinnacle data for at least one selection
+  let matchesWithPinnacle = 0;
+  for (const [matchId, selMap] of matchMap.entries()) {
+    const hasPinnacle = [...selMap.values()].some((s) => s.pinnacle !== null);
+    if (!hasPinnacle) continue;
+
+    const matchCache: Record<string, OddspapiValidation> = {};
+
+    for (const [selName, sd] of selMap.entries()) {
+      if (sd.best <= 1.01) continue;
+      const pinnacleImplied = sd.pinnacle ? 1 / sd.pinnacle : null;
+
+      matchCache[selName] = {
+        pinnacleOdds: sd.pinnacle,
+        pinnacleImplied,
+        bestOdds: sd.best,
+        bestBookmaker: sd.bestBookmaker || null,
+        oddsUpliftPct: null,
+        sharpSoftSpread: null,
+        consensusPct: null,
+        isContrarian: false,
+        pinnacleAligned: false,
+        hasPinnacleData: sd.pinnacle !== null,
+      };
+    }
+
+    if (Object.keys(matchCache).length > 0) {
+      cache.set(matchId, matchCache as { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation });
+      matchesWithPinnacle++;
+    }
+  }
+
+  logger.info(
+    { matchesWithPinnacle, totalMatches: matchMap.size },
+    "Built Pinnacle validation cache from API-Football Pinnacle data",
+  );
+
+  return cache;
 }

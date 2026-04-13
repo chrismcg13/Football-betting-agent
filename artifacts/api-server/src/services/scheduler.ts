@@ -18,13 +18,14 @@ import {
   getOddspapiFixtureId,
   getOddspapiValidation,
   prefetchAndStoreOddsPapiOdds,
+  buildPinnacleValidationFromApiFootball,
   fetchAndStoreClosingLineForPendingBets,
   type OddsPapiValidationCache,
   logDailyBudgetSummary,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement } from "./apiFootball";
-import { runLeagueDiscovery, seedBaselineLeagues } from "./leagueDiscovery";
+import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings } from "./leagueDiscovery";
 import { db, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql } from "drizzle-orm";
 
@@ -181,8 +182,20 @@ export async function runTradingCycle(): Promise<{
     // 5a. Pre-fetch OddsPapi Match Odds for mapped matches into odds_snapshots
     //     so value detection treats those as real (not synthetic) odds
     // Pinnacle upgrade: maxFetches=80 covers ~40 fixtures × 2 market types each
-    const oddsPapiCache: OddsPapiValidationCache = await prefetchAndStoreOddsPapiOdds(earliest, latest, 80);
-    logger.info({ matchesPrefetched: oddsPapiCache.size }, "OddsPapi pre-fetch done — running value detection");
+    const [oddsPapiCacheRaw, afPinnacleCache] = await Promise.all([
+      prefetchAndStoreOddsPapiOdds(earliest, latest, 80),
+      // Build Pinnacle validation cache from API-Football's own Pinnacle bookmaker data.
+      // This is our primary source of real Pinnacle odds — API-Football includes Pinnacle
+      // as one of its bookmakers, so we already have these odds in odds_snapshots.
+      buildPinnacleValidationFromApiFootball(earliest, latest),
+    ]);
+
+    // Merge: OddsPapi entries take priority (more authoritative), AF-Pinnacle fills the rest
+    const oddsPapiCache: OddsPapiValidationCache = new Map([...afPinnacleCache, ...oddsPapiCacheRaw]);
+    logger.info(
+      { oddsPapiMatches: oddsPapiCacheRaw.size, afPinnacleMatches: afPinnacleCache.size, mergedTotal: oddsPapiCache.size },
+      "Pinnacle validation cache ready (OddsPapi + API-Football Pinnacle merged)",
+    );
 
     const valueSummary = await detectValueBets();
     const timely = valueSummary.valueBets.filter(
@@ -242,7 +255,24 @@ export async function runTradingCycle(): Promise<{
         if (cachedMatch) {
           const sel = bet.selectionName as keyof typeof cachedMatch;
           if (cachedMatch[sel]) {
-            validation = { ...cachedMatch[sel], isContrarian: false, pinnacleAligned: false };
+            const raw = cachedMatch[sel];
+            // Compute pinnacleAligned from cached Pinnacle implied probability vs model
+            let pinnacleAligned = false;
+            let isContrarian = false;
+            if (raw.pinnacleImplied !== null) {
+              const diff = bet.modelProbability - raw.pinnacleImplied;
+              if (diff < 0) {
+                // Pinnacle more bullish than model — sharp money backs our selection
+                pinnacleAligned = true;
+              } else if (Math.abs(diff) <= 0.03) {
+                // Within 3% — effectively aligned
+                pinnacleAligned = true;
+              } else if (diff > 0.08) {
+                // Model significantly above Pinnacle — contrarian
+                isContrarian = true;
+              }
+            }
+            validation = { ...raw, pinnacleAligned, isContrarian };
           }
         }
 
@@ -471,7 +501,7 @@ export async function runTradingCycle(): Promise<{
           enhancedOpportunityScore: validation?.hasPinnacleData ? effectiveScore : null,
           pinnacleOdds: validation?.pinnacleOdds ?? null,
           pinnacleImplied: validation?.pinnacleImplied ?? null,
-          bestOdds: validation?.bestOdds ?? null,
+          bestOdds: validation?.bestOdds ?? backOdds,
           bestBookmaker: validation?.bestBookmaker ?? null,
           betThesis: thesis,
           isContrarian,
@@ -817,7 +847,12 @@ export async function runFeaturesNow(): Promise<
 export async function runOddspapiMappingNow(): Promise<
   ReturnType<typeof runOddspapiFixtureMapping>
 > {
-  return runOddspapiFixtureMapping();
+  const result = await runOddspapiFixtureMapping();
+  // After mapping, update which discovered leagues now have confirmed Pinnacle coverage
+  void updatePinnacleOddsFromActualMappings().catch((err) =>
+    logger.warn({ err }, "Pinnacle coverage sync failed — non-fatal"),
+  );
+  return result;
 }
 
 export async function runLeagueDiscoveryNow(): Promise<ReturnType<typeof runLeagueDiscovery>> {
@@ -828,4 +863,9 @@ export async function runLeagueDiscoveryNow(): Promise<ReturnType<typeof runLeag
 export async function runIngestDiscoveredFixturesNow(): Promise<ReturnType<typeof ingestFixturesForDiscoveredLeagues>> {
   logger.info("Manual discovered-league fixture ingestion triggered");
   return ingestFixturesForDiscoveredLeagues();
+}
+
+export async function runPinnacleCoverageUpdateNow(): Promise<ReturnType<typeof updatePinnacleOddsFromActualMappings>> {
+  logger.info("Manual Pinnacle coverage sync triggered");
+  return updatePinnacleOddsFromActualMappings();
 }

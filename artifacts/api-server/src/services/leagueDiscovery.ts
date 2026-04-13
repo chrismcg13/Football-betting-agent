@@ -9,8 +9,8 @@
  * Runs: weekly (Sunday midnight) + on-demand via API.
  */
 
-import { db, discoveredLeaguesTable, leagueEdgeScoresTable, learningNarrativesTable, complianceLogsTable } from "@workspace/db";
-import { eq, inArray, sql, and } from "drizzle-orm";
+import { db, discoveredLeaguesTable, leagueEdgeScoresTable, learningNarrativesTable, complianceLogsTable, oddspapiFixtureMapTable, matchesTable, oddsSnapshotsTable } from "@workspace/db";
+import { eq, inArray, sql, and, like } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { ALL_LEAGUE_IDS } from "./apiFootball";
 
@@ -442,4 +442,59 @@ export async function seedBaselineLeagues(): Promise<void> {
   }
 
   logger.info({ count: leagueEntries.length }, "Baseline leagues seeded into discovered_leagues");
+}
+
+// ─── Dynamic Pinnacle coverage update ─────────────────────────────────────────
+// After OddsPapi fixture mapping runs, check which leagues actually have mapped
+// fixtures and update hasPinnacleOdds accordingly. This is more accurate than
+// the static KNOWN_PINNACLE_LEAGUE_IDS list.
+
+export async function updatePinnacleOddsFromActualMappings(): Promise<{
+  updated: number;
+  leaguesWithPinnacle: string[];
+}> {
+  // Strategy 1: leagues that have actual Pinnacle bookmaker data via API-Football
+  // source = "api_football_real:Pinnacle" is the most reliable signal
+  const leaguesWithAfPinnacle = await db
+    .selectDistinct({ league: matchesTable.league })
+    .from(oddsSnapshotsTable)
+    .innerJoin(matchesTable, eq(oddsSnapshotsTable.matchId, matchesTable.id))
+    .where(eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"));
+
+  // Strategy 2: leagues with OddsPapi fixture mappings (secondary signal)
+  const leaguesWithOddsPapiMapping = await db
+    .selectDistinct({ league: matchesTable.league })
+    .from(oddspapiFixtureMapTable)
+    .innerJoin(matchesTable, eq(oddspapiFixtureMapTable.matchId, matchesTable.id));
+
+  // Merge both sources
+  const leagueSet = new Set<string>();
+  for (const r of leaguesWithAfPinnacle) leagueSet.add(r.league);
+  for (const r of leaguesWithOddsPapiMapping) leagueSet.add(r.league);
+  const leagueNames = [...leagueSet];
+
+  if (leagueNames.length === 0) {
+    logger.info("No Pinnacle coverage found from any source — hasPinnacleOdds unchanged");
+    return { updated: 0, leaguesWithPinnacle: [] };
+  }
+
+  // Update discovered_leagues for these leagues
+  let updated = 0;
+  for (const name of leagueNames) {
+    const result = await db
+      .update(discoveredLeaguesTable)
+      .set({ hasPinnacleOdds: true, lastChecked: new Date() })
+      .where(and(eq(discoveredLeaguesTable.name, name), eq(discoveredLeaguesTable.hasPinnacleOdds, false)));
+
+    if ((result.rowCount ?? 0) > 0) {
+      updated++;
+      logger.info({ league: name }, "Updated hasPinnacleOdds=true from Pinnacle data (API-Football or OddsPapi)");
+    }
+  }
+
+  logger.info(
+    { afPinnacle: leaguesWithAfPinnacle.length, oddsPapiMapped: leaguesWithOddsPapiMapping.length, newlyUpdated: updated },
+    "Pinnacle coverage sync complete",
+  );
+  return { updated, leaguesWithPinnacle: leagueNames };
 }
