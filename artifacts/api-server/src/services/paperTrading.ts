@@ -186,6 +186,24 @@ export async function placePaperBet(
     return { placed: false, reason };
   };
 
+  // ── Banned-market hardstop ─────────────────────────────────────────────────
+  // These markets are permanently banned due to unreliable edge signals or
+  // poor settlement data. Block placement regardless of agent status.
+  const BANNED_MARKETS = new Set([
+    "OVER_UNDER_05",     // ~92% win rate — no edge signal
+    "OVER_UNDER_15",     // ~75% win rate — no edge signal
+    "TOTAL_CARDS_55",    // ~85% win rate — no edge signal
+    "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
+    "TOTAL_CORNERS_85",  // Too predictable; only 9.5/10.5 retained
+    "TOTAL_CORNERS_115", // Too predictable; only 9.5/10.5 retained
+    "FIRST_HALF_OU_05",  // Too easy; FIRST_HALF_OU_15 retained instead
+  ]);
+  if (BANNED_MARKETS.has(marketType)) {
+    logger.warn({ matchId, marketType, selectionName }, "HARDSTOP: Banned market — bet blocked at placement");
+    return logReject(`Banned market: ${marketType}`);
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   const status = await getAgentStatus();
   if (status !== "running") {
     return logReject(`Agent is not running (status: ${status})`);
@@ -1026,4 +1044,82 @@ export async function deduplicatePendingBets(): Promise<{
     totalAfter: totalBefore - toVoid.size,
     removedByReason,
   };
+}
+
+// ─── Void bets on banned markets ──────────────────────────────────────────────
+// Used by the admin endpoint to void any existing pending bets on markets that
+// are now permanently banned. Refunds the stake to bankroll.
+
+export async function voidBetsOnBannedMarkets(): Promise<{
+  voided: number;
+  totalStakeRefunded: number;
+  byMarket: Record<string, number>;
+}> {
+  const BANNED_MARKETS = [
+    "OVER_UNDER_05",
+    "OVER_UNDER_15",
+    "TOTAL_CARDS_55",
+    "TOTAL_CARDS_45",
+    "TOTAL_CORNERS_85",
+    "TOTAL_CORNERS_115",
+    "FIRST_HALF_OU_05",
+  ];
+
+  const pendingBanned = await db
+    .select({
+      id: paperBetsTable.id,
+      marketType: paperBetsTable.marketType,
+      stake: paperBetsTable.stake,
+    })
+    .from(paperBetsTable)
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        inArray(paperBetsTable.marketType, BANNED_MARKETS),
+      ),
+    );
+
+  if (pendingBanned.length === 0) {
+    logger.info("voidBetsOnBannedMarkets: no pending bets on banned markets");
+    return { voided: 0, totalStakeRefunded: 0, byMarket: {} };
+  }
+
+  const byMarket: Record<string, number> = {};
+  let totalStakeRefunded = 0;
+
+  for (const bet of pendingBanned) {
+    const stake = parseFloat(bet.stake ?? "0");
+    byMarket[bet.marketType] = (byMarket[bet.marketType] ?? 0) + 1;
+    totalStakeRefunded += stake;
+
+    await db
+      .update(paperBetsTable)
+      .set({ status: "void", settlementPnl: "0", settledAt: new Date() })
+      .where(eq(paperBetsTable.id, bet.id));
+  }
+
+  // Refund total stake to bankroll
+  const currentBankroll = await getBankroll();
+  const newBankroll = currentBankroll + totalStakeRefunded;
+  await setConfigValue("bankroll", String(newBankroll.toFixed(2)));
+
+  await db.insert(complianceLogsTable).values({
+    actionType: "void_banned_market_bets",
+    details: {
+      voided: pendingBanned.length,
+      totalStakeRefunded: totalStakeRefunded.toFixed(2),
+      byMarket,
+      bannedMarkets: BANNED_MARKETS,
+      bankrollBefore: currentBankroll,
+      bankrollAfter: newBankroll,
+    },
+    timestamp: new Date(),
+  });
+
+  logger.info(
+    { voided: pendingBanned.length, totalStakeRefunded: totalStakeRefunded.toFixed(2), byMarket },
+    "voidBetsOnBannedMarkets: complete — stake refunded to bankroll",
+  );
+
+  return { voided: pendingBanned.length, totalStakeRefunded, byMarket };
 }

@@ -4,6 +4,7 @@ import {
   integer,
   text,
   timestamp,
+  unique,
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
@@ -18,7 +19,9 @@ export const oddspapiFixtureMapTable = pgTable("oddspapi_fixture_map", {
   cachedAt: timestamp("cached_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
-});
+}, (t) => [
+  unique("oddspapi_fixture_map_match_id_unique").on(t.matchId),
+]);
 
 export const insertOddspapiFixtureMapSchema = createInsertSchema(
   oddspapiFixtureMapTable,

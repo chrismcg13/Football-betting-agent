@@ -137,11 +137,12 @@ export async function getOddspapiStatus(): Promise<{
   enabled: boolean;
 }> {
   const key = process.env.ODDSPAPI_KEY;
-  const [todayCount, monthCount] = await Promise.all([
+  const [todayCount, monthCount, effectiveDailyCap] = await Promise.all([
     getOddspapiUsageToday(),
     getOddspapiUsageThisMonth(),
+    getEffectiveDailyCap(),
   ]);
-  return { todayCount, monthCount, dailyCap: DAILY_CAP, monthlyCap: MONTHLY_CAP, enabled: !!key };
+  return { todayCount, monthCount, dailyCap: effectiveDailyCap, monthlyCap: MONTHLY_CAP, enabled: !!key };
 }
 
 // ─── Core fetch ───────────────────────────────────────────────────────────────
@@ -187,13 +188,43 @@ async function fetchOddsPapi<T = unknown>(
 
 // ─── Team name normalisation (shared with apiFootball.ts logic) ───────────────
 
+function transliterate(s: string): string {
+  return s
+    .replace(/[àáâãäå]/gi, "a")
+    .replace(/[èéêë]/gi, "e")
+    .replace(/[ìíîï]/gi, "i")
+    .replace(/[òóôõöø]/gi, "o")
+    .replace(/[ùúûü]/gi, "u")
+    .replace(/[ñ]/gi, "n")
+    .replace(/[çć]/gi, "c")
+    .replace(/[ýÿ]/gi, "y")
+    .replace(/[žźż]/gi, "z")
+    .replace(/[šś]/gi, "s")
+    .replace(/[łľ]/gi, "l")
+    .replace(/[ß]/gi, "ss")
+    .replace(/[đ]/gi, "d");
+}
+
 function normalizeTeam(name: string): string {
-  return name
+  return transliterate(name)
     .toLowerCase()
-    .replace(/\bfc\b|\bsc\b|\bac\b|\bcf\b|\bfk\b|\bsk\b|\bsv\b|\butd\b|\bunited\b/g, "")
+    // Remove leading ordinals like "1.", "2." that German/Spanish clubs use
+    .replace(/^\d+\.\s*/, "")
+    // Remove common club suffixes and prefixes
+    .replace(/\b(fc|sc|ac|cf|fk|sk|sv|utd|united|club|sporting|real|athletic|atletico|atlético|olympique|olympico|inter|internazionale)\b/g, "")
+    // Remove all non-ASCII after transliteration
     .replace(/[^a-z0-9 ]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function wordOverlap(a: string, b: string): number {
+  const wa = new Set(a.split(" ").filter((w) => w.length > 2));
+  const wb = new Set(b.split(" ").filter((w) => w.length > 2));
+  if (wa.size === 0 || wb.size === 0) return 0;
+  let overlap = 0;
+  for (const w of wa) { if (wb.has(w)) overlap++; }
+  return overlap / Math.min(wa.size, wb.size);
 }
 
 function teamMatch(a: string, b: string): boolean {
@@ -201,9 +232,13 @@ function teamMatch(a: string, b: string): boolean {
   const nb = normalizeTeam(b);
   if (na === nb) return true;
   if (na.includes(nb) || nb.includes(na)) return true;
+  // First-word match for longer names (e.g. "leverkusen" == "leverkusen")
   const fa = na.split(" ")[0] ?? "";
   const fb = nb.split(" ")[0] ?? "";
-  return fa.length > 3 && fa === fb;
+  if (fa.length > 4 && fa === fb) return true;
+  // Word-overlap ≥ 60% is a match
+  if (wordOverlap(na, nb) >= 0.6) return true;
+  return false;
 }
 
 // ─── Fixture response parsing ─────────────────────────────────────────────────
@@ -269,62 +304,82 @@ function extractFixtureDate(f: RawFixture): string | null {
   return raw.slice(0, 10);
 }
 
-// ─── 1. Daily fixture mapping (1 request/day at 6am UTC) ─────────────────────
+// ─── 1. Daily fixture mapping ─────────────────────────────────────────────────
+// Fetches 7 days of fixtures from OddsPapi (hasOdds=true), matches against our
+// DB using fuzzy team-name matching, and upserts oddspapi_fixture_map entries.
+// Includes detailed per-league diagnostics and unmatched fixture reporting.
 
 export async function runOddspapiFixtureMapping(): Promise<{
   total: number;
   mapped: number;
   newMappings: number;
+  unmatchedDb: number;
+  unmatchedOp: number;
+  perLeague: Record<string, { dbCount: number; mappedCount: number }>;
 }> {
   const key = process.env.ODDSPAPI_KEY;
   if (!key) {
     logger.info("ODDSPAPI_KEY not set — skipping fixture mapping");
-    return { total: 0, mapped: 0, newMappings: 0 };
+    return { total: 0, mapped: 0, newMappings: 0, unmatchedDb: 0, unmatchedOp: 0, perLeague: {} };
   }
 
   if (!(await canMakeOddspapiRequest(1))) {
     logger.warn("OddsPapi budget exhausted — skipping fixture mapping");
-    return { total: 0, mapped: 0, newMappings: 0 };
+    return { total: 0, mapped: 0, newMappings: 0, unmatchedDb: 0, unmatchedOp: 0, perLeague: {} };
   }
 
   const now = new Date();
   const todayDate = now.toISOString().slice(0, 10);
-  const plusFour = new Date(now.getTime() + 4 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const plusSeven = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  logger.info({ from: todayDate, to: plusFour }, "Running OddsPapi fixture mapping");
+  logger.info({ from: todayDate, to: plusSeven }, "Running OddsPapi fixture mapping (7-day window)");
 
-  // CRITICAL: filter hasOdds=true so we only match against fixtures that have
-  // bookmaker odds. Without this filter we get duplicate fixture stubs for top leagues
-  // that match team names but have hasOdds=false — causing us to miss the real fixture.
   const rawFixtures = await fetchOddsPapi<RawFixture[]>("/fixtures", {
     sportId: 10,
     from: todayDate,
-    to: plusFour,
+    to: plusSeven,
     hasOdds: "true",
   }, "fixtures");
 
   if (!rawFixtures || !Array.isArray(rawFixtures)) {
     logger.warn("OddsPapi fixture response was empty or unexpected format");
-    return { total: 0, mapped: 0, newMappings: 0 };
+    return { total: 0, mapped: 0, newMappings: 0, unmatchedDb: 0, unmatchedOp: 0, perLeague: {} };
   }
 
   logger.info({ count: rawFixtures.length }, "OddsPapi fixtures received");
 
-  // Get upcoming matches from our DB (next 7 days)
+  // Log sample of OddsPapi fixtures for name-matching diagnosis
+  const sampleOp = rawFixtures.slice(0, 10).map((f) => {
+    const t = extractTeamNames(f);
+    return { fixtureId: extractFixtureStringId(f), home: t?.home, away: t?.away, date: extractFixtureDate(f) };
+  });
+  logger.info({ sample: sampleOp }, "OddsPapi fixture sample (first 10)");
+
+  // Get upcoming matches from our DB (next 7 days + 1h back for in-progress)
   const upcoming = await db
     .select()
     .from(matchesTable)
     .where(
       and(
         eq(matchesTable.status, "scheduled"),
-        gte(matchesTable.kickoffTime, new Date(now.getTime() - 3 * 60 * 60 * 1000)),
+        gte(matchesTable.kickoffTime, new Date(now.getTime() - 1 * 60 * 60 * 1000)),
+        lte(matchesTable.kickoffTime, new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)),
       ),
     );
 
+  // Track which OddsPapi fixtures were used (for unmatched-OP reporting)
+  const usedOpFixtureIds = new Set<string>();
+  const perLeague: Record<string, { dbCount: number; mappedCount: number }> = {};
+
   let mapped = 0;
   let newMappings = 0;
+  const unmatchedDbMatches: Array<{ home: string; away: string; date: string; league: string }> = [];
 
   for (const match of upcoming) {
+    const league = match.league ?? "Unknown";
+    if (!perLeague[league]) perLeague[league] = { dbCount: 0, mappedCount: 0 };
+    perLeague[league].dbCount++;
+
     // Check if already cached
     const existing = await db
       .select({ id: oddspapiFixtureMapTable.id, oddspapiFixtureId: oddspapiFixtureMapTable.oddspapiFixtureId })
@@ -334,51 +389,107 @@ export async function runOddspapiFixtureMapping(): Promise<{
 
     if (existing[0]) {
       mapped++;
-      // Refresh cachedAt to keep it warm
+      perLeague[league].mappedCount++;
       await db
         .update(oddspapiFixtureMapTable)
         .set({ cachedAt: new Date() })
         .where(eq(oddspapiFixtureMapTable.id, existing[0].id));
+      if (existing[0].oddspapiFixtureId) usedOpFixtureIds.add(existing[0].oddspapiFixtureId);
       continue;
     }
 
     const matchDate = match.kickoffTime.toISOString().slice(0, 10);
 
-    // Try to find a matching fixture in the API response
-    const found = rawFixtures.find((f) => {
+    // Pass 1: exact date + fuzzy team match
+    let found = rawFixtures.find((f) => {
       const teams = extractTeamNames(f);
       if (!teams) return false;
-      const dateMatch = extractFixtureDate(f) === matchDate;
-      return dateMatch && teamMatch(match.homeTeam, teams.home) && teamMatch(match.awayTeam, teams.away);
+      return extractFixtureDate(f) === matchDate
+        && teamMatch(match.homeTeam, teams.home)
+        && teamMatch(match.awayTeam, teams.away);
     });
+
+    // Pass 2: ±1 day tolerance (handles UTC vs local timezone edge cases)
+    if (!found) {
+      const dayBefore = new Date(match.kickoffTime.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const dayAfter  = new Date(match.kickoffTime.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      found = rawFixtures.find((f) => {
+        const teams = extractTeamNames(f);
+        if (!teams) return false;
+        const fd = extractFixtureDate(f);
+        return (fd === dayBefore || fd === dayAfter)
+          && teamMatch(match.homeTeam, teams.home)
+          && teamMatch(match.awayTeam, teams.away);
+      });
+    }
 
     if (found) {
       const fixId = extractFixtureStringId(found);
       if (!fixId) continue;
+
       await db.insert(oddspapiFixtureMapTable).values({
         matchId: match.id,
         oddspapiFixtureId: fixId,
         cachedAt: new Date(),
+      }).onConflictDoUpdate({
+        target: oddspapiFixtureMapTable.matchId,
+        set: { oddspapiFixtureId: fixId, cachedAt: new Date() },
       });
 
       logger.info(
-        { matchId: match.id, oddspapiFixtureId: fixId, home: match.homeTeam, away: match.awayTeam },
+        { matchId: match.id, oddspapiFixtureId: fixId, home: match.homeTeam, away: match.awayTeam, league },
         "OddsPapi fixture mapped",
       );
 
+      usedOpFixtureIds.add(fixId);
       mapped++;
       newMappings++;
+      perLeague[league].mappedCount++;
+    } else {
+      unmatchedDbMatches.push({ home: match.homeTeam, away: match.awayTeam, date: matchDate, league });
     }
+  }
+
+  // Log per-league coverage
+  const leagueSummary = Object.entries(perLeague)
+    .map(([lg, v]) => ({ league: lg, dbCount: v.dbCount, mappedCount: v.mappedCount, coveragePct: Math.round(v.mappedCount / v.dbCount * 100) }))
+    .sort((a, b) => b.dbCount - a.dbCount);
+
+  logger.info({ leagueSummary }, "OddsPapi fixture mapping — per-league coverage");
+
+  // Log unmatched DB matches (first 20) for diagnosis
+  if (unmatchedDbMatches.length > 0) {
+    logger.info(
+      { count: unmatchedDbMatches.length, sample: unmatchedDbMatches.slice(0, 20) },
+      "OddsPapi fixture mapping — unmatched DB matches (no OddsPapi equivalent found)",
+    );
+  }
+
+  // Log OddsPapi fixtures that weren't matched to any DB entry
+  const unmatchedOp = rawFixtures.filter((f) => {
+    const id = extractFixtureStringId(f);
+    return id && !usedOpFixtureIds.has(id);
+  });
+  const unmatchedOpCount = unmatchedOp.length;
+  if (unmatchedOpCount > 0) {
+    const sampleUnmatched = unmatchedOp.slice(0, 10).map((f) => {
+      const t = extractTeamNames(f);
+      return { home: t?.home, away: t?.away, date: extractFixtureDate(f) };
+    });
+    logger.info(
+      { count: unmatchedOpCount, sample: sampleUnmatched },
+      "OddsPapi fixture mapping — OddsPapi fixtures not in our DB (first 10)",
+    );
   }
 
   await db.insert(complianceLogsTable).values({
     actionType: "oddspapi_fixture_mapping",
-    details: { total: rawFixtures.length, dbMatches: upcoming.length, mapped, newMappings },
+    details: { total: rawFixtures.length, dbMatches: upcoming.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount, perLeague: leagueSummary },
     timestamp: new Date(),
   });
 
-  logger.info({ total: rawFixtures.length, mapped, newMappings }, "OddsPapi fixture mapping complete");
-  return { total: rawFixtures.length, mapped, newMappings };
+  logger.info({ total: rawFixtures.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount }, "OddsPapi fixture mapping complete");
+  return { total: rawFixtures.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount, perLeague: Object.fromEntries(Object.entries(perLeague)) };
 }
 
 // ─── OddsPapi odds response parsing ──────────────────────────────────────────
@@ -737,32 +848,32 @@ export type OddsPapiValidationCache = Map<number, Record<string, OddspapiValidat
 
 // All bet-relevant targets we extract from every OddsPapi odds response.
 // One API call returns all markets, so we pull everything at once.
+// BANNED markets are excluded from prefetch so we never validate or cache them.
+// Mirrors the BANNED_MARKETS set in valueDetection.ts.
 const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   // Match Winner (1x2)
   { marketType: "MATCH_ODDS",       selectionName: "Home" },
   { marketType: "MATCH_ODDS",       selectionName: "Draw" },
   { marketType: "MATCH_ODDS",       selectionName: "Away" },
-  // Goals O/U
+  // Goals O/U — OVER_UNDER_05 and OVER_UNDER_15 are banned, excluded
   { marketType: "OVER_UNDER_25",    selectionName: "Over 2.5" },
   { marketType: "OVER_UNDER_25",    selectionName: "Under 2.5" },
   { marketType: "OVER_UNDER_35",    selectionName: "Over 3.5" },
   { marketType: "OVER_UNDER_35",    selectionName: "Under 3.5" },
   { marketType: "OVER_UNDER_45",    selectionName: "Over 4.5" },
   { marketType: "OVER_UNDER_45",    selectionName: "Under 4.5" },
-  // Corners O/U
-  { marketType: "TOTAL_CORNERS_75",  selectionName: "Over 7.5 Corners" },
-  { marketType: "TOTAL_CORNERS_75",  selectionName: "Under 7.5 Corners" },
-  { marketType: "TOTAL_CORNERS_85",  selectionName: "Over 8.5 Corners" },
-  { marketType: "TOTAL_CORNERS_85",  selectionName: "Under 8.5 Corners" },
+  // Corners O/U — only 9.5 and 10.5 are active; 8.5 and 11.5 are banned
   { marketType: "TOTAL_CORNERS_95",  selectionName: "Over 9.5 Corners" },
   { marketType: "TOTAL_CORNERS_95",  selectionName: "Under 9.5 Corners" },
   { marketType: "TOTAL_CORNERS_105", selectionName: "Over 10.5 Corners" },
   { marketType: "TOTAL_CORNERS_105", selectionName: "Under 10.5 Corners" },
-  { marketType: "TOTAL_CORNERS_115", selectionName: "Over 11.5 Corners" },
-  { marketType: "TOTAL_CORNERS_115", selectionName: "Under 11.5 Corners" },
   // BTTS
   { marketType: "BTTS",              selectionName: "Yes" },
   { marketType: "BTTS",              selectionName: "No" },
+  // Double Chance
+  { marketType: "DOUBLE_CHANCE",     selectionName: "1X" },
+  { marketType: "DOUBLE_CHANCE",     selectionName: "X2" },
+  { marketType: "DOUBLE_CHANCE",     selectionName: "12" },
 ];
 
 export async function prefetchAndStoreOddsPapiOdds(
@@ -1003,6 +1114,93 @@ export async function prefetchAndStoreOddsPapiOdds(
   return cache;
 }
 
+// ─── Load OddsPapi cache from already-stored snapshots (no API calls) ─────────
+// Used by the trading cycle to read cached data without spending budget.
+// Scheduled bulk prefetch crons populate the DB; this function reads it.
+
+export async function loadOddsPapiCacheFromSnapshots(
+  earliestKickoff: Date,
+  latestKickoff: Date,
+): Promise<OddsPapiValidationCache> {
+  const cache: OddsPapiValidationCache = new Map();
+
+  const rows = await db
+    .select({
+      matchId: oddsSnapshotsTable.matchId,
+      marketType: oddsSnapshotsTable.marketType,
+      selectionName: oddsSnapshotsTable.selectionName,
+      backOdds: oddsSnapshotsTable.backOdds,
+    })
+    .from(oddsSnapshotsTable)
+    .innerJoin(matchesTable, eq(oddsSnapshotsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(oddsSnapshotsTable.source, "oddspapi"),
+        eq(matchesTable.status, "scheduled"),
+        gte(matchesTable.kickoffTime, earliestKickoff),
+        lte(matchesTable.kickoffTime, latestKickoff),
+      ),
+    );
+
+  if (rows.length === 0) return cache;
+
+  // Group by matchId → build validation records
+  // We only have best-odds (no per-bookmaker breakdown) from the snapshot store.
+  // For alignment scoring, pinnacleOdds must come from buildPinnacleValidationFromApiFootball.
+  // This cache provides bestOdds + hasPinnacleData=false (overridden by merge in scheduler).
+  const matchMap = new Map<number, Record<string, { backOdds: number; marketType: string }>>();
+  for (const row of rows) {
+    const odds = parseFloat(row.backOdds ?? "0");
+    if (!odds || odds <= 1.01) continue;
+    if (!matchMap.has(row.matchId)) matchMap.set(row.matchId, {});
+    const m = matchMap.get(row.matchId)!;
+    if (!m[row.selectionName] || odds > m[row.selectionName]!.backOdds) {
+      m[row.selectionName] = { backOdds: odds, marketType: row.marketType };
+    }
+  }
+
+  for (const [matchId, selMap] of matchMap.entries()) {
+    const matchCache: Record<string, OddspapiValidation> = {};
+    for (const [selName, data] of Object.entries(selMap)) {
+      matchCache[selName] = {
+        pinnacleOdds: null,
+        pinnacleImplied: null,
+        bestOdds: data.backOdds,
+        bestBookmaker: "OddsPapi",
+        oddsUpliftPct: null,
+        sharpSoftSpread: null,
+        consensusPct: null,
+        isContrarian: false,
+        pinnacleAligned: false,
+        hasPinnacleData: false,
+      };
+    }
+    if (Object.keys(matchCache).length > 0) cache.set(matchId, matchCache);
+  }
+
+  logger.info({ matchCount: cache.size, totalSelections: rows.length }, "OddsPapi snapshot cache loaded from DB");
+  return cache;
+}
+
+// ─── Dedicated scheduled bulk prefetch ────────────────────────────────────────
+// Called by the morning (6am) and midday (12pm) crons.
+// windowDays controls how far ahead we prefetch; maxFetches controls budget use.
+
+export async function runDedicatedBulkPrefetch(
+  windowDays: number,
+  maxFetches: number,
+): Promise<{ fetched: number; totalSelections: number }> {
+  const now = new Date();
+  const earliest = new Date(now.getTime() + 60 * 60 * 1000); // 1h from now (skip imminent matches)
+  const latest   = new Date(now.getTime() + windowDays * 24 * 60 * 60 * 1000);
+
+  logger.info({ windowDays, maxFetches }, "Dedicated OddsPapi bulk prefetch starting");
+  const cache = await prefetchAndStoreOddsPapiOdds(earliest, latest, maxFetches);
+  const totalSelections = [...cache.values()].reduce((n, m) => n + Object.keys(m).length, 0);
+  logger.info({ fetched: cache.size, totalSelections }, "Dedicated OddsPapi bulk prefetch complete");
+  return { fetched: cache.size, totalSelections };
+}
+
 // ─── Log daily budget usage summary ──────────────────────────────────────────
 
 export async function logDailyBudgetSummary(): Promise<void> {
@@ -1176,12 +1374,12 @@ export async function buildPinnacleValidationFromApiFootball(
   const cache: OddsPapiValidationCache = new Map();
 
   // Markets we bet on — fetch Pinnacle and all-bookmaker odds for these.
-  // Exclude ASIAN_HANDICAP (huge volume, not bet) and FIRST_HALF_ markets (rarely used).
+  // Exclude: ASIAN_HANDICAP (huge volume, not bet), FIRST_HALF_ markets (rarely used),
+  // and banned markets: OVER_UNDER_05/15, TOTAL_CORNERS_85/115, TOTAL_CARDS_45/55, FIRST_HALF_OU_05.
   const RELEVANT_MARKETS = [
     "MATCH_ODDS",
     "OVER_UNDER_25", "OVER_UNDER_35", "OVER_UNDER_45",
-    "TOTAL_CORNERS_75", "TOTAL_CORNERS_85", "TOTAL_CORNERS_95",
-    "TOTAL_CORNERS_105", "TOTAL_CORNERS_115",
+    "TOTAL_CORNERS_95", "TOTAL_CORNERS_105",
     "DOUBLE_CHANCE", "BTTS",
   ];
 

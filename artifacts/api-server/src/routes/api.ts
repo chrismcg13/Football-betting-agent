@@ -9,6 +9,7 @@ import {
   agentConfigTable,
   leagueEdgeScoresTable,
   oddspapiLeagueCoverageTable,
+  oddspapiFixtureMapTable,
 } from "@workspace/db";
 import {
   eq,
@@ -30,6 +31,7 @@ import {
   getAgentStatus,
   backfillCornersCardsStats,
   deduplicatePendingBets,
+  voidBetsOnBannedMarkets,
 } from "../services/paperTrading";
 import {
   runIngestionNow,
@@ -46,6 +48,7 @@ import { getAllTeamXGStats } from "../services/xgIngestionService";
 import {
   getOddspapiStatus,
   prefetchAndStoreOddsPapiOdds,
+  runDedicatedBulkPrefetch,
 } from "../services/oddsPapi";
 import {
   getApiBudgetStatus,
@@ -1340,6 +1343,112 @@ router.post("/oddspapi/map-fixtures", async (_req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     logger.error({ err }, "OddsPapi fixture mapping failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/oddspapi/bulk-prefetch — trigger a dedicated bulk prefetch
+// Body: { windowDays?: number, maxFetches?: number }
+// Defaults: windowDays=7, maxFetches=80
+// ─────────────────────────────────────────────
+router.post("/oddspapi/bulk-prefetch", async (req, res) => {
+  const body = req.body as Record<string, unknown>;
+  const windowDays = Math.min(Number(body?.windowDays ?? 7), 14);
+  const maxFetches = Math.min(Number(body?.maxFetches ?? 80), 150);
+  logger.info({ windowDays, maxFetches }, "Manual OddsPapi bulk prefetch triggered");
+  try {
+    const result = await runDedicatedBulkPrefetch(windowDays, maxFetches);
+    res.json({ success: true, windowDays, maxFetches, ...result });
+  } catch (err) {
+    logger.error({ err }, "Manual OddsPapi bulk prefetch failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/oddspapi/coverage-report — per-league fixture mapping coverage
+// ─────────────────────────────────────────────
+router.get("/oddspapi/coverage-report", async (_req, res) => {
+  try {
+    const window7d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const [totalUpcoming, mappedRows] = await Promise.all([
+      db
+        .select({ count: sql<number>`COUNT(*)` })
+        .from(matchesTable)
+        .where(
+          and(
+            eq(matchesTable.status, "scheduled"),
+            gte(matchesTable.kickoffTime, new Date()),
+            lte(matchesTable.kickoffTime, window7d),
+          ),
+        ),
+      db
+        .select({
+          matchId: oddspapiFixtureMapTable.matchId,
+          oddspapiFixtureId: oddspapiFixtureMapTable.oddspapiFixtureId,
+        })
+        .from(oddspapiFixtureMapTable),
+    ]);
+
+    const mappedMatchIds = new Set(mappedRows.map((r) => r.matchId));
+    const allUpcoming = await db
+      .select({ id: matchesTable.id, league: matchesTable.league, homeTeam: matchesTable.homeTeam, awayTeam: matchesTable.awayTeam, kickoffTime: matchesTable.kickoffTime })
+      .from(matchesTable)
+      .where(
+        and(
+          eq(matchesTable.status, "scheduled"),
+          gte(matchesTable.kickoffTime, new Date()),
+          lte(matchesTable.kickoffTime, window7d),
+        ),
+      );
+
+    const perLeague: Record<string, { total: number; mapped: number; fixtures: Array<{ home: string; away: string; kickoff: string; mapped: boolean }> }> = {};
+    for (const m of allUpcoming) {
+      const lg = m.league ?? "Unknown";
+      if (!perLeague[lg]) perLeague[lg] = { total: 0, mapped: 0, fixtures: [] };
+      perLeague[lg].total++;
+      const isMapped = mappedMatchIds.has(m.id);
+      if (isMapped) perLeague[lg].mapped++;
+      perLeague[lg].fixtures.push({ home: m.homeTeam, away: m.awayTeam, kickoff: m.kickoffTime.toISOString(), mapped: isMapped });
+    }
+
+    const summary = Object.entries(perLeague)
+      .map(([league, data]) => ({
+        league,
+        total: data.total,
+        mapped: data.mapped,
+        unmapped: data.total - data.mapped,
+        coveragePct: Math.round(data.mapped / data.total * 100),
+        fixtures: data.fixtures,
+      }))
+      .sort((a, b) => b.total - a.total);
+
+    res.json({
+      totalUpcoming: Number(totalUpcoming[0]?.count ?? 0),
+      totalMapped: mappedMatchIds.size,
+      overallCoveragePct: totalUpcoming[0]?.count
+        ? Math.round(mappedMatchIds.size / Number(totalUpcoming[0].count) * 100)
+        : 0,
+      perLeague: summary,
+    });
+  } catch (err) {
+    logger.error({ err }, "OddsPapi coverage report failed");
+    res.status(500).json({ error: "Failed to retrieve coverage report" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/void-banned-bets — void all pending bets on banned markets
+// Refunds stakes to bankroll. Safe to run multiple times (idempotent).
+// ─────────────────────────────────────────────
+router.post("/admin/void-banned-bets", async (_req, res) => {
+  logger.info("Manual void-banned-bets triggered via API");
+  try {
+    const result = await voidBetsOnBannedMarkets();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "void-banned-bets failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });

@@ -1,0 +1,37 @@
+PINNACLE UTILISATION REVIEW: We're paying for 5,000 OddsPapi requests/month but only achieving 16% Pinnacle coverage. This needs to be dramatically higher. Also some banned markets have slipped through.
+
+FIX 1: BANNED MARKET ENFORCEMENT
+Over 0.5 Goals bets are appearing again (CD Tondela Over 0.5, Levante Over 0.5). These were banned. Search the entire codebase for where OVER_UNDER_05 and OVER_UNDER_15 are evaluated and make sure they are blocked at EVERY entry point — value detection, trading cycle, and bet placement. Also block Under 8.5 Corners (TOTAL_CORNERS_85) — this was supposed to be banned, only 9.5 and 10.5 should be active. Run a check on all 49 pending bets and void any that are on banned markets.
+
+FIX 2: MAXIMISE PINNACLE FIXTURE MAPPING
+The daily fixture mapper is only finding 37 fixtures. With 22+ leagues there should be 150-300 fixtures in the next 7 days.
+
+- Run the fixture mapper NOW for all active leagues, not just the ones from this morning
+- For each league, search OddsPapi fixtures for the next 7 days
+- Log exactly how many fixtures are found per league and which leagues return zero
+- If a league returns zero fixtures from OddsPapi, try alternative search terms (some leagues have different names on OddsPapi vs API-Football)
+- Cache successful league name mappings so we don't waste requests on name mismatches
+
+FIX 3: PINNACLE ODDS PREFETCH STRATEGY
+Current approach fetches Pinnacle odds for 37 fixtures. With 150 requests/day we can cover far more.
+
+New strategy:
+- Morning run (6am): fetch Pinnacle odds for ALL mapped fixtures kicking off in next 4 days — this is the bulk prefetch, use up to 80 requests
+- Midday run (12pm): refresh odds for fixtures kicking off today and tomorrow — catch line movements, use up to 30 requests  
+- Pre-kickoff run (every 30 mins): fetch closing lines for fixtures kicking off within 90 minutes — use up to 20 requests
+- Trading cycle validation: for any new candidates not already prefetched, fetch on demand — use up to 20 requests
+- Total: ~150/day, matching our budget perfectly
+
+FIX 4: FIXTURE NAME MATCHING
+Show me the OddsPapi fixture mapping success rate — how many of our database matches successfully map to OddsPapi fixture IDs? If it's below 50%, there's a name matching problem. Common issues:
+- "Man Utd" vs "Manchester United"
+- "Bayern" vs "FC Bayern München"  
+- "Sporting CP" vs "Sporting Lisbon"
+Show the unmatched fixtures so we can see what's failing.
+
+FIX 5: VERIFY COVERAGE BY LEAGUE
+After the expanded fixture mapping, show me a table:
+- League name | Total fixtures next 7 days | Mapped to OddsPapi | Has Pinnacle odds | Coverage %
+- Sort by coverage ascending so we can see which leagues are problematic
+
+Run all fixes then run a full trading cycle and show me the new Pinnacle coverage percentage. Target: 70%+ of all candidates should have Pinnacle validation.

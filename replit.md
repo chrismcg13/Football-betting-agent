@@ -216,7 +216,9 @@ Computes 17 ML features per upcoming match:
 | Trading cycle | Every 10 minutes | Detects value bets, places paper bets |
 | Settlement | Every 5 minutes | Syncs match results from API-Football, then settles pending bets |
 | API-Football odds | Every 2 hours, 24/7 | ALL bookmakers (20+) in single call, 2h freshness window |
-| OddsPapi Pinnacle | Every 10 min (trading) | Top-8 fixtures ≤48h only, skips 2nd-div leagues, capped 7/day |
+| OddsPapi morning bulk prefetch | Daily 06:10 UTC | 7-day window, up to 80 API calls, stores all Pinnacle odds in DB |
+| OddsPapi midday refresh | Daily 12:00 UTC | 2-day window, up to 30 API calls, refreshes pre-kickoff line movements |
+| OddsPapi trading cycle | Every 10 min (trading) | Reads from DB snapshots (free) + max 20 on-demand cache-miss calls |
 | API-Football team stats | Every 12 hours UTC | Fetches cards/corners/shots stats |
 | Learning loop | Daily at 03:00 UTC | Generates narratives, retrains model |
 | xG ingestion | Daily at 05:00 UTC | Derives team xG rolling stats from internal feature engine |
@@ -246,10 +248,15 @@ Computes 17 ML features per upcoming match:
 
 Bonus in opportunity score: `(leagueEdgeScore - 50) / 5`, capped ±10 points.
 
-## New Dashboard Endpoints
+## Admin & OddsPapi Endpoints
 
 - `GET /api/dashboard/scan-stats` — `{leaguesActive, fixturesUpcoming, marketsPerFixture, lineMovementsToday, budgetUsedToday, budgetCap}`
 - `GET /api/dashboard/line-movements` — Last 50 significant line movements with direction and hours to KO
+- `GET /api/dashboard/oddspapi-budget` — `{todayCount, monthCount, dailyCap (effective), monthlyCap, enabled}` — uses effective cap from DB override, not hardcoded 150
+- `POST /api/admin/void-banned-bets` — Voids all pending bets on banned markets, refunds stake to bankroll. Idempotent.
+- `POST /api/oddspapi/bulk-prefetch` — Triggers dedicated bulk prefetch. Body: `{windowDays: 1-14, maxFetches: 1-150}`. Stores Pinnacle odds in DB cache.
+- `GET /api/oddspapi/coverage-report` — Per-league Pinnacle fixture coverage for next 7 days: `{totalUpcoming, totalMapped, overallCoveragePct, perLeague[]}`
+- `POST /api/oddspapi/map-fixtures` — Re-runs fixture mapping with extended 7-day window + improved fuzzy matching. Returns `{total, mapped, newMappings, unmatchedDb, unmatchedOp, perLeague}`
 
 ## xG Intelligence Layer
 

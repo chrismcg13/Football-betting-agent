@@ -18,6 +18,8 @@ import {
   getOddspapiFixtureId,
   getOddspapiValidation,
   prefetchAndStoreOddsPapiOdds,
+  loadOddsPapiCacheFromSnapshots,
+  runDedicatedBulkPrefetch,
   buildPinnacleValidationFromApiFootball,
   fetchAndStoreClosingLineForPendingBets,
   type OddsPapiValidationCache,
@@ -179,11 +181,11 @@ export async function runTradingCycle(): Promise<{
     const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);
     const latest   = new Date(now.getTime() + 168 * 60 * 60 * 1000);
 
-    // 5a. Pre-fetch OddsPapi Match Odds for mapped matches into odds_snapshots
-    //     so value detection treats those as real (not synthetic) odds
-    // Pinnacle upgrade: maxFetches=80 covers ~40 fixtures × 2 market types each
+    // 5a. Load pre-fetched OddsPapi odds from DB snapshots (no API calls here).
+    //     The scheduled 6am bulk prefetch and 12pm midday refresh populate the DB.
+    //     Only cache misses in step 6 will trigger on-demand API calls (max 20/cycle).
     const [oddsPapiCacheRaw, afPinnacleCache] = await Promise.all([
-      prefetchAndStoreOddsPapiOdds(earliest, latest, 80),
+      loadOddsPapiCacheFromSnapshots(earliest, latest),
       // Build Pinnacle validation cache from API-Football's own Pinnacle bookmaker data.
       // This is our primary source of real Pinnacle odds — API-Football includes Pinnacle
       // as one of its bookmakers, so we already have these odds in odds_snapshots.
@@ -255,9 +257,10 @@ export async function runTradingCycle(): Promise<{
 
     type OddsValidation = Awaited<ReturnType<typeof getOddspapiValidation>>;
 
-    // Pinnacle upgrade: validate ALL candidates sequentially (not parallel) to
-    // respect OddsPapi's 1 req/s rate limit. Cache hits (from pre-fetch) are free.
-    // Only cache misses trigger API calls, each gated by canMakeOddspapiRequest().
+    // Validate all candidates. Cache hits (from scheduled bulk prefetch) are free.
+    // Only cache misses trigger on-demand API calls, capped at 20/cycle to stay
+    // within our daily budget. Bulk prefetch crons (6am/12pm) cover the rest.
+    const MAX_ONDEMAND_PER_CYCLE = 20;
     const enhancedCandidates: Array<{ bet: typeof rankedForOddsPapi[number]; validation: OddsValidation | null; effectiveScore: number }> = [];
     let apiCallsThisCycle = 0;
 
@@ -290,7 +293,7 @@ export async function runTradingCycle(): Promise<{
           }
         }
 
-        if (!validation) {
+        if (!validation && apiCallsThisCycle < MAX_ONDEMAND_PER_CYCLE) {
           const oddspapiId = await getOddspapiFixtureId(bet.matchId);
           if (oddspapiId) {
             // Rate-limit guard: 1.2s between API calls to avoid 429s
@@ -731,6 +734,28 @@ export function startScheduler(): void {
     void safeRunOddspapiMapping();
   }, { timezone: "UTC" });
   logger.info("OddsPapi fixture mapping scheduler active — daily at 06:05 UTC");
+
+  // OddsPapi morning bulk prefetch: daily at 06:10 UTC
+  // Fetches 7 days of Pinnacle odds for all mapped fixtures (≤ 80 API calls).
+  // This is the main budget allocation — populates the DB snapshot cache for the day.
+  cron.schedule("10 6 * * *", () => {
+    logger.info("Morning OddsPapi bulk prefetch triggered (7-day window, 80 req max)");
+    void runDedicatedBulkPrefetch(7, 80)
+      .then((r) => logger.info(r, "Morning OddsPapi bulk prefetch complete"))
+      .catch((err) => logger.error({ err }, "Morning OddsPapi bulk prefetch failed"));
+  }, { timezone: "UTC" });
+  logger.info("Morning OddsPapi bulk prefetch scheduler active — daily at 06:10 UTC (80 req max)");
+
+  // OddsPapi midday refresh: daily at 12:00 UTC
+  // Refreshes odds for fixtures kicking off in the next 48h (live line movement).
+  // Capped at 30 requests to stay well within daily budget.
+  cron.schedule("0 12 * * *", () => {
+    logger.info("Midday OddsPapi refresh triggered (2-day window, 30 req max)");
+    void runDedicatedBulkPrefetch(2, 30)
+      .then((r) => logger.info(r, "Midday OddsPapi refresh complete"))
+      .catch((err) => logger.warn({ err }, "Midday OddsPapi refresh failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Midday OddsPapi refresh scheduler active — daily at 12:00 UTC (30 req max)");
 
   // OddsPapi budget summary: daily at 00:01 UTC
   cron.schedule("1 0 * * *", () => {
