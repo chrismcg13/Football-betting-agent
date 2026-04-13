@@ -84,10 +84,10 @@ const NEW_MARKET_TYPES = new Set(["TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_COR
 
 function kellyFractionForScore(opportunityScore: number, marketType?: string): number {
   let fraction: number;
-  if (opportunityScore >= 88) fraction = 0.5;
-  else if (opportunityScore >= 80) fraction = 0.375;
-  else if (opportunityScore >= 72) fraction = 0.25;
-  else fraction = 0.125; // 65-72
+  if (opportunityScore >= 80) fraction = 0.50;       // high confidence
+  else if (opportunityScore >= 72) fraction = 0.375; // confident
+  else if (opportunityScore >= 65) fraction = 0.25;  // standard
+  else fraction = 0.125;                             // conservative (58-65)
   // 0.7x multiplier for new unproven market types
   if (marketType && NEW_MARKET_TYPES.has(marketType)) fraction *= 0.7;
   return fraction;
@@ -237,20 +237,24 @@ export async function placePaperBet(
   }
 
   // ── Exposure-based risk gate ─────────────────────────────────────────────
-  // In paper_mode this check is skipped to maximise data collection speed.
-  // When paper_mode=false it reinstates automatically for live trading.
-  const paperMode = (await getConfigValue("paper_mode")) === "true";
-  if (!paperMode) {
+  // Applied in all modes (paper and live). Limits total unsettled exposure to
+  // max_unsettled_exposure_pct of current bankroll (default 40%).
+  let exposureAtPlacement: { current: number; max: number; pct: number } = { current: 0, max: 0, pct: 0 };
+  {
     const maxExposurePct = Number(
-      (await getConfigValue("max_exposure_pct")) ?? "0.20",
+      (await getConfigValue("max_unsettled_exposure_pct")) ?? "0.40",
     );
     const currentExposure = await getTotalPendingExposure();
     const maxExposure = bankroll * maxExposurePct;
     if (currentExposure + stake > maxExposure) {
+      const matchLabel = `${matchId}`;
       return logReject(
-        `Exposure limit breached: current £${currentExposure.toFixed(2)} + new stake £${stake.toFixed(2)} = £${(currentExposure + stake).toFixed(2)} would exceed ${(maxExposurePct * 100).toFixed(0)}% of bankroll £${maxExposure.toFixed(2)}`,
+        `Exposure limit reached (£${(currentExposure + stake).toFixed(0)}/£${maxExposure.toFixed(0)}). Skipping bet on match ${matchLabel} to protect bankroll.`,
       );
     }
+
+    // Capture exposure snapshot for compliance log below
+    exposureAtPlacement = { current: currentExposure, max: maxExposure, pct: Math.round((currentExposure / maxExposure) * 1000) / 10 };
   }
 
   const potentialProfit =
@@ -304,6 +308,11 @@ export async function placePaperBet(
       kellyFraction,
       dynamicKellyFraction: kellyFraction,
       modelVersion,
+      exposureAtPlacement: {
+        currentExposure: Math.round(exposureAtPlacement.current * 100) / 100,
+        maxExposure: Math.round(exposureAtPlacement.max * 100) / 100,
+        exposurePct: exposureAtPlacement.pct,
+      },
     },
     timestamp: new Date(),
   });

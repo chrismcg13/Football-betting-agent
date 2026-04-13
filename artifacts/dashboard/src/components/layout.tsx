@@ -54,6 +54,12 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const bankroll = summary?.currentBankroll ?? 0;
   const todayPnl = summary?.todayPnl ?? 0;
   const roi = summary?.overallRoiPct ?? 0;
+  const pendingExposure = (summary as any)?.pendingExposure ?? 0;
+  const maxExposure = (summary as any)?.maxExposure ?? 0;
+  const exposurePct = (summary as any)?.exposurePct ?? 0;
+  // exposurePct is (unsettled / maxExposure)*100. maxExposure = 40% of bankroll.
+  // Green <25% bankroll (=62.5% of cap), amber 25-35% (=62.5-87.5%), red 35-40% (=87.5-100%)
+  const exposureColor = exposurePct >= 87.5 ? "#ef4444" : exposurePct >= 62.5 ? "#f59e0b" : "#10b981";
 
   return (
     <div className="min-h-screen flex flex-col md:flex-row" style={{ background: "#0f172a" }}>
@@ -87,6 +93,33 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 {pnl >= 0 ? "+" : ""}{formatCurrency(pnl)} total P&amp;L
               </p>
             )}
+          </div>
+        </div>
+
+        {/* Exposure pill */}
+        <div className="px-4 py-2.5 border-b" style={{ borderColor: "#334155" }}>
+          <div className="flex items-center gap-2">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-[9px] uppercase tracking-wider font-semibold" style={{ color: exposureColor }}>Exposure</p>
+                <p className="text-[10px] font-mono" style={{ color: exposureColor }}>
+                  {summary ? `${exposurePct.toFixed(0)}%` : "—"}
+                </p>
+              </div>
+              <div className="w-full rounded-full h-1.5 bg-slate-800">
+                <div
+                  className="h-1.5 rounded-full transition-all"
+                  style={{ width: `${Math.min(100, exposurePct)}%`, background: exposureColor }}
+                />
+              </div>
+              <p className="text-[9px] font-mono mt-1" style={{ color: exposurePct >= 100 ? "#ef4444" : "#64748b" }}>
+                {summary
+                  ? exposurePct >= 100
+                    ? "Exposure limit reached — waiting for bets to settle"
+                    : `£${pendingExposure.toLocaleString("en-GB", { maximumFractionDigits: 0 })} / £${maxExposure.toLocaleString("en-GB", { maximumFractionDigits: 0 })} unsettled`
+                  : "—"}
+              </p>
+            </div>
           </div>
         </div>
 
