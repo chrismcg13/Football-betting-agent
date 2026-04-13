@@ -77,15 +77,10 @@ async function bootstrapDataIfEmpty(): Promise<void> {
       await runFeaturesNow();
       logger.info("Initial data bootstrap complete");
     } else {
-      // DB has data — still run features on startup so upcoming matches have fresh
-      // feature vectors available for the trading cycle
-      logger.info({ matchCount }, "Database has data — running startup feature computation for upcoming matches");
-      try {
-        await runFeaturesNow();
-        logger.info("Startup feature computation complete");
-      } catch (featureErr) {
-        logger.warn({ err: featureErr }, "Startup feature computation failed — will retry on next scheduled run");
-      }
+      logger.info({ matchCount }, "Database has data — queuing startup feature computation (non-blocking)");
+      void runFeaturesNow()
+        .then((r) => logger.info(r, "Startup feature computation complete"))
+        .catch((featureErr) => logger.warn({ err: featureErr }, "Startup feature computation failed — will retry on next scheduled run"));
     }
   } catch (err) {
     logger.warn({ err }, "Initial data bootstrap failed — will retry on first scheduled run");
@@ -224,14 +219,8 @@ async function main() {
   startSettlementCron();
   logger.info("Settlement cron started (every 5 min, all environments)");
 
-  // All other crons (ingestion, trading, odds, learning) are production-only to
-  // prevent this dev environment from racing the production VM for API quota.
-  if (process.env["NODE_ENV"] === "production") {
-    startScheduler();
-    logger.info("Autonomous scheduler started (production mode)");
-  } else {
-    logger.info("Expensive schedulers DISABLED in development — use manual API triggers (/api/trading/run, /api/ingestion/run, etc.)");
-  }
+  startScheduler();
+  logger.info("Autonomous scheduler started");
 
   // 5. Load or bootstrap the ML model
   const modelLoaded = await loadLatestModel();

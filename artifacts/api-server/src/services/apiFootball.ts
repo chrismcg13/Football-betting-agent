@@ -15,7 +15,7 @@ import {
   oddsHistoryTable,
   discoveredLeaguesTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, desc, sql, ne } from "drizzle-orm";
+import { eq, and, gte, lte, desc, sql, ne, like } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://v3.football.api-sports.io";
@@ -634,6 +634,7 @@ export async function fetchAndStoreOddsForFixture(
   kickoffTime?: Date,
 ): Promise<number> {
   // Check if we already have fresh odds (< 2 hours old)
+  // Source format is "api_football_real:BookmakerName", so use LIKE prefix match
   const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
   const existingReal = await db
     .select({ id: oddsSnapshotsTable.id })
@@ -641,7 +642,7 @@ export async function fetchAndStoreOddsForFixture(
     .where(
       and(
         eq(oddsSnapshotsTable.matchId, matchId),
-        eq(oddsSnapshotsTable.source, "api_football_real"),
+        like(oddsSnapshotsTable.source, "api_football_real%"),
         gte(oddsSnapshotsTable.snapshotTime, twoHoursAgo),
       ),
     )

@@ -1,5 +1,5 @@
 import { db, matchesTable, featuresTable } from "@workspace/db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc, ne, or, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
   getStandings,
@@ -462,6 +462,149 @@ export async function computeFeaturesForMatch(
   logger.info({ matchId, featureCount: features.length }, "Features saved");
 }
 
+async function getDbTeamMatches(teamName: string, limit: number): Promise<FDMatch[]> {
+  const rows = await db
+    .select()
+    .from(matchesTable)
+    .where(
+      and(
+        eq(matchesTable.status, "finished"),
+        or(
+          eq(matchesTable.homeTeam, teamName),
+          eq(matchesTable.awayTeam, teamName),
+        ),
+      ),
+    )
+    .orderBy(desc(matchesTable.kickoffTime))
+    .limit(limit);
+
+  return rows.map((r) => ({
+    utcDate: r.kickoffTime.toISOString(),
+    homeTeam: { id: r.homeTeam === teamName ? 1 : 2, name: r.homeTeam },
+    awayTeam: { id: r.awayTeam === teamName ? 2 : 1, name: r.awayTeam },
+    score: {
+      winner:
+        r.homeScore === null || r.awayScore === null
+          ? null
+          : r.homeScore > r.awayScore
+            ? "HOME_TEAM"
+            : r.homeScore < r.awayScore
+              ? "AWAY_TEAM"
+              : "DRAW",
+      fullTime: { home: r.homeScore, away: r.awayScore },
+    },
+  })) as FDMatch[];
+}
+
+async function computeFeaturesFromDb(
+  matchId: number,
+  homeTeam: string,
+  awayTeam: string,
+  league: string,
+): Promise<void> {
+  logger.info({ matchId, homeTeam, awayTeam }, "Computing features from DB history");
+
+  const homeTeamId = 1;
+  const awayTeamId = 2;
+
+  const homeMatches = await getDbTeamMatches(homeTeam, 20);
+  const awayMatches = await getDbTeamMatches(awayTeam, 20);
+
+  const homeForm5 = computeForm(homeMatches, homeTeamId, "home", 5);
+  const awayForm5 = computeForm(awayMatches, awayTeamId, "away", 5);
+
+  const homeGoals = computeGoalAverages(homeMatches, homeTeamId, "home", 10);
+  const awayGoals = computeGoalAverages(awayMatches, awayTeamId, "away", 10);
+
+  const homeBtts = computeBttsRate(homeMatches, homeTeamId, "home", 10);
+  const awayBtts = computeBttsRate(awayMatches, awayTeamId, "away", 10);
+
+  const homeOver25 = computeOver25Rate(homeMatches, homeTeamId, "home", 10);
+  const awayOver25 = computeOver25Rate(awayMatches, awayTeamId, "away", 10);
+
+  const h2hHomeWinRate = 0.4;
+
+  const homeCleanSheets = computeCleanSheetRate(homeMatches, homeTeamId, "home", 5);
+  const awayCleanSheets = computeCleanSheetRate(awayMatches, awayTeamId, "away", 5);
+
+  const homePointsTraj = computePointsTrajectory(homeMatches, homeTeamId, 10);
+  const awayPointsTraj = computePointsTrajectory(awayMatches, awayTeamId, 10);
+
+  const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
+  const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
+
+  const homeXg = computeXgProxy(homeMatches, homeTeamId, "home", 10);
+  const awayXg = computeXgProxy(awayMatches, awayTeamId, "away", 10);
+  const xgDiff = homeXg - awayXg;
+
+  const storedFeatures = await db
+    .select({ featureName: featuresTable.featureName, featureValue: featuresTable.featureValue })
+    .from(featuresTable)
+    .where(eq(featuresTable.matchId, matchId));
+
+  const stored: Record<string, number> = {};
+  for (const f of storedFeatures) {
+    stored[f.featureName] = Number(f.featureValue);
+  }
+
+  const homeYellowCards = stored["home_yellow_cards_avg"] ?? 1.8;
+  const awayYellowCards = stored["away_yellow_cards_avg"] ?? 1.6;
+  const combinedCardsPrediction = homeYellowCards + awayYellowCards;
+  const homeShotsOnTargetAvg = stored["home_shots_on_target_avg"] ?? (homeXg * 5);
+  const awayShotsOnTargetAvg = stored["away_shots_on_target_avg"] ?? (awayXg * 5);
+  const homeConversionRate = homeShotsOnTargetAvg > 0 ? homeGoals.scored / homeShotsOnTargetAvg : 0.2;
+  const awayConversionRate = awayShotsOnTargetAvg > 0 ? awayGoals.scored / awayShotsOnTargetAvg : 0.2;
+  const homeCornersAvg = stored["home_corners_avg"] ?? Math.round(homeXg * 3.5 * 10) / 10;
+  const awayCornersAvg = stored["away_corners_avg"] ?? Math.round(awayXg * 3.0 * 10) / 10;
+  const combinedCornersPrediction = homeCornersAvg + awayCornersAvg;
+  const homeGoalMomentum = 0.5 + homePointsTraj * 2;
+  const awayGoalMomentum = 0.5 + awayPointsTraj * 2;
+
+  const leaguePositionDiff = 0;
+
+  const features: Array<[string, number]> = [
+    ["home_form_last5", homeForm5],
+    ["away_form_last5", awayForm5],
+    ["home_goals_scored_avg", homeGoals.scored],
+    ["home_goals_conceded_avg", homeGoals.conceded],
+    ["away_goals_scored_avg", awayGoals.scored],
+    ["away_goals_conceded_avg", awayGoals.conceded],
+    ["h2h_home_win_rate", h2hHomeWinRate],
+    ["league_position_diff", leaguePositionDiff],
+    ["home_btts_rate", homeBtts],
+    ["away_btts_rate", awayBtts],
+    ["home_over25_rate", homeOver25],
+    ["away_over25_rate", awayOver25],
+    ["home_clean_sheet_rate", homeCleanSheets],
+    ["away_clean_sheet_rate", awayCleanSheets],
+    ["home_points_trajectory", homePointsTraj],
+    ["away_points_trajectory", awayPointsTraj],
+    ["home_days_since_last_match", homeDaysSince],
+    ["away_days_since_last_match", awayDaysSince],
+    ["home_xg_proxy", homeXg],
+    ["away_xg_proxy", awayXg],
+    ["xg_diff", xgDiff],
+    ["home_yellow_cards_avg", homeYellowCards],
+    ["away_yellow_cards_avg", awayYellowCards],
+    ["combined_cards_prediction", combinedCardsPrediction],
+    ["home_shots_on_target_avg", homeShotsOnTargetAvg],
+    ["away_shots_on_target_avg", awayShotsOnTargetAvg],
+    ["home_shot_conversion_rate", Math.min(homeConversionRate, 1)],
+    ["away_shot_conversion_rate", Math.min(awayConversionRate, 1)],
+    ["home_corners_avg", homeCornersAvg],
+    ["away_corners_avg", awayCornersAvg],
+    ["combined_corners_prediction", combinedCornersPrediction],
+    ["home_goals_last3_vs_last10", Math.max(0, homeGoalMomentum)],
+    ["away_goals_last3_vs_last10", Math.max(0, awayGoalMomentum)],
+  ];
+
+  for (const [name, value] of features) {
+    await upsertFeature(matchId, name, value);
+  }
+
+  logger.info({ matchId, featureCount: features.length }, "Features saved (DB-backed)");
+}
+
 export async function runFeatureEngineForUpcomingMatches(): Promise<{
   processed: number;
   skipped: number;
@@ -484,49 +627,102 @@ export async function runFeatureEngineForUpcomingMatches(): Promise<{
   let skipped = 0;
   let failed = 0;
 
+  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+
   for (const match of upcomingMatches) {
-    if (!match.betfairEventId?.startsWith("fd_")) {
+    const existingFeature = await db
+      .select({ computedAt: featuresTable.computedAt })
+      .from(featuresTable)
+      .where(
+        and(
+          eq(featuresTable.matchId, match.id),
+          eq(featuresTable.featureName, "home_form_last5"),
+        ),
+      )
+      .limit(1);
+
+    if (existingFeature.length > 0 && existingFeature[0]!.computedAt > sixHoursAgo) {
       skipped++;
       continue;
     }
 
-    const fdMatchId = parseInt(
-      match.betfairEventId.replace("fd_", ""),
-      10,
-    );
-    if (isNaN(fdMatchId)) {
-      skipped++;
-      continue;
-    }
-
-    const homeTeamId = await getStoredTeamId(match.id, "_home_team_id");
-    const awayTeamId = await getStoredTeamId(match.id, "_away_team_id");
-
-    if (!homeTeamId || !awayTeamId) {
-      logger.debug(
-        { matchId: match.id },
-        "Team IDs not yet stored — run ingestion first",
+    if (match.betfairEventId?.startsWith("af_")) {
+      try {
+        await computeFeaturesFromDb(
+          match.id,
+          match.homeTeam,
+          match.awayTeam,
+          match.league,
+        );
+        processed++;
+      } catch (err) {
+        logger.error(
+          { err, matchId: match.id, homeTeam: match.homeTeam, awayTeam: match.awayTeam },
+          "Feature computation (DB-backed) failed for match",
+        );
+        failed++;
+      }
+    } else if (match.betfairEventId?.startsWith("fd_")) {
+      const fdMatchId = parseInt(
+        match.betfairEventId.replace("fd_", ""),
+        10,
       );
-      skipped++;
-      continue;
-    }
+      if (isNaN(fdMatchId)) {
+        skipped++;
+        continue;
+      }
 
-    try {
-      await computeFeaturesForMatch(
-        match.id,
-        homeTeamId,
-        awayTeamId,
-        match.league,
-        fdMatchId,
-        standingsCache,
-      );
-      processed++;
-    } catch (err) {
-      logger.error(
-        { err, matchId: match.id, homeTeam: match.homeTeam, awayTeam: match.awayTeam },
-        "Feature computation failed for match",
-      );
-      failed++;
+      const homeTeamId = await getStoredTeamId(match.id, "_home_team_id");
+      const awayTeamId = await getStoredTeamId(match.id, "_away_team_id");
+
+      if (!homeTeamId || !awayTeamId) {
+        try {
+          await computeFeaturesFromDb(
+            match.id,
+            match.homeTeam,
+            match.awayTeam,
+            match.league,
+          );
+          processed++;
+        } catch (err) {
+          logger.error(
+            { err, matchId: match.id },
+            "Feature computation (DB fallback for fd_) failed",
+          );
+          failed++;
+        }
+        continue;
+      }
+
+      try {
+        await computeFeaturesForMatch(
+          match.id,
+          homeTeamId,
+          awayTeamId,
+          match.league,
+          fdMatchId,
+          standingsCache,
+        );
+        processed++;
+      } catch (err) {
+        logger.error(
+          { err, matchId: match.id, homeTeam: match.homeTeam, awayTeam: match.awayTeam },
+          "Feature computation failed for match",
+        );
+        failed++;
+      }
+    } else {
+      try {
+        await computeFeaturesFromDb(
+          match.id,
+          match.homeTeam,
+          match.awayTeam,
+          match.league,
+        );
+        processed++;
+      } catch (err) {
+        skipped++;
+      }
     }
   }
 
