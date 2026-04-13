@@ -32,7 +32,9 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use((_req: Request, res: Response, next: NextFunction) => {
+// No-cache for API responses only — do NOT apply globally or it overrides
+// the static asset cache headers on the dashboard.
+app.use("/api", (_req: Request, res: Response, next: NextFunction) => {
   res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
@@ -54,10 +56,27 @@ app.use("/api", router);
 const _serverDir = path.dirname(fileURLToPath(import.meta.url));
 const dashboardPublicDir = path.resolve(_serverDir, "../../..", "artifacts/dashboard/dist/public");
 if (fs.existsSync(dashboardPublicDir)) {
-  app.use("/dashboard", express.static(dashboardPublicDir));
+  // Serve hashed assets (JS/CSS) with long-lived immutable cache — filenames
+  // change on every build so stale cache is never an issue.
+  app.use("/dashboard/assets", express.static(path.join(dashboardPublicDir, "assets"), {
+    maxAge: "1y",
+    immutable: true,
+  }));
+
+  // Serve all other static files (favicon, opengraph, etc.) with short cache.
+  // index:false prevents express.static from auto-serving index.html — the SPA
+  // fallback below handles that with explicit no-cache headers instead.
+  app.use("/dashboard", express.static(dashboardPublicDir, { maxAge: "1m", index: false }));
+
+  // SPA fallback — always serve index.html with no-cache so browsers never
+  // serve a stale entry point pointing to old hashed asset filenames.
   app.get(/^\/dashboard(\/.*)?$/, (_req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
     res.sendFile(path.join(dashboardPublicDir, "index.html"));
   });
+
   logger.info({ dir: dashboardPublicDir }, "Dashboard static files registered");
 } else {
   logger.warn({ dir: dashboardPublicDir }, "Dashboard dist not found — dashboard will not be served (run dashboard build first)");
