@@ -235,13 +235,18 @@ Computes 17 ML features per upcoming match:
 
 ## League Coverage (ALL_LEAGUE_IDS in apiFootball.ts)
 
-34 leagues tracked across 4 tiers:
+39 leagues tracked across 5 tiers:
 - **Tier 1**: PL, Bundesliga, La Liga, Serie A, Ligue 1, Eredivisie, Primeira Liga, Série A (Brazil), Championship, UCL, UEL
-- **Tier 2**: Ligue 2, 2. Bundesliga, Serie B, Segunda División
-- **Tier 3**: Scottish Prem, Belgian Pro, Swiss Super, Austrian BL, Danish Superliga, Eliteserien, Allsvenskan, Süper Lig, Super League Greece
+- **Tier 2**: Ligue 2, 2. Bundesliga, Serie B, Segunda División, EFL League One (41), EFL League Two (42)
+- **Tier 3**: Scottish Prem, Belgian Pro, Swiss Super, Austrian BL, Danish Superliga, Eliteserien, Allsvenskan, Süper Lig, Super League Greece, Ukrainian Premier League (333)
 - **Tier 4** (Pinnacle-covered additions): J1 League, A-League Men, Ekstraklasa, Czech First League, Liga I (Romania), HNL (Croatia), MLS, Liga BetPlay (Colombia), Conference League
+- **Tier 5** (emerging/covered): Saudi Pro League (307), South Africa PSL (288)
 
-AUG_MAY_LEAGUES season logic: European/Australian leagues use `currentYear - 1` if month < July. South American/Asian leagues use `currentYear`.
+AUG_MAY_LEAGUES season logic: European/Australian/Saudi/South African leagues use `currentYear - 1` if month < July. South American/Asian leagues use `currentYear`.
+
+## Discovery Bonus (valueDetection.ts)
+
+For leagues with <10 total bets, a discovery bonus of `(10 - betCount) × 3` is added to the opportunity score (max +30 pts). This helps the system place initial bets in new leagues to start collecting settlement data. Discovery leagues: EFL League One, EFL League Two, South Africa PSL, Saudi Pro League, Ukrainian Premier League, CONMEBOL Libertadores, Europa League, Norwegian Eliteserien. The bonus auto-decays as bets accumulate.
 
 ## League Edge Scores (src/services/valueDetection.ts)
 

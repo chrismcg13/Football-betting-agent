@@ -69,10 +69,13 @@ export const LEAGUE_IDS: Record<string, number> = {
 export const ALL_LEAGUE_IDS: number[] = [
   // Tier 1 (Top 5 + UEFA)
   39, 78, 140, 135, 61, 88, 94, 71, 40, 2, 3,
-  // Tier 2 (second divisions)
+  // Tier 2 (second divisions + English lower)
   62, 79, 136, 141,
+  41,   // EFL League One (England)
+  42,   // EFL League Two (England)
   // Tier 3 (European top flights)
   179, 144, 207, 218, 119, 103, 113, 203, 197,
+  333,  // Ukrainian Premier League
   // Tier 4 (additional Pinnacle-covered leagues)
   98,   // J1 League (Japan)
   188,  // A-League Men (Australia)
@@ -83,6 +86,9 @@ export const ALL_LEAGUE_IDS: number[] = [
   253,  // MLS (USA)
   262,  // Liga BetPlay (Colombia)
   4,    // UEFA Conference League
+  // Tier 5 (emerging/covered)
+  307,  // Saudi Pro League
+  288,  // South Africa PSL
 ];
 
 // Second-division leagues — higher edge, no OddsPapi (not covered)
@@ -1094,6 +1100,10 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
     283, // Romanian Liga I (Jul-May)
     210, // Croatian HNL (Jul-May)
     188, // A-League Men (Oct-May)
+    41, 42, // League One, League Two (Aug-May)
+    333, // Ukrainian Premier League (Jul-May)
+    307, // Saudi Pro League (Aug-May)
+    288, // South Africa PSL (Aug-May)
   ]);
 
   function getSeasonForLeague(leagueId: number): number {

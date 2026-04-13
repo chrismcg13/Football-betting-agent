@@ -57,6 +57,11 @@ const KNOWN_PINNACLE_LEAGUE_IDS = new Set([
   62,   // Ligue 2
   79,   // 2. Bundesliga
   141,  // Segunda División
+  41,   // EFL League One
+  42,   // EFL League Two
+  333,  // Ukrainian Premier League
+  307,  // Saudi Pro League
+  288,  // South Africa PSL
 ]);
 
 // ─── Tier classification ──────────────────────────────────────────────────────

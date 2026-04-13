@@ -280,6 +280,38 @@ function computeOpportunityScore(params: {
   return score;
 }
 
+const DISCOVERY_LEAGUES = new Set([
+  "EFL League One", "EFL League Two",
+  "South Africa PSL", "Saudi Pro League", "Ukrainian Premier League",
+  "CONMEBOL Libertadores", "Europa League", "Norwegian Eliteserien",
+]);
+
+const discoveryBetCounts: Map<string, number> = new Map();
+let discoveryCountsLoaded = false;
+
+async function getDiscoveryBonus(league: string): Promise<number> {
+  if (!DISCOVERY_LEAGUES.has(league)) return 0;
+
+  if (!discoveryCountsLoaded) {
+    const rows = await db
+      .select({ league: matchesTable.league, cnt: sql<number>`count(*)` })
+      .from(paperBetsTable)
+      .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+      .where(sql`${matchesTable.league} IN (${sql.join(
+        [...DISCOVERY_LEAGUES].map(l => sql`${l}`), sql`, `
+      )})`)
+      .groupBy(matchesTable.league);
+    for (const r of rows) {
+      discoveryBetCounts.set(r.league, Number(r.cnt));
+    }
+    discoveryCountsLoaded = true;
+  }
+
+  const count = discoveryBetCounts.get(league) ?? 0;
+  if (count >= 10) return 0;
+  return Math.round((10 - count) * 3);
+}
+
 // ─── Synthetic odds generator (fallback only — capped at score 55) ────────────
 
 interface SyntheticOddsRow {
@@ -625,6 +657,8 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
   const hotMinBets = Number(cfg.hot_streak_min_bets_per_week ?? "5");
   const hotBonus = Number(cfg.hot_streak_bonus ?? "15");
 
+  discoveryCountsLoaded = false;
+
   const matches = await db
     .select()
     .from(matchesTable)
@@ -723,12 +757,13 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
 
       const streakBonus = await getHotStreakBonus(match.league, oddsRow.marketType, hotWeeks, hotMinBets, hotBonus);
       const leagueEdgeScore = await getLeagueEdgeScore(match.league ?? "");
+      const discoveryBonus = await getDiscoveryBonus(match.league ?? "");
 
       // Pull market spread features (computed from all-bookmaker odds)
       const marketSpread = featureMap["avg_market_spread"] ?? featureMap["market_spread_home"] ?? undefined;
       const bookmakerCount = featureMap["bookmaker_count_home"] ? Math.round(featureMap["bookmaker_count_home"]) : undefined;
 
-      const opportunityScore = computeOpportunityScore({
+      const baseOpportunityScore = computeOpportunityScore({
         edge,
         modelProbability: modelProb,
         backOdds,
@@ -739,6 +774,10 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         marketSpread,
         bookmakerCount,
       });
+      const opportunityScore = Math.min(baseOpportunityScore + discoveryBonus, 100);
+      if (discoveryBonus > 0) {
+        logger.info({ matchId: match.id, league: match.league, marketType: oddsRow.marketType, baseScore: baseOpportunityScore, discoveryBonus, finalScore: opportunityScore }, "Discovery bonus applied");
+      }
 
       // Both real and synthetic odds must meet the configured min_opportunity_score floor
       const effectiveMinScore = minOppScore;
