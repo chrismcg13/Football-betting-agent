@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { useModel, useNarratives } from "@/hooks/use-dashboard";
+import { useModel, useNarratives, useDiscoveredLeagues, useLeagueDiscoveryStats } from "@/hooks/use-dashboard";
 import { formatRelativeTime } from "@/lib/format";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -8,7 +8,7 @@ import {
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import {
-  Activity, AlertTriangle, Brain, Target, TrendingDown, TrendingUp, Zap,
+  Activity, AlertTriangle, Brain, Globe, Target, TrendingDown, TrendingUp, Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -402,10 +402,48 @@ const TYPE_OPTIONS = [
   { value: "model_retrain", label: "Model Retrained" },
 ];
 
+// ─── League status badge ──────────────────────────────────────────────────────
+
+function LeagueStatusBadge({ status, hasPinnacle }: { status: string; hasPinnacle: boolean }) {
+  if (status === "active") {
+    return (
+      <span className={cn(
+        "text-[10px] font-semibold px-2 py-0.5 rounded-full border",
+        hasPinnacle
+          ? "bg-violet-950 text-violet-400 border-violet-800"
+          : "bg-emerald-950 text-emerald-400 border-emerald-800",
+      )}>
+        {hasPinnacle ? "PINNACLE" : "ACTIVE"}
+      </span>
+    );
+  }
+  if (status === "monitoring") {
+    return <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-amber-950 text-amber-400 border-amber-800">MONITORING</span>;
+  }
+  return <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-slate-800 text-slate-500 border-slate-700">DISABLED</span>;
+}
+
+// ─── Tier label ───────────────────────────────────────────────────────────────
+
+const TIER_LABELS: Record<string, string> = {
+  top5: "Top 5 European",
+  top_division: "Top Division",
+  second_division: "Second Division",
+  scandinavia: "Scandinavia",
+  eastern_europe: "Eastern Europe",
+  south_america: "South America",
+  asia_pacific: "Asia-Pacific",
+  third_division: "Third Division",
+  unknown: "Other",
+};
+
 export default function Learning() {
   const [typeFilter, setTypeFilter] = useState("all");
+  const [leagueFilter, setLeagueFilter] = useState<"all" | "active" | "monitoring">("all");
   const { data: model, isLoading: modelLoading } = useModel();
   const { data: narrativesData, isLoading: narrativesLoading } = useNarratives();
+  const { data: discoveredLeagues, isLoading: leaguesLoading } = useDiscoveredLeagues();
+  const { data: discoveryStats } = useLeagueDiscoveryStats();
 
   const narratives = useMemo(() => {
     const all = (narrativesData?.narratives as any[]) ?? [];
@@ -449,6 +487,106 @@ export default function Learning() {
           {modelLoading ? <Skeleton className="h-52 w-full" /> : <AccuracyChart model={model} />}
           <p className="text-xs text-slate-600 mt-2">Solid blue = accuracy · dashed purple = calibration</p>
         </div>
+      </div>
+
+      {/* League Discovery */}
+      <div
+        className="rounded-xl border p-5"
+        style={{ background: "#1e293b", borderColor: "#334155" }}
+      >
+        <div className="flex items-start justify-between gap-4 mb-4 flex-wrap">
+          <div>
+            <div className="flex items-center gap-2 mb-0.5">
+              <Globe className="h-4 w-4 text-violet-400" />
+              <h3 className="text-base font-semibold text-white">League Discovery</h3>
+            </div>
+            <p className="text-xs text-slate-500">
+              Global scan of all in-season leagues — auto-activating markets where we can find edge
+            </p>
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            {(["all", "active", "monitoring"] as const).map((f) => (
+              <button
+                key={f}
+                onClick={() => setLeagueFilter(f)}
+                className={cn(
+                  "px-3 py-1 rounded-full text-xs font-semibold border transition-colors",
+                  leagueFilter === f
+                    ? "bg-violet-600 border-violet-500 text-white"
+                    : "bg-transparent border-slate-700 text-slate-400 hover:text-white",
+                )}
+              >
+                {f === "all" ? "All" : f === "active" ? "Active" : "Monitoring"}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Stats row */}
+        {discoveryStats && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+            {[
+              { label: "Active", value: (discoveryStats as any).active, color: "text-emerald-400" },
+              { label: "With Pinnacle", value: (discoveryStats as any).withPinnacleOdds, color: "text-violet-400" },
+              { label: "Monitoring", value: (discoveryStats as any).monitoring, color: "text-amber-400" },
+              { label: "Total Found", value: (discoveryStats as any).totalDiscovered, color: "text-slate-300" },
+            ].map(({ label, value, color }) => (
+              <div key={label} className="rounded-lg border p-3" style={{ background: "#172033", borderColor: "#334155" }}>
+                <p className="text-[10px] uppercase tracking-widest text-slate-600 mb-1">{label}</p>
+                <p className={cn("text-xl font-bold font-mono", color)}>{value ?? "—"}</p>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* League table */}
+        {leaguesLoading ? (
+          <div className="space-y-2">
+            {[...Array(6)].map((_, i) => <Skeleton key={i} className="h-10 w-full rounded-lg" />)}
+          </div>
+        ) : !discoveredLeagues || (discoveredLeagues as any[]).length === 0 ? (
+          <div className="rounded-xl border p-8 text-center" style={{ background: "#172033", borderColor: "#334155" }}>
+            <Globe className="h-8 w-8 text-slate-600 mx-auto mb-3" />
+            <p className="text-sm text-slate-500">Run the league discovery scan to populate this list.</p>
+          </div>
+        ) : (
+          <div className="overflow-auto rounded-lg border" style={{ borderColor: "#334155" }}>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b" style={{ borderColor: "#334155", background: "#172033" }}>
+                  <th className="text-left px-4 py-2.5 text-slate-500 font-semibold">League</th>
+                  <th className="text-left px-3 py-2.5 text-slate-500 font-semibold hidden sm:table-cell">Country</th>
+                  <th className="text-left px-3 py-2.5 text-slate-500 font-semibold hidden md:table-cell">Tier</th>
+                  <th className="text-left px-3 py-2.5 text-slate-500 font-semibold">Status</th>
+                  <th className="text-right px-4 py-2.5 text-slate-500 font-semibold">Edge Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(discoveredLeagues as any[])
+                  .filter((l) => leagueFilter === "all" || l.status === leagueFilter)
+                  .map((l, i) => (
+                    <tr
+                      key={l.id}
+                      className="border-b transition-colors hover:bg-slate-800/40"
+                      style={{ borderColor: "#1e293b", background: i % 2 === 0 ? "transparent" : "rgba(15,23,42,0.3)" }}
+                    >
+                      <td className="px-4 py-2.5 font-medium text-white">{l.name}</td>
+                      <td className="px-3 py-2.5 text-slate-400 hidden sm:table-cell">{l.country || "—"}</td>
+                      <td className="px-3 py-2.5 text-slate-500 hidden md:table-cell">{TIER_LABELS[l.tier] ?? l.tier}</td>
+                      <td className="px-3 py-2.5">
+                        <LeagueStatusBadge status={l.status} hasPinnacle={l.hasPinnacleOdds} />
+                      </td>
+                      <td className="px-4 py-2.5 text-right font-mono font-semibold text-slate-300">{l.seedEdgeScore}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <p className="text-[10px] text-slate-600 mt-3">
+          Discovery scans weekly · Purple = Pinnacle-confirmed CLV · First 20 bets per new league at 0.7× Kelly
+        </p>
       </div>
 
       {/* Narrative Feed */}

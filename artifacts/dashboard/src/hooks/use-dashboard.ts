@@ -159,6 +159,22 @@ export const useXGTeams = () => {
   });
 };
 
+export const useDiscoveredLeagues = () => {
+  return useQuery({
+    queryKey: ["leagues", "discovered"],
+    queryFn: () => fetcher("/api/leagues/discovered"),
+    refetchInterval: 5 * 60 * 1000,
+  });
+};
+
+export const useLeagueDiscoveryStats = () => {
+  return useQuery({
+    queryKey: ["leagues", "discovery-stats"],
+    queryFn: () => fetcher("/api/leagues/discovery-stats"),
+    refetchInterval: 5 * 60 * 1000,
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

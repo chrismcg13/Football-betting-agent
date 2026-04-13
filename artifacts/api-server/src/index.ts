@@ -2,6 +2,7 @@ import app from "./app";
 import { logger } from "./lib/logger";
 import { runMigrations } from "./lib/migrate";
 import { startScheduler, startSettlementCron, runIngestionNow, runFeaturesNow } from "./services/scheduler";
+import { seedBaselineLeagues } from "./services/leagueDiscovery";
 import { loadLatestModel, bootstrapModels } from "./services/predictionEngine";
 import { db, complianceLogsTable, matchesTable, leagueEdgeScoresTable } from "@workspace/db";
 import { sql, count } from "drizzle-orm";
@@ -211,6 +212,11 @@ async function main() {
 
   // 3. Seed league edge scores for expanded league coverage
   await seedLeagueEdgeScores();
+
+  // 3b. Seed baseline leagues into discovered_leagues (idempotent, dev + prod)
+  void seedBaselineLeagues().catch((err) =>
+    logger.warn({ err }, "Baseline league seed failed — non-fatal"),
+  );
 
   // 4. Start schedulers
   // Settlement cron always runs (dev + prod) — it is a lightweight DB operation,

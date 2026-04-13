@@ -13,8 +13,9 @@ import {
   complianceLogsTable,
   apiUsageTable,
   oddsHistoryTable,
+  discoveredLeaguesTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, desc, sql } from "drizzle-orm";
+import { eq, and, gte, lte, desc, sql, ne } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://v3.football.api-sports.io";
@@ -1012,4 +1013,107 @@ export async function getScanStats(): Promise<{
     budgetUsedToday: budgetStatus.used,
     budgetCap: budgetStatus.cap,
   };
+}
+
+// ─── Ingest fixtures for all discovered active leagues ─────────────────────
+// Fetches upcoming fixtures (next 7 days) per discovered league from API-Football
+// and stores them in the matches table so the trading pipeline can evaluate them.
+
+export async function ingestFixturesForDiscoveredLeagues(): Promise<{
+  leaguesScanned: number;
+  fixturesInserted: number;
+  fixturesUpdated: number;
+}> {
+  // Fetch all active discovered leagues that have bookmaker odds
+  const activeLeagues = await db
+    .select({ leagueId: discoveredLeaguesTable.leagueId, name: discoveredLeaguesTable.name, country: discoveredLeaguesTable.country })
+    .from(discoveredLeaguesTable)
+    .where(and(eq(discoveredLeaguesTable.status, "active"), eq(discoveredLeaguesTable.hasApiFootballOdds, true)));
+
+  if (activeLeagues.length === 0) {
+    logger.info("No active discovered leagues to ingest fixtures for");
+    return { leaguesScanned: 0, fixturesInserted: 0, fixturesUpdated: 0 };
+  }
+
+  const season = new Date().getFullYear();
+  const today = new Date();
+  const in7Days = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const fromStr = today.toISOString().slice(0, 10);
+  const toStr = in7Days.toISOString().slice(0, 10);
+
+  let fixturesInserted = 0;
+  let fixturesUpdated = 0;
+  let leaguesScanned = 0;
+
+  for (const league of activeLeagues) {
+    if (!(await canMakeRequest(2))) {
+      logger.warn({ remaining: activeLeagues.length - leaguesScanned }, "Budget constraint — stopping fixture ingestion for discovered leagues");
+      break;
+    }
+
+    try {
+      const fixtures = await fetchApiFootball<ApiFixture[]>("/fixtures", {
+        league: league.leagueId,
+        season,
+        from: fromStr,
+        to: toStr,
+        status: "NS", // not started
+      });
+
+      if (!fixtures || fixtures.length === 0) {
+        leaguesScanned++;
+        continue;
+      }
+
+      await trackApiCall(`league_fixture_ingestion_${league.leagueId}`, 1);
+
+      for (const f of fixtures) {
+        const fixtureId = f.fixture?.id;
+        const homeTeamName = f.teams?.home?.name;
+        const awayTeamName = f.teams?.away?.name;
+        const kickoff = f.fixture?.date;
+
+        if (!fixtureId || !homeTeamName || !awayTeamName || !kickoff) continue;
+
+        const afKey = `af_${fixtureId}`;
+        const kickoffTime = new Date(kickoff);
+
+        // Skip fixtures that already started
+        if (kickoffTime <= new Date()) continue;
+
+        const existing = await db
+          .select({ id: matchesTable.id })
+          .from(matchesTable)
+          .where(eq(matchesTable.betfairEventId, afKey))
+          .limit(1);
+
+        if (existing.length === 0) {
+          await db.insert(matchesTable).values({
+            homeTeam: homeTeamName,
+            awayTeam: awayTeamName,
+            league: league.name,
+            country: league.country || f.league?.country || "Unknown",
+            kickoffTime,
+            status: "scheduled",
+            betfairEventId: afKey,
+          });
+          fixturesInserted++;
+        } else {
+          // Update status if needed
+          await db.update(matchesTable)
+            .set({ status: "scheduled" })
+            .where(eq(matchesTable.betfairEventId, afKey));
+          fixturesUpdated++;
+        }
+      }
+
+      leaguesScanned++;
+      await new Promise((r) => setTimeout(r, 200)); // Polite delay between leagues
+    } catch (err) {
+      logger.warn({ err, league: league.name }, "Fixture ingestion failed for league — skipping");
+    }
+  }
+
+  logger.info({ leaguesScanned, fixturesInserted, fixturesUpdated }, "Discovered league fixture ingestion complete");
+  return { leaguesScanned, fixturesInserted, fixturesUpdated };
 }

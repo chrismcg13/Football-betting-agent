@@ -38,7 +38,10 @@ import {
   getSchedulerStatus,
   runOddspapiMappingNow,
   runXGIngestionNow,
+  runLeagueDiscoveryNow,
+  runIngestDiscoveredFixturesNow,
 } from "../services/scheduler";
+import { getDiscoveredLeagues, getDiscoveryStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import {
   getOddspapiStatus,
@@ -1370,6 +1373,60 @@ router.get("/dashboard/line-movements", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "Line movements query failed");
     res.status(500).json({ error: "Failed to retrieve line movements" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/leagues/discovered — all discovered leagues with status
+// ─────────────────────────────────────────────
+router.get("/leagues/discovered", async (_req, res) => {
+  try {
+    const leagues = await getDiscoveredLeagues();
+    res.json(leagues);
+  } catch (err) {
+    logger.error({ err }, "Discovered leagues query failed");
+    res.status(500).json({ error: "Failed to retrieve discovered leagues" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/leagues/discovery-stats — summary stats for league discovery
+// ─────────────────────────────────────────────
+router.get("/leagues/discovery-stats", async (_req, res) => {
+  try {
+    const stats = await getDiscoveryStats();
+    res.json(stats);
+  } catch (err) {
+    logger.error({ err }, "Discovery stats query failed");
+    res.status(500).json({ error: "Failed to retrieve discovery stats" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/leagues/discovery/run — trigger league discovery now
+// ─────────────────────────────────────────────
+router.post("/leagues/discovery/run", async (_req, res) => {
+  try {
+    logger.info("Manual league discovery triggered via API");
+    const result = await runLeagueDiscoveryNow();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual league discovery failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/leagues/ingest-fixtures — ingest fixtures for all discovered active leagues
+// ─────────────────────────────────────────────
+router.post("/leagues/ingest-fixtures", async (_req, res) => {
+  try {
+    logger.info("Manual discovered-league fixture ingestion triggered via API");
+    const result = await runIngestDiscoveredFixturesNow();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual fixture ingestion failed");
+    res.status(500).json({ success: false, message: String(err) });
   }
 });
 

@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useSummary, useBets, useNarratives, usePerformance, useClvStats } from "@/hooks/use-dashboard";
+import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useLeagueDiscoveryStats } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
@@ -189,6 +189,7 @@ export default function Overview() {
   const { data: allBetsData, isLoading: loadingBets, isError: betsError } = useBets(1, 500, "all");
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
+  const { data: discoveryStats } = useLeagueDiscoveryStats();
 
   // ── Derived values ──────────────────────────────────────────────────────────
   const pnl = summary?.totalPnl ?? 0;
@@ -324,7 +325,7 @@ export default function Overview() {
       </div>
 
       {/* ── SECONDARY METRICS ───────────────────────────────────────────────── */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <SecondaryCard
           label="Bankroll"
           value={loadingSummary ? "—" : formatCurrency(bankroll)}
@@ -345,6 +346,16 @@ export default function Overview() {
               ? avgScore >= 80 ? "green" : avgScore >= 70 ? "amber" : "default"
               : "default"
           }
+        />
+        <SecondaryCard
+          label="Active Leagues"
+          value={discoveryStats ? `${(discoveryStats as any).active ?? "—"}` : "—"}
+          sub={
+            discoveryStats
+              ? `${(discoveryStats as any).withPinnacleOdds ?? 0} with Pinnacle · ${(discoveryStats as any).totalDiscovered ?? 0} total discovered`
+              : "Scanning globally for edge"
+          }
+          color={discoveryStats && (discoveryStats as any).active >= 30 ? "green" : "amber"}
         />
       </div>
 
