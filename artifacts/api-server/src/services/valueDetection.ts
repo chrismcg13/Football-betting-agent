@@ -740,9 +740,8 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         bookmakerCount,
       });
 
-      // Synthetic-odds bets are capped at 55 (below the 65 min score — effectively blocked)
-      // Real-odds bets must meet the configured min_opportunity_score (default 65)
-      const effectiveMinScore = isSynthetic ? 56 : minOppScore;
+      // Both real and synthetic odds must meet the configured min_opportunity_score floor
+      const effectiveMinScore = minOppScore;
       const decision = opportunityScore >= effectiveMinScore ? "value_bet" : "skip_low_score";
 
       await db.insert(complianceLogsTable).values({
