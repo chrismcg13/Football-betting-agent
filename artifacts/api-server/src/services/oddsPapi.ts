@@ -293,10 +293,14 @@ export async function runOddspapiFixtureMapping(): Promise<{
 
   logger.info({ from: todayDate, to: plusFour }, "Running OddsPapi fixture mapping");
 
+  // CRITICAL: filter hasOdds=true so we only match against fixtures that have
+  // bookmaker odds. Without this filter we get duplicate fixture stubs for top leagues
+  // that match team names but have hasOdds=false — causing us to miss the real fixture.
   const rawFixtures = await fetchOddsPapi<RawFixture[]>("/fixtures", {
     sportId: 10,
     from: todayDate,
     to: plusFour,
+    hasOdds: "true",
   }, "fixtures");
 
   if (!rawFixtures || !Array.isArray(rawFixtures)) {
@@ -378,16 +382,72 @@ export async function runOddspapiFixtureMapping(): Promise<{
 }
 
 // ─── OddsPapi odds response parsing ──────────────────────────────────────────
+//
+// Actual OddsPapi v4 /odds response (discovered by inspecting live data):
+//
+//   {
+//     fixtureId: "id...",
+//     hasOdds: true,
+//     bookmakerOdds: {                       ← OBJECT keyed by bookmaker slug
+//       "pinnacle": {
+//         bookmakerIsActive: true,
+//         suspended: false,
+//         markets: {                         ← OBJECT keyed by numeric market ID
+//           "101": {                         ← 1x2 Match Winner
+//             marketActive: true,
+//             outcomes: {                    ← OBJECT keyed by outcome ID
+//               "101": {
+//                 players: {
+//                   "0": {
+//                     bookmakerOutcomeId: "home",   ← "home"/"draw"/"away" for 1x2
+//                     price: 2.41,                  ← decimal odds
+//                     active: true,
+//                   }
+//                 }
+//               }
+//             }
+//           },
+//           "1010": { ... }                  ← O/U 2.5 goals; outcomeId = "2.5/over"
+//           "1012": { ... }                  ← O/U 3.5; outcomeId = "3.5/over"
+//           "10807": { ... }                 ← Corners O/U 10.5; outcomeId = "10.5/over"
+//         }
+//       }
+//     }
+//   }
+//
+// The bookmakerOutcomeId for lines markets encodes BOTH the line and direction:
+//   "2.5/over", "9.5/under", "10.5/over", "-1.0/home", etc.
+
+interface RawPlayerOdds {
+  active?: boolean;
+  bookmakerOutcomeId?: string | number;
+  price?: number;
+  mainLine?: boolean;
+}
+
+interface RawOutcome {
+  players?: Record<string, RawPlayerOdds>;
+}
+
+interface RawMarket {
+  bookmakerMarketId?: string;
+  marketActive?: boolean;
+  outcomes?: Record<string, RawOutcome>;
+}
 
 interface RawBookmakerOdds {
   bookmakerSlug?: string;
+  bookmakerName?: string;
+  bookmakerIsActive?: boolean;
+  suspended?: boolean;
+  // New format: Record<marketId, RawMarket>
+  markets?: Record<string, RawMarket> | Array<{ selections?: RawOddsSelection[] }>;
+  // Legacy fields (old array-format APIs)
   bookmaker?: string;
   slug?: string;
   name?: string;
-  bookmakerName?: string;
   odds?: RawOddsSelection[];
   selections?: RawOddsSelection[];
-  markets?: Array<{ selections?: RawOddsSelection[] }>;
 }
 
 interface RawOddsSelection {
@@ -403,7 +463,9 @@ interface RawOddsSelection {
 }
 
 interface RawOddsResponse {
-  bookmakerOdds?: RawBookmakerOdds[];
+  // New format: object keyed by bookmaker slug
+  bookmakerOdds?: Record<string, Omit<RawBookmakerOdds, "bookmakerSlug" | "bookmakerName">> | RawBookmakerOdds[];
+  // Legacy array formats
   bookmakers?: RawBookmakerOdds[];
   odds?: RawBookmakerOdds[];
 }
@@ -427,39 +489,54 @@ function getSelectionOdds(
   selectionName: string,
 ): number | null {
   const ouLine = OU_LINES[marketType];
+  const selLower = selectionName.toLowerCase();
 
   for (const sel of selections) {
     const label = (sel.selection ?? sel.label ?? sel.name ?? sel.outcome ?? "").toLowerCase();
     const odds = sel.odds ?? sel.value ?? sel.price;
     if (!odds || odds <= 1) continue;
-    const line = String(sel.line ?? sel.handicap ?? "");
+    const legacyLine = String(sel.line ?? sel.handicap ?? "");
 
-    // Match Winner (market 101)
-    if (marketType === "MATCH_ODDS") {
-      if (selectionName === "Home" && (label === "1" || label === "home" || label === "1x" && false)) return odds;
-      if (selectionName === "Draw" && (label === "x" || label === "draw")) return odds;
-      if (selectionName === "Away" && (label === "2" || label === "away")) return odds;
-    }
+    // ── New OddsPapi format: bookmakerOutcomeId encodes line+direction ──
+    // e.g. "home", "draw", "away", "2.5/over", "9.5/under", "10.5/over"
+    if (label.includes("/")) {
+      const slashIdx = label.lastIndexOf("/");
+      const linePart = label.slice(0, slashIdx);
+      const dirPart = label.slice(slashIdx + 1);
 
-    // Over/Under markets
-    if (ouLine && (label.includes("over") || label.includes("under"))) {
-      if (!line || line === ouLine || line === `${ouLine}`) {
-        if (selectionName.toLowerCase().includes("over") && label.includes("over")) return odds;
-        if (selectionName.toLowerCase().includes("under") && label.includes("under")) return odds;
+      // Match Winner with Asian handicap labels like "-1.0/home" — skip for MATCH_ODDS
+      if ((dirPart === "home" || dirPart === "away") && marketType === "MATCH_ODDS") {
+        continue;
       }
+
+      // Over/Under: "2.5/over", "9.5/under", "10.5/over" etc.
+      if ((dirPart === "over" || dirPart === "under") && ouLine) {
+        if (Math.abs(parseFloat(linePart) - parseFloat(ouLine)) < 0.01) {
+          if (selLower.includes("over") && dirPart === "over") return odds;
+          if (selLower.includes("under") && dirPart === "under") return odds;
+        }
+      }
+      continue; // handled slash-format; don't fall through to legacy logic
     }
 
-    // BTTS
+    // ── Match Winner (label: "home", "draw", "away" or legacy "1", "x", "2") ──
+    if (marketType === "MATCH_ODDS") {
+      if (selectionName === "Home" && (label === "home" || label === "1")) return odds;
+      if (selectionName === "Draw" && (label === "draw" || label === "x")) return odds;
+      if (selectionName === "Away" && (label === "away" || label === "2")) return odds;
+    }
+
+    // ── BTTS ──
     if (marketType === "BTTS") {
       if (selectionName === "Yes" && (label === "yes" || label === "gg")) return odds;
       if (selectionName === "No" && (label === "no" || label === "ng")) return odds;
     }
 
-    // Cards/Corners (generic over/under)
-    if ((marketType.startsWith("TOTAL_CARDS") || marketType.startsWith("TOTAL_CORNERS")) && ouLine) {
-      if (!line || line === ouLine || line === `${ouLine}`) {
-        if (selectionName.toLowerCase().includes("over") && label.includes("over")) return odds;
-        if (selectionName.toLowerCase().includes("under") && label.includes("under")) return odds;
+    // ── Legacy array-format Over/Under (label: "over 2.5", "under", etc.) ──
+    if (ouLine && (label.includes("over") || label.includes("under"))) {
+      if (!legacyLine || legacyLine === ouLine || legacyLine === `${ouLine}`) {
+        if (selLower.includes("over") && label.includes("over")) return odds;
+        if (selLower.includes("under") && label.includes("under")) return odds;
       }
     }
   }
@@ -467,11 +544,33 @@ function getSelectionOdds(
 }
 
 function extractSelections(bm: RawBookmakerOdds): RawOddsSelection[] {
+  const markets = bm.markets;
+
+  // ── New OddsPapi format: markets is Record<marketId, RawMarket> ──
+  if (markets && !Array.isArray(markets) && typeof markets === "object") {
+    const result: RawOddsSelection[] = [];
+    for (const market of Object.values(markets as Record<string, RawMarket>)) {
+      if (!market?.outcomes) continue;
+      for (const outcome of Object.values(market.outcomes)) {
+        for (const player of Object.values(outcome.players ?? {})) {
+          if (player.active === false) continue;
+          if (!player.price || player.price <= 1) continue;
+          result.push({
+            label: String(player.bookmakerOutcomeId ?? ""),
+            price: player.price,
+          });
+        }
+      }
+    }
+    return result;
+  }
+
+  // ── Legacy formats ──
+  if (Array.isArray(markets)) {
+    return (markets as Array<{ selections?: RawOddsSelection[] }>).flatMap((m) => m.selections ?? []);
+  }
   if (Array.isArray(bm.odds)) return bm.odds;
   if (Array.isArray(bm.selections)) return bm.selections;
-  if (Array.isArray(bm.markets)) {
-    return bm.markets.flatMap((m) => m.selections ?? []);
-  }
   return [];
 }
 
@@ -480,11 +579,24 @@ function getBookmakerSlug(bm: RawBookmakerOdds): string {
 }
 
 function getBookmakerName(bm: RawBookmakerOdds): string {
-  return bm.bookmakerName ?? bm.name ?? bm.bookmakerSlug ?? bm.slug ?? "Unknown";
+  const raw = bm.bookmakerName ?? bm.name ?? bm.bookmakerSlug ?? bm.slug ?? bm.bookmaker ?? "Unknown";
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
 function extractBookmakers(raw: RawOddsResponse): RawBookmakerOdds[] {
-  if (Array.isArray(raw.bookmakerOdds)) return raw.bookmakerOdds;
+  const bOdds = raw.bookmakerOdds;
+
+  // ── New OddsPapi format: bookmakerOdds is object keyed by bookmaker slug ──
+  if (bOdds && !Array.isArray(bOdds) && typeof bOdds === "object") {
+    return Object.entries(bOdds as Record<string, RawBookmakerOdds>).map(([slug, data]) => ({
+      ...data,
+      bookmakerSlug: slug,
+      bookmakerName: slug.charAt(0).toUpperCase() + slug.slice(1),
+    }));
+  }
+
+  // ── Legacy array formats ──
+  if (Array.isArray(bOdds)) return bOdds;
   if (Array.isArray(raw.bookmakers)) return raw.bookmakers;
   if (Array.isArray(raw.odds)) return raw.odds;
   return [];
@@ -511,8 +623,8 @@ export async function getOddspapiValidation(
     hasPinnacleData: false,
   };
 
-  const marketId = MARKET_IDS[marketType];
-  if (!marketId) return noData;
+  // The /odds endpoint returns ALL markets regardless of marketId; default to 101 (1x2)
+  const marketId = MARKET_IDS[marketType] ?? 101;
 
   if (!(await canMakeOddspapiRequest(1))) return noData;
 
@@ -936,8 +1048,7 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
       break;
     }
 
-    const marketId = MARKET_IDS[matchOddsMarket];
-    if (!marketId) { skipped += bets.length; continue; }
+    const marketId = MARKET_IDS[matchOddsMarket] ?? 101;
 
     // Rate-limit guard
     await new Promise((r) => setTimeout(r, 1200));
