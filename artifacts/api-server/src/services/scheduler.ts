@@ -190,11 +190,25 @@ export async function runTradingCycle(): Promise<{
       buildPinnacleValidationFromApiFootball(earliest, latest),
     ]);
 
-    // Merge: OddsPapi entries take priority (more authoritative), AF-Pinnacle fills the rest
-    const oddsPapiCache: OddsPapiValidationCache = new Map([...afPinnacleCache, ...oddsPapiCacheRaw]);
+    // Merge at selection level: OddsPapi takes priority for selections it has;
+    // AF-Pinnacle fills in the rest. This avoids OddsPapi overwriting all AF
+    // corners/O/U data just because it fetched MATCH_ODDS for that fixture.
+    const oddsPapiCache: OddsPapiValidationCache = new Map<number, Record<string, import("./oddsPapi").OddspapiValidation>>();
+    const allMatchIds = new Set([...afPinnacleCache.keys(), ...oddsPapiCacheRaw.keys()]);
+    for (const matchId of allMatchIds) {
+      const afEntry = afPinnacleCache.get(matchId) ?? {};
+      const opEntry = oddsPapiCacheRaw.get(matchId) ?? {};
+      // OddsPapi wins per-selection; AF-Pinnacle fills gaps
+      oddsPapiCache.set(matchId, { ...afEntry, ...opEntry });
+    }
     logger.info(
-      { oddsPapiMatches: oddsPapiCacheRaw.size, afPinnacleMatches: afPinnacleCache.size, mergedTotal: oddsPapiCache.size },
-      "Pinnacle validation cache ready (OddsPapi + API-Football Pinnacle merged)",
+      {
+        oddsPapiMatches: oddsPapiCacheRaw.size,
+        afPinnacleMatches: afPinnacleCache.size,
+        mergedTotal: oddsPapiCache.size,
+        totalSelections: [...oddsPapiCache.values()].reduce((n, m) => n + Object.keys(m).length, 0),
+      },
+      "Pinnacle validation cache ready (OddsPapi + API-Football Pinnacle merged, selection-level)",
     );
 
     const valueSummary = await detectValueBets();
@@ -253,9 +267,9 @@ export async function runTradingCycle(): Promise<{
 
         const cachedMatch = oddsPapiCache.get(bet.matchId);
         if (cachedMatch) {
-          const sel = bet.selectionName as keyof typeof cachedMatch;
-          if (cachedMatch[sel]) {
-            const raw = cachedMatch[sel];
+          // Cache is flat: selectionName → validation (covers all market types)
+          const raw = cachedMatch[bet.selectionName];
+          if (raw) {
             // Compute pinnacleAligned from cached Pinnacle implied probability vs model
             let pinnacleAligned = false;
             let isContrarian = false;

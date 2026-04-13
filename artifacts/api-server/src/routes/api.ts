@@ -45,6 +45,7 @@ import { getDiscoveredLeagues, getDiscoveryStats } from "../services/leagueDisco
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import {
   getOddspapiStatus,
+  prefetchAndStoreOddsPapiOdds,
 } from "../services/oddsPapi";
 import {
   getApiBudgetStatus,
@@ -1306,6 +1307,26 @@ router.get("/leagues/edge-scores", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "Failed to fetch league edge scores");
     res.status(500).json({ error: "Failed to retrieve league edge scores" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/oddspapi/prefetch — manually trigger multi-market odds prefetch
+// Accepts optional JSON body: { maxFetches: number } (default 40)
+// ─────────────────────────────────────────────
+router.post("/oddspapi/prefetch", async (req, res) => {
+  const maxFetches = Number((req.body as Record<string, unknown>)?.maxFetches ?? 40);
+  const now = new Date();
+  const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);
+  const latest   = new Date(now.getTime() + 168 * 60 * 60 * 1000);
+  logger.info({ maxFetches }, "Manual OddsPapi multi-market prefetch triggered");
+  try {
+    const cache = await prefetchAndStoreOddsPapiOdds(earliest, latest, maxFetches);
+    const totalSelections = [...cache.values()].reduce((n, m) => n + Object.keys(m).length, 0);
+    res.json({ success: true, fixturesFetched: cache.size, totalSelections });
+  } catch (err) {
+    logger.error({ err }, "OddsPapi prefetch failed");
+    res.status(500).json({ success: false, message: String(err) });
   }
 });
 

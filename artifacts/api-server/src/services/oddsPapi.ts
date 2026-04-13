@@ -726,10 +726,44 @@ export async function getOddspapiFixtureId(matchId: number): Promise<string | nu
 // odds as source="oddspapi" so value detection treats them as non-synthetic.
 // Returns a validation cache keyed by matchId to avoid re-fetching later.
 
-export type OddsPapiValidationCache = Map<
-  number,
-  { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation }
->;
+// Cache is keyed by matchId → flat map of selectionName → validation.
+// Selection names are unique across all market types we bet on:
+//   MATCH_ODDS:        "Home", "Draw", "Away"
+//   OVER_UNDER_*:      "Over 2.5", "Under 2.5", "Over 3.5", "Under 3.5", …
+//   TOTAL_CORNERS_*:   "Over 9.5 Corners", "Under 10.5 Corners", …
+//   BTTS:              "Yes", "No"
+//   DOUBLE_CHANCE:     "1X", "X2", "12"
+export type OddsPapiValidationCache = Map<number, Record<string, OddspapiValidation>>;
+
+// All bet-relevant targets we extract from every OddsPapi odds response.
+// One API call returns all markets, so we pull everything at once.
+const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
+  // Match Winner (1x2)
+  { marketType: "MATCH_ODDS",       selectionName: "Home" },
+  { marketType: "MATCH_ODDS",       selectionName: "Draw" },
+  { marketType: "MATCH_ODDS",       selectionName: "Away" },
+  // Goals O/U
+  { marketType: "OVER_UNDER_25",    selectionName: "Over 2.5" },
+  { marketType: "OVER_UNDER_25",    selectionName: "Under 2.5" },
+  { marketType: "OVER_UNDER_35",    selectionName: "Over 3.5" },
+  { marketType: "OVER_UNDER_35",    selectionName: "Under 3.5" },
+  { marketType: "OVER_UNDER_45",    selectionName: "Over 4.5" },
+  { marketType: "OVER_UNDER_45",    selectionName: "Under 4.5" },
+  // Corners O/U
+  { marketType: "TOTAL_CORNERS_75",  selectionName: "Over 7.5 Corners" },
+  { marketType: "TOTAL_CORNERS_75",  selectionName: "Under 7.5 Corners" },
+  { marketType: "TOTAL_CORNERS_85",  selectionName: "Over 8.5 Corners" },
+  { marketType: "TOTAL_CORNERS_85",  selectionName: "Under 8.5 Corners" },
+  { marketType: "TOTAL_CORNERS_95",  selectionName: "Over 9.5 Corners" },
+  { marketType: "TOTAL_CORNERS_95",  selectionName: "Under 9.5 Corners" },
+  { marketType: "TOTAL_CORNERS_105", selectionName: "Over 10.5 Corners" },
+  { marketType: "TOTAL_CORNERS_105", selectionName: "Under 10.5 Corners" },
+  { marketType: "TOTAL_CORNERS_115", selectionName: "Over 11.5 Corners" },
+  { marketType: "TOTAL_CORNERS_115", selectionName: "Under 11.5 Corners" },
+  // BTTS
+  { marketType: "BTTS",              selectionName: "Yes" },
+  { marketType: "BTTS",              selectionName: "No" },
+];
 
 export async function prefetchAndStoreOddsPapiOdds(
   earliestKickoff: Date,
@@ -816,8 +850,10 @@ export async function prefetchAndStoreOddsPapiOdds(
     if (!row) break;
     const { matchId, fixtureId, homeTeam, awayTeam } = row;
 
-    const marketId = MARKET_IDS["MATCH_ODDS"];
-    if (!marketId || !(await canMakeOddspapiRequest(1))) break;
+    // Use MATCH_ODDS market ID — but OddsPapi returns ALL markets regardless.
+    // One call per fixture gives us 1x2, goals O/U, corners O/U, BTTS, etc.
+    const marketId = MARKET_IDS["MATCH_ODDS"] ?? 101;
+    if (!(await canMakeOddspapiRequest(1))) break;
 
     // Rate-limit guard: OddsPapi enforces ~1 req/s — wait between calls
     if (i > 0) await new Promise((r) => setTimeout(r, 1200));
@@ -859,23 +895,26 @@ export async function prefetchAndStoreOddsPapiOdds(
         });
     }
 
-    // Build per-selection best-odds map
-    const selectionOdds: Record<string, { best: number; bookmaker: string; pinnacle: number | null; sharp: number[]; soft: number[] }> = {
-      Home:  { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] },
-      Draw:  { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] },
-      Away:  { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] },
-    };
+    // ── Extract ALL bet-relevant selections from this single API response ──
+    // Each bookmaker's selections are pre-flattened from the nested markets structure.
+    // PREFETCH_TARGETS covers 1x2, goals O/U, corners O/U, and BTTS.
+    type SelectionAgg = { best: number; bookmaker: string; pinnacle: number | null; sharp: number[]; soft: number[] };
+    const selectionOdds: Record<string, SelectionAgg> = {};
+
+    for (const target of PREFETCH_TARGETS) {
+      selectionOdds[target.selectionName] = { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] };
+    }
 
     for (const bm of bookmakers) {
       const slug = getBookmakerSlug(bm);
       const name = getBookmakerName(bm);
-      const selections = extractSelections(bm);
+      const bmSelections = extractSelections(bm);
 
-      for (const selName of ["Home", "Draw", "Away"] as const) {
-        const odds = getSelectionOdds(selections, "MATCH_ODDS", selName);
+      for (const { marketType, selectionName } of PREFETCH_TARGETS) {
+        const odds = getSelectionOdds(bmSelections, marketType, selectionName);
         if (!odds) continue;
 
-        const so = selectionOdds[selName];
+        const so = selectionOdds[selectionName];
         if (!so) continue;
         const implied = 1 / odds;
 
@@ -886,9 +925,12 @@ export async function prefetchAndStoreOddsPapiOdds(
       }
     }
 
-    // Store in odds_snapshots and build cache
+    // ── Build flat matchCache: selectionName → OddspapiValidation ──
     const now = new Date();
-    const matchCache: { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation } = {} as any;
+    const matchCache: Record<string, OddspapiValidation> = {};
+
+    // Track which selections we actually got Pinnacle odds for
+    let pinnacleSelectionsFound = 0;
 
     for (const [selName, so] of Object.entries(selectionOdds)) {
       if (so.best <= 1.01) continue;
@@ -896,6 +938,8 @@ export async function prefetchAndStoreOddsPapiOdds(
       const pinnacleImplied = so.pinnacle ? 1 / so.pinnacle : null;
       const sharpAvg = so.sharp.length ? so.sharp.reduce((a, b) => a + b, 0) / so.sharp.length : null;
       const softAvg = so.soft.length ? so.soft.reduce((a, b) => a + b, 0) / so.soft.length : null;
+
+      if (so.pinnacle) pinnacleSelectionsFound++;
 
       const validation: OddspapiValidation = {
         pinnacleOdds: so.pinnacle,
@@ -910,7 +954,11 @@ export async function prefetchAndStoreOddsPapiOdds(
         hasPinnacleData: so.pinnacle !== null,
       };
 
-      (matchCache as Record<string, OddspapiValidation>)[selName] = validation;
+      matchCache[selName] = validation;
+
+      // Determine the correct market type for this selection name
+      const targetMeta = PREFETCH_TARGETS.find((t) => t.selectionName === selName);
+      const marketTypeForSnapshot = targetMeta?.marketType ?? "MATCH_ODDS";
 
       // Upsert into odds_snapshots (delete old oddspapi snapshot first)
       await db
@@ -918,7 +966,7 @@ export async function prefetchAndStoreOddsPapiOdds(
         .where(
           and(
             eq(oddsSnapshotsTable.matchId, matchId),
-            eq(oddsSnapshotsTable.marketType, "MATCH_ODDS"),
+            eq(oddsSnapshotsTable.marketType, marketTypeForSnapshot),
             eq(oddsSnapshotsTable.selectionName, selName),
             eq(oddsSnapshotsTable.source, "oddspapi"),
           ),
@@ -926,7 +974,7 @@ export async function prefetchAndStoreOddsPapiOdds(
 
       await db.insert(oddsSnapshotsTable).values({
         matchId,
-        marketType: "MATCH_ODDS",
+        marketType: marketTypeForSnapshot,
         selectionName: selName,
         backOdds: String(so.best),
         layOdds: null,
@@ -936,10 +984,17 @@ export async function prefetchAndStoreOddsPapiOdds(
     }
 
     if (Object.keys(matchCache).length > 0) {
-      cache.set(matchId, matchCache as { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation });
+      cache.set(matchId, matchCache);
       logger.info(
-        { matchId, home: homeTeam, away: awayTeam, selections: Object.keys(matchCache) },
-        "OddsPapi MATCH_ODDS pre-fetched and stored",
+        {
+          matchId,
+          home: homeTeam,
+          away: awayTeam,
+          totalSelections: Object.keys(matchCache).length,
+          pinnacleSelections: pinnacleSelectionsFound,
+          markets: [...new Set(PREFETCH_TARGETS.filter(t => matchCache[t.selectionName]).map(t => t.marketType))],
+        },
+        "OddsPapi multi-market pre-fetch complete",
       );
     }
   }
@@ -1210,7 +1265,7 @@ export async function buildPinnacleValidationFromApiFootball(
     }
 
     if (Object.keys(matchCache).length > 0) {
-      cache.set(matchId, matchCache as { Home: OddspapiValidation; Draw: OddspapiValidation; Away: OddspapiValidation });
+      cache.set(matchId, matchCache);
       matchesWithPinnacle++;
     }
   }
