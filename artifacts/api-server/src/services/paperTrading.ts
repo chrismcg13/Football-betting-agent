@@ -534,7 +534,22 @@ export interface SettlementResult {
   totalPnl: number;
 }
 
+let settlingInProgress = false;
+
 export async function settleBets(): Promise<SettlementResult> {
+  if (settlingInProgress) {
+    logger.debug("settleBets already in progress — skipping concurrent call");
+    return { settled: 0, won: 0, lost: 0, totalPnl: 0 };
+  }
+  settlingInProgress = true;
+  try {
+    return await _settleBetsInner();
+  } finally {
+    settlingInProgress = false;
+  }
+}
+
+async function _settleBetsInner(): Promise<SettlementResult> {
   const pendingBets = await db
     .select()
     .from(paperBetsTable)

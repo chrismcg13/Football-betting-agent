@@ -214,7 +214,8 @@ Computes 17 ML features per upcoming match:
 | Data ingestion | Every 30 min, 24/7 | Fetches upcoming matches from football-data.org (7-day window) |
 | Feature computation | Every 6 hours UTC | Computes all ML features |
 | Trading cycle | Every 10 minutes | Detects value bets, places paper bets |
-| Settlement | Every 5 minutes | Syncs match results from API-Football, then settles pending bets |
+| Settlement (fast) | Every 5 minutes | 2-day lookback: syncs match results + settles bets + backfills corners/cards stats |
+| Settlement (deep) | Hourly at :15 | 7-day lookback: catches any missed match results from the past week |
 | API-Football odds | Every 2 hours, 24/7 | ALL bookmakers (20+) in single call, 2h freshness window |
 | OddsPapi morning bulk prefetch | Daily 06:10 UTC | 7-day window, up to 80 API calls, stores all Pinnacle odds in DB |
 | OddsPapi midday refresh | Daily 12:00 UTC | 2-day window, up to 30 API calls, refreshes pre-kickoff line movements |
@@ -312,9 +313,15 @@ Real odds for value scoring come from API-Football v3 (key: `API_FOOTBALL_KEY` s
 
 ## Settlement Architecture
 
-- `syncMatchResults()` in `scheduler.ts`: Fetches finished fixtures from API-Football for last 7 days, matches to DB matches via fuzzy team name matching (`teamNameMatch`), updates status='finished' with scores.
-- `determineBetWon()` in `paperTrading.ts`: Handles MATCH_ODDS, BTTS, DOUBLE_CHANCE (1X/X2/12), OVER_UNDER_05/15/25/35/45, ASIAN_HANDICAP. Returns `null` (void/refund) for TOTAL_CORNERS_*, TOTAL_CARDS_*, FIRST_HALF_RESULT (data not available in match score).
+Full pipeline runs as `runSettlementPipeline()` with concurrency guard:
+1. `syncMatchResults(daysBack)` — Fetches finished fixtures from API-Football, matches to DB via fuzzy `teamNameMatch`, updates status='finished' with scores + corners/cards stats.
+2. `settleBets()` — Settles pending bets on finished matches. CLV calculated using latest odds snapshot as closing proxy.
+3. `backfillCornersCardsStats()` — Finds finished matches with voided corners/cards bets that were missing stats, fetches stats from API-Football, and re-settles those bets.
+
+- `determineBetWon()`: Handles MATCH_ODDS, BTTS, DOUBLE_CHANCE (1X/X2/12), OVER_UNDER_05/15/25/35/45, ASIAN_HANDICAP, TOTAL_CORNERS_*, TOTAL_CARDS_*. Returns `null` (void/refund) for FIRST_HALF_RESULT (no half-time data) or missing stats.
 - Bankroll updated at settlement time only (not deducted at placement). Void bets = PnL 0 (stake refunded implicitly).
+- Manual trigger: `POST /api/admin/settle` — runs full pipeline with 7-day lookback.
+- Startup: fires 15s after boot with 7-day deep sweep.
 
 ## Startup
 

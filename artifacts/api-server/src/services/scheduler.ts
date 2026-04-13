@@ -3,7 +3,7 @@ import { logger } from "../lib/logger";
 import { runDataIngestion } from "./dataIngestion";
 import { runFeatureEngineForUpcomingMatches } from "./featureEngine";
 import { detectValueBets } from "./valueDetection";
-import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets } from "./paperTrading";
+import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets, backfillCornersCardsStats } from "./paperTrading";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
 import { runLearningLoop } from "./learningLoop";
@@ -564,11 +564,10 @@ export async function runTradingCycle(): Promise<{
 
 // ===================== Sync match results from football-data.org =====================
 
-export async function syncMatchResults(): Promise<number> {
-  // Fetch recently finished fixtures from API-Football (our active data source)
+export async function syncMatchResults(daysBack = 2): Promise<number> {
   let recentFixtures: Awaited<ReturnType<typeof fetchRecentFixtureResults>>;
   try {
-    recentFixtures = await fetchRecentFixtureResults(7);
+    recentFixtures = await fetchRecentFixtureResults(daysBack);
   } catch (err) {
     logger.warn({ err }, "syncMatchResults: failed to fetch recent fixtures");
     return 0;
@@ -671,20 +670,49 @@ export async function syncMatchResults(): Promise<number> {
  * syncMatchResults does call API-Football, but only for matches whose
  * kick-off time has already passed, so it is lightweight and necessary.
  */
+let settlementRunning = false;
+
+async function runSettlementPipeline(deep = false): Promise<void> {
+  if (settlementRunning) {
+    logger.debug("Settlement pipeline already running — skipping");
+    return;
+  }
+  settlementRunning = true;
+  try {
+    const daysBack = deep ? 7 : 2;
+    const synced = await syncMatchResults(daysBack);
+    if (synced > 0) logger.info({ synced, daysBack }, "Settlement pipeline: match results synced");
+
+    const r = await settleBets();
+    if (r.settled > 0) logger.info(r, "Settlement pipeline: bets settled");
+
+    const backfill = await backfillCornersCardsStats();
+    if (backfill.matchesUpdated > 0 || backfill.betsResettled > 0) {
+      logger.info(backfill, "Settlement pipeline: corners/cards backfill complete");
+    }
+  } catch (err) {
+    logger.warn({ err }, "Settlement pipeline failed — non-fatal");
+  } finally {
+    settlementRunning = false;
+  }
+}
+
 export function startSettlementCron(): void {
   cron.schedule("*/5 * * * *", () => {
-    void (async () => {
-      try {
-        const synced = await syncMatchResults();
-        if (synced > 0) logger.info({ synced }, "Settlement cron: match results synced");
-        const r = await settleBets();
-        if (r.settled > 0) logger.info(r, "Settlement cron: bets settled");
-      } catch (err) {
-        logger.warn({ err }, "Settlement cron failed — non-fatal");
-      }
-    })();
+    void runSettlementPipeline();
   }, { timezone: "UTC" });
-  logger.info("Settlement cron active — every 5 minutes (sync + settle)");
+  logger.info("Settlement cron active — every 5 minutes (sync 2-day + settle + backfill)");
+
+  cron.schedule("15 * * * *", () => {
+    logger.info("Deep settlement sweep triggered (7-day lookback)");
+    void runSettlementPipeline(true);
+  }, { timezone: "UTC" });
+  logger.info("Deep settlement sweep active — hourly at :15 (7-day lookback)");
+
+  setTimeout(() => {
+    logger.info("Startup settlement triggered (15s after boot)");
+    void runSettlementPipeline(true);
+  }, 15_000);
 }
 
 // ===================== Scheduler =====================
@@ -858,6 +886,23 @@ export function startScheduler(): void {
 }
 
 // ===================== Manual triggers (for API routes) =====================
+
+export async function runSettlementNow(): Promise<{ synced: number; settled: Awaited<ReturnType<typeof settleBets>>; backfill: { matchesUpdated: number; betsResettled: number } }> {
+  if (settlementRunning) {
+    logger.info("Manual settlement skipped — pipeline already running");
+    return { synced: 0, settled: { settled: 0, won: 0, lost: 0, totalPnl: 0 }, backfill: { matchesUpdated: 0, betsResettled: 0 } };
+  }
+  settlementRunning = true;
+  try {
+    logger.info("Manual settlement triggered via API");
+    const synced = await syncMatchResults(7);
+    const settled = await settleBets();
+    const backfill = await backfillCornersCardsStats();
+    return { synced, settled, backfill };
+  } finally {
+    settlementRunning = false;
+  }
+}
 
 export async function runIngestionNow(): Promise<void> {
   return safeRunIngestion();

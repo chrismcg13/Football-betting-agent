@@ -42,6 +42,7 @@ import {
   runXGIngestionNow,
   runLeagueDiscoveryNow,
   runIngestDiscoveredFixturesNow,
+  runSettlementNow,
 } from "../services/scheduler";
 import { getDiscoveredLeagues, getDiscoveryStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
@@ -1447,6 +1448,19 @@ router.get("/oddspapi/match-diagnostic", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "Match diagnostic failed");
     res.status(500).json({ error: "Failed to run match diagnostic" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/settle — run full settlement pipeline (sync results + settle + backfill)
+// ─────────────────────────────────────────────
+router.post("/admin/settle", async (_req, res) => {
+  try {
+    const result = await runSettlementNow();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "Manual settlement failed");
+    res.status(500).json({ success: false, message: String(err) });
   }
 });
 
