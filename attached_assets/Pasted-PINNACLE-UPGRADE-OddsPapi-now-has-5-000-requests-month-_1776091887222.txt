@@ -1,0 +1,47 @@
+PINNACLE UPGRADE: OddsPapi now has 5,000 requests/month (~166/day). Remove all budget rationing and validate every candidate with Pinnacle.
+
+1. Update the OddsPapi daily budget cap from 7 to 150 in agent_config and in all hardcoded limits
+2. Update the monthly budget cap from 250 to 4800 (leave 200 buffer)
+3. Remove the "top 8 candidates only" restriction — now validate ALL candidates that pass the preliminary opportunity score threshold
+4. Remove the "skip fixtures > 48h out" restriction — fetch Pinnacle odds for fixtures up to 7 days out so we have early line data
+5. Remove the "skip second division leagues" restriction — if Pinnacle has odds for a fixture, use them regardless of league tier
+6. Keep the oddspapi_league_coverage cache — don't waste requests on leagues where Pinnacle returns hasOdds: false, but retry each league once per week in case coverage has changed
+
+7. Enhanced scoring now applies to ALL bets, not just top 8:
+   - Every candidate gets Pinnacle validation before placement
+   - The +10 Pinnacle-aligned bonus and -10 contrarian penalty apply universally
+   - No bet gets placed without at least attempting Pinnacle validation (unless budget is somehow exhausted)
+
+8. CLV calculation upgrade:
+   - For every pending bet, fetch fresh Pinnacle odds 1 hour before kickoff as the TRUE closing line
+   - This costs 1 request per fixture but gives precise CLV instead of the API-Football proxy
+   - Schedule this as a pre-kickoff cron: check pending bets, for any kicking off in the next 90 minutes, fetch Pinnacle closing odds
+   - Store as closing_pinnacle_odds in paper_bets
+   - CLV calculation: clv = (placement_odds - closing_pinnacle_odds) / closing_pinnacle_odds × 100
+   - This is the professional-grade CLV calculation used by syndicates
+
+9. Contrarian detection now runs on every candidate:
+   - If model disagrees with Pinnacle by >5% but has opportunity score 75+, flag as contrarian
+   - Track contrarian bets separately on the dashboard — show win rate and ROI for Pinnacle-aligned vs contrarian bets
+   - This tells us whether the model has genuine insight beyond the sharp market
+
+10. Dashboard updates:
+    - CLV card should now show "over X scored bets" where X is close to total settled (not half)
+    - Add "Pinnacle Coverage: X%" metric showing what % of bets have Pinnacle CLV data
+    - Add a mini table on Performance page: "Pinnacle-Aligned vs Contrarian" showing win rate, ROI, CLV for each category
+    - Update budget display: "OddsPapi: X/150 today | X/5000 month"
+
+11. Update the OddsPapi request allocation:
+    - Pre-match odds validation: ~80 requests/day (covers all ~40 fixtures × 2 market types each)
+    - Closing line fetch: ~20 requests/day (for fixtures kicking off today)
+    - Fixture mapping: 1 request/day
+    - Leaves ~50 requests/day buffer for retries and new fixtures appearing
+
+12. Run a full trading cycle with unlimited Pinnacle validation and show me:
+    - How many candidates were evaluated
+    - How many got Pinnacle odds (coverage %)
+    - How many were Pinnacle-aligned vs contrarian
+    - How many bets placed with their enhanced scores
+    - Confirm CLV pre-kickoff cron is scheduled
+
+Log all changes to compliance: "Pinnacle upgrade: full validation active, 5000 req/month, CLV now uses Pinnacle closing line."
