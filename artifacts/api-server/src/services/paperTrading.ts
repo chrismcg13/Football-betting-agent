@@ -141,6 +141,12 @@ export interface PaperBetOptions {
   betThesis?: string | null;
   isContrarian?: boolean;
   stakeMultiplier?: number;
+  experimentTag?: string;
+  dataTier?: string;
+  opportunityBoosted?: boolean;
+  originalOpportunityScore?: number;
+  boostedOpportunityScore?: number;
+  syncEligible?: boolean;
 }
 
 export async function placePaperBet(
@@ -164,6 +170,12 @@ export async function placePaperBet(
     betThesis,
     isContrarian = false,
     stakeMultiplier = 1.0,
+    experimentTag,
+    dataTier = "experiment",
+    opportunityBoosted = false,
+    originalOpportunityScore,
+    boostedOpportunityScore,
+    syncEligible = false,
   } = options;
   const score = opportunityScore ?? 65;
 
@@ -201,6 +213,20 @@ export async function placePaperBet(
   if (BANNED_MARKETS.has(marketType)) {
     logger.warn({ matchId, marketType, selectionName }, "HARDSTOP: Banned market — bet blocked at placement");
     return logReject(`Banned market: ${marketType}`);
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // ── Production quarantine ──────────────────────────────────────────────
+  // In production, only promoted-tier bets are allowed. Experiment-tier and
+  // boosted bets must stay in the dev environment.
+  const currentEnv = process.env["ENVIRONMENT"] ?? "development";
+  if (currentEnv === "production") {
+    if (dataTier === "experiment") {
+      return logReject("Production quarantine: experiment-tier bets blocked in prod");
+    }
+    if (opportunityBoosted) {
+      return logReject("Production quarantine: opportunity-boosted bets blocked in prod");
+    }
   }
   // ──────────────────────────────────────────────────────────────────────────
 
@@ -301,9 +327,13 @@ export async function placePaperBet(
     marketType,
   );
 
-  // Apply contrarian and correlation multipliers
   if (isContrarian) stake = Math.round(stake * 0.6 * 100) / 100;
   if (stakeMultiplier !== 1.0) stake = Math.round(stake * stakeMultiplier * 100) / 100;
+  if (dataTier === "candidate") {
+    const CANDIDATE_STAKE_MULT = 0.25;
+    stake = Math.round(stake * CANDIDATE_STAKE_MULT * 100) / 100;
+    logger.info({ matchId, marketType, dataTier, originalStake: stake / CANDIDATE_STAKE_MULT, reducedStake: stake }, "Candidate-tier stake reduction applied (25%)");
+  }
 
   if (stake < 2) {
     return logReject(`Calculated stake £${stake} is below minimum £2`);
@@ -358,6 +388,12 @@ export async function placePaperBet(
       betThesis: betThesis ?? null,
       isContrarian: String(isContrarian),
       status: "pending",
+      dataTier,
+      experimentTag: experimentTag ?? null,
+      opportunityBoosted,
+      originalOpportunityScore: originalOpportunityScore ?? null,
+      boostedOpportunityScore: boostedOpportunityScore ?? null,
+      syncEligible,
     })
     .returning();
 

@@ -45,4 +45,9 @@ BETFAIR_PROXY_URL = "http://209.38.164.154:3001"
 BETFAIR_IDENTITY_PROXY_URL = "http://209.38.164.154:3001/identity"
 
 [userenv.production]
-SHARED_DATABASE_URL = "postgresql://postgres:password@helium/heliumdb?sslmode=disable"
+SHARED_DATABASE_URL = ""
+ENVIRONMENT = "production"
+DEV_DATABASE_URL = "postgresql://postgres:password@helium/heliumdb?sslmode=disable"
+
+[userenv.development]
+ENVIRONMENT = "development"

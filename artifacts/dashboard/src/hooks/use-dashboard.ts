@@ -175,6 +175,42 @@ export const useLeagueDiscoveryStats = () => {
   });
 };
 
+export const useExperiments = () => {
+  return useQuery({
+    queryKey: ["admin", "experiments"],
+    queryFn: () => fetcher("/api/admin/experiments"),
+    refetchInterval: 60000,
+  });
+};
+
+export const useRunPromotionEngine = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      fetcher("/api/admin/run-promotion-engine", { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["admin", "experiments"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard", "bets"] });
+    },
+  });
+};
+
+export const useManualPromote = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { experiment_tag: string; target_tier: string; reason: string }) =>
+      fetcher("/api/admin/promote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["admin", "experiments"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard", "bets"] });
+    },
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

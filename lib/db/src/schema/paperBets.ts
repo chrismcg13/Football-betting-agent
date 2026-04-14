@@ -5,6 +5,8 @@ import {
   timestamp,
   integer,
   numeric,
+  boolean,
+  real,
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
@@ -49,6 +51,14 @@ export const paperBetsTable = pgTable("paper_bets", {
     .notNull()
     .defaultNow(),
   settledAt: timestamp("settled_at", { withTimezone: true }),
+  dataTier: text("data_tier").notNull().default("experiment"),
+  experimentTag: text("experiment_tag"),
+  opportunityBoosted: boolean("opportunity_boosted").notNull().default(false),
+  originalOpportunityScore: real("original_opportunity_score"),
+  boostedOpportunityScore: real("boosted_opportunity_score"),
+  syncEligible: boolean("sync_eligible").notNull().default(false),
+  promotedAt: timestamp("promoted_at", { withTimezone: true }),
+  promotionAuditId: text("promotion_audit_id"),
 });
 
 export const insertPaperBetSchema = createInsertSchema(paperBetsTable).omit({

@@ -223,6 +223,9 @@ Computes 17 ML features per upcoming match:
 | API-Football team stats | Every 12 hours UTC | Fetches cards/corners/shots stats |
 | Learning loop | Daily at 03:00 UTC | Generates narratives, retrains model |
 | xG ingestion | Daily at 05:00 UTC | Derives team xG rolling stats from internal feature engine |
+| Promotion engine | Daily at 04:00 UTC | Evaluates experiments for promotion/demotion |
+| Experiment analysis | Sunday 04:00 UTC | Weekly self-analysis of experiment performance |
+| Dev→Prod sync | Every 6 hours | Syncs promoted settled bets from dev to prod (prod only) |
 
 ## Line Movement Tracking (src/services/lineMovement.ts)
 
@@ -302,6 +305,7 @@ React + Vite SPA at `/dashboard/`:
 - **Viability** — Opportunity pipeline, upcoming markets
 - **Learning & Model** — Model accuracy, narratives, feature importances
 - **Compliance** — Audit trail
+- **Experiment Lab** — Experiment pipeline visualization (experiment→candidate→promoted), per-experiment stats, manual promote/demote controls, promotion engine trigger
 - **Sidebar** — API Budget progress bar (0/90 requests), agent controls, bankroll
 
 ## Data Sources
@@ -328,13 +332,57 @@ Full pipeline runs as `runSettlementPipeline()` with concurrency guard:
 - Manual trigger: `POST /api/admin/settle` — runs full pipeline with 7-day lookback.
 - Startup: fires 15s after boot with 7-day deep sweep.
 
-## Shared Database (Dev ↔ Production)
+## Environment Isolation (Dev / Production)
 
-Dev and production environments share the same PostgreSQL database:
-- `lib/db/src/index.ts` connects via `SHARED_DATABASE_URL || DATABASE_URL`
-- Production has `SHARED_DATABASE_URL` set to the dev database URL
-- PostgreSQL advisory locks (`pg_try_advisory_lock`) prevent concurrent trading cycles and settlement pipelines across instances (lock IDs: 100001=trading, 100002=settlement)
-- Both environments run schedulers; the advisory locks ensure only one instance executes critical sections at a time
+Dev and production use **separate databases** with a controlled promotion pipeline:
+- `lib/db/src/index.ts` connects via `DATABASE_URL` only (no shared DB)
+- `ENVIRONMENT` env var: `"development"` or `"production"`
+- Production stores `DEV_DATABASE_URL` for sync scripts to read dev data
+- Startup safety check: aborts if prod DATABASE_URL host matches DEV_DATABASE_URL host
+- PostgreSQL advisory locks (`pg_try_advisory_lock`) prevent concurrent crons (lock IDs: 100001=trading, 100002=settlement)
+
+## Experiment → Promotion Pipeline
+
+Data flows through tiers: **experiment → candidate → promoted** (or abandoned/demoted).
+
+### Schema Extensions (paper_bets)
+- `data_tier`: experiment | candidate | promoted | demoted | abandoned (default: experiment)
+- `experiment_tag`: identifier for grouping related bets
+- `opportunity_boosted`: whether opportunity score was boosted by experiment
+- `original_opportunity_score` / `boosted_opportunity_score`: score tracking
+- `sync_eligible`: only true for promoted bets
+- `promoted_at` / `promotion_audit_id`: promotion tracking
+
+### New Tables
+- `experiment_registry`: tracks each experiment tag, tier, creation/promotion dates
+- `promotion_audit_log`: full audit trail of tier transitions with statistical evidence
+- `experiment_learning_journal`: weekly analysis entries with insights and recommendations
+
+### Promotion Engine (promotionEngine.ts)
+- Runs daily at 04:00 UTC
+- Thresholds: sample≥30, ROI≥3%, CLV≥1.5%, winRate≥52%, p-value≤0.10, weeks≥3, edge≥2%
+- Auto-promotes experiment→candidate→promoted based on statistical evidence
+- Demotion: ROI<-5% with sample≥20, or winRate<40% with sample≥15
+- Manual override: `POST /api/admin/promote` with experiment_tag, target_tier, reason
+- Configurable via env vars: PROMO_MIN_SAMPLE_SIZE, PROMO_MIN_ROI, etc.
+
+### Candidate Stake Reduction
+- Candidate-tier bets use 25% of normal stake (CANDIDATE_STAKE_MULT = 0.25)
+
+### Production Quarantine
+- In production, experiment-tier and opportunity-boosted bets are blocked at placement
+- Only promoted-tier bets flow to production via sync
+
+### Sync (syncDevToProd.ts)
+- Runs every 6 hours in production
+- Reads dev DB via DEV_DATABASE_URL, writes promoted settled bets to prod
+- Deduplicates by match_id + market_type + selection_name + placed_at
+
+### Self-Analysis (experimentAnalysis.ts)
+- Weekly at Sunday 04:00 UTC
+- Analyzes all experiment tiers with statistical summaries
+- Writes insights to experiment_learning_journal
+- API: `GET /api/admin/experiments`, `GET /api/admin/experiment-analysis`
 
 ## Startup
 

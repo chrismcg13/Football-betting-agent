@@ -30,6 +30,9 @@ import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement 
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings } from "./leagueDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql } from "drizzle-orm";
+import { runPromotionEngine } from "./promotionEngine";
+import { runWeeklyExperimentAnalysis } from "./experimentAnalysis";
+import { syncDevToProd } from "./syncDevToProd";
 
 // ===================== Status tracking =====================
 
@@ -562,6 +565,12 @@ export async function runTradingCycle(): Promise<{
           betThesis: thesis,
           isContrarian,
           stakeMultiplier: candidate.stakeMultiplier,
+          experimentTag: candidate.experimentTag,
+          dataTier: candidate.dataTier,
+          opportunityBoosted: candidate.opportunityBoosted,
+          originalOpportunityScore: candidate.originalOpportunityScore,
+          boostedOpportunityScore: candidate.boostedOpportunityScore,
+          syncEligible: candidate.syncEligible,
         },
       );
 
@@ -909,6 +918,30 @@ export function startScheduler(): void {
       .catch((err) => logger.warn({ err }, "Daily discovered-league fixture ingestion failed — non-fatal"));
   }, { timezone: "UTC" });
   logger.info("Discovered-league fixture ingestion scheduler active — daily 06:30 UTC");
+
+  cron.schedule("0 4 * * *", () => {
+    logger.info("Promotion engine triggered (daily 04:00 UTC)");
+    void runPromotionEngine().catch((err) => {
+      logger.error({ err }, "Promotion engine failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Promotion engine scheduler active — daily at 04:00 UTC");
+
+  cron.schedule("0 4 * * 0", () => {
+    logger.info("Weekly experiment self-analysis triggered (Sunday 04:00 UTC)");
+    void runWeeklyExperimentAnalysis().catch((err) => {
+      logger.error({ err }, "Weekly experiment analysis failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Weekly experiment analysis scheduler active — Sunday 04:00 UTC");
+
+  cron.schedule("0 */6 * * *", () => {
+    logger.info("Dev→Prod sync triggered (every 6 hours)");
+    void syncDevToProd().catch((err) => {
+      logger.error({ err }, "Dev→Prod sync failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Dev→Prod sync scheduler active — every 6 hours");
 
   // Startup trading cycle: fire 3 minutes after server start so any restart
   // doesn't leave the cycle dormant for up to 15 minutes.

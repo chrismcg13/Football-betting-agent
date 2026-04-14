@@ -1,7 +1,7 @@
 import { Link, useLocation } from "wouter";
 import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget, useScanStats } from "@/hooks/use-dashboard";
 import {
-  BarChart2, BookOpen, Brain, FileText, Play, Pause, Shield, Square, Target, Zap, Database,
+  BarChart2, BookOpen, Brain, FileText, FlaskConical, Play, Pause, Shield, Square, Target, Zap, Database,
 } from "lucide-react";
 import { formatCurrency } from "@/lib/format";
 import { Button } from "@/components/ui/button";
@@ -48,6 +48,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
     { href: "/viability", label: "Go Live Calculator", icon: Zap },
     { href: "/learning", label: "Agent Brain", icon: Brain },
     { href: "/compliance", label: "Audit Trail", icon: Shield },
+    { href: "/experiments", label: "Experiment Lab", icon: FlaskConical },
   ];
 
   const pnl = summary?.totalPnl ?? 0;

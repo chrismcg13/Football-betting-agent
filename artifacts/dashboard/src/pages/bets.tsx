@@ -40,6 +40,29 @@ function ClvBadge({ clv }: { clv: number | null }) {
   );
 }
 
+function DataTierBadge({ tier, boosted }: { tier?: string; boosted?: boolean }) {
+  if (!tier || tier === "promoted") return null;
+  const styles: Record<string, { bg: string; color: string; label: string }> = {
+    experiment: { bg: "#4c1d95", color: "#c4b5fd", label: "EXP" },
+    candidate: { bg: "#92400e", color: "#fcd34d", label: "CAND" },
+    demoted: { bg: "#7f1d1d", color: "#fca5a5", label: "DEMOTED" },
+    abandoned: { bg: "#374151", color: "#9ca3af", label: "ABANDONED" },
+  };
+  const s = styles[tier] ?? { bg: "#374151", color: "#9ca3af", label: tier.toUpperCase() };
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className="text-[10px] px-1.5 py-0.5 rounded font-semibold" style={{ background: s.bg, color: s.color }}>
+        {s.label}
+      </span>
+      {boosted && (
+        <span className="text-[10px] px-1 py-0.5 rounded font-semibold" style={{ background: "#1e3a5f", color: "#7dd3fc" }} title="Opportunity score boosted by experiment">
+          +BOOST
+        </span>
+      )}
+    </span>
+  );
+}
+
 function SharpBadge({ pinnacleAligned, isContrarian }: { pinnacleAligned?: boolean; isContrarian?: boolean }) {
   if (isContrarian) {
     return <span className="text-[10px] px-1.5 py-0.5 rounded font-semibold" style={{ background: "#7c1d1d", color: "#fca5a5" }}>CONTRARIAN</span>;
@@ -361,14 +384,17 @@ export default function Bets() {
                         {formatRelativeTime(bet.placedAt)}
                       </td>
                       <td className="py-3 px-3 font-medium text-white whitespace-nowrap">
-                        {bet.homeTeam && bet.awayTeam
-                          ? `${bet.homeTeam} vs ${bet.awayTeam}`
-                          : <span className="text-slate-500 italic">Match #{bet.matchId} (data pending)</span>}
-                        {bet.homeScore != null && bet.awayScore != null && (
-                          <span className="ml-2 text-xs text-slate-500 font-mono">
-                            {bet.homeScore}–{bet.awayScore}
-                          </span>
-                        )}
+                        <span className="inline-flex items-center gap-1.5">
+                          {bet.homeTeam && bet.awayTeam
+                            ? `${bet.homeTeam} vs ${bet.awayTeam}`
+                            : <span className="text-slate-500 italic">Match #{bet.matchId} (data pending)</span>}
+                          {bet.homeScore != null && bet.awayScore != null && (
+                            <span className="text-xs text-slate-500 font-mono">
+                              {bet.homeScore}–{bet.awayScore}
+                            </span>
+                          )}
+                          <DataTierBadge tier={bet.dataTier} boosted={bet.opportunityBoosted} />
+                        </span>
                       </td>
                       <td className="py-3 px-3 text-xs text-slate-400">{bet.league ?? "—"}</td>
                       <td className="py-3 px-3">

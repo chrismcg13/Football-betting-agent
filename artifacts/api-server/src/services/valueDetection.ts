@@ -11,6 +11,7 @@ import {
 } from "@workspace/db";
 import { eq, desc, and, gte, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
+import { ensureExperimentRegistered, getExperimentTier } from "./promotionEngine";
 import {
   predictOutcome,
   predictBtts,
@@ -38,6 +39,12 @@ export interface ValueBet {
   segmentBetCount: number;
   segmentRoi: number;
   hotStreakBonus: number;
+  experimentTag: string;
+  dataTier: string;
+  opportunityBoosted: boolean;
+  originalOpportunityScore: number;
+  boostedOpportunityScore: number;
+  syncEligible: boolean;
 }
 
 export interface EvaluationSummary {
@@ -775,9 +782,23 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         bookmakerCount,
       });
       const opportunityScore = Math.min(baseOpportunityScore + discoveryBonus, 100);
-      if (discoveryBonus > 0) {
+      const wasBoosted = discoveryBonus > 0;
+      if (wasBoosted) {
         logger.info({ matchId: match.id, league: match.league, marketType: oddsRow.marketType, baseScore: baseOpportunityScore, discoveryBonus, finalScore: opportunityScore }, "Discovery bonus applied");
       }
+
+      const expTag = `${(match.league ?? "unknown").toLowerCase().replace(/[^a-z0-9]/g, "-")}-${oddsRow.marketType.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
+      const settledCount = segmentStats.betCount;
+      const isExperimental = settledCount < 50;
+      let dataTier: string;
+      if (isExperimental) {
+        dataTier = "experiment";
+        await ensureExperimentRegistered(expTag, match.league ?? "unknown", oddsRow.marketType);
+      } else {
+        dataTier = await getExperimentTier(expTag);
+        if (dataTier === "experiment" || dataTier === "abandoned" || dataTier === "demoted") dataTier = "experiment";
+      }
+      const syncEligible = dataTier === "promoted";
 
       // Both real and synthetic odds must meet the configured min_opportunity_score floor
       const effectiveMinScore = minOppScore;
@@ -827,6 +848,12 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
           segmentBetCount: segmentStats.betCount,
           segmentRoi: segmentStats.roi,
           hotStreakBonus: streakBonus,
+          experimentTag: expTag,
+          dataTier,
+          opportunityBoosted: wasBoosted,
+          originalOpportunityScore: baseOpportunityScore,
+          boostedOpportunityScore: opportunityScore,
+          syncEligible,
         });
       }
     }

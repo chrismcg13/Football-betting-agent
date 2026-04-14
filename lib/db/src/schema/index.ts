@@ -14,3 +14,6 @@ export * from "./xgMatchData";
 export * from "./teamXgRolling";
 export * from "./oddsHistory";
 export * from "./discoveredLeagues";
+export * from "./experimentRegistry";
+export * from "./promotionAuditLog";
+export * from "./experimentLearningJournal";

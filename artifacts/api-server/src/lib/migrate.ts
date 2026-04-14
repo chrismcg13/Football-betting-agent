@@ -246,6 +246,82 @@ export async function runMigrations() {
       logger.info("Pinnacle upgrade compliance log written");
     }
 
+    // ── Experiment pipeline: new columns on paper_bets ──────────────────
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS data_tier TEXT NOT NULL DEFAULT 'experiment',
+        ADD COLUMN IF NOT EXISTS experiment_tag TEXT,
+        ADD COLUMN IF NOT EXISTS opportunity_boosted BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS original_opportunity_score REAL,
+        ADD COLUMN IF NOT EXISTS boosted_opportunity_score REAL,
+        ADD COLUMN IF NOT EXISTS sync_eligible BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS promotion_audit_id TEXT
+    `);
+
+    // ── Experiment registry table ────────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS experiment_registry (
+        id TEXT PRIMARY KEY,
+        experiment_tag TEXT NOT NULL,
+        league_code TEXT,
+        market_type TEXT,
+        data_tier TEXT NOT NULL DEFAULT 'experiment',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        tier_changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        current_sample_size INTEGER NOT NULL DEFAULT 0,
+        current_roi REAL,
+        current_clv REAL,
+        current_win_rate REAL,
+        current_p_value REAL,
+        current_edge REAL,
+        consecutive_negative_weeks INTEGER NOT NULL DEFAULT 0,
+        notes TEXT
+      )
+    `);
+
+    // ── Promotion audit log ──────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS promotion_audit_log (
+        id TEXT PRIMARY KEY,
+        experiment_tag TEXT NOT NULL,
+        previous_tier TEXT NOT NULL,
+        new_tier TEXT NOT NULL,
+        decision_reason TEXT NOT NULL,
+        metrics_snapshot JSONB,
+        thresholds_used JSONB,
+        decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        decided_by TEXT NOT NULL DEFAULT 'auto_promotion_engine'
+      )
+    `);
+
+    // ── Experiment learning journal ──────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS experiment_learning_journal (
+        id TEXT PRIMARY KEY,
+        analysis_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        experiment_tag TEXT,
+        analysis_type TEXT NOT NULL,
+        findings JSONB,
+        recommendations JSONB,
+        actions_taken JSONB
+      )
+    `);
+
+    // ── Index for experiment lookups ─────────────────────────────────────
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_experiment_tag
+        ON paper_bets(experiment_tag)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_data_tier
+        ON paper_bets(data_tier)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_sync_eligible
+        ON paper_bets(sync_eligible) WHERE sync_eligible = true
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

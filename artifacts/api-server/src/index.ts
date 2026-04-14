@@ -7,6 +7,20 @@ import { loadLatestModel, bootstrapModels } from "./services/predictionEngine";
 import { db, complianceLogsTable, matchesTable, leagueEdgeScoresTable } from "@workspace/db";
 import { sql, count } from "drizzle-orm";
 
+const ENVIRONMENT = process.env["ENVIRONMENT"] ?? "development";
+
+if (ENVIRONMENT === "production" && process.env["DATABASE_URL"]) {
+  const dbHost = new URL(process.env["DATABASE_URL"]).hostname;
+  const devDbUrl = process.env["DEV_DATABASE_URL"];
+  if (devDbUrl) {
+    const devHost = new URL(devDbUrl).hostname;
+    if (dbHost === devHost) {
+      console.error("FATAL: Production is pointing at the dev database. Aborting.");
+      process.exit(1);
+    }
+  }
+}
+
 const rawPort = process.env["PORT"];
 if (!rawPort) throw new Error("PORT environment variable is required but was not provided.");
 const port = Number(rawPort);

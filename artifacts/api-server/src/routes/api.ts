@@ -1586,4 +1586,96 @@ router.post("/leagues/ingest-fixtures", async (_req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// Experiment Pipeline API
+// ─────────────────────────────────────────────
+
+import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine } from "../services/promotionEngine";
+import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
+
+router.get("/admin/experiments", async (_req, res) => {
+  try {
+    const experiments = await getExperimentsSummary();
+    const grouped = {
+      experiment: experiments.filter(e => e.dataTier === "experiment"),
+      candidate: experiments.filter(e => e.dataTier === "candidate"),
+      promoted: experiments.filter(e => e.dataTier === "promoted"),
+      demoted: experiments.filter(e => e.dataTier === "demoted"),
+      abandoned: experiments.filter(e => e.dataTier === "abandoned"),
+    };
+    res.json({ success: true, grouped, total: experiments.length });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/experiments/:tag", async (req, res) => {
+  try {
+    const detail = await getExperimentDetail(req.params.tag);
+    res.json({ success: true, ...detail });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/promotion-log", async (_req, res) => {
+  try {
+    const log = await getPromotionLog();
+    res.json({ success: true, log });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/learning-journal/latest", async (_req, res) => {
+  try {
+    const entry = await getLatestLearningJournal();
+    res.json({ success: true, entry });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/promote", async (req, res) => {
+  try {
+    const { experiment_tag, target_tier, reason } = req.body ?? {};
+    if (!experiment_tag || !target_tier || !reason) {
+      res.status(400).json({ success: false, message: "experiment_tag, target_tier, and reason are required" });
+      return;
+    }
+    const result = await manualPromote(experiment_tag, target_tier, reason);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/run-promotion-engine", async (_req, res) => {
+  try {
+    const result = await runPromotionEngine();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/sync-to-prod", async (_req, res) => {
+  try {
+    const result = await syncDevToProd();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/sync-status", async (_req, res) => {
+  try {
+    const status = await getSyncStatus();
+    res.json({ success: true, ...status });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 export default router;
+

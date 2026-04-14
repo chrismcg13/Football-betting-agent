@@ -1,0 +1,300 @@
+# CRITICAL FIX: Reverse shared database, implement environment isolation, and build automated experiment-to-production promotion pipeline
+
+## Context
+
+You previously pointed production at the dev database via `SHARED_DATABASE_URL`. This is a catastrophic architecture flaw — it removes all environment isolation. A bad migration or test record in dev would destroy production data. This must be reversed immediately.
+
+Beyond that, the system needs a proper experiment pipeline. Dev is where the model learns — testing new leagues, low-data opportunities, opportunity score boosting, new model variants. Prod is where proven, validated strategies bet with real money. Data must NEVER leak from dev experiments into prod unless it has passed statistically significant promotion thresholds. This is non-negotiable — real money is at stake.
+
+**Do NOT take shortcuts. Do NOT share a single database between environments. Do NOT simplify the promotion thresholds. Follow every step below precisely.**
+
+---
+
+## Phase 1: Reverse the shared database damage
+
+1. Remove the `SHARED_DATABASE_URL` environment variable from production entirely.
+2. In `lib/db/src/index.ts`, revert the connection logic. Production must ONLY use `DATABASE_URL` (its own isolated database). Dev must ONLY use `DATABASE_URL` (its own isolated database). Each environment's `DATABASE_URL` must point to a DIFFERENT database. Remove all fallback chaining like `SHARED_DATABASE_URL || DATABASE_URL`.
+3. Confirm production has its own separate PostgreSQL database. If one doesn't exist, create it.
+4. Run all current schema migrations against the production database so the schema matches dev.
+
+---
+
+## Phase 2: Experiment tagging and data classification schema
+
+### 2a: New columns on the bets table (and any related prediction/trade tables)
+
+Add the following columns:
+
+- `data_tier` ENUM: `'experiment'`, `'candidate'`, `'promoted'` — default `'experiment'`
+- `experiment_tag` TEXT (nullable) — e.g. `"turkish-super-lig"`, `"new-corners-model-v2"`, `"brazil-serie-b-btts"`
+- `opportunity_boosted` BOOLEAN default `false` — flag for bets where opportunity scoring was artificially boosted to generate learning data in low-data scenarios
+- `original_opportunity_score` FLOAT (nullable) — the raw opportunity score BEFORE any boost was applied
+- `boosted_opportunity_score` FLOAT (nullable) — the score AFTER boost, so the model can compare organic vs boosted performance
+- `sync_eligible` BOOLEAN default `false` — only `true` for `promoted` tier bets
+- `promoted_at` TIMESTAMP (nullable) — when the bet's league/strategy was promoted
+- `promotion_audit_id` TEXT (nullable) — links to the promotion decision record
+
+### 2b: New `experiment_registry` table
+
+This is the model's master list of what it's testing and where each experiment stands:
+
+```
+experiment_registry:
+  id                    TEXT PRIMARY KEY (e.g. "turkish-super-lig-match-result")
+  experiment_tag        TEXT NOT NULL (matches bets.experiment_tag)
+  league_code           TEXT
+  market_type           TEXT (e.g. "match_result", "btts", "over_under", "corners", "cards")
+  data_tier             ENUM('experiment', 'candidate', 'promoted', 'demoted', 'abandoned')
+  created_at            TIMESTAMP
+  tier_changed_at       TIMESTAMP
+  current_sample_size   INTEGER default 0
+  current_roi           FLOAT
+  current_clv           FLOAT
+  current_win_rate      FLOAT
+  current_p_value       FLOAT
+  current_edge          FLOAT
+  consecutive_negative_weeks  INTEGER default 0
+  notes                 TEXT
+```
+
+### 2c: New `promotion_audit_log` table
+
+Every promotion or demotion decision must be logged and auditable:
+
+```
+promotion_audit_log:
+  id                    TEXT PRIMARY KEY
+  experiment_tag        TEXT
+  previous_tier         TEXT
+  new_tier              TEXT
+  decision_reason       TEXT (detailed explanation of why)
+  metrics_snapshot      JSONB (full snapshot of all metrics at decision time)
+  thresholds_used       JSONB (the thresholds that were applied)
+  decided_at            TIMESTAMP
+  decided_by            TEXT ('auto_promotion_engine' or 'manual_override')
+```
+
+### 2d: New `experiment_learning_journal` table
+
+The model's self-analysis log:
+
+```
+experiment_learning_journal:
+  id                    TEXT PRIMARY KEY
+  analysis_date         TIMESTAMP
+  experiment_tag        TEXT (nullable — null means system-wide analysis)
+  analysis_type         TEXT ('performance_review', 'opportunity_scoring_audit', 'promotion_readiness', 'demotion_warning', 'strategy_adjustment')
+  findings              JSONB
+  recommendations       JSONB
+  actions_taken         JSONB
+```
+
+### 2e: Auto-tagging rules
+
+Implement the following automatic tagging logic in the trading engine:
+
+- When a bet is placed on a league/team/market combination where the model has FEWER than 50 historical data points → automatically set `data_tier = 'experiment'` and `experiment_tag` to `"{league}-{market_type}"` format
+- When opportunity scoring has been boosted above its organic level to increase the chance of a bet being placed → set `opportunity_boosted = true`, record both the original and boosted scores
+- ALL bets in dev default to `sync_eligible = false` unless their league/market combination has `data_tier = 'promoted'` in the `experiment_registry`
+- Bets on promoted league/market combinations in dev automatically get `sync_eligible = true` and `data_tier = 'promoted'`
+
+---
+
+## Phase 3: Promotion engine — automated, threshold-based, auditable
+
+### 3a: Promotion thresholds (configurable via environment variables with these defaults)
+
+**Experiment → Candidate:**
+- `PROMO_MIN_SAMPLE_SIZE` = 30 (minimum settled bets in dev)
+- `PROMO_MIN_ROI` = 3.0 (minimum ROI percentage)
+- `PROMO_MIN_CLV` = 1.5 (minimum average closing line value percentage)
+- `PROMO_MIN_WIN_RATE` = 52.0 (minimum win rate percentage — adjust per market type)
+- `PROMO_MAX_P_VALUE` = 0.10 (results must be statistically significant at 90% confidence)
+- `PROMO_MIN_WEEKS_ACTIVE` = 3 (must have data across at least 3 separate weeks — prevents hot streak promotion)
+- `PROMO_MIN_EDGE` = 2.0 (minimum average estimated edge percentage)
+
+**Candidate → Promoted:**
+- `PROMO_CANDIDATE_MIN_SAMPLE` = 20 (additional bets at candidate-level reduced stakes in prod)
+- `PROMO_CANDIDATE_MIN_ROI` = 2.0
+- `PROMO_CANDIDATE_MIN_CLV` = 1.0
+- `PROMO_CANDIDATE_MAX_P_VALUE` = 0.05 (tighter — 95% confidence for full promotion)
+- `PROMO_CANDIDATE_MIN_WEEKS` = 2
+
+### 3b: Demotion thresholds
+
+**Promoted → Candidate (automatic demotion):**
+- ROI drops below 0% over rolling 30-bet window in prod
+- CLV drops below 0% over rolling 30-bet window
+- 3 consecutive weeks of negative ROI
+- Any of these triggers automatic demotion + audit log entry
+
+**Candidate → Experiment (automatic demotion):**
+- ROI drops below -5% during candidate phase
+- CLV negative over candidate sample
+- Immediate demotion back to experiment for more dev-side learning
+
+**Abandoned status:**
+- If an experiment has 50+ bets and ROI is below -10% with p-value < 0.10 (i.e. it's statistically significantly BAD), auto-flag as `abandoned` with a recommendation to stop testing
+
+### 3c: Promotion engine script
+
+Create `scripts/promotion-engine.ts` that:
+
+1. Runs automatically as a cron job every 24 hours (after overnight learning at 3am)
+2. Iterates through all entries in `experiment_registry`
+3. Recalculates all metrics (sample size, ROI, CLV, win rate, p-value, edge, weekly consistency) from the actual bet data
+4. Checks each experiment against the appropriate thresholds for its current tier
+5. If thresholds are met → promotes to the next tier, logs in `promotion_audit_log` with full metrics snapshot and reason
+6. If demotion thresholds are triggered → demotes, logs the demotion with explanation
+7. Updates `sync_eligible` on all bets accordingly (promoted = eligible, everything else = not eligible)
+8. Writes an entry to `experiment_learning_journal` summarising what changed and why
+9. CRITICAL: The promotion engine must NEVER skip the thresholds or allow exceptions. No bet data reaches prod sync without passing through this gate.
+
+### 3d: Candidate-tier stake reduction
+
+When a league/market is at `candidate` tier:
+- In prod, the staking engine must apply a `CANDIDATE_STAKE_MULTIPLIER` = 0.25 (25% of normal Kelly stake)
+- This is hardcoded as a safety measure — the model cannot override it
+- Once fully promoted, normal Kelly staking applies
+- Log that candidate-level staking was applied on every candidate-tier bet
+
+### 3e: Manual override endpoint (emergency only)
+
+- `POST /api/admin/promote` — body: `{ experiment_tag, target_tier, reason }` — allows manual promotion/demotion with a mandatory reason that gets logged in the audit table with `decided_by = 'manual_override'`
+- This is for emergencies only. The automated engine is the primary path.
+
+---
+
+## Phase 4: Dev → Prod sync mechanism (one direction, promoted data only)
+
+1. Create `scripts/sync-dev-to-prod.ts` that:
+   - Connects to BOTH databases using explicit separate connection strings
+   - Reads SETTLED bets from dev where `sync_eligible = true` AND `data_tier = 'promoted'` AND that don't yet exist in prod
+   - Copies associated data (settlements, bankroll impact, model performance metrics) ONLY for synced bets
+   - NEVER syncs bets where `data_tier` is `'experiment'` or `'candidate'` — even if someone manually set `sync_eligible = true`, the script must ALSO check `data_tier = 'promoted'` as a second gate
+   - NEVER writes anything from prod → dev
+   - Uses INSERT ... ON CONFLICT DO NOTHING so it's safely re-runnable
+   - Logs every sync action including: bets synced, bets skipped (with reason), experiment tags skipped
+
+2. Add cron job `sync-to-prod` running every 6 hours.
+
+3. Add endpoints:
+   - `POST /api/admin/sync-to-prod` — force manual sync
+   - `GET /api/admin/sync-status` — show last sync time, counts, any errors
+   - `GET /api/admin/experiments` — list all experiments grouped by tier, with current metrics
+   - `GET /api/admin/experiments/:tag` — detailed view of one experiment's full history and metrics
+   - `GET /api/admin/promotion-log` — full audit trail of all promotion/demotion decisions
+
+---
+
+## Phase 5: One-time data seed from dev → prod
+
+1. Write `scripts/seed-prod-from-dev.ts` that:
+   - Connects to both databases
+   - Copies all EXISTING historical bets that are on currently well-established, validated leagues (Premier League, La Liga, Bundesliga, Serie A, Ligue 1, Champions League, and any other leagues where the model currently has 50+ settled bets with positive metrics)
+   - Tags these as `data_tier = 'promoted'` in both databases
+   - Does NOT copy any bets on leagues/markets with fewer than 50 data points — those stay as experiments in dev only
+   - Uses INSERT ... ON CONFLICT DO NOTHING
+   - Logs row counts per table and per league
+2. Run this script once to populate prod.
+
+---
+
+## Phase 6: Deep learning self-analysis loop
+
+### 6a: Weekly self-analysis cron (runs Sunday 4am, after a full week of data)
+
+Create `scripts/experiment-self-analysis.ts` that:
+
+1. For EACH active experiment in `experiment_registry`:
+   - Calculate trailing performance metrics (ROI, CLV, win rate, edge, p-value) over last 7 days, last 30 days, and lifetime
+   - Compare boosted-opportunity bets vs organic bets — is the boost helping or generating noise?
+   - Identify which market types within the experiment are strongest/weakest
+   - Calculate how far the experiment is from promotion thresholds (e.g. "needs 12 more bets and +1.2% CLV to reach candidate")
+   - Flag any experiments that have stalled (no new bets in 14+ days)
+
+2. System-wide analysis:
+   - Which experiment is closest to promotion?
+   - Which promoted league is closest to demotion?
+   - Overall dev bankroll allocation — is too much being spent on experiments with low probability of promotion?
+   - Opportunity scoring effectiveness — across all experiments, are boosted opportunities generating positive or negative learning value?
+
+3. Write ALL findings to `experiment_learning_journal` with structured JSON
+
+4. Generate a summary available at `GET /api/admin/learning-journal/latest`
+
+### 6b: Adaptive opportunity scoring
+
+Based on self-analysis findings, the model should adjust its opportunity scoring boost behaviour:
+
+- If boosted opportunities in a specific experiment are performing significantly worse than organic ones (>5% ROI gap), reduce or remove the boost for that experiment
+- If an experiment is close to promotion thresholds and needs more sample size, maintain the boost to accelerate data collection
+- If an experiment has been running for 8+ weeks with no trajectory toward promotion, recommend abandonment in the learning journal
+- Log every boost adjustment decision
+
+---
+
+## Phase 7: Safety guardrails
+
+1. Add `ENVIRONMENT` env var: `"development"` in dev, `"production"` in prod.
+
+2. Startup safety check: if `ENVIRONMENT=production`, log the database host on startup. If it matches the dev database host, REFUSE TO START and log: `"FATAL: Production is pointing at the dev database. Aborting."`
+
+3. Production data quarantine: if `ENVIRONMENT=production`, the trading engine, model learning pipeline, and all bankroll calculations must IGNORE any bet records that have `data_tier = 'experiment'` or `opportunity_boosted = true` (unless the bet is also `data_tier = 'promoted'` — a promoted bet that was originally boosted is fine, the promotion thresholds validated it). This is defence-in-depth — these records should never reach prod, but if they do, prod rejects them.
+
+4. Keep the advisory locks from the previous change for cron collision prevention within each environment.
+
+5. Immutability rule: once a bet's `data_tier` has been set to `'promoted'` and it has been synced to prod, the promotion engine must NOT demote that individual bet's tier. Demotion applies to the EXPERIMENT (league/market combination) going forward — it stops NEW bets from syncing. Historical synced data stays in prod.
+
+---
+
+## Phase 8: Dashboard updates
+
+### Dev dashboard:
+- Show experiment badges on all bets (colour-coded: red = experiment, amber = candidate, green = promoted)
+- Show a "Lab" icon on opportunity-boosted bets
+- Add an "Experiments" tab showing:
+  - All active experiments with current metrics, tier, and distance-to-promotion
+  - Visual progress bars toward promotion thresholds
+  - Recent promotion/demotion events
+  - Latest learning journal entry summary
+
+### Prod dashboard:
+- Only show promoted-tier bets in all views, metrics, and calculations
+- Add a small "Promotion Pipeline" widget showing: how many experiments are in candidate stage (coming soon to prod), and the latest promotion event
+- All ROI, win rate, CLV, and edge calculations must EXCLUDE any non-promoted data
+
+---
+
+## Phase 9: Documentation
+
+Update `replit.md` with a comprehensive "Environment Architecture & Experiment Pipeline" section covering:
+
+- Dev and prod use SEPARATE databases — always, non-negotiable
+- Data tier system: experiment → candidate → promoted (and demotion paths)
+- Promotion thresholds and what each one means
+- How opportunity scoring boost works and how it's tracked
+- How the weekly self-analysis works
+- How to manually check experiment status and promotion readiness
+- How to run a manual sync
+- How the startup safety check prevents shared database accidents
+- That the promotion engine is the ONLY path for data to flow from dev to prod — no shortcuts, no manual overrides without audit logging
+
+---
+
+## Phase 10: Verification
+
+After ALL changes:
+
+1. Show me the database host that dev connects to
+2. Show me the database host that prod connects to
+3. Confirm they are DIFFERENT hosts
+4. Show me the `experiment_registry` table with at least 2 entries
+5. Show me the auto-tagging working: place a test bet on a low-data league in dev and confirm it gets tagged as `experiment` with `sync_eligible = false`
+6. Run the seed script and show me row counts per league
+7. Run the promotion engine and show me it correctly evaluates thresholds
+8. Run the sync script and confirm ONLY promoted bets reach prod
+9. Show me the dev dashboard with experiment badges visible
+10. Publish to production and confirm the prod dashboard loads with promoted bets only and all metrics exclude experimental data
+
+**Do not mark this as complete until all 10 verification steps are confirmed.**
