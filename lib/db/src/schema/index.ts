@@ -17,3 +17,4 @@ export * from "./discoveredLeagues";
 export * from "./experimentRegistry";
 export * from "./promotionAuditLog";
 export * from "./experimentLearningJournal";
+export * from "./competitionConfig";

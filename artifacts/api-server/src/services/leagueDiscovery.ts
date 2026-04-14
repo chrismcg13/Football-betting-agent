@@ -9,13 +9,15 @@
  * Runs: weekly (Sunday midnight) + on-demand via API.
  */
 
-import { db, discoveredLeaguesTable, leagueEdgeScoresTable, learningNarrativesTable, complianceLogsTable, oddspapiFixtureMapTable, matchesTable, oddsSnapshotsTable } from "@workspace/db";
+import { db, discoveredLeaguesTable, leagueEdgeScoresTable, learningNarrativesTable, complianceLogsTable, oddspapiFixtureMapTable, matchesTable, oddsSnapshotsTable, competitionConfigTable } from "@workspace/db";
 import { eq, inArray, sql, and, like } from "drizzle-orm";
 import { logger } from "../lib/logger";
-import { ALL_LEAGUE_IDS } from "./apiFootball";
+import { ALL_LEAGUE_IDS, TIER1_LEAGUE_IDS, TIER2_LEAGUE_IDS, TIER3_LEAGUE_IDS } from "./apiFootball";
 
 // ─── Pre-known leagues to ALWAYS include (hardcoded IDs from apiFootball.ts) ──
 const BASELINE_LEAGUE_IDS = new Set(ALL_LEAGUE_IDS);
+const TIER1_SET = new Set(TIER1_LEAGUE_IDS);
+const TIER2_SET = new Set(TIER2_LEAGUE_IDS);
 
 // ─── Known Pinnacle-covered league IDs (confirmed coverage) ──────────────────
 // This list grows as OddsPapi fixture mapping confirms coverage.
@@ -69,47 +71,58 @@ const KNOWN_PINNACLE_LEAGUE_IDS = new Set([
 function classifyLeague(leagueId: number, leagueName: string, countryName: string): {
   tier: string;
   seedEdgeScore: number;
+  numericTier: number;
 } {
+  if (TIER1_SET.has(leagueId)) return { tier: "tier1", seedEdgeScore: 75, numericTier: 1 };
+  if (TIER2_SET.has(leagueId)) return { tier: "tier2", seedEdgeScore: 78, numericTier: 2 };
+
   const name = leagueName.toLowerCase();
   const country = countryName.toLowerCase();
 
-  // Top 5 + UCL/UEL
   const top5Ids = new Set([39, 140, 135, 78, 61, 2, 3]);
-  if (top5Ids.has(leagueId)) return { tier: "top5", seedEdgeScore: 75 };
+  if (top5Ids.has(leagueId)) return { tier: "tier1", seedEdgeScore: 75, numericTier: 1 };
 
-  // Well-known top divisions
-  const tier1Ids = new Set([88, 94, 40, 71, 179, 144, 203, 197, 98, 292, 188, 128, 207, 218, 103, 113, 119]);
-  if (tier1Ids.has(leagueId)) return { tier: "top_division", seedEdgeScore: 78 };
+  const tier2Names = ["championship", "ligue 2", "2. bundesliga", "serie b", "segunda", "segunda división"];
+  if (tier2Names.some((n) => name.includes(n))) return { tier: "tier2", seedEdgeScore: 82, numericTier: 2 };
 
-  // Second divisions of major countries (high edge potential)
-  const tier2Names = ["championship", "ligue 2", "2. bundesliga", "serie b", "segunda", "segunda división", "segunda b"];
-  if (tier2Names.some((n) => name.includes(n))) return { tier: "second_division", seedEdgeScore: 82 };
-
-  const tier2Ids = new Set([62, 79, 136, 141]);
-  if (tier2Ids.has(leagueId)) return { tier: "second_division", seedEdgeScore: 82 };
-
-  // Scandinavia (undervalued markets)
   const scandCountries = ["sweden", "norway", "denmark", "finland", "iceland"];
-  if (scandCountries.includes(country)) return { tier: "scandinavia", seedEdgeScore: 78 };
+  if (scandCountries.includes(country)) return { tier: "tier2", seedEdgeScore: 78, numericTier: 2 };
 
-  // Eastern Europe (sharp money, thin margins)
   const eeCountries = ["poland", "czech republic", "romania", "croatia", "ukraine", "serbia", "slovakia", "hungary"];
-  if (eeCountries.includes(country)) return { tier: "eastern_europe", seedEdgeScore: 78 };
+  if (eeCountries.includes(country)) return { tier: "tier2", seedEdgeScore: 78, numericTier: 2 };
 
-  // South America (value markets)
   const saCountries = ["brazil", "argentina", "colombia", "chile", "peru", "uruguay", "ecuador", "paraguay", "bolivia", "venezuela"];
-  if (saCountries.includes(country)) return { tier: "south_america", seedEdgeScore: 78 };
+  if (saCountries.includes(country)) return { tier: "tier2", seedEdgeScore: 78, numericTier: 2 };
 
-  // Asia-Pacific
-  const apCountries = ["japan", "south korea", "australia", "china", "thailand", "indonesia", "malaysia"];
-  if (apCountries.includes(country)) return { tier: "asia_pacific", seedEdgeScore: 78 };
+  const apCountries = ["japan", "south korea", "australia", "china", "thailand", "indonesia", "malaysia", "india", "saudi arabia", "qatar", "uae"];
+  if (apCountries.includes(country)) return { tier: "tier2", seedEdgeScore: 78, numericTier: 2 };
 
-  // Third divisions / lower
-  const lowerNames = ["liga 3", "third", "national", "3. liga", "serie c", "division 3"];
-  if (lowerNames.some((n) => name.includes(n))) return { tier: "third_division", seedEdgeScore: 75 };
+  const lowerNames = ["liga 3", "third", "national", "3. liga", "serie c", "division 3", "league two", "league one"];
+  if (lowerNames.some((n) => name.includes(n))) return { tier: "tier3", seedEdgeScore: 75, numericTier: 3 };
 
-  // Default: top division of smaller country
-  return { tier: "top_division", seedEdgeScore: 77 };
+  return { tier: "tier3", seedEdgeScore: 77, numericTier: 3 };
+}
+
+function classifyCompetitionType(leagueName: string, leagueType: string): { type: string; gender: string } {
+  const name = leagueName.toLowerCase();
+
+  const gender = (name.includes("women") || name.includes("féminine") || name.includes("frauen") ||
+    name.includes("femminile") || name.includes("femenina") || name.includes("nwsl") ||
+    name.includes("wsl") || name.includes("liga f") || name.includes("she believes")) ? "female" : "male";
+
+  let type: string;
+  if (leagueType === "Cup") {
+    type = "cup";
+  } else if (name.includes("world cup") || name.includes("euro") || name.includes("nations league") ||
+    name.includes("copa america") || name.includes("gold cup") || name.includes("africa cup") ||
+    name.includes("asian cup") || name.includes("olympic") || name.includes("friendlies") ||
+    name.includes("qualifiers")) {
+    type = "international";
+  } else {
+    type = "league";
+  }
+
+  return { type, gender };
 }
 
 // ─── API-Football fetch helper ────────────────────────────────────────────────
@@ -230,24 +243,59 @@ export async function runLeagueDiscovery(): Promise<LeagueDiscoveryResult> {
     report: [],
   };
 
-  // 4. Process each in-season league
-  // Limit to first 200 to stay within budget (~200 requests per scan)
-  const toProcess = inSeason.slice(0, 200);
-
-  for (const leagueData of toProcess) {
+  // 4. Process ALL in-season leagues (no cap — we have 75k/day budget)
+  for (const leagueData of inSeason) {
     const leagueId: number = leagueData.league?.id;
     const leagueName: string = leagueData.league?.name ?? "Unknown";
     const countryName: string = leagueData.country?.name ?? "Unknown";
 
     if (!leagueId) continue;
 
-    const { tier, seedEdgeScore } = classifyLeague(leagueId, leagueName, countryName);
+    const { tier, seedEdgeScore, numericTier } = classifyLeague(leagueId, leagueName, countryName);
+    const leagueType = leagueData.league?.type ?? "League";
+    const { type: compType, gender } = classifyCompetitionType(leagueName, leagueType);
     const hasPinnacleOdds = KNOWN_PINNACLE_LEAGUE_IDS.has(leagueId);
     const isExisting = existingMap.has(leagueId);
 
-    // Get fixture count for the current season
     const currentSeasonData = (leagueData.seasons as any[])?.find((s: any) => s.current === true);
-    const fixtureCount: number = currentSeasonData?.coverage?.fixtures?.events ? 100 : 0;
+    const coverage = currentSeasonData?.coverage;
+    const hasEvents = !!coverage?.fixtures?.events;
+    const hasStatistics = !!coverage?.fixtures?.statistics;
+    const hasLineups = !!coverage?.fixtures?.lineups;
+    const fixtureCount: number = hasEvents ? 100 : 0;
+    const currentSeason = currentSeasonData?.year as number | undefined;
+
+    const pollingFrequency = numericTier === 1 ? "high" : numericTier === 2 ? "medium" : "low";
+
+    await db.insert(competitionConfigTable).values({
+      apiFootballId: leagueId,
+      name: leagueName,
+      country: countryName,
+      type: compType,
+      gender,
+      tier: numericTier,
+      isActive: true,
+      hasStatistics,
+      hasLineups,
+      hasOdds: false,
+      hasEvents,
+      hasPinnacleOdds,
+      currentSeason,
+      pollingFrequency,
+      coverageCheckedAt: new Date(),
+    }).onConflictDoUpdate({
+      target: competitionConfigTable.apiFootballId,
+      set: {
+        isActive: true,
+        hasStatistics,
+        hasLineups,
+        hasEvents,
+        hasPinnacleOdds,
+        currentSeason,
+        pollingFrequency,
+        coverageCheckedAt: new Date(),
+      },
+    });
 
     let hasApiFootballOdds = false;
 
@@ -451,22 +499,19 @@ export async function seedBaselineLeagues(): Promise<void> {
   }
 
   const nameById = new Map(leagueEntries.map(([n, id]) => [id, n]));
-  const EXTRA_LEAGUE_NAMES: Record<number, string> = {
-    98: "J1 League", 188: "A-League Men", 106: "Ekstraklasa",
-    345: "Czech First League", 283: "Liga I", 210: "HNL",
-    253: "Major League Soccer", 262: "Liga BetPlay", 4: "UEFA Europa Conference League",
-  };
 
   for (const id of ALL_LEAGUE_IDS) {
     if (nameById.has(id)) continue;
-    const name = EXTRA_LEAGUE_NAMES[id] || `League ${id}`;
-    const { tier, seedEdgeScore } = classifyLeague(id, name, "");
+    const meta = LEAGUE_ID_NAMES[id];
+    const name = meta?.name ?? `League ${id}`;
+    const country = meta?.country ?? "";
+    const { tier, seedEdgeScore } = classifyLeague(id, name, country);
     const hasPinnacle = KNOWN_PINNACLE_LEAGUE_IDS.has(id);
 
     await db.insert(discoveredLeaguesTable).values({
       leagueId: id,
       name,
-      country: "",
+      country,
       tier,
       fixtureCount: 0,
       hasApiFootballOdds: true,
@@ -474,11 +519,218 @@ export async function seedBaselineLeagues(): Promise<void> {
       seedEdgeScore,
       status: "active",
       activatedAt: new Date(),
-      discoveryNotes: "Baseline league — seeded at startup via ALL_LEAGUE_IDS.",
+      discoveryNotes: `Baseline league — seeded at startup via ALL_LEAGUE_IDS. ${meta ? `(${meta.type}, ${meta.gender})` : ""}`,
     }).onConflictDoNothing();
+
+    // Also update name if entry already exists with generic name
+    if (meta) {
+      await db.update(discoveredLeaguesTable)
+        .set({ name, country })
+        .where(and(
+          eq(discoveredLeaguesTable.leagueId, id),
+          like(discoveredLeaguesTable.name, "League %"),
+        ));
+    }
   }
 
   logger.info({ count: leagueEntries.length + ALL_LEAGUE_IDS.length }, "Baseline leagues seeded into discovered_leagues");
+}
+
+// ─── Seed competition config from hardcoded tier lists ──────────────────────
+
+const LEAGUE_ID_NAMES: Record<number, { name: string; country: string; type: string; gender: string }> = {
+  1: { name: "FIFA World Cup", country: "World", type: "international", gender: "male" },
+  2: { name: "UEFA Champions League", country: "World", type: "cup", gender: "male" },
+  3: { name: "UEFA Europa League", country: "World", type: "cup", gender: "male" },
+  4: { name: "UEFA Conference League", country: "World", type: "cup", gender: "male" },
+  5: { name: "UEFA Nations League", country: "Europe", type: "international", gender: "male" },
+  6: { name: "Africa Cup of Nations", country: "Africa", type: "international", gender: "male" },
+  7: { name: "AFC Asian Cup", country: "Asia", type: "international", gender: "male" },
+  8: { name: "FIFA Women's World Cup", country: "World", type: "international", gender: "female" },
+  9: { name: "Copa America", country: "South America", type: "international", gender: "male" },
+  10: { name: "International Friendlies", country: "World", type: "international", gender: "male" },
+  11: { name: "CONCACAF Gold Cup", country: "North America", type: "international", gender: "male" },
+  12: { name: "CAF Champions League", country: "Africa", type: "cup", gender: "male" },
+  13: { name: "CONMEBOL Libertadores", country: "South America", type: "cup", gender: "male" },
+  14: { name: "CONMEBOL Sudamericana", country: "South America", type: "cup", gender: "male" },
+  15: { name: "FIFA WC Qualifiers - UEFA", country: "Europe", type: "international", gender: "male" },
+  16: { name: "CONCACAF Champions Cup", country: "North America", type: "cup", gender: "male" },
+  17: { name: "AFC Champions League", country: "Asia", type: "cup", gender: "male" },
+  20: { name: "CAF Confederation Cup", country: "Africa", type: "cup", gender: "male" },
+  22: { name: "International Friendlies Women", country: "World", type: "international", gender: "female" },
+  29: { name: "FIFA WC Qualifiers - CONMEBOL", country: "South America", type: "international", gender: "male" },
+  30: { name: "FIFA WC Qualifiers - AFC", country: "Asia", type: "international", gender: "male" },
+  31: { name: "FIFA WC Qualifiers - CONCACAF", country: "North America", type: "international", gender: "male" },
+  33: { name: "FIFA WC Qualifiers - CAF", country: "Africa", type: "international", gender: "male" },
+  34: { name: "FIFA WC Qualifiers - OFC", country: "Oceania", type: "international", gender: "male" },
+  39: { name: "Premier League", country: "England", type: "league", gender: "male" },
+  40: { name: "Championship", country: "England", type: "league", gender: "male" },
+  41: { name: "EFL League One", country: "England", type: "league", gender: "male" },
+  42: { name: "EFL League Two", country: "England", type: "league", gender: "male" },
+  43: { name: "National League", country: "England", type: "league", gender: "male" },
+  45: { name: "FA Cup", country: "England", type: "cup", gender: "male" },
+  46: { name: "League Cup", country: "England", type: "cup", gender: "male" },
+  61: { name: "Ligue 1", country: "France", type: "league", gender: "male" },
+  62: { name: "Ligue 2", country: "France", type: "league", gender: "male" },
+  63: { name: "National 1", country: "France", type: "league", gender: "male" },
+  66: { name: "Coupe de France", country: "France", type: "cup", gender: "male" },
+  71: { name: "Brasileirão Série A", country: "Brazil", type: "league", gender: "male" },
+  78: { name: "Bundesliga", country: "Germany", type: "league", gender: "male" },
+  79: { name: "2. Bundesliga", country: "Germany", type: "league", gender: "male" },
+  80: { name: "3. Liga", country: "Germany", type: "league", gender: "male" },
+  81: { name: "DFB-Pokal", country: "Germany", type: "cup", gender: "male" },
+  88: { name: "Eredivisie", country: "Netherlands", type: "league", gender: "male" },
+  94: { name: "Primeira Liga", country: "Portugal", type: "league", gender: "male" },
+  95: { name: "Segunda Liga", country: "Portugal", type: "league", gender: "male" },
+  98: { name: "J1 League", country: "Japan", type: "league", gender: "male" },
+  103: { name: "Eliteserien", country: "Norway", type: "league", gender: "male" },
+  104: { name: "OBOS-ligaen", country: "Norway", type: "league", gender: "male" },
+  106: { name: "Ekstraklasa", country: "Poland", type: "league", gender: "male" },
+  113: { name: "Allsvenskan", country: "Sweden", type: "league", gender: "male" },
+  114: { name: "Superettan", country: "Sweden", type: "league", gender: "male" },
+  119: { name: "Superliga", country: "Denmark", type: "league", gender: "male" },
+  120: { name: "1st Division", country: "Denmark", type: "league", gender: "male" },
+  128: { name: "Liga Profesional", country: "Argentina", type: "league", gender: "male" },
+  135: { name: "Serie A", country: "Italy", type: "league", gender: "male" },
+  136: { name: "Serie B", country: "Italy", type: "league", gender: "male" },
+  137: { name: "Coppa Italia", country: "Italy", type: "cup", gender: "male" },
+  138: { name: "Serie C", country: "Italy", type: "league", gender: "male" },
+  140: { name: "La Liga", country: "Spain", type: "league", gender: "male" },
+  141: { name: "Segunda División", country: "Spain", type: "league", gender: "male" },
+  143: { name: "Copa del Rey", country: "Spain", type: "cup", gender: "male" },
+  144: { name: "Jupiler Pro League", country: "Belgium", type: "league", gender: "male" },
+  145: { name: "First Division B", country: "Belgium", type: "league", gender: "male" },
+  156: { name: "KNVB Beker", country: "Netherlands", type: "cup", gender: "male" },
+  157: { name: "Copa do Brasil", country: "Brazil", type: "cup", gender: "male" },
+  169: { name: "Chinese Super League", country: "China", type: "league", gender: "male" },
+  179: { name: "Scottish Premiership", country: "Scotland", type: "league", gender: "male" },
+  180: { name: "Scottish Cup", country: "Scotland", type: "cup", gender: "male" },
+  181: { name: "Scottish Championship", country: "Scotland", type: "league", gender: "male" },
+  188: { name: "A-League Men", country: "Australia", type: "league", gender: "male" },
+  196: { name: "A-League Women", country: "Australia", type: "league", gender: "female" },
+  197: { name: "Super League", country: "Greece", type: "league", gender: "male" },
+  200: { name: "Botola Pro", country: "Morocco", type: "league", gender: "male" },
+  201: { name: "Ligue 1", country: "Algeria", type: "league", gender: "male" },
+  202: { name: "Ligue 1", country: "Tunisia", type: "league", gender: "male" },
+  203: { name: "Süper Lig", country: "Turkey", type: "league", gender: "male" },
+  204: { name: "1. Lig", country: "Turkey", type: "league", gender: "male" },
+  207: { name: "Super League", country: "Switzerland", type: "league", gender: "male" },
+  210: { name: "HNL", country: "Croatia", type: "league", gender: "male" },
+  218: { name: "Bundesliga", country: "Austria", type: "league", gender: "male" },
+  230: { name: "Liga MX", country: "Mexico", type: "league", gender: "male" },
+  231: { name: "Liga Expansión MX", country: "Mexico", type: "league", gender: "male" },
+  233: { name: "Egyptian Premier League", country: "Egypt", type: "league", gender: "male" },
+  235: { name: "Premier Liga", country: "Russia", type: "league", gender: "male" },
+  239: { name: "Primera División", country: "Costa Rica", type: "league", gender: "male" },
+  242: { name: "Serie A", country: "Ecuador", type: "league", gender: "male" },
+  253: { name: "Major League Soccer", country: "USA", type: "league", gender: "male" },
+  254: { name: "NWSL", country: "USA", type: "league", gender: "female" },
+  262: { name: "Liga BetPlay", country: "Colombia", type: "league", gender: "male" },
+  265: { name: "Primera División", country: "Chile", type: "league", gender: "male" },
+  268: { name: "Primera División", country: "Uruguay", type: "league", gender: "male" },
+  270: { name: "Primera División", country: "Paraguay", type: "league", gender: "male" },
+  271: { name: "Primera División", country: "Bolivia", type: "league", gender: "male" },
+  281: { name: "Liga 1", country: "Peru", type: "league", gender: "male" },
+  283: { name: "Liga I", country: "Romania", type: "league", gender: "male" },
+  288: { name: "Premier Division", country: "South Africa", type: "league", gender: "male" },
+  292: { name: "K League 1", country: "South Korea", type: "league", gender: "male" },
+  296: { name: "Thai League 1", country: "Thailand", type: "league", gender: "male" },
+  299: { name: "Primera División", country: "Venezuela", type: "league", gender: "male" },
+  301: { name: "Stars League", country: "Qatar", type: "league", gender: "male" },
+  305: { name: "Pro League", country: "UAE", type: "league", gender: "male" },
+  307: { name: "Saudi Pro League", country: "Saudi Arabia", type: "league", gender: "male" },
+  318: { name: "Premier League", country: "Ghana", type: "league", gender: "male" },
+  320: { name: "Premier League", country: "Kenya", type: "league", gender: "male" },
+  321: { name: "NPFL", country: "Nigeria", type: "league", gender: "male" },
+  323: { name: "Indian Super League", country: "India", type: "league", gender: "male" },
+  332: { name: "Liga Nacional", country: "Honduras", type: "league", gender: "male" },
+  333: { name: "Premier League", country: "Ukraine", type: "league", gender: "male" },
+  345: { name: "Czech First League", country: "Czech Republic", type: "league", gender: "male" },
+  480: { name: "Olympic Football Men", country: "World", type: "international", gender: "male" },
+  523: { name: "Olympic Football Women", country: "World", type: "international", gender: "female" },
+  524: { name: "Serie A Femminile", country: "Italy", type: "league", gender: "female" },
+  770: { name: "Frauen-Bundesliga", country: "Germany", type: "league", gender: "female" },
+  771: { name: "WSL", country: "England", type: "league", gender: "female" },
+  773: { name: "Division 1 Féminine", country: "France", type: "league", gender: "female" },
+  775: { name: "Liga F", country: "Spain", type: "league", gender: "female" },
+  790: { name: "Brasileiro Feminino", country: "Brazil", type: "league", gender: "female" },
+  848: { name: "UEFA Nations League", country: "Europe", type: "international", gender: "male" },
+  960: { name: "UEFA Women's Euro", country: "Europe", type: "international", gender: "female" },
+};
+
+export async function seedCompetitionConfig(): Promise<{ seeded: number }> {
+  let seeded = 0;
+  for (const leagueId of ALL_LEAGUE_IDS) {
+    const meta = LEAGUE_ID_NAMES[leagueId];
+    if (!meta) continue;
+
+    const { numericTier } = classifyLeague(leagueId, meta.name, meta.country);
+    const pollingFrequency = numericTier === 1 ? "high" : numericTier === 2 ? "medium" : "low";
+
+    try {
+      const result = await db.insert(competitionConfigTable).values({
+        apiFootballId: leagueId,
+        name: meta.name,
+        country: meta.country,
+        type: meta.type,
+        gender: meta.gender,
+        tier: numericTier,
+        isActive: true,
+        hasStatistics: false,
+        hasLineups: false,
+        hasOdds: false,
+        hasEvents: false,
+        hasPinnacleOdds: KNOWN_PINNACLE_LEAGUE_IDS.has(leagueId),
+        pollingFrequency,
+      }).onConflictDoNothing();
+      if ((result.rowCount ?? 0) > 0) seeded++;
+    } catch (err) {
+      logger.warn({ err, leagueId }, "Failed to seed competition config entry");
+    }
+  }
+  logger.info({ seeded, total: ALL_LEAGUE_IDS.length }, "Competition config seeding complete");
+  return { seeded };
+}
+
+export async function getCompetitionCoverageStats(): Promise<{
+  totalCompetitions: number;
+  activeCompetitions: number;
+  byTier: Record<string, number>;
+  byType: Record<string, number>;
+  byGender: Record<string, number>;
+  withPinnacle: number;
+  withStatistics: number;
+  pollingBreakdown: Record<string, number>;
+}> {
+  const all = await db.select().from(competitionConfigTable);
+  const active = all.filter((c) => c.isActive);
+
+  const byTier: Record<string, number> = { "1": 0, "2": 0, "3": 0 };
+  const byType: Record<string, number> = { league: 0, cup: 0, international: 0 };
+  const byGender: Record<string, number> = { male: 0, female: 0 };
+  const pollingBreakdown: Record<string, number> = { high: 0, medium: 0, low: 0, dormant: 0 };
+  let withPinnacle = 0;
+  let withStatistics = 0;
+
+  for (const c of all) {
+    byTier[String(c.tier)] = (byTier[String(c.tier)] ?? 0) + 1;
+    byType[c.type] = (byType[c.type] ?? 0) + 1;
+    byGender[c.gender] = (byGender[c.gender] ?? 0) + 1;
+    pollingBreakdown[c.pollingFrequency] = (pollingBreakdown[c.pollingFrequency] ?? 0) + 1;
+    if (c.hasPinnacleOdds) withPinnacle++;
+    if (c.hasStatistics) withStatistics++;
+  }
+
+  return {
+    totalCompetitions: all.length,
+    activeCompetitions: active.length,
+    byTier,
+    byType,
+    byGender,
+    withPinnacle,
+    withStatistics,
+    pollingBreakdown,
+  };
 }
 
 // ─── Dynamic Pinnacle coverage update ─────────────────────────────────────────

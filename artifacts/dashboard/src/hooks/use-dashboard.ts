@@ -183,6 +183,14 @@ export const useGoLiveReadiness = () => {
   });
 };
 
+export const useCoverage = () => {
+  return useQuery({
+    queryKey: ["admin", "coverage"],
+    queryFn: () => fetcher("/api/admin/coverage"),
+    refetchInterval: 120000,
+  });
+};
+
 export const useExperiments = () => {
   return useQuery({
     queryKey: ["admin", "experiments"],

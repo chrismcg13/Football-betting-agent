@@ -27,7 +27,7 @@ import {
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement } from "./apiFootball";
-import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings } from "./leagueDiscovery";
+import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql } from "drizzle-orm";
 import { runPromotionEngine } from "./promotionEngine";
@@ -894,30 +894,29 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("xG ingestion scheduler active — daily at 05:00 UTC");
 
-  // League discovery: weekly on Sunday at 00:30 UTC
-  // Costs ~200 API-Football requests — trivial against 75k/day budget.
-  // After discovery, ingest fixtures for newly discovered leagues.
-  cron.schedule("30 0 * * 0", () => {
-    logger.info("Weekly league discovery triggered by scheduler");
+  // League discovery: DAILY at 00:30 UTC (was weekly — now aggressive, we have budget)
+  // Scans all API-Football leagues and populates competition_config + discovered_leagues.
+  cron.schedule("30 0 * * *", () => {
+    logger.info("Daily league discovery triggered by scheduler");
     void runLeagueDiscovery()
       .then((result) => {
-        logger.info({ activated: result.activatedLeagues.length, total: result.totalLeaguesFound }, "Weekly league discovery complete");
+        logger.info({ activated: result.activatedLeagues.length, total: result.totalLeaguesFound }, "Daily league discovery complete");
         return ingestFixturesForDiscoveredLeagues();
       })
       .then((r) => logger.info(r, "Post-discovery fixture ingestion complete"))
-      .catch((err) => logger.warn({ err }, "Weekly league discovery failed — non-fatal"));
+      .catch((err) => logger.warn({ err }, "Daily league discovery failed — non-fatal"));
   }, { timezone: "UTC" });
-  logger.info("League discovery scheduler active — weekly Sunday 00:30 UTC");
+  logger.info("League discovery scheduler active — daily 00:30 UTC");
 
-  // Discovered league fixture ingestion: daily at 06:30 UTC (after odds refresh at 06:00)
-  // Ensures the matches table stays current with all active discovered leagues.
-  cron.schedule("30 6 * * *", () => {
-    logger.info("Daily discovered-league fixture ingestion triggered");
+  // Discovered league fixture ingestion: TWICE daily (06:30 and 18:30 UTC)
+  // With 200+ competitions, this is where most API budget goes.
+  cron.schedule("30 6,18 * * *", () => {
+    logger.info("Discovered-league fixture ingestion triggered");
     void ingestFixturesForDiscoveredLeagues()
-      .then((r) => logger.info(r, "Daily discovered-league fixture ingestion complete"))
-      .catch((err) => logger.warn({ err }, "Daily discovered-league fixture ingestion failed — non-fatal"));
+      .then((r) => logger.info(r, "Discovered-league fixture ingestion complete"))
+      .catch((err) => logger.warn({ err }, "Discovered-league fixture ingestion failed — non-fatal"));
   }, { timezone: "UTC" });
-  logger.info("Discovered-league fixture ingestion scheduler active — daily 06:30 UTC");
+  logger.info("Discovered-league fixture ingestion scheduler active — twice daily 06:30 & 18:30 UTC");
 
   cron.schedule("0 4 * * *", () => {
     logger.info("Promotion engine triggered (daily 04:00 UTC)");
@@ -962,8 +961,9 @@ export function startScheduler(): void {
   }, 3 * 60 * 1000); // 3 minutes after start
   logger.info("Startup warmup scheduled — odds refresh + trading cycle in 3 min");
 
-  // Seed baseline leagues at startup (idempotent — uses onConflictDoNothing)
+  // Seed baseline leagues + competition config at startup (idempotent — uses onConflictDoNothing)
   void seedBaselineLeagues().catch((err) => logger.warn({ err }, "Baseline league seed failed — non-fatal"));
+  void seedCompetitionConfig().catch((err) => logger.warn({ err }, "Competition config seed failed — non-fatal"));
 }
 
 // ===================== Manual triggers (for API routes) =====================

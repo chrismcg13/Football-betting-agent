@@ -322,6 +322,47 @@ export async function runMigrations() {
         ON paper_bets(sync_eligible) WHERE sync_eligible = true
     `);
 
+    // ── Competition config table (expansion to 200+ competitions) ─────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS competition_config (
+        id SERIAL PRIMARY KEY,
+        api_football_id INTEGER NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        country TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL DEFAULT 'league',
+        gender TEXT NOT NULL DEFAULT 'male',
+        tier INTEGER NOT NULL DEFAULT 3,
+        is_active BOOLEAN NOT NULL DEFAULT false,
+        has_statistics BOOLEAN NOT NULL DEFAULT false,
+        has_lineups BOOLEAN NOT NULL DEFAULT false,
+        has_odds BOOLEAN NOT NULL DEFAULT false,
+        has_events BOOLEAN NOT NULL DEFAULT false,
+        has_pinnacle_odds BOOLEAN NOT NULL DEFAULT false,
+        seasonal_start TEXT,
+        seasonal_end TEXT,
+        current_season INTEGER,
+        polling_frequency TEXT NOT NULL DEFAULT 'dormant',
+        last_polled_at TIMESTAMPTZ,
+        total_api_calls_used INTEGER NOT NULL DEFAULT 0,
+        fixture_count INTEGER NOT NULL DEFAULT 0,
+        coverage_checked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_competition_config_tier
+        ON competition_config(tier)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_competition_config_active
+        ON competition_config(is_active) WHERE is_active = true
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_competition_config_polling
+        ON competition_config(polling_frequency)
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

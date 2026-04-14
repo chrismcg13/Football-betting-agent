@@ -45,7 +45,7 @@ import {
   runIngestDiscoveredFixturesNow,
   runSettlementNow,
 } from "../services/scheduler";
-import { getDiscoveredLeagues, getDiscoveryStats } from "../services/leagueDiscovery";
+import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import {
   getOddspapiStatus,
@@ -1856,6 +1856,40 @@ router.get("/admin/experiment-analysis", async (_req, res) => {
     `);
     res.json({ success: true, entries: (rows as any).rows ?? [] });
   } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/coverage", async (_req, res) => {
+  try {
+    const coverage = await getCompetitionCoverageStats();
+
+    const budgetResult = await db.execute(sql`
+      SELECT
+        COALESCE((SELECT SUM(request_count)::int FROM api_usage WHERE created_at >= CURRENT_DATE), 0) AS today_calls,
+        COALESCE((SELECT SUM(request_count)::int FROM api_usage WHERE created_at >= NOW() - INTERVAL '30 days'), 0) AS month_calls
+    `);
+    const budgetRow = (budgetResult as any).rows?.[0] ?? {};
+    const todayCalls = budgetRow.today_calls ?? 0;
+    const monthCalls = budgetRow.month_calls ?? 0;
+
+    const MONTHLY_LIMIT = 75000;
+    const DAILY_TARGET = 2500;
+
+    res.json({
+      success: true,
+      ...coverage,
+      apiBudget: {
+        dailyUsed: todayCalls,
+        dailyTarget: DAILY_TARGET,
+        monthlyUsed: monthCalls,
+        monthlyLimit: MONTHLY_LIMIT,
+        dailyUtilisation: Math.round((todayCalls / DAILY_TARGET) * 100),
+        monthlyUtilisation: Math.round((monthCalls / MONTHLY_LIMIT) * 100),
+      },
+    });
+  } catch (err) {
+    logger.warn({ err }, "Coverage stats failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });

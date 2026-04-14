@@ -1,0 +1,350 @@
+# EXPANSION: Massively increase competition coverage for faster experiment pipeline
+
+## Context
+
+We currently cover 38 leagues. API-Football has 1,238 competitions available. We're using 729/75,000 API budget and 6/300 daily on Pinnacle. The model needs MORE data across MORE competitions to accelerate the experiment → candidate → promoted pipeline. Even without Pinnacle odds validation, the model can still collect data, build statistical profiles, learn patterns, and validate its own predictions. Pinnacle validation makes the edge sharper, but data collection and self-learning don't require it.
+
+We have a PAID API-Football plan: 75,000 requests/month (~2,500/day). We are currently using barely 729 of those 75,000. That is 1% utilisation — massively underusing what we're paying for. The model should be working MUCH harder. We have the budget to ingest aggressively across hundreds of competitions simultaneously.
+
+**Do NOT just add random leagues. Follow the structured approach below — but do NOT be conservative with API calls. We have 2,500/day to spend. Use them.**
+
+---
+
+## Phase 1: Discovery — Find ALL available competitions
+
+### Step 1: Query API-Football for the full competition list
+
+Use the API-Football endpoint: `GET /leagues` with no filters to retrieve ALL 1,238 available competitions. This is a single API call.
+
+Parse the response and categorise every competition into these tiers:
+
+**Tier 1 — HIGH PRIORITY (add immediately):**
+These are major international and continental competitions with strong data coverage. Use these API-Football league IDs (verify each one by querying the API — IDs may differ in your version):
+
+INTERNATIONAL — MEN:
+- FIFA World Cup (league ID: 1) — 2026 tournament starting June, fixtures already available
+- FIFA World Cup Qualifiers — all confederations:
+  - UEFA Qualifiers
+  - CONMEBOL Qualifiers
+  - CONCACAF Qualifiers
+  - CAF Qualifiers
+  - AFC Qualifiers
+  - OFC Qualifiers
+- International Friendlies (men)
+- UEFA Nations League
+- CONMEBOL Copa America
+- CONCACAF Gold Cup / Nations League
+- CAF Africa Cup of Nations
+- AFC Asian Cup
+- Gulf Cup of Nations
+- AFF Championship (Southeast Asia)
+
+INTERNATIONAL — WOMEN:
+- FIFA Women's World Cup
+- International Friendlies (women)
+- UEFA Women's Championship (Euros)
+- SheBelieves Cup
+- Algarve Cup
+- CONMEBOL Copa America Femenina
+- CAF Women's Africa Cup of Nations
+- Olympic Football (men and women)
+
+CONTINENTAL CLUB COMPETITIONS:
+- UEFA Europa League (if not already covered)
+- UEFA Conference League (if not already covered)
+- CONMEBOL Libertadores
+- CONMEBOL Sudamericana
+- CAF Champions League
+- CAF Confederation Cup
+- AFC Champions League Elite
+- AFC Champions League Two
+- CONCACAF Champions Cup
+- OFC Champions League
+
+**Tier 2 — MEDIUM PRIORITY (add if budget allows):**
+Top domestic leagues NOT already covered. Focus on leagues with good fixture statistics coverage in API-Football. Check the coverage endpoint for each:
+
+EUROPE (top divisions not yet covered):
+- Eredivisie (Netherlands)
+- Jupiler Pro League (Belgium)
+- Scottish Premiership
+- Süper Lig (Turkey)
+- Super League (Greece)
+- Ekstraklasa (Poland)
+- Czech First League
+- Austrian Bundesliga
+- Swiss Super League
+- Danish Superliga
+- Norwegian Eliteserien
+- Swedish Allsvenskan
+- Ukrainian Premier League
+- Russian Premier Liga
+- Croatian HNL
+
+SOUTH AMERICA:
+- Argentine Liga Profesional
+- Colombian Liga BetPlay
+- Uruguayan Primera División
+- Peruvian Liga 1
+- Paraguayan Primera División
+- Venezuelan Primera División
+- Ecuadorian Serie A
+- Chilean Primera División
+- Bolivian Primera División
+
+NORTH/CENTRAL AMERICA:
+- MLS (USA)
+- Liga MX (Mexico)
+- Liga Expansión MX (Mexico 2nd)
+- Costa Rica Primera División
+- Honduran Liga Nacional
+
+ASIA:
+- J1 League (Japan)
+- K League 1 (South Korea)
+- Chinese Super League
+- Saudi Pro League
+- UAE Pro League
+- Qatar Stars League
+- Indian Super League
+- Thai League 1
+- A-League (Australia)
+
+AFRICA:
+- Egyptian Premier League
+- South African Premier Division
+- Moroccan Botola Pro
+- Tunisian Ligue 1
+- Algerian Ligue 1
+- Nigerian NPFL
+- Kenyan Premier League
+- Ghanaian Premier League
+
+WOMEN'S DOMESTIC:
+- WSL (England Women)
+- NWSL (USA Women)
+- Division 1 Féminine (France Women)
+- Frauen-Bundesliga (Germany Women)
+- Liga F (Spain Women)
+- Serie A Femminile (Italy Women)
+- A-League Women (Australia)
+- Brasileiro Women (Brazil)
+
+DOMESTIC CUPS (for countries already covered):
+- FA Cup (England)
+- League Cup / Carabao Cup (England)
+- Copa del Rey (Spain)
+- DFB-Pokal (Germany)
+- Coppa Italia (Italy)
+- Coupe de France (France)
+- Scottish Cup
+- KNVB Beker (Netherlands)
+- Copa do Brasil
+
+**Tier 3 — LOW PRIORITY (add only if significant budget remains):**
+- Lower divisions of major leagues (Championship, Serie B, Ligue 2, 2. Bundesliga)
+- Smaller domestic leagues worldwide
+- Youth/reserve competitions
+
+### Step 2: For each competition, check data coverage
+
+Before adding any competition, query: `GET /leagues?id={league_id}&current=true`
+
+Check the coverage object. We NEED at minimum:
+- `fixtures.events = true` (goals, cards, etc.)
+- `fixtures.statistics = true` (match stats)
+- `standings = true`
+
+NICE TO HAVE but not required:
+- `fixtures.lineups = true`
+- `fixtures.players_statistics = true`
+- `predictions = true`
+
+If a competition has fixtures.events AND fixtures.statistics, add it. If it only has events but no statistics, add it at lower priority (still useful for goals/cards models). If it has neither, skip it.
+
+### Step 3: Check for active fixtures and pull historical data
+
+For ALL competitions being added:
+
+**Current season:** Query `GET /fixtures?league={league_id}&season=2026` (or 2025 for southern hemisphere leagues that span calendar years). If fixtures exist, mark as active and begin polling immediately.
+
+**Historical backfill:** Also query the previous 2 seasons (2024, 2025) to pull historical match data. The model needs this for building baseline statistical profiles — team form, scoring patterns, home/away performance. This is especially important for competitions we're adding for the first time. Use the historical backfill budget allocation (400 calls/day) to systematically pull past season data for all Tier 1 and Tier 2 competitions over the first week.
+
+**Off-season handling:** If a competition has no fixtures in the current season, flag it as `seasonal` with `polling_frequency = 'dormant'`. Check weekly for season activation. Still pull historical data for model learning.
+
+---
+
+## Phase 2: Aggressive API budget utilisation
+
+We have 75,000 requests/month = ~2,500/day. We are currently wasting this budget. Here's how to use it properly:
+
+### Budget allocation strategy (daily — ~2,500 calls available):
+
+1. **Competition discovery and coverage check (50 calls/day initially, then 10/day ongoing):** On first run, query all competitions for coverage details and active seasons. After initial setup, periodic checks for newly active seasons.
+
+2. **Fixture ingestion — active competitions (800 calls/day):** For ALL competitions with upcoming matches in the next 14 days, fetch fixture details, pre-match data, team form, head-to-head records. With 200+ active competitions, this gives ~4 calls per competition per day.
+
+3. **Results, events, and statistics (800 calls/day):** Fetch completed match results, full match statistics, events (goals, cards, substitutions), and player statistics. This is where the model learns. Pull EVERYTHING available — the more data per match, the better the model's feature generation.
+
+4. **Standings and form data (300 calls/day):** Update league tables, team form, home/away splits, goals scored/conceded across all active competitions.
+
+5. **Historical backfill (400 calls/day):** For newly added competitions, pull historical data from previous seasons (2023-2024, 2024-2025). This gives the model a baseline to learn from BEFORE the current season's bets start settling. Prioritise Tier 1 and Tier 2 competitions for backfill.
+
+6. **Reserve buffer (150 calls/day):** Buffer for retries, error recovery, and ad-hoc queries.
+
+**TOTAL: ~2,500 calls/day — this uses the budget we're paying for.**
+
+### Polling frequency (be aggressive):
+
+- Competitions with fixtures TODAY: poll every 15 minutes for live updates, pre-match lineups
+- Competitions with fixtures THIS WEEK: poll every 2 hours for odds movements, team news
+- Competitions with fixtures in the next 14 DAYS: poll twice daily
+- Competitions in active season but no fixtures in 14 days: poll daily for standings/form updates
+- Off-season competitions: poll weekly to check for new season activation
+
+### Request tracking dashboard:
+
+- Log every API-Football request with timestamp, endpoint, competition, and response status
+- Show daily and monthly usage prominently on the dashboard overview
+- Show a budget utilisation gauge: "Using X/2,500 daily" and "Using X/75,000 monthly"
+- Set alerts at 80% monthly budget (60,000 calls) — at that point, throttle Tier 3 only
+- NEVER throttle Tier 1 or Tier 2 — these are the highest value data sources
+- The goal is to USE 80-90% of the monthly budget, not to conserve it. We're paying for it.
+
+---
+
+## Phase 3: Data ingestion pipeline updates
+
+### 3a: Update the ingestion cron to handle multiple data sources per competition
+
+The current ingestion pulls from football-data.org as primary. Expand this:
+
+- football-data.org remains primary for leagues it covers (it has deeper historical data for the big European leagues)
+- API-Football becomes the primary source for ALL competitions not covered by football-data.org
+- Where both sources cover the same competition, use football-data.org for historical data and API-Football for live/current season data
+- Add a `data_source` field to fixture and match records tracking which API provided the data
+
+### 3b: Competition configuration table
+
+Create a `competition_config` table:
+
+```
+competition_config:
+  id                    TEXT PRIMARY KEY
+  api_football_id       INTEGER
+  football_data_id      INTEGER (nullable — not all comps are on football-data.org)
+  name                  TEXT
+  country               TEXT
+  type                  TEXT ('league' | 'cup' | 'international')
+  gender                TEXT ('male' | 'female')
+  tier                  INTEGER (1, 2, or 3)
+  is_active             BOOLEAN (has fixtures in current season)
+  has_statistics         BOOLEAN
+  has_lineups           BOOLEAN
+  has_odds              BOOLEAN
+  seasonal_start        TEXT (e.g. "August" for European leagues, "March" for J-League)
+  seasonal_end          TEXT
+  polling_frequency     TEXT ('high' | 'medium' | 'low' | 'dormant')
+  last_polled_at        TIMESTAMP
+  total_api_calls_used  INTEGER default 0
+  created_at            TIMESTAMP
+```
+
+### 3c: Naming normalisation
+
+This is CRITICAL. Different APIs use different names for the same competition:
+- "Premier League" vs "English Premier League" vs "England - Premier League"
+- "UEFA Champions League" vs "Champions League" vs "CL"
+
+Create a `competition_aliases` table that maps variant names to canonical names. When ingesting from multiple sources, always normalise to the canonical name before storing.
+
+Similarly, team names vary across APIs:
+- "Man United" vs "Manchester United" vs "Manchester Utd"
+- "Inter" vs "Inter Milan" vs "Internazionale"
+
+Extend the existing team name normalisation (if any) to handle these variants. Use fuzzy matching with a confidence threshold — log any matches below 90% confidence for manual review.
+
+---
+
+## Phase 4: Experiment pipeline integration
+
+All new competitions flow directly into the experiment pipeline:
+
+- Every new league/market combination starts as `data_tier = 'experiment'` automatically
+- The model builds statistical profiles as data accumulates
+- International competitions (World Cup, continental cups) get their own experiment tags like `"fifa-world-cup-match-result"`, `"copa-america-btts"`
+- Women's competitions get tags like `"wsl-match-result"`, `"nwsl-btts"`
+- Cup competitions get tags like `"fa-cup-match-result"`, `"copa-del-rey-btts"`
+
+The model treats all competitions equally in the experiment pipeline — the promotion thresholds don't care whether it's the Premier League or the Guatemalan Liga Nacional. What matters is statistical proof of edge.
+
+### Special consideration for international competitions:
+
+International tournaments (World Cup, Euros, Copa America etc.) have fewer fixtures per year than domestic leagues. The model needs to account for this:
+- International experiment tags will take LONGER to reach 30 bets — this is expected and fine
+- The `PROMO_MIN_WEEKS_ACTIVE` threshold should still apply (prevents promoting on a single tournament's hot streak)
+- Consider grouping related qualifiers with the main tournament under one experiment tag IF the same prediction model and feature set applies (e.g. "fifa-wc-qualifiers-match-result" might group all confederation qualifiers)
+
+---
+
+## Phase 5: Dashboard update
+
+Add to the dev dashboard sidebar or overview:
+
+**"Coverage" section showing:**
+- Total competitions configured: X
+- Currently active (have upcoming fixtures): Y  
+- Today's API budget: used/remaining
+- Competitions by tier: Tier 1: X, Tier 2: Y, Tier 3: Z
+- Competitions by type: Leagues: X, Cups: Y, International: Z
+- Competitions by gender: Men: X, Women: Y
+
+Update the existing "Market Coverage" widget on the overview to reflect the expanded coverage.
+
+---
+
+## Phase 6: Pinnacle coverage awareness
+
+We're at budget on Pinnacle (OddsPapi). Not all new competitions will have Pinnacle odds. The system should:
+
+- Track which competitions have Pinnacle odds available (query OddsPapi once to check)
+- For competitions WITHOUT Pinnacle odds: the model can still collect data, build models, and track its own predicted odds vs actual outcomes. It just can't calculate CLV against Pinnacle.
+- For the promotion pipeline: if a competition has no Pinnacle CLV data, the promotion engine should use an alternative edge metric — e.g. the model's predicted probability vs the best available bookmaker odds, or the model's accuracy against its own probability estimates.
+- Flag these competitions in the experiment lab: "No Pinnacle coverage — using model self-validation"
+- These can still be promoted if other metrics (ROI, win rate, p-value, sample size) meet thresholds. CLV is the strongest signal of edge, but it's not the ONLY signal.
+
+---
+
+## Phase 7: Execution — DO THIS AGGRESSIVELY
+
+We are paying for 75,000 API calls/month and using 1%. That changes NOW.
+
+1. First, query API-Football `GET /leagues` to get the full list of 1,238 competitions. Store it.
+2. Cross-reference with what we already cover. Identify ALL gaps.
+3. Add ALL Tier 1 competitions immediately — these are non-negotiable.
+4. Add ALL Tier 2 competitions with active seasons. Don't be selective — we have the budget.
+5. Add Tier 3 competitions that have active fixtures and decent data coverage.
+6. Update the ingestion cron to poll ALL newly added competitions at the frequencies specified in Phase 2.
+7. Begin historical backfill for Tier 1 and Tier 2 — pull 2024 and 2025 season data.
+8. Run a manual ingestion cycle to pull initial data for all new competitions.
+9. Verify new fixtures are appearing in the system and experiment tags are being created.
+10. Show me the updated competition count, API budget utilisation, and a breakdown by tier/type/gender.
+
+**TARGET: Within 48 hours, we should be covering 200+ competitions and using 1,500+ API calls/day. Within a week, we should be at 300+ competitions and 2,000+ calls/day.**
+
+---
+
+## Verification
+
+1. Show me the total number of competitions now configured (TARGET: 200+)
+2. Show me the breakdown: Tier 1 / Tier 2 / Tier 3 counts
+3. Show me at least 10 international competitions with upcoming fixtures being ingested
+4. Show me at least 5 women's competitions being ingested
+5. Show me at least 5 domestic cup competitions being ingested
+6. Show me the API budget usage: daily calls should be 1,500+ (up from ~25/day)
+7. Show me new experiment tags appearing in the experiment registry for newly added competitions
+8. Show me the updated "Market Coverage" on the dashboard — should show 200+ leagues, massively more matches/movements
+9. Confirm the smart polling is working — off-season competitions should show `polling_frequency = 'dormant'`, competitions with fixtures today should show `polling_frequency = 'high'`
+10. Show me historical backfill progress — how many past-season matches have been pulled for Tier 1 competitions
+
+Do not mark complete until all 10 verification points are confirmed.

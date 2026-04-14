@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useLeagueDiscoveryStats, useGoLiveReadiness, useExperiments } from "@/hooks/use-dashboard";
+import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useLeagueDiscoveryStats, useGoLiveReadiness, useExperiments, useCoverage } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
@@ -192,6 +192,7 @@ export default function Overview() {
   const { data: discoveryStats } = useLeagueDiscoveryStats();
   const { data: readiness } = useGoLiveReadiness();
   const { data: experimentsData } = useExperiments();
+  const { data: coverageData } = useCoverage();
 
   // ── Derived values ──────────────────────────────────────────────────────────
   const pnl = summary?.totalPnl ?? 0;
@@ -495,6 +496,83 @@ export default function Overview() {
           </div>
         )}
       </div>
+
+      {/* ── COMPETITION COVERAGE ──────────────────────────────────────────── */}
+      {coverageData && (
+        <div
+          className="rounded-xl border p-5"
+          style={{ background: "#1e293b", borderColor: "#334155" }}
+        >
+          <div className="flex items-start justify-between gap-4 mb-4 flex-wrap">
+            <div>
+              <p className="text-sm font-semibold text-white">Competition Coverage</p>
+              <p className="text-xs text-slate-500 mt-0.5">
+                API-Football competitions configured for data ingestion
+              </p>
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              <div className="text-right">
+                <p className="text-3xl font-mono font-bold text-cyan-400">
+                  {(coverageData as any).totalCompetitions ?? 0}
+                </p>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium">Competitions</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+            {[
+              { label: "Tier 1", value: (coverageData as any).byTier?.["1"] ?? 0, color: "#22c55e" },
+              { label: "Tier 2", value: (coverageData as any).byTier?.["2"] ?? 0, color: "#f59e0b" },
+              { label: "Tier 3", value: (coverageData as any).byTier?.["3"] ?? 0, color: "#6366f1" },
+              { label: "Active", value: (coverageData as any).activeCompetitions ?? 0, color: "#06b6d4" },
+            ].map((s) => (
+              <div
+                key={s.label}
+                className="rounded-lg px-3 py-2 border text-center"
+                style={{ background: "#0f172a", borderColor: "#1e293b" }}
+              >
+                <p className="text-lg font-mono font-bold" style={{ color: s.color }}>{s.value}</p>
+                <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">{s.label}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-3">
+            {[
+              { label: "Leagues", value: (coverageData as any).byType?.league ?? 0 },
+              { label: "Cups", value: (coverageData as any).byType?.cup ?? 0 },
+              { label: "International", value: (coverageData as any).byType?.international ?? 0 },
+              { label: "Men", value: (coverageData as any).byGender?.male ?? 0 },
+              { label: "Women", value: (coverageData as any).byGender?.female ?? 0 },
+              { label: "With Pinnacle", value: (coverageData as any).withPinnacle ?? 0 },
+            ].map((s) => (
+              <div
+                key={s.label}
+                className="flex items-center justify-between rounded-lg px-3 py-1.5 border"
+                style={{ background: "#0f172a", borderColor: "#1e293b" }}
+              >
+                <span className="text-[11px] text-slate-400">{s.label}</span>
+                <span className="text-sm font-mono font-bold text-white">{s.value}</span>
+              </div>
+            ))}
+          </div>
+
+          {(coverageData as any).apiBudget && (
+            <div className="pt-3 border-t flex items-center gap-4 flex-wrap" style={{ borderColor: "#334155" }}>
+              <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">API Budget:</span>
+              <span className="text-[11px] text-slate-300 font-mono">
+                {(coverageData as any).apiBudget.dailyUsed}/{(coverageData as any).apiBudget.dailyTarget} today
+                ({(coverageData as any).apiBudget.dailyUtilisation}%)
+              </span>
+              <span className="text-[11px] text-slate-300 font-mono">
+                {(coverageData as any).apiBudget.monthlyUsed}/{(coverageData as any).apiBudget.monthlyLimit} monthly
+                ({(coverageData as any).apiBudget.monthlyUtilisation}%)
+              </span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── PROFIT CHART ────────────────────────────────────────────────────── */}
       <div
