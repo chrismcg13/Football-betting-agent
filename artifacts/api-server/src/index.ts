@@ -217,34 +217,62 @@ async function main() {
     process.exit(1);
   }
 
-  // 3. Seed league edge scores for expanded league coverage
+  // 3. Production database hygiene
+  // On first production deploy, clear any stale data that leaked from dev.
+  // Production data should ONLY come via the syncDevToProd pipeline.
+  if (ENVIRONMENT === "production") {
+    const staleCheck = await db.execute(sql`
+      SELECT COUNT(*) as cnt FROM paper_bets
+      WHERE data_tier != 'promoted' OR data_tier IS NULL
+    `);
+    const staleCount = Number(staleCheck.rows[0]?.cnt ?? 0);
+    if (staleCount > 0) {
+      logger.warn({ staleCount }, "Production DB contains non-promoted bets — cleaning stale data");
+      await db.execute(sql`DELETE FROM paper_bets WHERE data_tier != 'promoted' OR data_tier IS NULL`);
+      await db.execute(sql`DELETE FROM experiment_registry`);
+      await db.execute(sql`DELETE FROM promotion_audit_log`);
+      await db.execute(sql`DELETE FROM experiment_learning_journal`);
+      const configExists = await db.execute(sql`SELECT 1 FROM agent_config WHERE key = 'bankroll'`);
+      if (configExists.rows.length > 0) {
+        await db.execute(sql`UPDATE agent_config SET value = '500' WHERE key = 'bankroll'`);
+      }
+      logger.info("Production DB cleaned — only promoted bets (if any) remain. Bankroll reset to £500.");
+    }
+  }
+
+  // 3b. Seed league edge scores for expanded league coverage
   await seedLeagueEdgeScores();
 
-  // 3b. Seed baseline leagues into discovered_leagues (idempotent, dev + prod)
+  // 3c. Seed baseline leagues into discovered_leagues (idempotent, dev + prod)
   void seedBaselineLeagues().catch((err) =>
     logger.warn({ err }, "Baseline league seed failed — non-fatal"),
   );
 
-  // 4. Start schedulers
-  // Settlement cron always runs (dev + prod) — it is a lightweight DB operation,
-  // no API quota is consumed beyond the minimal syncMatchResults calls for past fixtures.
-  startSettlementCron();
-  logger.info("Settlement cron started (every 5 min, all environments)");
+  // 4. Start schedulers — DEV ONLY
+  // In production, the server only serves the dashboard API. All data ingestion,
+  // betting, settlement, and ML training happen exclusively in the dev environment.
+  // Data flows to production ONLY via the syncDevToProd pipeline after promotion.
+  let modelLoaded = false;
+  if (ENVIRONMENT !== "production") {
+    startSettlementCron();
+    logger.info("Settlement cron started (every 5 min)");
 
-  startScheduler();
-  logger.info("Autonomous scheduler started");
+    startScheduler();
+    logger.info("Autonomous scheduler started");
 
-  // 5. Load or bootstrap the ML model
-  const modelLoaded = await loadLatestModel();
-  if (!modelLoaded) {
-    logger.info("No existing model found — triggering bootstrap training in background");
-    void bootstrapModels().catch((err) =>
-      logger.error({ err }, "Background bootstrap training failed"),
-    );
+    modelLoaded = await loadLatestModel();
+    if (!modelLoaded) {
+      logger.info("No existing model found — triggering bootstrap training in background");
+      void bootstrapModels().catch((err) =>
+        logger.error({ err }, "Background bootstrap training failed"),
+      );
+    }
+
+    void bootstrapDataIfEmpty();
+  } else {
+    logger.info("PRODUCTION MODE — schedulers, settlement, ML training, and data ingestion DISABLED");
+    logger.info("Production serves dashboard API only. Data arrives via syncDevToProd pipeline.");
   }
-
-  // 5. Fetch initial data if the database is empty (non-blocking)
-  void bootstrapDataIfEmpty();
 
   // 6. Log agent started to compliance audit trail
   await logAgentStarted({
@@ -262,6 +290,7 @@ async function main() {
     logger.info(
       {
         port,
+        environment: ENVIRONMENT,
         dbConnected: dbOk,
         betfairConfigured: betfairOk,
         footballDataConfigured: footballDataOk,

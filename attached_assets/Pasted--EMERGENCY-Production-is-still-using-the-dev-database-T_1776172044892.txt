@@ -1,0 +1,70 @@
+# EMERGENCY: Production is still using the dev database. This is NOT isolated.
+
+## Proof
+
+I just opened the production dashboard at football-betting-agent.replit.app/dashboard/ in an incognito browser. It shows:
+- 19 settled bets
+- £123.32 profit
+- 68.4% win rate
+- 13W - 6L
+- Bankroll £623.32
+
+This is the SAME data as dev. The databases are NOT separate. Everything we built — experiment tags, promotion engine, sync scripts — is meaningless if both environments read from the same database.
+
+## What you need to do RIGHT NOW
+
+### Step 1: Prove the problem
+Run this in the PRODUCTION deployment's shell (not dev):
+```bash
+echo $DATABASE_URL | sed 's/:[^:]*@/@***@/'
+echo $ENVIRONMENT
+```
+
+I expect this will show the same database host as dev (helium), which means the "separate database" was never actually created.
+
+### Step 2: Create an ACTUALLY separate production database
+
+Replit deployments can have their own PostgreSQL instance. Do ONE of the following:
+
+**Option A:** In the Replit deployment settings, provision a NEW PostgreSQL database for the production deployment. Set its connection string as `DATABASE_URL` in the production environment variables. This DATABASE_URL must point to a DIFFERENT host than `helium`.
+
+**Option B:** If Replit doesn't support separate databases per deployment, create a second PostgreSQL database manually (e.g. via Neon, Supabase free tier, or Railway) and set that connection string as the production `DATABASE_URL`.
+
+### Step 3: Run migrations on the new prod database
+The new production database will be empty. Run ALL schema migrations against it so the tables exist.
+
+### Step 4: Do NOT seed it yet
+Leave the production database empty. We will seed it ONLY after confirming isolation. Zero bets on prod is the correct starting state.
+
+### Step 5: Republish and verify
+1. Republish the app
+2. Open the production dashboard
+3. It MUST show: 0 bets, £0 profit, £500 bankroll (starting balance), 0% ROI, 0% win rate
+4. Open the dev dashboard simultaneously — it should still show the 19 settled bets and all existing data
+
+If prod and dev show DIFFERENT data, isolation is confirmed. 
+
+### Step 6: Show me proof
+After republishing, show me:
+```bash
+# From PRODUCTION shell:
+echo $DATABASE_URL | sed 's/:[^:]*@/@***@/'
+# Should NOT contain "helium"
+
+# From DEV shell:
+echo $DATABASE_URL | sed 's/:[^:]*@/@***@/'
+# Should contain "helium"
+```
+
+The hosts MUST be different. If they are the same, we do not have isolation regardless of what any code says.
+
+### Step 7: THEN seed prod with promoted data only
+Only after isolation is confirmed, run the seed script to copy ONLY promoted-tier settled bets from dev to prod. Since nothing is promoted yet (all experiments have <30 bets), prod should remain at zero bets after seeding too. That's correct — prod stays empty until experiments earn promotion through the pipeline.
+
+## Do NOT mark this complete until:
+1. Production DATABASE_URL points to a DIFFERENT host than dev
+2. The production dashboard shows ZERO bets
+3. The dev dashboard still shows all 19+ settled bets
+4. You show me both DATABASE_URL hosts side by side (masked passwords, visible hosts)
+
+This is the #1 blocker for going live with real money. Nothing else matters until this is fixed.
