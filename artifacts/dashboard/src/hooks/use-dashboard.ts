@@ -175,6 +175,14 @@ export const useLeagueDiscoveryStats = () => {
   });
 };
 
+export const useGoLiveReadiness = () => {
+  return useQuery({
+    queryKey: ["admin", "go-live-readiness"],
+    queryFn: () => fetcher("/api/admin/go-live-readiness"),
+    refetchInterval: 120000,
+  });
+};
+
 export const useExperiments = () => {
   return useQuery({
     queryKey: ["admin", "experiments"],

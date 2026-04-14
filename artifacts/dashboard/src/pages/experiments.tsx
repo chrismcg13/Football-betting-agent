@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useExperiments, useRunPromotionEngine, useManualPromote } from "@/hooks/use-dashboard";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -68,6 +68,16 @@ function TierCard({ tier, experiments }: { tier: string; experiments: any[] }) {
   );
 }
 
+function formatTimeAgo(dateStr: string | null): string {
+  if (!dateStr) return "";
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const hours = Math.floor(diff / 3600000);
+  if (hours < 1) return "< 1h ago";
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
   const [expanded, setExpanded] = useState(false);
   const promote = useManualPromote();
@@ -83,10 +93,10 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
   return (
     <div className={cn("rounded-lg border p-3", isAbandoned && "opacity-50")} style={{ background: isAbandoned ? "#111111" : "#0f172a", borderColor: isAbandoned ? "#1e1e1e" : "#334155" }}>
       <div className="flex items-center justify-between cursor-pointer" onClick={() => setExpanded(!expanded)}>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap min-w-0">
           <span className={cn("text-sm font-semibold", isAbandoned ? "text-slate-500 line-through" : "text-white")}>{exp.experimentTag ?? "unknown"}</span>
           <span className="text-xs text-slate-500">{exp.sampleSize ?? 0} bets</span>
-          {exp.progress && (
+          {exp.progress && !isAbandoned && (
             <span
               className="text-[10px] font-mono px-1.5 py-0.5 rounded"
               style={{
@@ -98,8 +108,14 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
               {exp.progress.overall}% ready
             </span>
           )}
+          {exp.betsPerWeek > 0 && !isAbandoned && (
+            <span className="text-[10px] text-slate-600 font-mono">{exp.betsPerWeek}/wk</span>
+          )}
+          {exp.estWeeksToEval != null && tier === "experiment" && (
+            <span className="text-[10px] text-blue-400/70 font-mono">~{exp.estWeeksToEval}w to eval</span>
+          )}
         </div>
-        <div className="flex items-center gap-3 text-xs">
+        <div className="flex items-center gap-3 text-xs shrink-0">
           <span className={cn("font-mono", Number(exp.roi) >= 0 ? "text-emerald-400" : "text-red-400")}>
             ROI: {roi}%
           </span>
@@ -110,7 +126,7 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
       </div>
       {expanded && (
         <div className="mt-3 pt-3 border-t" style={{ borderColor: "#334155" }}>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs mb-3">
+          <div className="grid grid-cols-2 md:grid-cols-6 gap-3 text-xs mb-3">
             <div>
               <span className="text-slate-500 block">Sample Size</span>
               <span className="text-white font-mono">{exp.sampleSize ?? 0}</span>
@@ -133,6 +149,10 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
               <span className="text-slate-500 block">Market</span>
               <span className="text-white font-mono text-[10px]">{exp.marketType ?? "—"}</span>
             </div>
+            <div>
+              <span className="text-slate-500 block">Last Bet</span>
+              <span className="text-slate-400 font-mono text-[10px]">{formatTimeAgo(exp.lastBetAt)}</span>
+            </div>
           </div>
 
           {tier === "experiment" && exp.progress && (
@@ -142,6 +162,8 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
               <ProgressBar value={exp.progress.roi} label="ROI" color="#3b82f6" />
               <ProgressBar value={exp.progress.clv} label="CLV" color="#06b6d4" />
               <ProgressBar value={exp.progress.winRate} label="Win Rate" color="#f59e0b" />
+              <ProgressBar value={exp.progress.pValue} label="P-Value" color="#ec4899" />
+              <ProgressBar value={exp.progress.edge} label="Edge" color="#14b8a6" />
             </div>
           )}
 
@@ -205,6 +227,15 @@ export default function Experiments() {
 
   const grouped = data?.grouped ?? { experiment: [], candidate: [], promoted: [], demoted: [], abandoned: [] };
 
+  const closestToPromotion = useMemo(() => {
+    const experiments = grouped.experiment ?? [];
+    if (experiments.length === 0) return null;
+    return experiments.reduce((best: any, exp: any) => {
+      if (!best || (exp.progress?.overall ?? 0) > (best.progress?.overall ?? 0)) return exp;
+      return best;
+    }, null);
+  }, [grouped.experiment]);
+
   return (
     <div className="space-y-5 max-w-7xl mx-auto">
       <div className="flex items-center justify-between">
@@ -225,22 +256,57 @@ export default function Experiments() {
         </Button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div className="rounded-xl border p-4" style={{ background: "#1e293b", borderColor: "#334155" }}>
-          <span className="text-xs text-slate-500 uppercase tracking-wider font-semibold">Total Experiments</span>
+          <span className="text-xs text-slate-500 uppercase tracking-wider font-semibold">Total Active</span>
           <p className="text-2xl font-bold text-white mt-1">{data?.total ?? 0}</p>
+          <p className="text-[10px] text-slate-600 mt-0.5">with bets placed</p>
         </div>
         <div className="rounded-xl border p-4" style={{ background: "#1e293b", borderColor: "#334155" }}>
-          <span className="text-xs text-slate-500 uppercase tracking-wider font-semibold">Active (Exp + Candidate)</span>
-          <p className="text-2xl font-bold text-amber-400 mt-1">
-            {(grouped.experiment?.length ?? 0) + (grouped.candidate?.length ?? 0)}
-          </p>
+          <span className="text-xs text-slate-500 uppercase tracking-wider font-semibold">Experiments</span>
+          <p className="text-2xl font-bold text-violet-400 mt-1">{grouped.experiment?.length ?? 0}</p>
+          <p className="text-[10px] text-slate-600 mt-0.5">gathering data</p>
         </div>
         <div className="rounded-xl border p-4" style={{ background: "#1e293b", borderColor: "#334155" }}>
-          <span className="text-xs text-slate-500 uppercase tracking-wider font-semibold">Promoted</span>
+          <span className="text-xs text-slate-500 uppercase tracking-wider font-semibold">Candidates</span>
+          <p className="text-2xl font-bold text-amber-400 mt-1">{grouped.candidate?.length ?? 0}</p>
+          <p className="text-[10px] text-slate-600 mt-0.5">awaiting validation</p>
+        </div>
+        <div className="rounded-xl border p-4" style={{ background: "#052e16", borderColor: "#166534" }}>
+          <span className="text-xs text-emerald-500 uppercase tracking-wider font-semibold">Promoted</span>
           <p className="text-2xl font-bold text-emerald-400 mt-1">{grouped.promoted?.length ?? 0}</p>
+          <p className="text-[10px] text-emerald-700 mt-0.5">production-ready</p>
         </div>
       </div>
+
+      {closestToPromotion && (
+        <div className="rounded-xl border p-4" style={{ background: "#1e1b4b", borderColor: "#4c1d95" }}>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <span className="text-[10px] text-violet-400 uppercase tracking-wider font-semibold">Closest to Promotion</span>
+              <p className="text-sm font-bold text-white mt-0.5">{closestToPromotion.experimentTag}</p>
+            </div>
+            <div className="flex items-center gap-4 text-xs">
+              <span className="font-mono text-violet-300">{closestToPromotion.progress?.overall ?? 0}% ready</span>
+              <span className="font-mono text-slate-400">{closestToPromotion.sampleSize} bets</span>
+              {closestToPromotion.estWeeksToEval != null && (
+                <span className="font-mono text-blue-300">~{closestToPromotion.estWeeksToEval}w to eval</span>
+              )}
+              <span className={cn("font-mono", Number(closestToPromotion.roi) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                ROI: {Number(closestToPromotion.roi).toFixed(1)}%
+              </span>
+            </div>
+          </div>
+          {closestToPromotion.progress && (
+            <div className="mt-2 h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
+              <div
+                className="h-full rounded-full transition-all duration-500"
+                style={{ width: `${Math.min(100, closestToPromotion.progress.overall)}%`, background: "#8b5cf6" }}
+              />
+            </div>
+          )}
+        </div>
+      )}
 
       {data?.thresholds && (
         <div className="rounded-lg border p-3 text-xs" style={{ background: "#0f172a", borderColor: "#1e293b" }}>

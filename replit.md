@@ -67,7 +67,9 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
     - Demotion (promoted→candidate): rolling 30-bet window, ROI<0% or CLV<0% or 3 consecutive negative weeks
     - Demotion (candidate→experiment): ROI<-5% or CLV<0%
     - Abandon: ≥50 bets, ROI<-10%, p-value≤0.10
-*   **Dashboard:** `/experiments` page shows experiments sorted by sample size (only those with ≥1 bet shown), with progress bars, distance-to-promotion metrics, and manual promote/demote with full audit logging. Abandoned experiments shown greyed out with strikethrough at bottom.
+*   **Dashboard:** `/experiments` page shows experiments sorted by sample size (only those with ≥1 bet shown), with progress bars (Sample, ROI, CLV, Win Rate, P-Value, Edge), distance-to-promotion metrics, bets/week velocity, estimated weeks to evaluation, last bet timestamp, and manual promote/demote with full audit logging. Abandoned experiments shown greyed out with strikethrough at bottom. 4-column summary (Total Active, Experiments, Candidates, Promoted) + "Closest to Promotion" spotlight card.
+*   **Go Live Readiness Panel:** Overview page shows weighted readiness score (6 criteria: sample size 30%, promoted strategy 25%, CLV 15%, ROI 10%, win rate 10%, bankroll growth 10%). Includes pace estimate and estimated days to target. API: `/api/admin/go-live-readiness`.
+*   **Demo Day Panel:** Enhanced with pipeline snapshot (promoted/candidate/experiment counts) and betting pace estimate.
 *   **Crons:** Promotion engine daily at 04:00 UTC, experiment analysis Sundays at 04:00, dev→prod sync every 6 hours.
 *   **Excluded Markets (abandoned):** OVER_UNDER_05 (all leagues) — unfavourable risk/reward structure (~92% base win rate). 8 experiment tags set to `abandoned` tier. Historical bet data preserved for audit.
 *   **Production Schedulers:** All schedulers (betting, settlement, ML training, data ingestion) are DISABLED in production. Production only serves the dashboard API. Data flows exclusively via syncDevToProd pipeline.

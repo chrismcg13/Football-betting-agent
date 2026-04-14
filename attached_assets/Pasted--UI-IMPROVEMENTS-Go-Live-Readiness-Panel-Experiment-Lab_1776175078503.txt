@@ -1,0 +1,153 @@
+# UI IMPROVEMENTS: Go-Live Readiness Panel + Experiment Lab Enhancements
+
+## Part 1: Replace Demo Day Countdown with Go-Live Readiness Panel (PROD ONLY)
+
+The "Journey to Demo Day" countdown on the prod dashboard is no longer relevant. Replace it with a "Go-Live Readiness" panel that shows automated criteria for switching to real money.
+
+### Go-Live Criteria (all must be met — show as a checklist with green ticks/red crosses):
+
+1. **Promoted Markets ≥ 3** — At least 3 league-market combinations at `promoted` tier
+   - Show: current count / 3 required
+   - List the promoted market names if any exist
+
+2. **Combined Promoted Sample ≥ 100** — Total settled bets across all promoted markets
+   - Show: current count / 100 required
+
+3. **Promoted ROI ≥ 3%** — Overall ROI across all promoted-tier settled bets
+   - Show: current ROI% (or "No data" if nothing promoted yet)
+
+4. **Promoted CLV ≥ 1.5%** — Overall CLV across all promoted-tier settled bets
+   - Show: current CLV%
+
+5. **Candidate Validation ≥ 7 days** — At least one league-market has been in candidate tier for 7+ days in prod with no demotion triggers
+   - Show: days since first candidate promotion (or "No candidates yet")
+
+6. **No Active Demotion Flags** — Zero promoted or candidate markets currently flagged for demotion
+   - Show: count of flagged markets (should be 0)
+
+### Visual design:
+- Show an overall readiness score as a percentage (weighted: sample size and promoted count are 60% of the score, metrics are 40%)
+- When ALL criteria are met, show a prominent green "READY TO GO LIVE" banner with a celebratory visual treatment
+- When not ready, show "BUILDING CONFIDENCE" with the checklist showing what's still needed
+- Include an estimated time to readiness based on current dev betting rate and promotion pipeline velocity
+- DO NOT show this panel on dev — dev keeps its existing overview. This is prod-only.
+
+### Also on the prod dashboard:
+- Remove the "Journey to Demo Day" section entirely
+- Remove any reference to "Demo Day: April 23, 2026"
+- Remove "More data needed. The model is still learning." message — replace with context-appropriate status based on the go-live criteria
+- The "Paper Trading v1.0" subtitle should change to "Production v1.0" when ENVIRONMENT=production
+
+---
+
+## Part 2: Experiment Lab Improvements (DEV ONLY)
+
+### 2a: Fix the readiness score weighting
+
+The current "78% ready" on 3-bet experiments is misleading. The readiness percentage must be weighted to reflect that sample size is the hardest and most important gate:
+
+- **Sample size: 50% weight** (this is almost always the bottleneck)
+- **Weeks active: 15% weight** (time-based, can't be rushed)
+- **ROI: 10% weight**
+- **CLV: 10% weight**  
+- **Win rate: 5% weight**
+- **P-value: 5% weight**
+- **Edge: 5% weight**
+
+So an experiment with 3 bets out of 30 required = 10% on the sample dimension = 5% contribution to overall readiness. It should show roughly 10-15% ready, not 78%.
+
+### 2b: De-emphasise unreliable early metrics
+
+When an experiment has fewer than 15 settled bets:
+- Show ROI, win rate, and CLV values in a muted/greyed-out style (e.g. 50% opacity)
+- Add a small tooltip or label: "Low sample — metrics will stabilise"
+- Do NOT show these experiments as "78% ready" — the metric gates being "met" on 3 bets is statistical noise, not signal
+
+When an experiment has 15+ settled bets:
+- Show metrics in full colour
+- These numbers are starting to become meaningful
+
+When an experiment has 30+ settled bets:
+- Full colour, full confidence display
+- Show "Ready for promotion evaluation" if other criteria are also close
+
+### 2c: Add estimated time to promotion
+
+For each experiment, calculate and display:
+- Current betting frequency for this league-market (bets per week over the last 14 days)
+- Based on that rate, estimated weeks until 30 settled bets
+- Display as: "~3 weeks to evaluation" or "~12 days to evaluation"
+- If betting frequency is 0 (no bets in last 14 days), show "Stalled — no recent activity"
+
+### 2d: Add sorting and filtering
+
+Add controls at the top of the experiment list:
+
+**Sort by (dropdown):**
+- Readiness (highest first) — default
+- Sample size (most bets first)
+- ROI (highest first) — only meaningful for 15+ bet experiments
+- CLV (highest first)
+- Estimated time to promotion (soonest first)
+- Most recent bet (newest activity first)
+
+**Filter by (toggles/chips):**
+- Tier: Experiment / Candidate / Promoted / Demoted / Abandoned
+- Minimum bets: 0 / 5+ / 10+ / 20+
+- League (dropdown of all leagues with experiments)
+- Market type: Match Result / BTTS / Over/Under / Corners / Cards
+- Hide stalled (no bets in 14+ days) — toggle, default OFF
+
+**Search:** Free text search box that filters by experiment tag name
+
+### 2e: Add a "Top Prospects" summary section
+
+At the top of the Experiment Lab page, before the full list, add a highlighted section:
+
+**"Closest to Promotion"** — Show the top 5 experiments by readiness score that have at least 10 settled bets. These are the ones actually likely to promote soon. Show:
+- Experiment tag
+- Bets: X / 30
+- Estimated time to promotion
+- Key metrics (ROI, CLV, WR)
+- A mini progress bar
+
+This gives me an at-a-glance view of what's about to graduate without scrolling through 514 experiments.
+
+### 2f: Add a "Recently Active" mini-section
+
+Below "Closest to Promotion", show the 5 experiments with the most recent bet activity. This tells me where the model is currently finding opportunities.
+
+### 2g: Experiment detail view improvements
+
+When clicking into an individual experiment (the expand/detail view), show:
+- Full metrics with confidence intervals where possible
+- Boosted vs organic performance comparison (win rate and ROI for opportunity_boosted=true vs false within this experiment)
+- Betting frequency chart (bets per week over time)
+- Cumulative P&L chart for this experiment
+- All promotion audit log entries for this experiment
+- Current distance to each individual promotion threshold (the "needs X more" display that already exists)
+
+---
+
+## Part 3: Prod Dashboard Cleanup
+
+When ENVIRONMENT=production:
+- Header shows "Production v1.0" instead of "Paper Trading v1.0"
+- Hide or disable any buttons/features that could trigger trading (there shouldn't be any since scheduler is off, but double-check)
+- The Experiment Lab page on prod should show a read-only view with a note: "Experiments run in the development environment. Data appears here after promotion."
+- If no data exists yet in prod, show a friendly empty state: "Waiting for first promoted strategy. The model is learning and validating in the development environment." with a brief explanation of the promotion pipeline.
+
+---
+
+## Verification
+
+After all changes:
+1. Show me the prod dashboard with the Go-Live Readiness panel (all criteria should show red/unmet since nothing is promoted yet)
+2. Show me the dev Experiment Lab with corrected readiness scores (the 3-bet experiments should show ~10-15% ready, not 78%)
+3. Show me the "Closest to Promotion" section with the top 5 prospects
+4. Show me the sorting dropdown working
+5. Show me the filter by minimum bets (filter to 5+ should dramatically reduce the list from 514)
+6. Confirm "Paper Trading v1.0" still shows on dev and "Production v1.0" shows on prod
+7. Confirm Demo Day countdown is completely removed from prod
+
+Do not mark complete until all 7 verification points are confirmed.

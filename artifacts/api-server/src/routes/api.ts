@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   db,
+  pool,
   paperBetsTable,
   matchesTable,
   complianceLogsTable,
@@ -1605,39 +1606,83 @@ router.get("/admin/experiments", async (_req, res) => {
       minWeeksActive: parseInt(process.env.PROMO_MIN_WEEKS_ACTIVE ?? "3"),
       minEdge: parseFloat(process.env.PROMO_MIN_EDGE ?? "2.0"),
     };
+    const betsPerWeekByTag: Record<string, number> = {};
+    try {
+      const bpw = await pool.query(`
+        SELECT experiment_tag, COUNT(*)::int as cnt
+        FROM paper_bets
+        WHERE placed_at > NOW() - INTERVAL '14 days' AND experiment_tag IS NOT NULL
+        GROUP BY experiment_tag
+      `);
+      for (const r of bpw.rows) {
+        betsPerWeekByTag[r.experiment_tag] = Math.round((r.cnt / 2) * 10) / 10;
+      }
+    } catch (err) {
+      logger.warn({ err }, "Failed to fetch bets/week by tag for experiments enrichment");
+    }
+
+    const mostRecentBetByTag: Record<string, string> = {};
+    try {
+      const mrb = await pool.query(`
+        SELECT experiment_tag, MAX(placed_at) as latest
+        FROM paper_bets
+        WHERE experiment_tag IS NOT NULL
+        GROUP BY experiment_tag
+      `);
+      for (const r of mrb.rows) {
+        mostRecentBetByTag[r.experiment_tag] = r.latest;
+      }
+    } catch (err) {
+      logger.warn({ err }, "Failed to fetch most recent bet by tag for experiments enrichment");
+    }
+
     const enriched = experiments
-      .map(e => ({
-        experimentTag: e.experimentTag ?? e.id,
-        leagueCode: e.leagueCode,
-        marketType: e.marketType,
-        dataTier: e.dataTier,
-        sampleSize: e.currentSampleSize ?? 0,
-        roi: e.currentRoi ?? 0,
-        clv: e.currentClv ?? 0,
-        winRate: e.currentWinRate ?? 0,
-        pValue: e.currentPValue ?? 1,
-        edge: e.currentEdge ?? 0,
-        consecutiveNegativeWeeks: e.consecutiveNegativeWeeks ?? 0,
-        tierChangedAt: e.tierChangedAt,
-        progress: {
-          sampleSize: Math.min(100, Math.round(((e.currentSampleSize ?? 0) / thresholds.minSampleSize) * 100)),
-          roi: Math.min(100, Math.round(Math.max(0, (e.currentRoi ?? 0) / thresholds.minRoi) * 100)),
-          clv: Math.min(100, Math.round(Math.max(0, (e.currentClv ?? 0) / thresholds.minClv) * 100)),
-          winRate: Math.min(100, Math.round(Math.max(0, (e.currentWinRate ?? 0) / thresholds.minWinRate) * 100)),
-          overall: 0,
-        },
-        distance: {
-          betsNeeded: Math.max(0, thresholds.minSampleSize - (e.currentSampleSize ?? 0)),
-          roiNeeded: Math.max(0, thresholds.minRoi - (e.currentRoi ?? 0)),
-          clvNeeded: Math.max(0, thresholds.minClv - (e.currentClv ?? 0)),
-          winRateNeeded: Math.max(0, thresholds.minWinRate - (e.currentWinRate ?? 0)),
-        },
-      }))
       .map(e => {
-        e.progress.overall = Math.round(
-          (e.progress.sampleSize + e.progress.roi + e.progress.clv + e.progress.winRate) / 4
-        );
-        return e;
+        const tag = e.experimentTag ?? e.id;
+        const sample = e.currentSampleSize ?? 0;
+        const betsPerWeek = betsPerWeekByTag[tag] ?? 0;
+        const betsNeeded = Math.max(0, thresholds.minSampleSize - sample);
+        const estWeeks = betsPerWeek > 0 ? Math.ceil(betsNeeded / betsPerWeek) : null;
+
+        const tierChangedMs = e.tierChangedAt ? new Date(e.tierChangedAt).getTime() : 0;
+        const weeksActive = tierChangedMs > 0 ? Math.floor((Date.now() - tierChangedMs) / (7 * 24 * 3600 * 1000)) : 0;
+
+        const pSample = Math.min(100, Math.round((sample / thresholds.minSampleSize) * 100));
+        const pWeeks = Math.min(100, Math.round((weeksActive / thresholds.minWeeksActive) * 100));
+        const pRoi = Math.min(100, Math.round(Math.max(0, (e.currentRoi ?? 0) / thresholds.minRoi) * 100));
+        const pClv = Math.min(100, Math.round(Math.max(0, (e.currentClv ?? 0) / thresholds.minClv) * 100));
+        const pWinRate = Math.min(100, Math.round(Math.max(0, (e.currentWinRate ?? 0) / thresholds.minWinRate) * 100));
+        const pPValue = (e.currentPValue ?? 1) <= thresholds.maxPValue ? 100 : Math.min(100, Math.round(Math.max(0, (1 - (e.currentPValue ?? 1)) / (1 - thresholds.maxPValue)) * 100));
+        const pEdge = Math.min(100, Math.round(Math.max(0, (e.currentEdge ?? 0) / thresholds.minEdge) * 100));
+
+        const overall = Math.min(100, Math.max(0, Math.round(
+          pSample * 0.50 + pWeeks * 0.15 + pRoi * 0.10 + pClv * 0.10 + pWinRate * 0.05 + pPValue * 0.05 + pEdge * 0.05
+        )));
+
+        return {
+          experimentTag: tag,
+          leagueCode: e.leagueCode,
+          marketType: e.marketType,
+          dataTier: e.dataTier,
+          sampleSize: sample,
+          roi: e.currentRoi ?? 0,
+          clv: e.currentClv ?? 0,
+          winRate: e.currentWinRate ?? 0,
+          pValue: e.currentPValue ?? 1,
+          edge: e.currentEdge ?? 0,
+          consecutiveNegativeWeeks: e.consecutiveNegativeWeeks ?? 0,
+          tierChangedAt: e.tierChangedAt,
+          betsPerWeek,
+          estWeeksToEval: estWeeks,
+          lastBetAt: mostRecentBetByTag[tag] ?? null,
+          progress: { sampleSize: pSample, roi: pRoi, clv: pClv, winRate: pWinRate, pValue: pPValue, edge: pEdge, weeks: pWeeks, overall },
+          distance: {
+            betsNeeded,
+            roiNeeded: Math.max(0, thresholds.minRoi - (e.currentRoi ?? 0)),
+            clvNeeded: Math.max(0, thresholds.minClv - (e.currentClv ?? 0)),
+            winRateNeeded: Math.max(0, thresholds.minWinRate - (e.currentWinRate ?? 0)),
+          },
+        };
       })
       .sort((a, b) => b.sampleSize - a.sampleSize);
     const grouped = {
@@ -1666,6 +1711,65 @@ router.get("/admin/promotion-log", async (_req, res) => {
   try {
     const log = await getPromotionLog();
     res.json({ success: true, log });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/go-live-readiness", async (_req, res) => {
+  try {
+    const thresholds = {
+      minSampleSize: parseInt(process.env.PROMO_MIN_SAMPLE_SIZE ?? "30"),
+      minRoi: parseFloat(process.env.PROMO_MIN_ROI ?? "3.0"),
+      minClv: parseFloat(process.env.PROMO_MIN_CLV ?? "1.5"),
+      minWinRate: parseFloat(process.env.PROMO_MIN_WIN_RATE ?? "52.0"),
+      minWeeksActive: parseInt(process.env.PROMO_MIN_WEEKS_ACTIVE ?? "3"),
+      minEdge: parseFloat(process.env.PROMO_MIN_EDGE ?? "2.0"),
+    };
+
+    const [bankroll, summaryResult, promotedResult, clvResult, betsPerDayResult] = await Promise.all([
+      getBankroll(),
+      pool.query(`SELECT COUNT(*)::int as total_settled, COUNT(*) FILTER (WHERE status='won')::int as wins, COUNT(*) FILTER (WHERE status='lost')::int as losses FROM paper_bets WHERE status IN ('won','lost')`),
+      pool.query(`SELECT COUNT(*)::int as cnt FROM experiment_registry WHERE data_tier='promoted'`),
+      pool.query(`SELECT AVG(clv_pct::numeric)::float as avg_clv FROM paper_bets WHERE clv_pct IS NOT NULL AND status IN ('won','lost')`),
+      pool.query(`SELECT COUNT(*)::float / GREATEST(1, EXTRACT(EPOCH FROM (MAX(placed_at)-MIN(placed_at))) / 86400) as bets_per_day FROM paper_bets WHERE placed_at > NOW() - INTERVAL '14 days'`),
+    ]);
+
+    const totalSettled = summaryResult.rows[0]?.total_settled ?? 0;
+    const wins = summaryResult.rows[0]?.wins ?? 0;
+    const losses = summaryResult.rows[0]?.losses ?? 0;
+    const winRate = totalSettled > 0 ? (wins / totalSettled) * 100 : 0;
+    const promotedCount = promotedResult.rows[0]?.cnt ?? 0;
+    const avgClv = clvResult.rows[0]?.avg_clv ?? 0;
+    const betsPerDay = betsPerDayResult.rows[0]?.bets_per_day ?? 0;
+    const totalPnl = bankroll - 500;
+    const roi = totalSettled > 0 ? (totalPnl / 500) * 100 : 0;
+
+    const TARGET_SETTLED = 500;
+
+    const checks = [
+      { id: "sample_size", label: `${TARGET_SETTLED}+ settled bets`, met: totalSettled >= TARGET_SETTLED, current: totalSettled, target: TARGET_SETTLED, weight: 0.30 },
+      { id: "promoted_strategy", label: "1+ promoted strategy", met: promotedCount >= 1, current: promotedCount, target: 1, weight: 0.25 },
+      { id: "positive_clv", label: `CLV > ${thresholds.minClv}%`, met: avgClv >= thresholds.minClv, current: Number(avgClv.toFixed(2)), target: thresholds.minClv, weight: 0.15 },
+      { id: "positive_roi", label: `ROI > ${thresholds.minRoi}%`, met: roi >= thresholds.minRoi, current: Number(roi.toFixed(2)), target: thresholds.minRoi, weight: 0.10 },
+      { id: "win_rate", label: `Win rate > ${thresholds.minWinRate}%`, met: winRate >= thresholds.minWinRate, current: Number(winRate.toFixed(1)), target: thresholds.minWinRate, weight: 0.10 },
+      { id: "bankroll_growth", label: "Bankroll above starting", met: bankroll > 500, current: Number(bankroll), target: 500, weight: 0.10 },
+    ];
+
+    const overallScore = Math.min(100, Math.max(0, Math.round(checks.reduce((acc, c) => acc + (c.met ? c.weight * 100 : Math.max(0, Math.min(c.weight * 100, (c.current / c.target) * c.weight * 100))), 0))));
+    const betsRemaining = Math.max(0, TARGET_SETTLED - totalSettled);
+    const estDaysToTarget = betsPerDay > 0 ? Math.ceil(betsRemaining / betsPerDay) : null;
+
+    res.json({
+      success: true,
+      overallScore,
+      checks,
+      totalSettled,
+      betsPerDay: Number(betsPerDay.toFixed(1)),
+      estDaysToTarget,
+      promotedCount,
+      ready: checks.every(c => c.met),
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
   }

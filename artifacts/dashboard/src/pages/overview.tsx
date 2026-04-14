@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useLeagueDiscoveryStats } from "@/hooks/use-dashboard";
+import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useLeagueDiscoveryStats, useGoLiveReadiness, useExperiments } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
@@ -190,6 +190,8 @@ export default function Overview() {
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
   const { data: perfData, isLoading: loadingPerf } = usePerformance();
   const { data: discoveryStats } = useLeagueDiscoveryStats();
+  const { data: readiness } = useGoLiveReadiness();
+  const { data: experimentsData } = useExperiments();
 
   // ── Derived values ──────────────────────────────────────────────────────────
   const pnl = summary?.totalPnl ?? 0;
@@ -359,6 +361,66 @@ export default function Overview() {
         />
       </div>
 
+      {/* ── GO LIVE READINESS PANEL ──────────────────────────────────────────── */}
+      {readiness && (
+        <div
+          className="rounded-xl border p-5"
+          style={{
+            background: readiness.ready ? "#052e16" : "#1e293b",
+            borderColor: readiness.ready ? "#166534" : "#334155",
+          }}
+        >
+          <div className="flex items-start justify-between gap-4 mb-4 flex-wrap">
+            <div>
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-semibold text-white">Go Live Readiness</p>
+                {readiness.ready && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-semibold">
+                    READY
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                All criteria must be met before transitioning from paper to real-money trading
+              </p>
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              <div className="text-right">
+                <p className="text-3xl font-mono font-bold" style={{ color: readiness.overallScore >= 80 ? "#22c55e" : readiness.overallScore >= 50 ? "#f59e0b" : "#ef4444" }}>
+                  {readiness.overallScore}%
+                </p>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wide font-medium">Overall Score</p>
+              </div>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 mb-4">
+            {(readiness.checks ?? []).map((check: any) => (
+              <div
+                key={check.id}
+                className="flex items-center gap-2 rounded-lg px-3 py-2 border"
+                style={{
+                  background: check.met ? "#052e16" : "#0f172a",
+                  borderColor: check.met ? "#166534" : "#1e293b",
+                }}
+              >
+                <span className={cn("text-sm shrink-0", check.met ? "text-emerald-400" : "text-slate-600")}>
+                  {check.met ? "✓" : "○"}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className={cn("text-xs font-medium", check.met ? "text-emerald-300" : "text-slate-400")}>{check.label}</p>
+                  <p className="text-[10px] font-mono text-slate-500">{check.current} / {check.target}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          {readiness.estDaysToTarget != null && !readiness.ready && (
+            <p className="text-xs text-slate-500">
+              At current pace ({readiness.betsPerDay} bets/day), sample target reached in ~{readiness.estDaysToTarget} days
+            </p>
+          )}
+        </div>
+      )}
+
       {/* ── DEMO DAY PROGRESS ───────────────────────────────────────────────── */}
       <div
         className="rounded-xl border p-5"
@@ -387,6 +449,7 @@ export default function Overview() {
             </div>
           </div>
         </div>
+
         <div className="h-2.5 w-full rounded-full bg-slate-700/60 overflow-hidden mb-3">
           <div
             className={cn(
@@ -396,14 +459,40 @@ export default function Overview() {
             style={{ width: `${Math.max(progressPct, 0.5)}%` }}
           />
         </div>
-        {demoDayPositive ? (
-          <p className="text-xs font-medium text-emerald-400">
-            ✓ Early indicators are positive. Model is beating the market.
-          </p>
-        ) : (
-          <p className="text-xs font-medium text-amber-400">
-            ⏳ More data needed. The model is still learning.
-          </p>
+
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          {demoDayPositive ? (
+            <p className="text-xs font-medium text-emerald-400">
+              ✓ Early indicators are positive. Model is beating the market.
+            </p>
+          ) : (
+            <p className="text-xs font-medium text-amber-400">
+              ⏳ More data needed. The model is still learning.
+            </p>
+          )}
+          {readiness?.betsPerDay > 0 && settledBets < SETTLED_TARGET && (
+            <p className="text-[10px] text-slate-500 font-mono">
+              ~{readiness.betsPerDay} bets/day · est. {readiness.estDaysToTarget ?? "?"} days to target
+            </p>
+          )}
+        </div>
+
+        {/* Pipeline snapshot */}
+        {experimentsData?.grouped && (
+          <div className="mt-3 pt-3 border-t flex items-center gap-3 flex-wrap" style={{ borderColor: "#334155" }}>
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Pipeline:</span>
+            {[
+              { tier: "promoted", count: experimentsData.grouped.promoted?.length ?? 0, color: "#22c55e" },
+              { tier: "candidate", count: experimentsData.grouped.candidate?.length ?? 0, color: "#f59e0b" },
+              { tier: "experiment", count: experimentsData.grouped.experiment?.length ?? 0, color: "#8b5cf6" },
+            ].map(t => (
+              <span key={t.tier} className="inline-flex items-center gap-1.5 text-[11px]">
+                <span className="w-2 h-2 rounded-full" style={{ background: t.color }} />
+                <span className="text-slate-400">{t.count}</span>
+                <span className="text-slate-600">{t.tier}</span>
+              </span>
+            ))}
+          </div>
         )}
       </div>
 
