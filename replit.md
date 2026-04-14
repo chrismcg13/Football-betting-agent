@@ -67,5 +67,7 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
     - Demotion (promoted→candidate): rolling 30-bet window, ROI<0% or CLV<0% or 3 consecutive negative weeks
     - Demotion (candidate→experiment): ROI<-5% or CLV<0%
     - Abandon: ≥50 bets, ROI<-10%, p-value≤0.10
-*   **Dashboard:** `/experiments` page shows experiments sorted by sample size, with progress bars, distance-to-promotion metrics, and manual promote/demote with full audit logging.
+*   **Dashboard:** `/experiments` page shows experiments sorted by sample size (only those with ≥1 bet shown), with progress bars, distance-to-promotion metrics, and manual promote/demote with full audit logging. Abandoned experiments shown greyed out with strikethrough at bottom.
 *   **Crons:** Promotion engine daily at 04:00 UTC, experiment analysis Sundays at 04:00, dev→prod sync every 6 hours.
+*   **Excluded Markets (abandoned):** OVER_UNDER_05 (all leagues) — unfavourable risk/reward structure (~92% base win rate). 8 experiment tags set to `abandoned` tier. Historical bet data preserved for audit.
+*   **Production Schedulers:** All schedulers (betting, settlement, ML training, data ingestion) are DISABLED in production. Production only serves the dashboard API. Data flows exclusively via syncDevToProd pipeline.

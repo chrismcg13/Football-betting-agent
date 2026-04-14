@@ -73,6 +73,7 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
   const promote = useManualPromote();
   const [targetTier, setTargetTier] = useState("candidate");
   const [reason, setReason] = useState("");
+  const isAbandoned = tier === "abandoned";
 
   const hasBets = (exp.sampleSize ?? 0) > 0;
   const roi = hasBets ? Number(exp.roi).toFixed(1) : "—";
@@ -80,10 +81,10 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
   const clv = hasBets ? Number(exp.clv).toFixed(2) : "—";
 
   return (
-    <div className="rounded-lg border p-3" style={{ background: "#0f172a", borderColor: "#334155" }}>
+    <div className={cn("rounded-lg border p-3", isAbandoned && "opacity-50")} style={{ background: isAbandoned ? "#111111" : "#0f172a", borderColor: isAbandoned ? "#1e1e1e" : "#334155" }}>
       <div className="flex items-center justify-between cursor-pointer" onClick={() => setExpanded(!expanded)}>
         <div className="flex items-center gap-2">
-          <span className="text-sm font-semibold text-white">{exp.experimentTag ?? "unknown"}</span>
+          <span className={cn("text-sm font-semibold", isAbandoned ? "text-slate-500 line-through" : "text-white")}>{exp.experimentTag ?? "unknown"}</span>
           <span className="text-xs text-slate-500">{exp.sampleSize ?? 0} bets</span>
           {exp.progress && (
             <span

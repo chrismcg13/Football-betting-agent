@@ -1641,7 +1641,7 @@ router.get("/admin/experiments", async (_req, res) => {
       })
       .sort((a, b) => b.sampleSize - a.sampleSize);
     const grouped = {
-      experiment: enriched.filter(e => e.dataTier === "experiment"),
+      experiment: enriched.filter(e => e.dataTier === "experiment" && e.sampleSize > 0),
       candidate: enriched.filter(e => e.dataTier === "candidate"),
       promoted: enriched.filter(e => e.dataTier === "promoted"),
       demoted: enriched.filter(e => e.dataTier === "demoted"),
