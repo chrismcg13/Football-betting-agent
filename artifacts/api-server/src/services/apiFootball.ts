@@ -95,8 +95,11 @@ export const TIER1_LEAGUE_IDS: number[] = [
 
   // International — Women
   8,    // FIFA Women's World Cup
+  880,  // FIFA Women's World Cup Qualifiers - Europe
   22,   // International Friendlies (Women)
+  666,  // Women's International Friendlies
   960,  // UEFA Women's Euro
+  1083, // UEFA Women's Championship Qualifiers
 
   // Olympic
   480,  // Olympic Football (Men)
@@ -214,6 +217,8 @@ export const TIER2_LEAGUE_IDS: number[] = [
 export const TIER3_LEAGUE_IDS: number[] = [
   // Lower divisions of major leagues
   43,   // National League (England 5th tier)
+  50,   // National League North (England 6th tier)
+  51,   // National League South (England 6th tier)
   80,   // 3. Liga (Germany)
   138,  // Serie C (Italy)
   63,   // National 1 (France 3rd tier)
@@ -223,11 +228,13 @@ export const TIER3_LEAGUE_IDS: number[] = [
   239,  // Costa Rica Primera División
   332,  // Honduran Liga Nacional
   318,  // Ghanaian Premier League
-  321,  // Nigerian NPFL
+  399,  // Nigerian NPFL
   320,  // Kenyan Premier League
 
   // Second divisions of Tier 2 countries
-  181,  // Scottish Championship
+  183,  // Scottish League One
+  184,  // Scottish League Two
+  181,  // Scottish FA Cup
   145,  // Belgian First Division B
   120,  // Danish 1st Division
   104,  // Norwegian OBOS-ligaen (2nd)
@@ -1245,7 +1252,7 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
     218, 219, // Austria
     207, 208, // Switzerland
     197, 198, // Greece
-    179, 180, 181, // Scotland
+    179, 180, 181, 183, 184, // Scotland
     119, 120, // Denmark
     2, 3, 4, 848, // UCL, UEL, UECL, Nations League
     5, 15, // UEFA Nations League, WC Qualifiers
