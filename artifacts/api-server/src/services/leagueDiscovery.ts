@@ -202,11 +202,25 @@ export interface LeagueReport {
 export async function runLeagueDiscovery(): Promise<LeagueDiscoveryResult> {
   logger.info("League discovery starting — fetching all in-season leagues from API-Football");
 
-  // 1. Fetch all current in-season leagues
   const currentYear = new Date().getFullYear();
-  const leagues = await apiFetch<any[]>("/leagues", { current: "true", season: currentYear });
+  const currentMonth = new Date().getMonth() + 1;
+  const prevYear = currentYear - 1;
 
-  if (!leagues || leagues.length === 0) {
+  const leaguesCurrent = await apiFetch<any[]>("/leagues", { current: "true", season: currentYear });
+  const leaguesPrev = currentMonth <= 6
+    ? await apiFetch<any[]>("/leagues", { current: "true", season: prevYear })
+    : null;
+
+  const seenIds = new Set<number>();
+  const allLeagues: any[] = [];
+  for (const l of leaguesCurrent ?? []) {
+    if (l.league?.id) { seenIds.add(l.league.id); allLeagues.push(l); }
+  }
+  for (const l of leaguesPrev ?? []) {
+    if (l.league?.id && !seenIds.has(l.league.id)) { seenIds.add(l.league.id); allLeagues.push(l); }
+  }
+
+  if (allLeagues.length === 0) {
     logger.warn("League discovery: no leagues returned from API-Football");
     return {
       totalLeaguesFound: 0, inSeasonCount: 0, newLeagues: 0,
@@ -215,13 +229,11 @@ export async function runLeagueDiscovery(): Promise<LeagueDiscoveryResult> {
     };
   }
 
-  logger.info({ total: leagues.length }, "League discovery: raw leagues fetched");
+  logger.info({ total: allLeagues.length, currentSeason: leaguesCurrent?.length ?? 0, prevSeason: leaguesPrev?.length ?? 0 }, "League discovery: raw leagues fetched (current + prev season)");
 
-  // 2. Filter to leagues that are in-season and have upcoming fixtures
-  const inSeason = leagues.filter((l: any) => {
+  const inSeason = allLeagues.filter((l: any) => {
     const seasons = l.seasons as any[];
-    const current = seasons?.find((s: any) => s.current === true && s.year === currentYear);
-    return !!current;
+    return seasons?.some((s: any) => s.current === true);
   });
 
   logger.info({ inSeason: inSeason.length }, "League discovery: in-season leagues found");
@@ -231,7 +243,7 @@ export async function runLeagueDiscovery(): Promise<LeagueDiscoveryResult> {
   const existingMap = new Map(existing.map((r) => [r.leagueId, r]));
 
   const result: LeagueDiscoveryResult = {
-    totalLeaguesFound: leagues.length,
+    totalLeaguesFound: allLeagues.length,
     inSeasonCount: inSeason.length,
     newLeagues: 0,
     activatedLeagues: [],
@@ -665,6 +677,92 @@ const LEAGUE_ID_NAMES: Record<number, { name: string; country: string; type: str
   1040: { name: "UEFA Nations League Women", country: "Europe", type: "international", gender: "female" },
   1083: { name: "UEFA Women's Championship Qualifiers", country: "Europe", type: "international", gender: "female" },
   666: { name: "Women's International Friendlies", country: "World", type: "international", gender: "female" },
+  18: { name: "AFC Cup", country: "Asia", type: "cup", gender: "male" },
+  19: { name: "CAF Super Cup", country: "Africa", type: "cup", gender: "male" },
+  32: { name: "AFCON Qualifiers", country: "Africa", type: "international", gender: "male" },
+  35: { name: "WCQ CONMEBOL", country: "South America", type: "international", gender: "male" },
+  36: { name: "WCQ AFC", country: "Asia", type: "international", gender: "male" },
+  37: { name: "WCQ CAF", country: "Africa", type: "international", gender: "male" },
+  38: { name: "WCQ OFC", country: "Oceania", type: "international", gender: "male" },
+  44: { name: "FA Community Shield", country: "England", type: "cup", gender: "male" },
+  64: { name: "National 2", country: "France", type: "league", gender: "male" },
+  72: { name: "Brasileirão Série B", country: "Brazil", type: "league", gender: "male" },
+  73: { name: "Brasileirão Série C", country: "Brazil", type: "league", gender: "male" },
+  75: { name: "Copa do Nordeste", country: "Brazil", type: "cup", gender: "male" },
+  89: { name: "Eerste Divisie", country: "Netherlands", type: "league", gender: "male" },
+  99: { name: "J2 League", country: "Japan", type: "league", gender: "male" },
+  100: { name: "J3 League", country: "Japan", type: "league", gender: "male" },
+  107: { name: "I Liga", country: "Poland", type: "league", gender: "male" },
+  129: { name: "Copa de la Liga", country: "Argentina", type: "cup", gender: "male" },
+  142: { name: "Segunda División RFEF", country: "Spain", type: "league", gender: "male" },
+  170: { name: "Chinese League One", country: "China", type: "league", gender: "male" },
+  182: { name: "Scottish League Cup", country: "Scotland", type: "cup", gender: "male" },
+  198: { name: "Super League 2", country: "Greece", type: "league", gender: "male" },
+  208: { name: "Swiss Challenge League", country: "Switzerland", type: "league", gender: "male" },
+  211: { name: "Druga HNL", country: "Croatia", type: "league", gender: "male" },
+  219: { name: "2. Liga", country: "Austria", type: "league", gender: "male" },
+  234: { name: "Liga Panameña", country: "Panama", type: "league", gender: "male" },
+  240: { name: "Primera División", country: "El Salvador", type: "league", gender: "male" },
+  241: { name: "Liga Nacional", country: "Guatemala", type: "league", gender: "male" },
+  243: { name: "Jamaica Premier League", country: "Jamaica", type: "league", gender: "male" },
+  255: { name: "USL Championship", country: "USA", type: "league", gender: "male" },
+  256: { name: "USL League One", country: "USA", type: "league", gender: "male" },
+  258: { name: "Canadian Premier League", country: "Canada", type: "league", gender: "male" },
+  269: { name: "Primera B", country: "Venezuela", type: "league", gender: "male" },
+  279: { name: "Liga Dominicana", country: "Dominican Republic", type: "league", gender: "male" },
+  284: { name: "Liga II", country: "Romania", type: "league", gender: "male" },
+  286: { name: "First Professional League", country: "Bulgaria", type: "league", gender: "male" },
+  289: { name: "National First Division", country: "South Africa", type: "league", gender: "male" },
+  293: { name: "K League 2", country: "South Korea", type: "league", gender: "male" },
+  297: { name: "Thai League 2", country: "Thailand", type: "league", gender: "male" },
+  298: { name: "V-League", country: "Vietnam", type: "league", gender: "male" },
+  302: { name: "Qatar Second Division", country: "Qatar", type: "league", gender: "male" },
+  308: { name: "Saudi First Division", country: "Saudi Arabia", type: "league", gender: "male" },
+  319: { name: "Ethiopian Premier League", country: "Ethiopia", type: "league", gender: "male" },
+  321: { name: "Uganda Premier League", country: "Uganda", type: "league", gender: "male" },
+  322: { name: "Tanzanian Premier League", country: "Tanzania", type: "league", gender: "male" },
+  324: { name: "I-League", country: "India", type: "league", gender: "male" },
+  325: { name: "Malaysian Super League", country: "Malaysia", type: "league", gender: "male" },
+  326: { name: "Malaysian Premier League", country: "Malaysia", type: "league", gender: "male" },
+  334: { name: "Zambian Super League", country: "Zambia", type: "league", gender: "male" },
+  335: { name: "Zimbabwe PSL", country: "Zimbabwe", type: "league", gender: "male" },
+  336: { name: "PrvaLiga", country: "Slovenia", type: "league", gender: "male" },
+  338: { name: "Kazakhstan Premier League", country: "Kazakhstan", type: "league", gender: "male" },
+  340: { name: "Uzbekistan Super League", country: "Uzbekistan", type: "league", gender: "male" },
+  346: { name: "FNL", country: "Czech Republic", type: "league", gender: "male" },
+  347: { name: "Persha Liga", country: "Ukraine", type: "league", gender: "male" },
+  348: { name: "Vysshaya Liga", country: "Belarus", type: "league", gender: "male" },
+  354: { name: "Ligat HaAl", country: "Israel", type: "league", gender: "male" },
+  355: { name: "Super Liga", country: "Serbia", type: "league", gender: "male" },
+  357: { name: "League of Ireland Premier", country: "Ireland", type: "league", gender: "male" },
+  372: { name: "Superliga", country: "Albania", type: "league", gender: "male" },
+  373: { name: "Premijer Liga", country: "Bosnia-Herzegovina", type: "league", gender: "male" },
+  374: { name: "Veikkausliiga", country: "Finland", type: "league", gender: "male" },
+  375: { name: "Virsliga", country: "Latvia", type: "league", gender: "male" },
+  376: { name: "A Lyga", country: "Lithuania", type: "league", gender: "male" },
+  377: { name: "Úrvalsdeild", country: "Iceland", type: "league", gender: "male" },
+  378: { name: "First Division", country: "Cyprus", type: "league", gender: "male" },
+  382: { name: "Meistriliiga", country: "Estonia", type: "league", gender: "male" },
+  383: { name: "Erovnuli Liga", country: "Georgia", type: "league", gender: "male" },
+  384: { name: "Prva Liga", country: "North Macedonia", type: "league", gender: "male" },
+  385: { name: "Betrideildin", country: "Faroe Islands", type: "league", gender: "male" },
+  387: { name: "Meridianbet 1. CFL", country: "Montenegro", type: "league", gender: "male" },
+  388: { name: "National Division", country: "Luxembourg", type: "league", gender: "male" },
+  390: { name: "Divizia Nationala", country: "Moldova", type: "league", gender: "male" },
+  396: { name: "NIFL Premiership", country: "Northern Ireland", type: "league", gender: "male" },
+  528: { name: "EFL Trophy", country: "England", type: "cup", gender: "male" },
+  527: { name: "Premier League 2", country: "England", type: "league", gender: "male" },
+  530: { name: "CONCACAF Nations League", country: "North America", type: "international", gender: "male" },
+  772: { name: "Championship Women", country: "England", type: "league", gender: "female" },
+  793: { name: "Damallsvenskan", country: "Sweden", type: "league", gender: "female" },
+  794: { name: "Toppserien", country: "Norway", type: "league", gender: "female" },
+  795: { name: "Kvindeligaen", country: "Denmark", type: "league", gender: "female" },
+  868: { name: "UEFA Youth League", country: "Europe", type: "cup", gender: "male" },
+  891: { name: "W-League", country: "Australia", type: "league", gender: "female" },
+  1082: { name: "WCQ Women CONMEBOL", country: "South America", type: "international", gender: "female" },
+  1084: { name: "WCQ Women AFC", country: "Asia", type: "international", gender: "female" },
+  1085: { name: "WCQ Women CAF", country: "Africa", type: "international", gender: "female" },
+  1086: { name: "WCQ Women CONCACAF", country: "North America", type: "international", gender: "female" },
 };
 
 export async function seedCompetitionConfig(): Promise<{ seeded: number }> {

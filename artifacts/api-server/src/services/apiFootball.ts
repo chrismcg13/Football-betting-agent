@@ -213,37 +213,145 @@ export const TIER2_LEAGUE_IDS: number[] = [
   // (some already included above)
 ];
 
-// ─── TIER 3: Lower divisions + smaller leagues ──────────────────────────────
+// ─── TIER 3: Lower divisions + smaller leagues + data collection ────────────
 export const TIER3_LEAGUE_IDS: number[] = [
-  // Lower divisions of major leagues
-  43,   // National League (England 5th tier)
-  50,   // National League North (England 6th tier)
-  51,   // National League South (England 6th tier)
+  // Lower divisions — England
+  43,   // National League (5th tier)
+  50,   // National League North (6th tier)
+  51,   // National League South (6th tier)
+  44,   // FA Community Shield
+
+  // Lower divisions — Germany / Spain / Italy / France
   80,   // 3. Liga (Germany)
   138,  // Serie C (Italy)
   63,   // National 1 (France 3rd tier)
+  64,   // National 2 (France 4th tier)
+  142,  // Segunda División B (Spain, now RFEF)
 
-  // Smaller top flights
-  271,  // Bolivian Primera División
-  239,  // Costa Rica Primera División
-  332,  // Honduran Liga Nacional
-  318,  // Ghanaian Premier League
-  399,  // Nigerian NPFL
-  320,  // Kenyan Premier League
-
-  // Second divisions of Tier 2 countries
+  // Scotland — full coverage
   183,  // Scottish League One
   184,  // Scottish League Two
   181,  // Scottish FA Cup
+  182,  // Scottish League Cup
+
+  // Second divisions — Tier 2 countries
   145,  // Belgian First Division B
   120,  // Danish 1st Division
   104,  // Norwegian OBOS-ligaen (2nd)
   114,  // Swedish Superettan (2nd)
   204,  // Turkish 1. Lig
   95,   // Portuguese Segunda Liga
+  89,   // Eerste Divisie (Netherlands 2nd)
+  129,  // Liga Profesional Argentina 2nd (Copa de la Liga)
+  219,  // Austrian 2. Liga
+  208,  // Swiss Challenge League (2nd)
+  198,  // Super League Greece 2
+  284,  // Romanian Liga II
+  211,  // Croatian Druga HNL
+  107,  // Polish I Liga (2nd)
+  346,  // Czech FNL (2nd)
 
-  // Women's — additional
+  // Smaller top flights — Americas
+  271,  // Bolivian Primera División
+  239,  // Costa Rica Primera División
+  332,  // Honduran Liga Nacional
+  240,  // El Salvador Primera División
+  241,  // Guatemala Liga Nacional
+  234,  // Panamanian LPF
+  243,  // Jamaican Premier League
+  279,  // Dominican Liga Mayor
+  269,  // Venezuelan Primera B
+  72,   // Brasileirão Série B (Brazil 2nd)
+  73,   // Brasileirão Série C (Brazil 3rd)
+  75,   // Copa do Nordeste (Brazil regional)
+
+  // North America — lower
+  254,  // NWSL (USA Women, also in Tier2)
+  255,  // USL Championship (USA 2nd)
+  256,  // USL League One (USA 3rd)
+  258,  // Canadian Premier League
+
+  // Asia — smaller leagues
+  99,   // J2 League (Japan 2nd)
+  100,  // J3 League (Japan 3rd)
+  293,  // K League 2 (South Korea 2nd)
+  170,  // Chinese League One (2nd)
+  297,  // Thai League 2
+  324,  // Indian I-League
+  308,  // Saudi First Division
+  302,  // Qatar Second Division
+  325,  // Malaysian Super League
+  326,  // Malaysian Premier League
+  298,  // Vietnamese V-League
+  340,  // Uzbekistan Super League
+  338,  // Kazakh Premier League
+
+  // Africa — expanded
+  318,  // Ghanaian Premier League
+  399,  // Nigerian NPFL
+  320,  // Kenyan Premier League
+  289,  // South Africa First Division
+  321,  // Ugandan Premier League
+  322,  // Tanzanian Premier League
+  319,  // Ethiopian Premier League
+  334,  // Zambian Super League
+  335,  // Zimbabwean PSL
+
+  // Europe — smaller top flights
+  372,  // Albanian Superliga
+  373,  // Bosnian Premier League
+  286,  // Bulgarian First League
+  378,  // Cypriot First Division
+  382,  // Estonian Meistriliiga
+  374,  // Finnish Veikkausliiga
+  383,  // Georgian Erovnuli Liga
+  354,  // Israeli Premier League
+  375,  // Latvian Higher League
+  376,  // Lithuanian A Lyga
+  355,  // Serbian Super Liga
+  336,  // Slovenian PrvaLiga
+  387,  // Montenegrin First League
+  384,  // North Macedonian First League
+  348,  // Belarusian Premier League
+  347,  // Ukrainian First League (2nd)
+  390,  // Moldovan National Division
+  388,  // Luxembourgish National Division
+  377,  // Icelandic Úrvalsdeild
+  385,  // Faroese Premier League
+  357,  // Irish Premier Division
+  396,  // Northern Irish Premiership
+
+  // Continental cups — additional
+  18,   // AFC Cup
+  19,   // CAF Super Cup
+  480,  // Olympics Men (if active)
+  523,  // Olympics Women (if active)
+
+  // International friendlies & qualifiers
+  32,   // AFCON Qualifiers
+  35,   // WCQ - CONMEBOL
+  36,   // WCQ - AFC
+  37,   // WCQ - CAF
+  38,   // WCQ - OFC
+  530,  // CONCACAF Nations League
+
+  // Women's — expanded
   790,  // Brasileiro Women (Brazil)
+  772,  // Championship Women (England 2nd)
+  776,  // Serie A Women (Spain 2nd? / alt)
+  891,  // W-League (Australia Women)
+  793,  // Damallsvenskan (Sweden Women)
+  794,  // Toppserien (Norway Women)
+  795,  // Kvindeligaen (Denmark Women)
+  1082, // Women's WCQ - CONMEBOL
+  1084, // Women's WCQ - AFC
+  1085, // Women's WCQ - CAF
+  1086, // Women's WCQ - CONCACAF
+
+  // Youth / Reserve leagues (data-rich)
+  868,  // UEFA Youth League
+  527,  // Premier League 2 (reserves)
+  528,  // EFL Trophy
 ];
 
 // All league IDs we scan (used for fixture discovery by league) — deduplicated
@@ -1240,9 +1348,9 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
   const toStr = in14Days.toISOString().slice(0, 10);
 
   const AUG_MAY_LEAGUES = new Set([
-    39, 40, 41, 42, 43, 44, 45, 46, // England
+    39, 40, 41, 42, 43, 44, 45, 46, 50, 51, // England (incl National League N/S)
     78, 79, 80, 81, // Germany
-    61, 62, 63, 66, // France
+    61, 62, 63, 64, 66, // France (incl National 2)
     135, 136, 137, 138, // Italy
     140, 141, 142, 143, // Spain
     94, 95, // Portugal
@@ -1252,17 +1360,19 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
     218, 219, // Austria
     207, 208, // Switzerland
     197, 198, // Greece
-    179, 180, 181, 183, 184, // Scotland
+    179, 180, 181, 182, 183, 184, // Scotland (incl League Cup)
     119, 120, // Denmark
     2, 3, 4, 848, // UCL, UEL, UECL, Nations League
     5, 15, // UEFA Nations League, WC Qualifiers
     16, 31, 13, 14, // Continental club
-    106, 345, 283, 210, 333, // Eastern Europe
+    106, 107, 345, 346, 283, 284, 210, 211, 333, 347, // Eastern Europe + 2nd divs
     188, 196, // Australia
-    307, 288, // Saudi, South Africa
+    307, 308, 288, 289, // Saudi + 2nd, South Africa + 1st div
     233, 200, 201, 202, // Africa (Egypt, Morocco, Tunisia, Algeria)
     235, // Russia
-    771, 770, 773, 775, 524, // Women's European
+    372, 373, 286, 378, 354, 355, 336, 387, 384, 348, 390, 388, 396, // Small Euro top flights
+    771, 770, 773, 775, 524, 772, // Women's European
+    868, 527, 528, // Youth/reserves
   ]);
 
   function getSeasonForLeague(leagueId: number): number {
@@ -1322,11 +1432,15 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
           .where(eq(matchesTable.betfairEventId, afKey))
           .limit(1);
 
+        const resolvedLeagueName = (f.league?.name && !f.league.name.match(/^League \d+$/))
+          ? f.league.name
+          : league.name;
+
         if (existing.length === 0) {
           await db.insert(matchesTable).values({
             homeTeam: homeTeamName,
             awayTeam: awayTeamName,
-            league: league.name,
+            league: resolvedLeagueName,
             country: league.country || f.league?.country || "Unknown",
             kickoffTime,
             status: "scheduled",
