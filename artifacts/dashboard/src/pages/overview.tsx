@@ -233,7 +233,7 @@ export default function Overview() {
   const recentResults = useMemo(() => {
     const bets = (allBetsData?.bets as any[]) ?? [];
     return bets
-      .filter((b: any) => b.status === "won" || b.status === "lost" || b.status === "void")
+      .filter((b: any) => b.status === "won" || b.status === "lost")
       .slice(0, 20);
   }, [allBetsData]);
 
