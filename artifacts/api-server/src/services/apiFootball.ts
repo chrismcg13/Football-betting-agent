@@ -1445,6 +1445,7 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
             kickoffTime,
             status: "scheduled",
             betfairEventId: afKey,
+            apiFixtureId: fixtureId,
           });
           fixturesInserted++;
         } else {

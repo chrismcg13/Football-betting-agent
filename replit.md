@@ -37,7 +37,7 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
 *   **xG Intelligence:** Integrates Expected Goals (xG) data, derived from the internal feature engine, to inform predictions and team performance analysis.
 *   **Risk Management:** Implements circuit breakers (daily/weekly loss limits), a bankroll floor, cold market filtering, and hot-streak detection to safeguard the simulated bankroll.
 *   **Experiment Pipeline:** A robust system to manage betting strategies through experiment, candidate, and promoted tiers, with statistical evidence driving progression. This includes schema extensions for `paper_bets`, new tables (`experiment_registry`, `promotion_audit_log`, `experiment_learning_journal`), and a daily promotion engine. Candidate bets use reduced stakes, and in production, only promoted strategies are allowed to place bets.
-*   **Settlement Architecture:** A comprehensive pipeline for syncing match results, settling paper bets, and backfilling missing statistics, supporting various market types and handling void bets.
+*   **Settlement Architecture:** Settlement cron runs every 2 minutes. `syncMatchResults` fetches finished fixtures from API-Football and matches to DB using `apiFixtureId` (primary) then fuzzy team name matching (fallback). Backfill re-settles voided bets (all markets) only when voided >1hr after placement (protects dedup/admin voids). `apiFixtureId` stored during fixture ingestion for reliable matching.
 *   **Environment Isolation:** Strict separation of development and production databases, with a controlled synchronization mechanism for promoted strategies.
 *   **Startup Process:** Automated database migrations and agent configuration seeding on server startup.
 

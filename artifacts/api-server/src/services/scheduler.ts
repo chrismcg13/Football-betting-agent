@@ -627,14 +627,13 @@ export async function syncMatchResults(daysBack = 2): Promise<number> {
     return 0;
   }
 
-  // Get all matches in DB that are still 'scheduled' and past kickoff
   const scheduledMatches = await db
     .select()
     .from(matchesTable)
     .where(
       and(
         eq(matchesTable.status, "scheduled"),
-        sql`${matchesTable.kickoffTime} < NOW() - INTERVAL '90 minutes'`,
+        sql`${matchesTable.kickoffTime} < NOW()`,
       ),
     );
 
@@ -646,18 +645,27 @@ export async function syncMatchResults(daysBack = 2): Promise<number> {
   let updated = 0;
   const matchedDbIds = new Set<number>();
 
+  const fixtureIdIndex = new Map<number, (typeof scheduledMatches)[0]>();
+  for (const m of scheduledMatches) {
+    if (m.apiFixtureId) fixtureIdIndex.set(m.apiFixtureId, m);
+  }
+
   for (const fixture of recentFixtures) {
     const homeGoals = fixture.goals?.home ?? fixture.score?.fulltime?.home;
     const awayGoals = fixture.goals?.away ?? fixture.score?.fulltime?.away;
     if (homeGoals === null || homeGoals === undefined || awayGoals === null || awayGoals === undefined) continue;
 
-    // Find matching DB match using fuzzy team name matching
-    const dbMatch = scheduledMatches.find(
-      (m) =>
-        !matchedDbIds.has(m.id) &&
-        teamNameMatch(m.homeTeam, fixture.teams.home.name) &&
-        teamNameMatch(m.awayTeam, fixture.teams.away.name),
-    );
+    let dbMatch = fixtureIdIndex.get(fixture.fixture.id);
+    if (dbMatch && matchedDbIds.has(dbMatch.id)) dbMatch = undefined;
+
+    if (!dbMatch) {
+      dbMatch = scheduledMatches.find(
+        (m) =>
+          !matchedDbIds.has(m.id) &&
+          teamNameMatch(m.homeTeam, fixture.teams.home.name) &&
+          teamNameMatch(m.awayTeam, fixture.teams.away.name),
+      );
+    }
     if (!dbMatch) continue;
 
     // Fetch corner/card stats while we have the fixture ID
@@ -755,10 +763,10 @@ async function runSettlementPipeline(deep = false): Promise<void> {
 }
 
 export function startSettlementCron(): void {
-  cron.schedule("*/5 * * * *", () => {
+  cron.schedule("*/2 * * * *", () => {
     void runSettlementPipeline();
   }, { timezone: "UTC" });
-  logger.info("Settlement cron active — every 5 minutes (sync 2-day + settle + backfill)");
+  logger.info("Settlement cron active — every 2 minutes (sync 2-day + settle + backfill)");
 
   cron.schedule("15 * * * *", () => {
     logger.info("Deep settlement sweep triggered (7-day lookback)");

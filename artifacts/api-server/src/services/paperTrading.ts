@@ -783,133 +783,103 @@ const CORNERS_CARDS_MARKETS = new Set([
 ]);
 
 export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: number; betsResettled: number }> {
-  // 1. Find finished matches with voided corners/cards bets that have no stats yet
-  const voidedBets = await db
-    .select({ matchId: paperBetsTable.matchId, marketType: paperBetsTable.marketType })
+  const allVoidedBets = await db
+    .select()
     .from(paperBetsTable)
     .where(eq(paperBetsTable.status, "void"));
 
-  const relevantMatchIds = [
+  if (allVoidedBets.length === 0) {
+    return { matchesUpdated: 0, betsResettled: 0 };
+  }
+
+  const cornersCardsMatchIds = [
     ...new Set(
-      voidedBets
+      allVoidedBets
         .filter((b) => CORNERS_CARDS_MARKETS.has(b.marketType))
         .map((b) => b.matchId),
     ),
   ];
 
-  if (relevantMatchIds.length === 0) {
-    return { matchesUpdated: 0, betsResettled: 0 };
-  }
-
-  const matches = await db
-    .select()
-    .from(matchesTable)
-    .where(
-      and(
-        inArray(matchesTable.id, relevantMatchIds),
-        eq(matchesTable.status, "finished"),
-        or(isNull(matchesTable.totalCorners), isNull(matchesTable.totalCards)),
-      ),
-    );
-
-  if (matches.length === 0) {
-    logger.info("backfillCornersCardsStats: no finished matches need stats backfill");
-    return { matchesUpdated: 0, betsResettled: 0 };
-  }
-
-  // 2. Group matches by date and fetch fixtures to find their API fixture IDs
-  const dateGroups = new Map<string, typeof matches>();
-  for (const m of matches) {
-    const dateStr = m.kickoffTime.toISOString().slice(0, 10);
-    if (!dateGroups.has(dateStr)) dateGroups.set(dateStr, []);
-    dateGroups.get(dateStr)!.push(m);
-  }
-
-  const matchIdToFixtureId = new Map<number, number>();
-
-  for (const [date, dateMatches] of dateGroups) {
-    const fixtures = await getFixturesForDate(date);
-    const finished = fixtures.filter(
-      (f) => f.fixture.status.short === "FT" || f.fixture.status.short === "AET" || f.fixture.status.short === "PEN",
-    );
-    for (const dbMatch of dateMatches) {
-      // If we already have an apiFixtureId stored, use it
-      if (dbMatch.apiFixtureId) {
-        matchIdToFixtureId.set(dbMatch.id, dbMatch.apiFixtureId);
-        continue;
-      }
-      const fixture = finished.find(
-        (f) =>
-          teamNameMatch(dbMatch.homeTeam, f.teams.home.name) &&
-          teamNameMatch(dbMatch.awayTeam, f.teams.away.name),
-      );
-      if (fixture) {
-        matchIdToFixtureId.set(dbMatch.id, fixture.fixture.id);
-      } else {
-        logger.warn(
-          { matchId: dbMatch.id, home: dbMatch.homeTeam, away: dbMatch.awayTeam, date },
-          "backfillCornersCardsStats: could not find API fixture",
-        );
-      }
-    }
-  }
-
-  // 3. Fetch stats and update matches
   let matchesUpdated = 0;
-  for (const dbMatch of matches) {
-    const fixtureId = matchIdToFixtureId.get(dbMatch.id);
-    if (!fixtureId) continue;
 
-    const stats = await fetchMatchStatsForSettlement(fixtureId);
-    if (!stats) {
-      logger.warn({ matchId: dbMatch.id, fixtureId }, "backfillCornersCardsStats: no stats from API");
-      continue;
+  if (cornersCardsMatchIds.length > 0) {
+    const matchesNeedingStats = await db
+      .select()
+      .from(matchesTable)
+      .where(
+        and(
+          inArray(matchesTable.id, cornersCardsMatchIds),
+          eq(matchesTable.status, "finished"),
+          or(isNull(matchesTable.totalCorners), isNull(matchesTable.totalCards)),
+        ),
+      );
+
+    if (matchesNeedingStats.length > 0) {
+      const dateGroups = new Map<string, typeof matchesNeedingStats>();
+      for (const m of matchesNeedingStats) {
+        const dateStr = m.kickoffTime.toISOString().slice(0, 10);
+        if (!dateGroups.has(dateStr)) dateGroups.set(dateStr, []);
+        dateGroups.get(dateStr)!.push(m);
+      }
+
+      for (const [date, dateMatches] of dateGroups) {
+        const fixtures = await getFixturesForDate(date);
+        const finished = fixtures.filter(
+          (f) => f.fixture.status.short === "FT" || f.fixture.status.short === "AET" || f.fixture.status.short === "PEN",
+        );
+        for (const dbMatch of dateMatches) {
+          let fixtureId = dbMatch.apiFixtureId;
+          if (!fixtureId) {
+            const fixture = finished.find(
+              (f) =>
+                teamNameMatch(dbMatch.homeTeam, f.teams.home.name) &&
+                teamNameMatch(dbMatch.awayTeam, f.teams.away.name),
+            );
+            if (!fixture) continue;
+            fixtureId = fixture.fixture.id;
+          }
+
+          const stats = await fetchMatchStatsForSettlement(fixtureId);
+          if (!stats) continue;
+
+          await db
+            .update(matchesTable)
+            .set({
+              apiFixtureId: fixtureId,
+              totalCorners: stats.totalCorners,
+              totalCards: stats.totalCards,
+            })
+            .where(eq(matchesTable.id, dbMatch.id));
+
+          matchesUpdated++;
+        }
+      }
     }
-
-    await db
-      .update(matchesTable)
-      .set({
-        apiFixtureId: fixtureId,
-        totalCorners: stats.totalCorners,
-        totalCards: stats.totalCards,
-      })
-      .where(eq(matchesTable.id, dbMatch.id));
-
-    logger.info(
-      { matchId: dbMatch.id, fixtureId, totalCorners: stats.totalCorners, totalCards: stats.totalCards },
-      "backfillCornersCardsStats: stats stored for match",
-    );
-    matchesUpdated++;
   }
 
-  // 4. Re-settle voided corners/cards bets for matches now having stats
-  const updatedMatchIds = [...matchIdToFixtureId.keys()];
-  if (updatedMatchIds.length === 0) return { matchesUpdated, betsResettled: 0 };
-
-  const updatedMatches = await db
+  const allVoidMatchIds = [...new Set(allVoidedBets.map((b) => b.matchId))];
+  const finishedMatches = await db
     .select()
     .from(matchesTable)
-    .where(inArray(matchesTable.id, updatedMatchIds));
-  const updatedMatchMap = new Map(updatedMatches.map((m) => [m.id, m]));
-
-  const voidedCornersCardsBets = await db
-    .select()
-    .from(paperBetsTable)
     .where(
       and(
-        eq(paperBetsTable.status, "void"),
-        inArray(paperBetsTable.matchId, updatedMatchIds),
+        inArray(matchesTable.id, allVoidMatchIds),
+        eq(matchesTable.status, "finished"),
       ),
     );
+  const matchMap = new Map(finishedMatches.map((m) => [m.id, m]));
 
   let betsResettled = 0;
   let pnlDelta = 0;
 
-  for (const bet of voidedCornersCardsBets) {
-    if (!CORNERS_CARDS_MARKETS.has(bet.marketType)) continue;
-    const match = updatedMatchMap.get(bet.matchId);
+  for (const bet of allVoidedBets) {
+    const match = matchMap.get(bet.matchId);
     if (!match || match.homeScore === null || match.awayScore === null) continue;
-    if (match.totalCorners === null && match.totalCards === null) continue;
+
+    if (bet.settledAt && bet.placedAt) {
+      const voidedMs = new Date(bet.settledAt).getTime() - new Date(bet.placedAt).getTime();
+      if (voidedMs < 3600_000) continue;
+    }
 
     const outcome = determineBetWon(
       bet.marketType,
@@ -919,7 +889,7 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
       { totalCorners: match.totalCorners ?? null, totalCards: match.totalCards ?? null },
     );
 
-    if (outcome === null) continue; // still not determinable
+    if (outcome === null) continue;
 
     const stake = Number(bet.stake);
     const odds = Number(bet.oddsAtPlacement);
@@ -929,7 +899,7 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
 
     await db
       .update(paperBetsTable)
-      .set({ status: newStatus, settlementPnl: String(settlementPnl) })
+      .set({ status: newStatus, settlementPnl: String(settlementPnl), settledAt: new Date() })
       .where(eq(paperBetsTable.id, bet.id));
 
     pnlDelta += settlementPnl;
@@ -937,11 +907,10 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
 
     logger.info(
       { betId: bet.id, market: bet.marketType, selection: bet.selectionName, newStatus, settlementPnl },
-      "backfillCornersCardsStats: voided bet re-settled",
+      "backfill: voided bet re-settled",
     );
   }
 
-  // 5. Update bankroll for the PnL delta
   if (betsResettled > 0) {
     const bankrollStr = await getConfigValue("bankroll");
     const bankroll = parseFloat(bankrollStr ?? "500");
@@ -949,7 +918,7 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
     await setConfigValue("bankroll", String(newBankroll));
     logger.info(
       { betsResettled, pnlDelta, bankroll, newBankroll },
-      "backfillCornersCardsStats: bankroll updated after re-settlement",
+      "backfill: bankroll updated after re-settlement",
     );
   }
 
