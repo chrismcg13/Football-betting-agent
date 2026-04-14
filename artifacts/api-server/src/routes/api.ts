@@ -1590,7 +1590,7 @@ router.post("/leagues/ingest-fixtures", async (_req, res) => {
 // Experiment Pipeline API
 // ─────────────────────────────────────────────
 
-import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine } from "../services/promotionEngine";
+import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags } from "../services/promotionEngine";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 
 router.get("/admin/experiments", async (_req, res) => {
@@ -1672,6 +1672,41 @@ router.get("/admin/sync-status", async (_req, res) => {
   try {
     const status = await getSyncStatus();
     res.json({ success: true, ...status });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/backfill-experiment-tags", async (_req, res) => {
+  try {
+    const result = await backfillExperimentTags();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.patch("/admin/bets/:id/sync-eligible", async (req, res) => {
+  try {
+    const betId = parseInt(req.params.id);
+    const { sync_eligible } = req.body ?? {};
+    if (typeof sync_eligible !== "boolean") {
+      res.status(400).json({ success: false, message: "sync_eligible (boolean) required" });
+      return;
+    }
+    await db.execute(sql`UPDATE paper_bets SET sync_eligible = ${sync_eligible} WHERE id = ${betId}`);
+    res.json({ success: true, betId, sync_eligible });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/experiment-analysis", async (_req, res) => {
+  try {
+    const rows = await db.execute(sql`
+      SELECT * FROM experiment_learning_journal ORDER BY analysis_date DESC LIMIT 20
+    `);
+    res.json({ success: true, entries: (rows as any).rows ?? [] });
   } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
   }

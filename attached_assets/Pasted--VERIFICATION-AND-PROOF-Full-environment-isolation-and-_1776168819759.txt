@@ -1,0 +1,231 @@
+# VERIFICATION AND PROOF: Full environment isolation and experiment pipeline testing
+
+## BEFORE ANYTHING ELSE — answer these critical questions with ACTUAL OUTPUT, not summaries:
+
+### Q1: Database isolation (THIS IS THE MOST IMPORTANT CHECK)
+Run these queries and show me the EXACT output:
+
+```sql
+-- In dev: 
+SELECT current_database(), inet_server_addr(), inet_server_port();
+
+-- In prod:
+SELECT current_database(), inet_server_addr(), inet_server_port();
+```
+
+If these return the SAME database name and host, STOP EVERYTHING. The shared database has not been reversed and all other work is meaningless. Go back and complete Phase 1 from the original prompt before proceeding.
+
+### Q2: Startup safety check
+Show me the exact code in the server startup that checks whether production is pointing at the dev database and refuses to start if so. Show the file path and the relevant lines. If this doesn't exist, implement it now.
+
+### Q3: Environment variable confirmation
+Show me the output of:
+```bash
+# In dev:
+echo $ENVIRONMENT
+echo $DATABASE_URL | sed 's/:[^:]*@/@***@/' # mask password
+
+# In prod:
+echo $ENVIRONMENT  
+echo $DATABASE_URL | sed 's/:[^:]*@/@***@/' # mask password
+```
+
+Confirm ENVIRONMENT is set to "development" and "production" respectively, and the DATABASE_URL values point to DIFFERENT hosts.
+
+---
+
+## TEST SUITE: Prove every component works end-to-end
+
+Run each test below IN ORDER. Show me the ACTUAL command/query and its ACTUAL output for every single one. Do not summarise — show raw output.
+
+### Test 1: Experiment registry baseline
+```sql
+SELECT experiment_tag, data_tier, current_sample_size, current_roi, current_clv, current_win_rate, current_p_value 
+FROM experiment_registry 
+ORDER BY data_tier, current_sample_size DESC;
+```
+I expect to see:
+- Established leagues (Premier League, La Liga, Bundesliga, Serie A, Ligue 1, Champions League) with `data_tier = 'promoted'` IF they have 50+ bets and positive metrics
+- Low-data leagues/markets as `experiment`
+- Show me the COUNTS: how many experiments, how many candidates, how many promoted?
+
+### Test 2: Bet data tier distribution
+```sql
+SELECT data_tier, COUNT(*), 
+       ROUND(AVG(CASE WHEN opportunity_boosted THEN 1 ELSE 0 END)::numeric * 100, 1) as pct_boosted
+FROM paper_bets 
+GROUP BY data_tier 
+ORDER BY data_tier;
+```
+Also:
+```sql
+SELECT COUNT(*) as total_bets FROM paper_bets;
+```
+The total should be 616+. If it's only 409, where are the missing bets? Find them.
+
+### Test 3: Auto-tagging proof
+Show me the code that automatically tags bets as experiments when placed on low-data leagues. Then prove it works:
+```sql
+-- Show bets on leagues with fewer than 50 historical data points
+-- These should ALL have data_tier = 'experiment' and an experiment_tag
+SELECT pb.id, pb.home_team, pb.away_team, pb.data_tier, pb.experiment_tag, pb.opportunity_boosted, pb.sync_eligible
+FROM paper_bets pb
+WHERE pb.data_tier = 'experiment'
+ORDER BY pb.created_at DESC
+LIMIT 20;
+```
+Critically: are there ANY bets on low-data leagues that are NOT tagged as experiments? Run:
+```sql
+-- FIND UNTAGGED LOW-DATA BETS (these are dangerous — they could leak to prod)
+-- This query should return ZERO rows
+SELECT pb.id, pb.league, pb.home_team, pb.away_team, pb.data_tier, pb.experiment_tag, pb.sync_eligible
+FROM paper_bets pb
+WHERE pb.experiment_tag IS NULL
+AND pb.data_tier = 'experiment';
+```
+
+### Test 4: Sync eligibility check
+```sql
+-- ALL experiment and candidate bets must have sync_eligible = false
+-- This query should return ZERO rows
+SELECT id, data_tier, sync_eligible, experiment_tag
+FROM paper_bets 
+WHERE data_tier IN ('experiment', 'candidate') 
+AND sync_eligible = true;
+```
+If this returns ANY rows, that's a data leak risk. Fix immediately.
+
+### Test 5: Promoted bets quality check
+```sql
+-- Show me what's been promoted and prove it deserves to be
+SELECT experiment_tag, 
+       COUNT(*) as bets,
+       ROUND(AVG(CASE WHEN status = 'won' THEN 1 ELSE 0 END)::numeric * 100, 1) as win_rate,
+       ROUND(SUM(COALESCE(profit_loss, 0))::numeric, 2) as total_pnl,
+       ROUND(AVG(COALESCE(clv, 0))::numeric, 3) as avg_clv
+FROM paper_bets 
+WHERE data_tier = 'promoted' 
+AND status IN ('won', 'lost')
+GROUP BY experiment_tag
+ORDER BY bets DESC;
+```
+Every promoted group should have: 50+ settled bets, positive ROI, positive CLV. If any promoted group has negative CLV or fewer than 30 bets, the promotion engine has a bug.
+
+### Test 6: Opportunity scoring tracking
+```sql
+-- Show boosted vs non-boosted performance comparison
+SELECT opportunity_boosted,
+       COUNT(*) as bets,
+       ROUND(AVG(CASE WHEN status = 'won' THEN 1 ELSE 0 END)::numeric * 100, 1) as win_rate,
+       ROUND(SUM(COALESCE(profit_loss, 0))::numeric, 2) as total_pnl
+FROM paper_bets
+WHERE status IN ('won', 'lost')
+GROUP BY opportunity_boosted;
+```
+Also confirm both score columns exist and are populated for boosted bets:
+```sql
+SELECT id, original_opportunity_score, boosted_opportunity_score
+FROM paper_bets
+WHERE opportunity_boosted = true
+LIMIT 10;
+```
+
+### Test 7: Promotion audit trail
+```sql
+SELECT id, experiment_tag, previous_tier, new_tier, decision_reason, decided_at, decided_by
+FROM promotion_audit_log
+ORDER BY decided_at DESC
+LIMIT 20;
+```
+If this is empty, the promotion engine ran but didn't log its decisions. That's a bug — every tier assignment must be audited.
+
+### Test 8: Sync script dry run
+Run the sync script in dry-run / preview mode and show me:
+- How many bets it WOULD sync to prod
+- How many it WOULD skip (and why)
+- Confirm it only picks up `data_tier = 'promoted'` AND `sync_eligible = true`
+- Confirm it checks BOTH conditions (not just one)
+
+Show me the relevant code from `scripts/sync-dev-to-prod.ts` where the WHERE clause filters bets. I need to see the double-gate: `WHERE sync_eligible = true AND data_tier = 'promoted'`.
+
+### Test 9: Production quarantine proof
+Show me the exact code in `placePaperBet()` that blocks experiment-tier and opportunity-boosted bets in production. Show file path and line numbers. Then prove it works by showing me what happens if you try to call the place-bet function with an experiment-tier bet while ENVIRONMENT=production — it should reject it.
+
+### Test 10: Prod dashboard data purity
+On the PRODUCTION dashboard:
+- What is the total bet count shown?
+- What is the overall ROI shown?
+- What is the overall CLV shown?
+
+Now compare: 
+```sql
+-- These numbers should MATCH what the prod dashboard shows
+-- Run against PROD database only
+SELECT COUNT(*) as total_bets,
+       ROUND(SUM(COALESCE(profit_loss, 0))::numeric / NULLIF(SUM(stake), 0) * 100, 2) as roi_pct,
+       ROUND(AVG(COALESCE(clv, 0))::numeric, 3) as avg_clv
+FROM paper_bets
+WHERE data_tier = 'promoted'
+AND status IN ('won', 'lost');
+```
+If the dashboard is showing different numbers than this query, it's including non-promoted data in its calculations.
+
+### Test 11: Demotion thresholds
+Show me the code that checks for automatic demotion conditions:
+- ROI below 0% over rolling 30-bet window
+- CLV below 0% over rolling 30-bet window  
+- 3 consecutive weeks of negative ROI
+
+If demotion logic doesn't exist yet, implement it now. This is critical for protecting the live bankroll.
+
+### Test 12: Missing components check
+Confirm each of these exists and show me the file path. If any are missing, implement them:
+
+- [ ] `scripts/sync-dev-to-prod.ts` — the one-way sync script
+- [ ] `scripts/seed-prod-from-dev.ts` — the one-time data seed
+- [ ] `scripts/promotion-engine.ts` — the automated promotion/demotion engine
+- [ ] `scripts/experiment-self-analysis.ts` — the weekly self-analysis
+- [ ] Cron job: sync-to-prod (every 6 hours)
+- [ ] Cron job: promotion-engine (daily after overnight learning)
+- [ ] Cron job: experiment-self-analysis (weekly Sunday 4am)
+- [ ] Endpoint: `POST /api/admin/sync-to-prod`
+- [ ] Endpoint: `GET /api/admin/sync-status`
+- [ ] Endpoint: `GET /api/admin/experiments`
+- [ ] Endpoint: `GET /api/admin/experiments/:tag`
+- [ ] Endpoint: `GET /api/admin/promotion-log`
+- [ ] Endpoint: `POST /api/admin/promote` (manual override with audit)
+- [ ] Endpoint: `PATCH /api/admin/bets/:id/sync-eligible`
+
+For each missing item, implement it fully before marking this task complete.
+
+---
+
+## FINAL SUMMARY OUTPUT
+
+After running all tests, provide a single summary table:
+
+```
+| Test | Status | Evidence |
+|------|--------|----------|
+| Database isolation | PASS/FAIL | dev=host_a, prod=host_b |
+| Startup safety check | PASS/FAIL | file:line |
+| Environment vars | PASS/FAIL | dev=development, prod=production |
+| Experiment registry | PASS/FAIL | X experiments, Y candidates, Z promoted |
+| Bet count | PASS/FAIL | total=N (expected 616+) |
+| Auto-tagging | PASS/FAIL | 0 untagged low-data bets |
+| Sync eligibility | PASS/FAIL | 0 eligible experiment/candidate bets |
+| Promoted quality | PASS/FAIL | all promoted groups have 50+ bets, +ROI, +CLV |
+| Opportunity tracking | PASS/FAIL | both score columns populated |
+| Audit trail | PASS/FAIL | N audit entries logged |
+| Sync double-gate | PASS/FAIL | WHERE clause confirmed |
+| Prod quarantine | PASS/FAIL | experiment bets rejected |
+| Dashboard purity | PASS/FAIL | numbers match promoted-only query |
+| Demotion logic | PASS/FAIL | file:line |
+| All scripts exist | PASS/FAIL | X/5 present |
+| All crons exist | PASS/FAIL | X/3 present |
+| All endpoints exist | PASS/FAIL | X/6 present |
+```
+
+**I will not switch to real money unless every row shows PASS. Any FAIL must be fixed and re-tested before this task is complete.**
+
+**Provide the direct URL to the /experiments dashboard page when complete.**

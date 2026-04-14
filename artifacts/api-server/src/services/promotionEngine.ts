@@ -426,6 +426,41 @@ export async function getLatestLearningJournal(): Promise<any> {
   return (rows as any).rows?.[0] ?? null;
 }
 
+export async function backfillExperimentTags(): Promise<{ tagged: number; registered: number; skipped: number }> {
+  logger.info("Starting experiment tag backfill for untagged bets");
+
+  const untagged = await db.execute(sql`
+    SELECT pb.id, pb.match_id, pb.market_type, m.league
+    FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    WHERE pb.experiment_tag IS NULL
+  `);
+
+  const rows = (untagged as any).rows ?? [];
+  let tagged = 0, skipped = 0, registeredSet = new Set<string>();
+
+  for (const row of rows) {
+    const league = row.league ?? "unknown";
+    const marketType = row.market_type ?? "unknown";
+    const expTag = `${league.toLowerCase().replace(/[^a-z0-9]/g, "-")}-${marketType.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
+
+    await db.execute(sql`
+      UPDATE paper_bets
+      SET experiment_tag = ${expTag}, data_tier = 'experiment'
+      WHERE id = ${row.id}
+    `);
+    tagged++;
+
+    if (!registeredSet.has(expTag)) {
+      await ensureExperimentRegistered(expTag, league, marketType);
+      registeredSet.add(expTag);
+    }
+  }
+
+  logger.info({ tagged, registered: registeredSet.size, skipped }, "Experiment tag backfill complete");
+  return { tagged, registered: registeredSet.size, skipped };
+}
+
 export function getSettledBetCountForLeagueMarket(league: string, marketType: string): Promise<number> {
   return db.execute(sql`
     SELECT COUNT(*) as cnt FROM paper_bets
