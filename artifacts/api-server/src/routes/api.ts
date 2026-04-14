@@ -1596,14 +1596,58 @@ import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 router.get("/admin/experiments", async (_req, res) => {
   try {
     const experiments = await getExperimentsSummary();
-    const grouped = {
-      experiment: experiments.filter(e => e.dataTier === "experiment"),
-      candidate: experiments.filter(e => e.dataTier === "candidate"),
-      promoted: experiments.filter(e => e.dataTier === "promoted"),
-      demoted: experiments.filter(e => e.dataTier === "demoted"),
-      abandoned: experiments.filter(e => e.dataTier === "abandoned"),
+    const thresholds = {
+      minSampleSize: parseInt(process.env.PROMO_MIN_SAMPLE_SIZE ?? "30"),
+      minRoi: parseFloat(process.env.PROMO_MIN_ROI ?? "3.0"),
+      minClv: parseFloat(process.env.PROMO_MIN_CLV ?? "1.5"),
+      minWinRate: parseFloat(process.env.PROMO_MIN_WIN_RATE ?? "52.0"),
+      maxPValue: parseFloat(process.env.PROMO_MAX_P_VALUE ?? "0.10"),
+      minWeeksActive: parseInt(process.env.PROMO_MIN_WEEKS_ACTIVE ?? "3"),
+      minEdge: parseFloat(process.env.PROMO_MIN_EDGE ?? "2.0"),
     };
-    res.json({ success: true, grouped, total: experiments.length });
+    const enriched = experiments
+      .map(e => ({
+        experimentTag: e.experimentTag ?? e.id,
+        leagueCode: e.leagueCode,
+        marketType: e.marketType,
+        dataTier: e.dataTier,
+        sampleSize: e.currentSampleSize ?? 0,
+        roi: e.currentRoi ?? 0,
+        clv: e.currentClv ?? 0,
+        winRate: e.currentWinRate ?? 0,
+        pValue: e.currentPValue ?? 1,
+        edge: e.currentEdge ?? 0,
+        consecutiveNegativeWeeks: e.consecutiveNegativeWeeks ?? 0,
+        tierChangedAt: e.tierChangedAt,
+        progress: {
+          sampleSize: Math.min(100, Math.round(((e.currentSampleSize ?? 0) / thresholds.minSampleSize) * 100)),
+          roi: Math.min(100, Math.round(Math.max(0, (e.currentRoi ?? 0) / thresholds.minRoi) * 100)),
+          clv: Math.min(100, Math.round(Math.max(0, (e.currentClv ?? 0) / thresholds.minClv) * 100)),
+          winRate: Math.min(100, Math.round(Math.max(0, (e.currentWinRate ?? 0) / thresholds.minWinRate) * 100)),
+          overall: 0,
+        },
+        distance: {
+          betsNeeded: Math.max(0, thresholds.minSampleSize - (e.currentSampleSize ?? 0)),
+          roiNeeded: Math.max(0, thresholds.minRoi - (e.currentRoi ?? 0)),
+          clvNeeded: Math.max(0, thresholds.minClv - (e.currentClv ?? 0)),
+          winRateNeeded: Math.max(0, thresholds.minWinRate - (e.currentWinRate ?? 0)),
+        },
+      }))
+      .map(e => {
+        e.progress.overall = Math.round(
+          (e.progress.sampleSize + e.progress.roi + e.progress.clv + e.progress.winRate) / 4
+        );
+        return e;
+      })
+      .sort((a, b) => b.sampleSize - a.sampleSize);
+    const grouped = {
+      experiment: enriched.filter(e => e.dataTier === "experiment"),
+      candidate: enriched.filter(e => e.dataTier === "candidate"),
+      promoted: enriched.filter(e => e.dataTier === "promoted"),
+      demoted: enriched.filter(e => e.dataTier === "demoted"),
+      abandoned: enriched.filter(e => e.dataTier === "abandoned"),
+    };
+    res.json({ success: true, grouped, total: enriched.length, thresholds });
   } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
   }

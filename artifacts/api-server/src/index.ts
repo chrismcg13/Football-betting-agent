@@ -10,15 +10,13 @@ import { sql, count } from "drizzle-orm";
 const ENVIRONMENT = process.env["ENVIRONMENT"] ?? "development";
 
 if (ENVIRONMENT === "production" && process.env["DATABASE_URL"]) {
-  const dbHost = new URL(process.env["DATABASE_URL"]).hostname;
-  const devDbUrl = process.env["DEV_DATABASE_URL"];
-  if (devDbUrl) {
-    const devHost = new URL(devDbUrl).hostname;
-    if (dbHost === devHost) {
-      console.error("FATAL: Production is pointing at the dev database. Aborting.");
-      process.exit(1);
-    }
+  const dbUrl = new URL(process.env["DATABASE_URL"]);
+  const KNOWN_DEV_HOSTS = ["helium", "localhost", "127.0.0.1"];
+  if (KNOWN_DEV_HOSTS.includes(dbUrl.hostname)) {
+    console.error("FATAL: Production DATABASE_URL points to a known dev host:", dbUrl.hostname, ". Aborting.");
+    process.exit(1);
   }
+  console.log("Startup safety check PASSED: Production DB host is", dbUrl.hostname);
 }
 
 const rawPort = process.env["PORT"];

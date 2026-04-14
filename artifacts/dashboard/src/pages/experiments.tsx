@@ -12,6 +12,36 @@ const tierColors: Record<string, { bg: string; border: string; text: string; dot
   abandoned: { bg: "#1e1e1e", border: "#374151", text: "#9ca3af", dot: "#6b7280" },
 };
 
+function ProgressBar({ value, label, color }: { value: number; label: string; color: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-[10px] text-slate-500 w-16 text-right shrink-0">{label}</span>
+      <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+        <div
+          className="h-full rounded-full transition-all duration-500"
+          style={{ width: `${Math.min(100, value)}%`, background: value >= 100 ? "#22c55e" : color }}
+        />
+      </div>
+      <span className="text-[10px] font-mono w-8 text-right" style={{ color: value >= 100 ? "#22c55e" : "#94a3b8" }}>
+        {value}%
+      </span>
+    </div>
+  );
+}
+
+function DistanceBadge({ label, value, unit }: { label: string; value: number; unit: string }) {
+  if (value <= 0) return (
+    <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-400 border border-emerald-800">
+      {label} ✓
+    </span>
+  );
+  return (
+    <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+      {label}: +{typeof value === "number" ? value.toFixed(value < 10 ? 1 : 0) : value}{unit}
+    </span>
+  );
+}
+
 function TierCard({ tier, experiments }: { tier: string; experiments: any[] }) {
   const colors = tierColors[tier] ?? tierColors.abandoned;
   return (
@@ -44,16 +74,29 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
   const [targetTier, setTargetTier] = useState("candidate");
   const [reason, setReason] = useState("");
 
-  const roi = exp.roi != null ? (Number(exp.roi) * 100).toFixed(1) : "—";
-  const winRate = exp.winRate != null ? (Number(exp.winRate) * 100).toFixed(1) : "—";
-  const clv = exp.avgClv != null ? Number(exp.avgClv).toFixed(2) : "—";
+  const hasBets = (exp.sampleSize ?? 0) > 0;
+  const roi = hasBets ? Number(exp.roi).toFixed(1) : "—";
+  const winRate = hasBets ? Number(exp.winRate).toFixed(1) : "—";
+  const clv = hasBets ? Number(exp.clv).toFixed(2) : "—";
 
   return (
     <div className="rounded-lg border p-3" style={{ background: "#0f172a", borderColor: "#334155" }}>
       <div className="flex items-center justify-between cursor-pointer" onClick={() => setExpanded(!expanded)}>
-        <div>
+        <div className="flex items-center gap-2">
           <span className="text-sm font-semibold text-white">{exp.experimentTag ?? "unknown"}</span>
-          <span className="ml-2 text-xs text-slate-500">{exp.betCount ?? 0} bets</span>
+          <span className="text-xs text-slate-500">{exp.sampleSize ?? 0} bets</span>
+          {exp.progress && (
+            <span
+              className="text-[10px] font-mono px-1.5 py-0.5 rounded"
+              style={{
+                background: exp.progress.overall >= 100 ? "#052e16" : "#1e293b",
+                color: exp.progress.overall >= 100 ? "#22c55e" : "#64748b",
+                border: `1px solid ${exp.progress.overall >= 100 ? "#166534" : "#334155"}`,
+              }}
+            >
+              {exp.progress.overall}% ready
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3 text-xs">
           <span className={cn("font-mono", Number(exp.roi) >= 0 ? "text-emerald-400" : "text-red-400")}>
@@ -61,39 +104,65 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
           </span>
           <span className="text-slate-400 font-mono">WR: {winRate}%</span>
           <span className="text-blue-300 font-mono">CLV: {clv}%</span>
+          <span className="text-slate-600 text-lg">{expanded ? "▾" : "▸"}</span>
         </div>
       </div>
       {expanded && (
         <div className="mt-3 pt-3 border-t" style={{ borderColor: "#334155" }}>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs mb-3">
             <div>
               <span className="text-slate-500 block">Sample Size</span>
-              <span className="text-white font-mono">{exp.betCount ?? 0}</span>
+              <span className="text-white font-mono">{exp.sampleSize ?? 0}</span>
             </div>
             <div>
-              <span className="text-slate-500 block">Won / Lost</span>
-              <span className="text-white font-mono">{exp.won ?? 0} / {exp.lost ?? 0}</span>
-            </div>
-            <div>
-              <span className="text-slate-500 block">Total P&L</span>
-              <span className={cn("font-mono", Number(exp.totalPnl) >= 0 ? "text-emerald-400" : "text-red-400")}>
-                {Number(exp.totalPnl) >= 0 ? "+" : ""}{Number(exp.totalPnl ?? 0).toFixed(2)}
+              <span className="text-slate-500 block">P-Value</span>
+              <span className={cn("font-mono", Number(exp.pValue) <= 0.1 ? "text-emerald-400" : "text-amber-400")}>
+                {hasBets ? Number(exp.pValue).toFixed(3) : "—"}
               </span>
             </div>
             <div>
-              <span className="text-slate-500 block">Avg Edge</span>
-              <span className="text-white font-mono">{exp.avgEdge != null ? (Number(exp.avgEdge) * 100).toFixed(1) + "%" : "—"}</span>
+              <span className="text-slate-500 block">Edge</span>
+              <span className="text-white font-mono">{hasBets ? Number(exp.edge).toFixed(1) + "%" : "—"}</span>
+            </div>
+            <div>
+              <span className="text-slate-500 block">League</span>
+              <span className="text-white font-mono text-[10px]">{exp.leagueCode ?? "—"}</span>
+            </div>
+            <div>
+              <span className="text-slate-500 block">Market</span>
+              <span className="text-white font-mono text-[10px]">{exp.marketType ?? "—"}</span>
             </div>
           </div>
-          {(tier === "experiment" || tier === "candidate") && (
+
+          {tier === "experiment" && exp.progress && (
+            <div className="mb-3 space-y-1.5 p-2 rounded-lg" style={{ background: "#0c0a1f" }}>
+              <span className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">Progress to Candidate</span>
+              <ProgressBar value={exp.progress.sampleSize} label="Sample" color="#8b5cf6" />
+              <ProgressBar value={exp.progress.roi} label="ROI" color="#3b82f6" />
+              <ProgressBar value={exp.progress.clv} label="CLV" color="#06b6d4" />
+              <ProgressBar value={exp.progress.winRate} label="Win Rate" color="#f59e0b" />
+            </div>
+          )}
+
+          {tier === "experiment" && exp.distance && (
+            <div className="flex flex-wrap gap-1 mb-3">
+              <DistanceBadge label="Bets" value={exp.distance.betsNeeded} unit="" />
+              <DistanceBadge label="ROI" value={exp.distance.roiNeeded} unit="%" />
+              <DistanceBadge label="CLV" value={exp.distance.clvNeeded} unit="%" />
+              <DistanceBadge label="WR" value={exp.distance.winRateNeeded} unit="%" />
+            </div>
+          )}
+
+          {(tier === "experiment" || tier === "candidate" || tier === "promoted") && (
             <div className="flex items-center gap-2 pt-2 border-t" style={{ borderColor: "#1e293b" }}>
               <Select value={targetTier} onValueChange={setTargetTier}>
                 <SelectTrigger className="w-[130px] h-7 text-xs border-slate-700 bg-slate-800/50">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="candidate">Candidate</SelectItem>
-                  <SelectItem value="promoted">Promoted</SelectItem>
+                  {tier !== "candidate" && <SelectItem value="candidate">Candidate</SelectItem>}
+                  {tier !== "promoted" && <SelectItem value="promoted">Promoted</SelectItem>}
+                  {tier !== "experiment" && <SelectItem value="experiment">Experiment</SelectItem>}
                   <SelectItem value="abandoned">Abandoned</SelectItem>
                   <SelectItem value="demoted">Demoted</SelectItem>
                 </SelectContent>
@@ -172,6 +241,17 @@ export default function Experiments() {
         </div>
       </div>
 
+      {data?.thresholds && (
+        <div className="rounded-lg border p-3 text-xs" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+          <span className="text-slate-500 font-semibold">Promotion thresholds: </span>
+          <span className="text-slate-400">
+            ≥{data.thresholds.minSampleSize} bets, ≥{data.thresholds.minRoi}% ROI, ≥{data.thresholds.minClv}% CLV,
+            ≥{data.thresholds.minWinRate}% WR, ≤{data.thresholds.maxPValue} p-value, ≥{data.thresholds.minWeeksActive} weeks,
+            ≥{data.thresholds.minEdge}% edge
+          </span>
+        </div>
+      )}
+
       {isLoading ? (
         <div className="space-y-4">
           {[...Array(3)].map((_, i) => (
@@ -180,9 +260,9 @@ export default function Experiments() {
         </div>
       ) : (
         <div className="space-y-4">
-          <TierCard tier="experiment" experiments={grouped.experiment ?? []} />
-          <TierCard tier="candidate" experiments={grouped.candidate ?? []} />
           <TierCard tier="promoted" experiments={grouped.promoted ?? []} />
+          <TierCard tier="candidate" experiments={grouped.candidate ?? []} />
+          <TierCard tier="experiment" experiments={grouped.experiment ?? []} />
           {(grouped.demoted?.length > 0 || grouped.abandoned?.length > 0) && (
             <>
               <TierCard tier="demoted" experiments={grouped.demoted ?? []} />

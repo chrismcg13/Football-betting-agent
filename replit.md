@@ -49,3 +49,23 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
 *   **OddsPapi:** Used for bulk prefetching and refreshing Pinnacle odds, with budget tracking and coverage reporting.
 *   **football-data.org:** (DISABLED) Previously used for data ingestion; now replaced by API-Football v3.
 *   **StatsBomb/Fotmob:** (Implicitly via internal feature engine) Data sources for Expected Goals (xG) which are then processed by the internal feature engine.
+
+## Production Safety
+
+*   **Startup Safety Check:** In production (`ENVIRONMENT=production`), the server checks `DATABASE_URL` hostname against known dev hosts (`helium`, `localhost`, `127.0.0.1`). If it matches, the server aborts with a FATAL error. No dependency on `DEV_DATABASE_URL` being set.
+*   **Production Quarantine:** `placePaperBet()` blocks experiment-tier and opportunity-boosted bets in production. Only promoted-tier bets are allowed.
+*   **Sync Double-Gate:** `syncDevToProd.ts` requires both `sync_eligible=true AND data_tier='promoted'` to sync bets from dev to prod.
+*   **Candidate Stake Reduction:** Candidate-tier bets use 25% Kelly multiplier (configurable via `CANDIDATE_STAKE_MULTIPLIER` env var).
+*   **ENVIRONMENT env var:** Set to `"production"` in the artifact.toml production run config.
+
+## Experiment Pipeline
+
+*   **Tag Format:** `{league-slug}-{market-type-slug}` (league-market granularity, NOT per-match)
+*   **Promotion Thresholds (env-var configurable):**
+    - Experiment → Candidate: ≥30 bets, ≥3% ROI, ≥1.5% CLV, ≥52% WR, ≤0.10 p-value, ≥3 weeks, ≥2% edge
+    - Candidate → Promoted: ≥20 bets, ≥2% ROI, ≥1% CLV, ≤0.05 p-value, ≥2 weeks
+    - Demotion (promoted→candidate): rolling 30-bet window, ROI<0% or CLV<0% or 3 consecutive negative weeks
+    - Demotion (candidate→experiment): ROI<-5% or CLV<0%
+    - Abandon: ≥50 bets, ROI<-10%, p-value≤0.10
+*   **Dashboard:** `/experiments` page shows experiments sorted by sample size, with progress bars, distance-to-promotion metrics, and manual promote/demote with full audit logging.
+*   **Crons:** Promotion engine daily at 04:00 UTC, experiment analysis Sundays at 04:00, dev→prod sync every 6 hours.

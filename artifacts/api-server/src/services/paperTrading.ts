@@ -330,9 +330,10 @@ export async function placePaperBet(
   if (isContrarian) stake = Math.round(stake * 0.6 * 100) / 100;
   if (stakeMultiplier !== 1.0) stake = Math.round(stake * stakeMultiplier * 100) / 100;
   if (dataTier === "candidate") {
-    const CANDIDATE_STAKE_MULT = 0.25;
+    const CANDIDATE_STAKE_MULT = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");
+    const originalStake = stake;
     stake = Math.round(stake * CANDIDATE_STAKE_MULT * 100) / 100;
-    logger.info({ matchId, marketType, dataTier, originalStake: stake / CANDIDATE_STAKE_MULT, reducedStake: stake }, "Candidate-tier stake reduction applied (25%)");
+    logger.info({ matchId, marketType, dataTier, originalStake, reducedStake: stake, multiplier: CANDIDATE_STAKE_MULT }, "Candidate-tier stake reduction applied");
   }
 
   if (stake < 2) {

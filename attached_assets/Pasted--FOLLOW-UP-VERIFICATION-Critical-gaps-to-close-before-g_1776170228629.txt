@@ -1,0 +1,138 @@
+# FOLLOW-UP VERIFICATION: Critical gaps to close before going live
+
+## Issue 1: Prove database isolation with ACTUAL DATA (not claims)
+
+You said "prod uses a separate database" but you couldn't query it. That's not proof. Do this:
+
+1. Publish the app to production right now.
+2. Open the production dashboard.  
+3. Show me the EXACT bet count displayed on the prod dashboard.
+
+**Expected result: ZERO bets on the prod dashboard.** Nothing has been promoted, nothing has been synced, so prod's database should be empty. If it shows 616 bets, the databases are still shared and everything we've built is theatre.
+
+If prod shows zero bets, that's genuine proof of isolation. Screenshot or paste the output.
+
+## Issue 2: Fix the startup safety check gap
+
+The current check:
+```typescript
+if (ENVIRONMENT === "production" && process.env["DATABASE_URL"]) {
+  const dbHost = new URL(process.env["DATABASE_URL"]).hostname;
+  const devDbUrl = process.env["DEV_DATABASE_URL"];
+  if (devDbUrl) {  // <-- THIS IS THE PROBLEM
+```
+
+If `DEV_DATABASE_URL` is not set in production (which it probably isn't — why would it be?), the entire safety check is silently skipped. Fix this:
+
+**Option A (preferred):** Hardcode the known dev database hostname in the check. The dev host is `helium`. So the check should be:
+
+```typescript
+if (ENVIRONMENT === "production" && process.env["DATABASE_URL"]) {
+  const dbUrl = new URL(process.env["DATABASE_URL"]);
+  const KNOWN_DEV_HOSTS = ["helium", "localhost", "127.0.0.1"];
+  if (KNOWN_DEV_HOSTS.includes(dbUrl.hostname)) {
+    console.error("FATAL: Production DATABASE_URL points to a known dev host:", dbUrl.hostname, ". Aborting.");
+    process.exit(1);
+  }
+  console.log("Startup safety check PASSED: Production DB host is", dbUrl.hostname);
+}
+```
+
+**Option B:** Fail closed — if ENVIRONMENT=production and the check cannot verify the DB is NOT dev, refuse to start.
+
+Implement one of these and show me the updated code.
+
+## Issue 3: Experiment tag granularity — this might be broken
+
+You said 502 experiments with a maximum of 6 bets per tag. Show me:
+
+```sql
+SELECT experiment_tag, current_sample_size 
+FROM experiment_registry 
+ORDER BY current_sample_size DESC 
+LIMIT 30;
+```
+
+Also:
+```sql
+-- Show me the tag format
+SELECT DISTINCT experiment_tag FROM experiment_registry LIMIT 30;
+```
+
+**What I'm worried about:** If tags look like `"arsenal-vs-chelsea-match-result"` (per-match), they'll never reach 30 bets and the promotion pipeline is permanently stuck. 
+
+**What they should look like:** `"premier-league-match-result"`, `"la-liga-btts"`, `"bundesliga-over-under"` — league + market type combinations. These are the level at which we want to track whether the model has edge.
+
+If the tags are too granular, fix the tagging logic:
+- Tags should follow format: `"{league-code}-{market-type}"` e.g. `"premier-league-match_result"`, `"la-liga-btts"`, `"serie-a-over_under_25"`
+- Re-run the backfill to consolidate tags to this format  
+- Update the experiment_registry to merge the granular entries into league-level entries
+- Recalculate all metrics at the league-market level
+
+This is critical — if the tags are wrong, the promotion engine will never promote anything and the whole pipeline is useless.
+
+## Issue 4: Verify the promotion thresholds match the spec
+
+Show me the EXACT threshold values currently in the code (not from memory, from the actual source):
+
+```
+Experiment → Candidate:
+  MIN_SAMPLE_SIZE = ?
+  MIN_ROI = ?
+  MIN_CLV = ?
+  MIN_WIN_RATE = ?
+  MAX_P_VALUE = ?
+  MIN_WEEKS_ACTIVE = ?
+  MIN_EDGE = ?
+
+Candidate → Promoted:
+  MIN_SAMPLE = ?
+  MIN_ROI = ?
+  MIN_CLV = ?
+  MAX_P_VALUE = ?
+  MIN_WEEKS = ?
+
+Demotion triggers:
+  Rolling window size = ?
+  ROI threshold = ?
+  CLV threshold = ?
+  Consecutive negative weeks = ?
+```
+
+Are these configurable via environment variables as specified, or hardcoded? They should be env vars with the defaults from the original spec.
+
+## Issue 5: Candidate stake reduction
+
+Show me the code that applies the 25% Kelly multiplier for candidate-tier bets in production. File path and line numbers. This is a critical safety rail — when something first gets promoted to candidate and starts betting with real money, it must be at reduced stakes.
+
+If this doesn't exist, implement it:
+- When `data_tier = 'candidate'` and `ENVIRONMENT = 'production'`, multiply the Kelly stake by `CANDIDATE_STAKE_MULTIPLIER` (env var, default 0.25)
+- Log that reduced staking was applied on every candidate-tier bet
+- When `data_tier = 'promoted'`, use full Kelly stake
+
+## Issue 6: What does the Experiment Lab dashboard actually show?
+
+Go to `/dashboard/experiments` and tell me:
+1. Total number of experiments listed
+2. How they're grouped (by tier? by league? by market?)
+3. Do the progress bars toward promotion thresholds work?
+4. Can I see distance-to-promotion for each experiment? (e.g. "needs 24 more bets and +1.2% CLV")
+5. Does the manual promote/demote actually write to the audit log?
+
+Test the manual promote: pick any experiment and promote it to candidate via the UI. Then:
+```sql
+SELECT * FROM promotion_audit_log ORDER BY decided_at DESC LIMIT 1;
+```
+Confirm it logged with `decided_by = 'manual_override'` and includes the full metrics snapshot. Then DEMOTE it back to experiment immediately — we don't want any false candidates.
+
+## Summary
+
+Show me results for all 6 issues. The tag granularity (Issue 3) is the one most likely to be broken and most critical to fix — if tags are per-match instead of per-league-market, rebuild them now.
+
+**Do not mark complete until:**
+- Prod dashboard shows ZERO bets (proving isolation)
+- Startup check works without DEV_DATABASE_URL being set
+- Experiment tags are at league-market granularity
+- At least one tag has 30+ bets and is being correctly evaluated for promotion
+- Candidate stake reduction code exists
+- Manual promote/demote writes to audit log
