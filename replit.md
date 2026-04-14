@@ -328,6 +328,14 @@ Full pipeline runs as `runSettlementPipeline()` with concurrency guard:
 - Manual trigger: `POST /api/admin/settle` — runs full pipeline with 7-day lookback.
 - Startup: fires 15s after boot with 7-day deep sweep.
 
+## Shared Database (Dev ↔ Production)
+
+Dev and production environments share the same PostgreSQL database:
+- `lib/db/src/index.ts` connects via `SHARED_DATABASE_URL || DATABASE_URL`
+- Production has `SHARED_DATABASE_URL` set to the dev database URL
+- PostgreSQL advisory locks (`pg_try_advisory_lock`) prevent concurrent trading cycles and settlement pipelines across instances (lock IDs: 100001=trading, 100002=settlement)
+- Both environments run schedulers; the advisory locks ensure only one instance executes critical sections at a time
+
 ## Startup
 
 On startup (`src/index.ts`), the server runs `runMigrations()` (idempotent `CREATE TABLE IF NOT EXISTS`) before starting Express. Agent config is seeded with `ON CONFLICT (key) DO NOTHING` so defaults are only written once.

@@ -28,7 +28,7 @@ import {
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings } from "./leagueDiscovery";
-import { db, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
+import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql } from "drizzle-orm";
 
 // ===================== Status tracking =====================
@@ -129,6 +129,37 @@ async function safeRunOddspapiMapping(): Promise<void> {
 
 // ===================== Trading cycle =====================
 
+const TRADING_LOCK_ID = 100001;
+const SETTLEMENT_LOCK_ID = 100002;
+
+const lockClients = new Map<number, Awaited<ReturnType<typeof pool.connect>>>();
+
+async function tryAdvisoryLock(lockId: number): Promise<boolean> {
+  try {
+    const client = await pool.connect();
+    const result = await client.query("SELECT pg_try_advisory_lock($1) AS acquired", [lockId]);
+    if (result.rows[0]?.acquired === true) {
+      lockClients.set(lockId, client);
+      return true;
+    }
+    client.release();
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function releaseAdvisoryLock(lockId: number): Promise<void> {
+  const client = lockClients.get(lockId);
+  if (!client) return;
+  try {
+    await client.query("SELECT pg_advisory_unlock($1)", [lockId]);
+  } catch { /* best effort */ } finally {
+    client.release();
+    lockClients.delete(lockId);
+  }
+}
+
 export async function runTradingCycle(): Promise<{
   betsPlaced: number;
   betsSettled: number;
@@ -139,6 +170,14 @@ export async function runTradingCycle(): Promise<{
     markRun("trading", "skipped");
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
   }
+
+  const lockAcquired = await tryAdvisoryLock(TRADING_LOCK_ID);
+  if (!lockAcquired) {
+    logger.warn("Trading cycle locked by another instance — skipping");
+    markRun("trading", "skipped");
+    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
+  }
+
   tradingCycleRunning = true;
   markStart("trading");
 
@@ -559,6 +598,7 @@ export async function runTradingCycle(): Promise<{
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
   } finally {
     tradingCycleRunning = false;
+    await releaseAdvisoryLock(TRADING_LOCK_ID);
   }
 }
 
@@ -677,6 +717,13 @@ async function runSettlementPipeline(deep = false): Promise<void> {
     logger.debug("Settlement pipeline already running — skipping");
     return;
   }
+
+  const lockAcquired = await tryAdvisoryLock(SETTLEMENT_LOCK_ID);
+  if (!lockAcquired) {
+    logger.debug("Settlement pipeline locked by another instance — skipping");
+    return;
+  }
+
   settlementRunning = true;
   try {
     const daysBack = deep ? 7 : 2;
@@ -694,6 +741,7 @@ async function runSettlementPipeline(deep = false): Promise<void> {
     logger.warn({ err }, "Settlement pipeline failed — non-fatal");
   } finally {
     settlementRunning = false;
+    await releaseAdvisoryLock(SETTLEMENT_LOCK_ID);
   }
 }
 
