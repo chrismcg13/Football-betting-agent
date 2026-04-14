@@ -5,6 +5,7 @@ import {
   matchesTable,
   complianceLogsTable,
   oddsSnapshotsTable,
+  competitionConfigTable,
 } from "@workspace/db";
 import { eq, and, gte, lt, inArray, desc, sql, isNull, or } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -213,6 +214,31 @@ export async function placePaperBet(
   if (BANNED_MARKETS.has(marketType)) {
     logger.warn({ matchId, marketType, selectionName }, "HARDSTOP: Banned market — bet blocked at placement");
     return logReject(`Banned market: ${marketType}`);
+  }
+
+  if (CORNERS_CARDS_MARKETS.has(marketType)) {
+    const [match] = await db
+      .select({ league: matchesTable.league, country: matchesTable.country })
+      .from(matchesTable)
+      .where(eq(matchesTable.id, matchId))
+      .limit(1);
+    if (!match) {
+      return logReject(`Cannot verify stats coverage — match ${matchId} not found`);
+    }
+    const [config] = await db
+      .select({ hasStatistics: competitionConfigTable.hasStatistics })
+      .from(competitionConfigTable)
+      .where(
+        and(
+          eq(competitionConfigTable.name, match.league),
+          eq(competitionConfigTable.country, match.country ?? ""),
+        ),
+      )
+      .limit(1);
+    if (!config || !config.hasStatistics) {
+      const isCornersMarket = marketType.startsWith("TOTAL_CORNERS");
+      return logReject(`No ${isCornersMarket ? "corners" : "cards"} stats coverage for league: ${match.league} (${match.country})`);
+    }
   }
   // ──────────────────────────────────────────────────────────────────────────
 

@@ -272,7 +272,7 @@ export async function runLeagueDiscovery(): Promise<LeagueDiscoveryResult> {
     const currentSeasonData = (leagueData.seasons as any[])?.find((s: any) => s.current === true);
     const coverage = currentSeasonData?.coverage;
     const hasEvents = !!coverage?.fixtures?.events;
-    const hasStatistics = !!coverage?.fixtures?.statistics;
+    const hasStatistics = !!coverage?.fixtures?.statistics_fixtures || !!coverage?.fixtures?.statistics;
     const hasLineups = !!coverage?.fixtures?.lineups;
     const fixtureCount: number = hasEvents ? 100 : 0;
     const currentSeason = currentSeasonData?.year as number | undefined;
