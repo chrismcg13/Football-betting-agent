@@ -403,3 +403,22 @@ export const useAgentControl = () => {
     },
   });
 };
+
+export const useLaunchPreflight = () => {
+  return useQuery({
+    queryKey: ["launch", "preflight"],
+    queryFn: () => fetcher("/api/launch-activation/preflight"),
+    staleTime: 10000,
+  });
+};
+
+export const useLaunchActivation = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => fetcher("/api/launch-activation", { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["dashboard", "summary"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard", "bets"] });
+    },
+  });
+};

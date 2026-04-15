@@ -1,0 +1,85 @@
+LAUNCH DAY ACTIVATION — IMMEDIATE LIVE CYCLE
+
+This prompt runs AFTER all infrastructure (Prompts 1-14) is verified and the Betfair Live API key is active. This is the moment we go live.
+
+STEP 1: PRE-LAUNCH VALIDATION
+Before placing any live bets, run a complete system check:
+- Confirm TRADING_MODE = "LIVE"
+- Confirm Betfair API key is valid (fetch balance successfully)
+- Confirm Betfair connectivity is healthy (Replit→VPS→Betfair chain is operational)
+- Confirm prod database is Neon
+- Confirm commission tracking is active
+- Confirm Pinnacle/OddsPapi integration is active and budget is healthy
+- Confirm all alerting is functional (fire a test info alert: "Go-live validation complete")
+- Confirm exposure limits are set to Level 1 values
+- Confirm opportunity score threshold = 68
+- Confirm dev→prod pipeline audit passed (Prompt 14)
+- Log all results. If ANY check fails, STOP. Do not proceed.
+
+STEP 2: SCAN EXISTING PAPER BETS FOR LIVE PROMOTION
+Query the dev database for all current paper trade bets that meet ALL of the following criteria:
+- Status: OPEN (not yet settled — the match has not kicked off yet)
+- Opportunity score >= 68
+- The fixture has Pinnacle odds available (verified via OddsPapi data)
+- The fixture has full API-Football data coverage
+- The league-market combination meets the Tier 1 data richness requirement
+- The match kick-off time is MORE than 30 minutes from now (don't rush into matches about to start — we need time for odds verification)
+- The match kick-off time is LESS than 72 hours from now (don't place bets too far in advance for the initial batch)
+- The current available odds on Betfair are within 5% of the odds at which the paper bet was identified (if odds have moved significantly against us, the edge may have gone — skip it)
+
+STEP 3: ODDS VERIFICATION & EDGE CONFIRMATION
+For each qualifying paper bet:
+a) Fetch the CURRENT live odds from the Betfair Exchange API for that exact market and selection
+b) Fetch the CURRENT Pinnacle odds and run the pre-bet Pinnacle filter (Prompt 3) — minimum 2% edge over Pinnacle implied probability
+c) Recalculate expected value using the current odds (not the paper trade odds)
+d) Apply the commission-adjusted EV formula from Prompt 12
+e) Confirm the bet still has positive commission-adjusted EV
+f) Check available liquidity at our target odds (Prompt 8) — ensure we can get the stake on
+g) Confirm the bet still meets all risk management criteria at current odds (Kelly sizing recalculated, exposure limits checked against CURRENT live balance)
+h) If the current odds are BETTER than the paper trade odds, this is a bonus — place the bet
+i) If the current odds are worse but still positive commission-adjusted EV with 2%+ Pinnacle edge, place the bet
+j) If the current odds no longer provide positive commission-adjusted EV, SKIP the bet and log why
+
+STEP 4: LIVE BET PLACEMENT
+For each bet that passes Step 3:
+a) Write the bet to prod database with status PENDING_PLACEMENT (as per Prompt 11 write-before-place pattern)
+b) Place the bet on Betfair via the live API using the execution layer from Prompt 8
+c) Use LIMIT orders at our calculated odds (do not use market orders — we want to control the price)
+d) Target <5 seconds from signal to Betfair API submission
+e) If the bet is matched: update status to PLACED, store Betfair betId, log success
+f) If the bet is unmatched after 5 minutes: check if odds have moved. If they've moved against us beyond our edge threshold, cancel and log. If they're close, leave for another 10 minutes then cancel if still unmatched.
+g) If partially matched: apply the partial fill rules from Prompt 8
+h) Log every action with full context including execution time and liquidity data
+
+STEP 5: POST-PLACEMENT REPORT
+After the batch is complete, generate a launch report:
+- Total paper bets scanned: X
+- Qualified for live promotion: X  
+- Passed Pinnacle validation: X
+- Passed odds verification: X
+- Successfully placed live: X
+- Skipped (Pinnacle edge insufficient): X
+- Skipped (odds moved): X
+- Skipped (insufficient data): X
+- Skipped (insufficient liquidity): X
+- Failed to place: X
+- Total stake deployed: £X (as % of live balance)
+- Current exposure: X% of balance
+- Average execution time: Xs
+- List every placed bet with: fixture, market, selection, stake, odds, opportunity score, Pinnacle edge %, expected commission-adjusted EV
+- Display this report on the dashboard and in the audit trail
+
+STEP 6: RESUME NORMAL OPERATIONS
+After the launch batch:
+- The normal 5-minute trading cycle takes over (as configured in Prompt 8)
+- All future bets go through the standard Tier 1 / Tier 2 pipeline with full Pinnacle validation
+- The launch batch bets are tracked identically to any other live bet — no special treatment for settlement or performance attribution
+- Fire an informational alert: "Live trading active. [X] bets placed. System operating normally."
+
+CRITICAL SAFETY RULES FOR THIS PROMPT:
+- If at any point the Betfair balance is lower than expected, STOP everything and alert me
+- If more than 3 bets fail to place, STOP the batch and alert me — something may be wrong with the API integration
+- The launch batch uses the SAME exposure limits as normal trading (Level 1 from Prompt 6: 2% max single bet, 25% max total open exposure, 8% max per league, 3% max correlated per fixture, etc.). No separate launch cap — this batch is just a normal trading cycle that happens to scan paper bets for qualification. Place bets in order of highest opportunity score first. If the exposure ceiling is reached, queue remaining qualified bets for the next normal 5-minute trading cycle.
+- This prompt runs ONCE. It is not a recurring job. After this, the normal trading cycle handles everything.
+
+Run this now and show me the launch report.

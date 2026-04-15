@@ -13,6 +13,7 @@ import predictionsRouter from "./predictions";
 import tradingRouter from "./trading";
 import learningRouter from "./learning";
 import apiRouter from "./api";
+import launchRouter from "./launch";
 
 const router: IRouter = Router();
 
@@ -30,5 +31,6 @@ router.use(predictionsRouter);
 router.use(tradingRouter);
 router.use(learningRouter);
 router.use(apiRouter);
+router.use(launchRouter);
 
 export default router;
