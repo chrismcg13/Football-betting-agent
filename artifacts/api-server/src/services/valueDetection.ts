@@ -757,6 +757,17 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
 
       if (edge <= minEdge) continue;
 
+      const { commissionAdjustedEV, getCommissionRate } = await import("./commissionService");
+      const commRate = await getCommissionRate("betfair");
+      const evCheck = commissionAdjustedEV(modelProb, backOdds, commRate);
+      if (evCheck.netEV <= 0) {
+        logger.debug(
+          { matchId: match.id, market: oddsRow.marketType, selection: oddsRow.selectionName, grossEV: evCheck.grossEV, netEV: evCheck.netEV, commRate },
+          "Skipping bet: positive gross EV but negative net EV after commission",
+        );
+        continue;
+      }
+
       const segmentStats = await getSegmentStats(match.league, oddsRow.marketType);
 
       const cold = await isColdMarket(match.league, oddsRow.marketType, segmentStats, coldMinBets, coldThreshold, coldCooldownDays);

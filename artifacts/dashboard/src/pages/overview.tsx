@@ -214,15 +214,15 @@ export default function Overview() {
       {/* Primary Metrics */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <PrimaryCard
-          label="Profit"
+          label="Net Profit"
           value={loadingSummary ? "—" : formatCurrency(pnl)}
-          sub={isLive ? "Net profit from live trading" : "Net profit from paper trading"}
+          sub={!loadingSummary ? `Gross: ${formatCurrency(summary?.totalGrossPnl ?? 0)} · Comm: ${formatCurrency(summary?.totalCommission ?? 0)}` : (isLive ? "Net profit from live trading" : "Net profit from paper trading")}
           color={!loadingSummary ? (pnl >= 0 ? "green" : "red") : "default"}
         />
         <PrimaryCard
           label="ROI"
           value={loadingSummary ? "—" : `${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`}
-          sub="Return on every £1 staked"
+          sub={!loadingSummary ? `Net after 5% commission · Gross: ${(summary?.grossRoiPct ?? 0) >= 0 ? "+" : ""}${(summary?.grossRoiPct ?? 0).toFixed(2)}%` : "Return on every £1 staked"}
           color={!loadingSummary ? (roi >= 0 ? "green" : "red") : "default"}
         />
         <PrimaryCard

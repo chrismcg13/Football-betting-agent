@@ -587,8 +587,10 @@ export async function placePaperBet(
     }
   }
 
+  const { getCommissionRate } = await import("./commissionService");
+  const commRate = await getCommissionRate("betfair");
   const potentialProfit =
-    Math.round(stake * (backOdds - 1) * 0.98 * 100) / 100;
+    Math.round(stake * (backOdds - 1) * (1 - commRate) * 100) / 100;
   const impliedProbability = 1 / backOdds;
 
   const kellyFraction = kellyFractionForScore(score);
@@ -1094,12 +1096,15 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     const isVoid = outcome === null;
     const betWon = outcome === true;
 
-    const settlementPnl = isVoid
-      ? 0
-      : betWon
-        ? Math.round(stake * (odds - 1) * 0.98 * 100) / 100
-        : -stake;
+    const { calculateSettlementWithCommission, getCommissionRate, getBetfairExchangeId } = await import("./commissionService");
+    const commissionRate = await getCommissionRate("betfair");
+    const exchangeId = await getBetfairExchangeId();
 
+    const commResult = isVoid
+      ? { grossPnl: 0, commissionRate: 0, commissionAmount: 0, netPnl: 0 }
+      : calculateSettlementWithCommission(stake, odds, betWon, commissionRate);
+
+    const settlementPnl = commResult.netPnl;
     const newStatus = isVoid ? "void" : betWon ? "won" : "lost";
     const now = new Date();
 
@@ -1148,6 +1153,11 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         settledAt: now,
         closingOddsProxy: closingOddsProxy != null ? String(closingOddsProxy) : null,
         clvPct: clvPct != null ? String(clvPct) : null,
+        exchangeId,
+        grossPnl: String(commResult.grossPnl),
+        commissionRate: String(commResult.commissionRate),
+        commissionAmount: String(commResult.commissionAmount),
+        netPnl: String(commResult.netPnl),
       })
       .where(eq(paperBetsTable.id, bet.id));
 
@@ -1165,11 +1175,12 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         odds,
         stake,
         outcome: newStatus,
+        grossPnl: commResult.grossPnl,
+        commissionRate: commResult.commissionRate,
+        commissionAmount: commResult.commissionAmount,
+        netPnl: commResult.netPnl,
         settlementPnl,
         opportunityScore: Number(bet.opportunityScore ?? 0),
-        commission: betWon
-          ? Math.round(stake * (odds - 1) * 0.02 * 100) / 100
-          : 0,
       },
       timestamp: now,
     });
@@ -1355,12 +1366,26 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
     const stake = Number(bet.stake);
     const odds = Number(bet.oddsAtPlacement);
     const betWon = outcome === true;
-    const settlementPnl = betWon ? Math.round(stake * (odds - 1) * 0.98 * 100) / 100 : -stake;
+
+    const { calculateSettlementWithCommission, getCommissionRate, getBetfairExchangeId } = await import("./commissionService");
+    const commRate = await getCommissionRate("betfair");
+    const exId = await getBetfairExchangeId();
+    const commResult = calculateSettlementWithCommission(stake, odds, betWon, commRate);
+    const settlementPnl = commResult.netPnl;
     const newStatus = betWon ? "won" : "lost";
 
     await db
       .update(paperBetsTable)
-      .set({ status: newStatus, settlementPnl: String(settlementPnl), settledAt: new Date() })
+      .set({
+        status: newStatus,
+        settlementPnl: String(settlementPnl),
+        settledAt: new Date(),
+        exchangeId: exId,
+        grossPnl: String(commResult.grossPnl),
+        commissionRate: String(commResult.commissionRate),
+        commissionAmount: String(commResult.commissionAmount),
+        netPnl: String(commResult.netPnl),
+      })
       .where(eq(paperBetsTable.id, bet.id));
 
     pnlDelta += settlementPnl;

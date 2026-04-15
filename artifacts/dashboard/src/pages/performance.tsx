@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import {
   usePerformance, useSummary, useClvStats, useBetsByLeague, useBetsByMarket,
-  useExecutionMetrics, useLiveTierStats, useModelHealth,
+  useExecutionMetrics, useLiveTierStats, useModelHealth, useCommissionStats,
 } from "@/hooks/use-dashboard";
 import { formatCurrency } from "@/lib/format";
 import { InfoTooltip } from "@/components/layout";
@@ -43,6 +43,7 @@ export default function Performance() {
   const { data: execMetrics } = useExecutionMetrics();
   const { data: tierStats } = useLiveTierStats();
   const { data: modelHealth } = useModelHealth();
+  const { data: commStats } = useCommissionStats();
 
   const pnl = summary?.totalPnl ?? 0;
   const roi = summary?.overallRoiPct ?? 0;
@@ -322,6 +323,86 @@ export default function Performance() {
               {execMetrics.relay.lastLatencyMs != null && (
                 <p className="text-[10px] text-slate-600">{execMetrics.relay.lastLatencyMs}ms latency</p>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {commStats && (
+        <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <h3 className="text-sm font-semibold text-white mb-4">Commission & Costs</h3>
+
+          {(commStats as any).premiumChargeWarning && (
+            <div className="rounded-lg border px-4 py-3 mb-4 bg-red-500/10 border-red-500/30">
+              <p className="text-sm text-red-300 font-medium">
+                Premium Charge Warning — Lifetime gross profit: {formatCurrency((commStats as any).lifetimeGrossProfit)} / £25,000 threshold
+              </p>
+            </div>
+          )}
+          {!((commStats as any).premiumChargeWarning) && (commStats as any).lifetimeGrossProfit >= 20000 && (
+            <div className="rounded-lg border px-4 py-3 mb-4 bg-amber-500/10 border-amber-500/30">
+              <p className="text-sm text-amber-300 font-medium">
+                Approaching Premium Charge — Lifetime gross profit: {formatCurrency((commStats as any).lifetimeGrossProfit)} / £25,000 threshold
+              </p>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+            <StatCard
+              label="Gross P&L (All Time)"
+              value={formatCurrency((commStats as any).allTime?.grossProfit ?? 0)}
+              color={((commStats as any).allTime?.grossProfit ?? 0) >= 0 ? "green" : "red"}
+              tooltip="Total profit before commission deduction"
+            />
+            <StatCard
+              label="Commission Paid"
+              value={formatCurrency((commStats as any).allTime?.totalCommission ?? 0)}
+              sub={`Effective rate: ${(((commStats as any).allTime?.effectiveRate ?? 0) * 100).toFixed(2)}%`}
+              color="amber"
+              tooltip="5% Betfair commission on net winnings only"
+            />
+            <StatCard
+              label="Net P&L (All Time)"
+              value={formatCurrency((commStats as any).allTime?.netProfit ?? 0)}
+              color={((commStats as any).allTime?.netProfit ?? 0) >= 0 ? "green" : "red"}
+              tooltip="Profit after commission — what you actually keep"
+            />
+            <StatCard
+              label="Projected Monthly Comm."
+              value={formatCurrency((commStats as any).projectedMonthlyCommission ?? 0)}
+              sub={`This month so far: ${formatCurrency((commStats as any).thisMonth?.totalCommission ?? 0)}`}
+              tooltip="Based on commission pace this month"
+            />
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold mb-1">This Week</p>
+              <p className="text-sm font-mono text-white">
+                Gross: <span className={cn((commStats as any).thisWeek?.grossProfit >= 0 ? "text-emerald-400" : "text-red-400")}>{formatCurrency((commStats as any).thisWeek?.grossProfit ?? 0)}</span>
+                {" · "}Comm: <span className="text-amber-400">{formatCurrency((commStats as any).thisWeek?.totalCommission ?? 0)}</span>
+                {" · "}Net: <span className={cn((commStats as any).thisWeek?.netProfit >= 0 ? "text-emerald-400" : "text-red-400")}>{formatCurrency((commStats as any).thisWeek?.netProfit ?? 0)}</span>
+              </p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold mb-1">Today</p>
+              <p className="text-sm font-mono text-white">
+                Gross: <span className={cn((commStats as any).today?.grossProfit >= 0 ? "text-emerald-400" : "text-red-400")}>{formatCurrency((commStats as any).today?.grossProfit ?? 0)}</span>
+                {" · "}Comm: <span className="text-amber-400">{formatCurrency((commStats as any).today?.totalCommission ?? 0)}</span>
+                {" · "}Net: <span className={cn((commStats as any).today?.netProfit >= 0 ? "text-emerald-400" : "text-red-400")}>{formatCurrency((commStats as any).today?.netProfit ?? 0)}</span>
+              </p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold mb-1">Exchanges</p>
+              <div className="space-y-0.5">
+                {((commStats as any).exchanges ?? []).map((ex: any) => (
+                  <p key={ex.id} className="text-xs font-mono">
+                    <span className={cn(ex.isActive ? "text-emerald-400" : "text-slate-600")}>{ex.isActive ? "●" : "○"}</span>
+                    {" "}<span className="text-slate-300">{ex.displayName}</span>
+                    {" "}<span className="text-slate-500">{((ex.commissionStructure?.standard_rate ?? 0) * 100).toFixed(1)}%</span>
+                  </p>
+                ))}
+              </div>
             </div>
           </div>
         </div>

@@ -25,3 +25,5 @@ export * from "./filteredBets";
 export * from "./liquiditySnapshots";
 export * from "./alerts";
 export * from "./cronExecutions";
+export * from "./exchanges";
+export * from "./commissionTracking";

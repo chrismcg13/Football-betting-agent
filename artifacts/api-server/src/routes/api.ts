@@ -94,6 +94,9 @@ async function getSettledBetsStats() {
       settlementPnl: paperBetsTable.settlementPnl,
       settledAt: paperBetsTable.settledAt,
       opportunityScore: paperBetsTable.opportunityScore,
+      grossPnl: paperBetsTable.grossPnl,
+      commissionAmount: paperBetsTable.commissionAmount,
+      netPnl: paperBetsTable.netPnl,
     })
     .from(paperBetsTable)
     .where(inArray(paperBetsTable.status, ["won", "lost", "void"]));
@@ -165,13 +168,20 @@ router.get("/dashboard/summary", async (req, res) => {
     (sum, b) => sum + Number(b.settlementPnl ?? 0),
     0,
   );
+  const totalGrossPnl = allSettled.reduce(
+    (sum, b) => sum + Number(b.grossPnl ?? b.settlementPnl ?? 0),
+    0,
+  );
+  const totalCommission = allSettled.reduce(
+    (sum, b) => sum + Number(b.commissionAmount ?? 0),
+    0,
+  );
 
   // Today P&L
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
-  const todayPnl = allSettled
-    .filter((b) => b.settledAt && new Date(b.settledAt) >= todayStart)
-    .reduce((sum, b) => sum + Number(b.settlementPnl ?? 0), 0);
+  const todaySettled = allSettled.filter((b) => b.settledAt && new Date(b.settledAt) >= todayStart);
+  const todayPnl = todaySettled.reduce((sum, b) => sum + Number(b.settlementPnl ?? 0), 0);
 
   // This week P&L
   const weekStart = new Date();
@@ -213,6 +223,8 @@ router.get("/dashboard/summary", async (req, res) => {
     currentBankroll: Math.round(bankroll * 100) / 100,
     startingBankroll: STARTING_BANKROLL,
     totalPnl: Math.round(totalPnl * 100) / 100,
+    totalGrossPnl: Math.round(totalGrossPnl * 100) / 100,
+    totalCommission: Math.round(totalCommission * 100) / 100,
     totalPnlPct:
       totalStake > 0
         ? Math.round((totalPnl / totalStake) * 10000) / 100
@@ -235,6 +247,10 @@ router.get("/dashboard/summary", async (req, res) => {
     overallRoiPct:
       totalStake > 0
         ? Math.round((totalPnl / totalStake) * 10000) / 100
+        : 0,
+    grossRoiPct:
+      totalStake > 0
+        ? Math.round((totalGrossPnl / totalStake) * 10000) / 100
         : 0,
     todayPnl: Math.round(todayPnl * 100) / 100,
     thisWeekPnl: Math.round(weekPnl * 100) / 100,
@@ -1191,6 +1207,23 @@ router.get("/trading/corrected-stats", async (_req, res) => {
 router.get("/dashboard/api-budget", async (_req, res) => {
   const budget = await getApiBudgetStatus();
   res.json(budget);
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/commission — commission tracking stats
+// ─────────────────────────────────────────────
+router.get("/dashboard/commission", async (_req, res) => {
+  try {
+    const { getCommissionStats, getExchanges } = await import("../services/commissionService");
+    const [stats, exchanges] = await Promise.all([
+      getCommissionStats(),
+      getExchanges(),
+    ]);
+    res.json({ ...stats, exchanges });
+  } catch (err) {
+    logger.error({ err }, "Failed to fetch commission stats");
+    res.status(500).json({ error: "Failed to fetch commission stats" });
+  }
 });
 
 // ─────────────────────────────────────────────

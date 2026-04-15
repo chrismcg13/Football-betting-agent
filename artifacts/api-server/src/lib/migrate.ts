@@ -605,6 +605,96 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
     `);
 
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS exchanges (
+        id SERIAL PRIMARY KEY,
+        exchange_name TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT false,
+        api_base_url TEXT,
+        commission_structure JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await db.execute(sql`
+      INSERT INTO exchanges (exchange_name, display_name, is_active, api_base_url, commission_structure)
+      VALUES (
+        'betfair',
+        'Betfair Exchange',
+        true,
+        'https://api.betfair.com/exchange',
+        '{"type": "net_winnings", "standard_rate": 0.05, "premium_charge_threshold": 25000, "premium_charge_rate": 0.20, "premium_charge_max_rate": 0.60, "discount_tiers": [{"min_points": 0, "rate": 0.05}, {"min_points": 1000, "rate": 0.04}, {"min_points": 5000, "rate": 0.03}], "notes": "Commission on net market winnings only. Premium Charge applies above £25k lifetime profit."}'
+      )
+      ON CONFLICT (exchange_name) DO UPDATE SET
+        commission_structure = EXCLUDED.commission_structure,
+        updated_at = NOW()
+    `);
+
+    await db.execute(sql`
+      INSERT INTO exchanges (exchange_name, display_name, is_active, api_base_url, commission_structure)
+      VALUES
+        ('smarkets', 'Smarkets', false, 'https://api.smarkets.com/v3', '{"type": "net_winnings", "standard_rate": 0.02, "notes": "Flat 2% commission on net winnings"}'),
+        ('betdaq', 'BETDAQ', false, 'https://api.betdaq.com', '{"type": "net_winnings", "standard_rate": 0.02, "notes": "2% commission, occasionally 0% promotions"}'),
+        ('matchbook', 'Matchbook', false, 'https://api.matchbook.com', '{"type": "net_winnings", "standard_rate": 0.018, "notes": "1.8% commission, competitive for high volume"}')
+      ON CONFLICT (exchange_name) DO NOTHING
+    `);
+
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS exchange_id INTEGER REFERENCES exchanges(id),
+        ADD COLUMN IF NOT EXISTS gross_pnl NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS commission_rate NUMERIC(6,4),
+        ADD COLUMN IF NOT EXISTS commission_amount NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS net_pnl NUMERIC(12,2)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS commission_tracking (
+        id SERIAL PRIMARY KEY,
+        exchange_id INTEGER NOT NULL REFERENCES exchanges(id),
+        period_type TEXT NOT NULL,
+        period_start DATE NOT NULL,
+        gross_profit NUMERIC(14,2) NOT NULL DEFAULT 0,
+        total_commission NUMERIC(14,2) NOT NULL DEFAULT 0,
+        net_profit NUMERIC(14,2) NOT NULL DEFAULT 0,
+        effective_rate NUMERIC(6,4),
+        bet_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(exchange_id, period_type, period_start)
+      )
+    `);
+
+    await db.execute(sql`
+      UPDATE paper_bets
+      SET exchange_id = (SELECT id FROM exchanges WHERE exchange_name = 'betfair' LIMIT 1)
+      WHERE exchange_id IS NULL
+    `);
+
+    await db.execute(sql`
+      UPDATE paper_bets
+      SET
+        gross_pnl = CASE
+          WHEN status = 'won' THEN ROUND(stake::numeric * (odds_at_placement::numeric - 1), 2)
+          WHEN status = 'lost' THEN -stake::numeric
+          WHEN status = 'void' THEN 0
+          ELSE NULL
+        END,
+        commission_rate = CASE WHEN status = 'won' THEN 0.0500 ELSE 0 END,
+        commission_amount = CASE
+          WHEN status = 'won' THEN ROUND(stake::numeric * (odds_at_placement::numeric - 1) * 0.05, 2)
+          ELSE 0
+        END,
+        net_pnl = CASE
+          WHEN status = 'won' THEN ROUND(stake::numeric * (odds_at_placement::numeric - 1) * 0.95, 2)
+          WHEN status = 'lost' THEN -stake::numeric
+          WHEN status = 'void' THEN 0
+          ELSE NULL
+        END
+      WHERE gross_pnl IS NULL AND status IN ('won', 'lost', 'void')
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

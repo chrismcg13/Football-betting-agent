@@ -118,6 +118,14 @@ export const useOddspapiBudget = () => {
   });
 };
 
+export const useCommissionStats = () => {
+  return useQuery({
+    queryKey: ["dashboard", "commission"],
+    queryFn: () => fetcher("/api/dashboard/commission"),
+    refetchInterval: 120000,
+  });
+};
+
 export const useClvStats = () => {
   return useQuery({
     queryKey: ["dashboard", "clv-stats"],

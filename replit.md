@@ -58,7 +58,7 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 **Pages:**
 *   **Overview** (`/dashboard/`): In-play bets with live scores, upcoming bets with countdown, agent recommendations, execution metrics, stat cards (Profit, ROI, Win Rate, CLV).
 *   **Bet History** (`/dashboard/bets`): In-play section at top, full bet table with Betfair execution details (fill status, matched size, avg price, P&L), CLV/Pinnacle columns, expandable reasoning with bet thesis. LiveTierBadge for Tier 1/2 classification.
-*   **Live Performance** (`/dashboard/performance`): P&L chart (cumulative, 90 days), league breakdown, market type breakdown, Tier 1 vs Tier 2 stats, execution quality panel, model health section.
+*   **Live Performance** (`/dashboard/performance`): P&L chart (cumulative, 90 days), league breakdown, market type breakdown, Tier 1 vs Tier 2 stats, execution quality panel, Commission & Costs section (gross/net P&L, effective rate, projected monthly commission, Premium Charge warning at £20k+, exchange list), model health section.
 *   **Experiment Lab** (`/dashboard/experiments`): Tier pipeline (experiment → candidate → promoted), Tier 1 qualification badges, progress bars, distance-to-promotion, manual promotion controls, tooltips for CLV/ROI/p-value.
 *   **Agent Brain** (`/dashboard/agent-brain`): Learning narratives, self-generated insights.
 *   **Audit Trail** (`/dashboard/compliance`): Compliance and transparency logs.
@@ -66,9 +66,9 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 
 **Shared Components (layout.tsx):** `LiveTierBadge`, `InfoTooltip`, `BetStatusBadge`, `OddsSourceBadge`.
 
-**Hooks (use-dashboard.ts):** `useSummary`, `useBets`, `usePerformance`, `useClvStats`, `useBetsByLeague`, `useBetsByMarket`, `useInPlayBets`, `useUpcomingBets`, `useExecutionMetrics`, `useLiveSummary`, `useAgentRecommendations`, `useModelHealth`, `useLiveTierStats`, `useExperiments`, `useRunPromotionEngine`, `useManualPromote`, `useAlerts`, `useUnreadAlertCount`, `useAcknowledgeAlert`, `useAcknowledgeAllAlerts`, `useFireTestAlert`, `useRunAlertDetection`.
+**Hooks (use-dashboard.ts):** `useSummary`, `useBets`, `usePerformance`, `useClvStats`, `useBetsByLeague`, `useBetsByMarket`, `useInPlayBets`, `useUpcomingBets`, `useExecutionMetrics`, `useLiveSummary`, `useAgentRecommendations`, `useModelHealth`, `useLiveTierStats`, `useExperiments`, `useRunPromotionEngine`, `useManualPromote`, `useAlerts`, `useUnreadAlertCount`, `useAcknowledgeAlert`, `useAcknowledgeAllAlerts`, `useFireTestAlert`, `useRunAlertDetection`, `useCommissionStats`.
 
-**API Endpoints consumed:** `/api/dashboard/summary`, `/api/dashboard/bets`, `/api/dashboard/performance`, `/api/dashboard/clv-stats`, `/api/dashboard/bets/by-league`, `/api/dashboard/bets/by-market`, `/api/dashboard/in-play`, `/api/dashboard/upcoming-bets`, `/api/dashboard/execution-metrics`, `/api/dashboard/live-summary`, `/api/dashboard/agent-recommendations`, `/api/admin/experiments`, `/api/alerts`, `/api/alerts/unread-count`, `/api/alerts/:id/acknowledge`, `/api/alerts/acknowledge-all`, `/api/alerts/test`, `/api/alerts/run-detection`.
+**API Endpoints consumed:** `/api/dashboard/summary`, `/api/dashboard/bets`, `/api/dashboard/performance`, `/api/dashboard/clv-stats`, `/api/dashboard/bets/by-league`, `/api/dashboard/bets/by-market`, `/api/dashboard/in-play`, `/api/dashboard/upcoming-bets`, `/api/dashboard/execution-metrics`, `/api/dashboard/live-summary`, `/api/dashboard/agent-recommendations`, `/api/admin/experiments`, `/api/alerts`, `/api/alerts/unread-count`, `/api/alerts/:id/acknowledge`, `/api/alerts/acknowledge-all`, `/api/alerts/test`, `/api/alerts/run-detection`, `/api/dashboard/commission`.
 
 # Alerting System
 
@@ -93,3 +93,13 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 **Phase 6 — Budget Projections:** Monthly usage projection (avg daily × days in month) on both API-Football and OddsPapi. Auto-throttle at 90% projected usage halves daily cap. Dashboard sidebar shows projection percentage with throttle warning (red "THROTTLED" indicator).
 
 **Scheduler crons:** Alert detection every 5 min, anomaly detection daily 04:30 UTC, cleanup weekly Sunday 06:00 UTC.
+
+# Commission Tracking
+
+**Schema:** `exchanges` table (Betfair 5% standard, Smarkets 2%, Betdaq 2%, Matchbook 1.8%). `commissionTracking` table for future per-market tracking. Commission columns on `paper_bets`: `grossPnl`, `commissionRate`, `commissionAmount`, `netPnl`, `exchangeId`.
+
+**Service (`commissionService.ts`):** `calculateSettlementWithCommission()` — 5% on gross winnings only (losses = no commission). `commissionAdjustedEV()` — pre-bet EV check: `netEV = p*(odds-1)*(1-rate) - (1-p)`. `getCommissionStats()` — all-time/month/week/today breakdown with effective rate computed against sum of positive gross wins. `getExchanges()` — lists all exchanges. Premium Charge warning at £20k+ (threshold £25k).
+
+**Integration points:** Value detection (`valueDetection.ts`) skips bets with positive gross EV but negative net EV after commission. Potential profit in `paperTrading.ts` uses commission-adjusted calculation. Settlement paths track gross/net separately. Summary endpoint includes `totalGrossPnl`, `totalCommission`, `grossRoiPct`.
+
+**Dashboard:** Overview shows "Net Profit" with gross/commission breakdown in subtitle. Performance page has Commission & Costs section with 4 stat cards, weekly/today breakdowns, exchange list with active indicators, and Premium Charge warning banners.

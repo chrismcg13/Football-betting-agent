@@ -73,6 +73,11 @@ export const paperBetsTable = pgTable("paper_bets", {
   pinnacleSnapshotCount: integer("pinnacle_snapshot_count").default(0),
   clvDataQuality: text("clv_data_quality").default("incomplete"),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  exchangeId: integer("exchange_id"),
+  grossPnl: numeric("gross_pnl", { precision: 12, scale: 2 }),
+  commissionRate: numeric("commission_rate", { precision: 6, scale: 4 }),
+  commissionAmount: numeric("commission_amount", { precision: 12, scale: 2 }),
+  netPnl: numeric("net_pnl", { precision: 12, scale: 2 }),
 });
 
 export const insertPaperBetSchema = createInsertSchema(paperBetsTable).omit({
