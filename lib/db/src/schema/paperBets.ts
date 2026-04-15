@@ -68,6 +68,10 @@ export const paperBetsTable = pgTable("paper_bets", {
   betfairPlacedAt: timestamp("betfair_placed_at", { withTimezone: true }),
   betfairSettledAt: timestamp("betfair_settled_at", { withTimezone: true }),
   betfairPnl: numeric("betfair_pnl", { precision: 12, scale: 2 }),
+  pinnacleEdgeCategory: text("pinnacle_edge_category"),
+  lineDirection: text("line_direction"),
+  pinnacleSnapshotCount: integer("pinnacle_snapshot_count").default(0),
+  clvDataQuality: text("clv_data_quality").default("incomplete"),
 });
 
 export const insertPaperBetSchema = createInsertSchema(paperBetsTable).omit({

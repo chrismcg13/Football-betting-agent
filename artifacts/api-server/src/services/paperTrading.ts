@@ -15,6 +15,7 @@ import { getThresholdCategory } from "./correlationDetector";
 import { isLiveMode, placeLiveBetOnBetfair, isBalanceStale, getLiveBankroll } from "./betfairLive";
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
 import { getLiveOppScoreThreshold } from "./liveThresholdReview";
+import { storePinnacleSnapshot } from "./oddsPapi";
 
 // ===================== Config helpers =====================
 
@@ -225,6 +226,8 @@ export interface PaperBetOptions {
   originalOpportunityScore?: number;
   boostedOpportunityScore?: number;
   syncEligible?: boolean;
+  pinnacleEdgeCategory?: "high_confidence" | "standard" | "filtered" | null;
+  lineDirection?: "toward" | "away" | "stable" | "unknown" | null;
 }
 
 export async function placePaperBet(
@@ -254,6 +257,8 @@ export async function placePaperBet(
     originalOpportunityScore,
     boostedOpportunityScore,
     syncEligible = false,
+    pinnacleEdgeCategory = null,
+    lineDirection = null,
   } = options;
   const score = opportunityScore ?? 65;
 
@@ -502,8 +507,23 @@ export async function placePaperBet(
       originalOpportunityScore: originalOpportunityScore ?? null,
       boostedOpportunityScore: boostedOpportunityScore ?? null,
       syncEligible,
+      pinnacleEdgeCategory: pinnacleEdgeCategory ?? null,
+      lineDirection: lineDirection ?? null,
+      pinnacleSnapshotCount: pinnacleOdds ? 1 : 0,
+      clvDataQuality: pinnacleOdds ? "incomplete" : "incomplete",
     })
     .returning();
+
+  if (bet?.id && pinnacleOdds) {
+    storePinnacleSnapshot({
+      betId: bet.id,
+      matchId,
+      marketType,
+      selectionName,
+      snapshotType: "identification",
+      pinnacleOdds,
+    }).catch((err) => logger.warn({ err, betId: bet.id }, "Failed to store snapshot A"));
+  }
 
   const kellyFraction = kellyFractionForScore(score);
 

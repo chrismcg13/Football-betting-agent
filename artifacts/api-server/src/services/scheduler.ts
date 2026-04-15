@@ -24,6 +24,11 @@ import {
   fetchAndStoreClosingLineForPendingBets,
   type OddsPapiValidationCache,
   logDailyBudgetSummary,
+  pinnaclePreBetFilter,
+  fetchPreKickoffSnapshots,
+  trackLineMovements,
+  backfillFilteredBetOutcomes,
+  analyseSharpMovements,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement } from "./apiFootball";
@@ -297,15 +302,14 @@ export async function runTradingCycle(): Promise<{
       return sb - sa;
     });
     // Pinnacle upgrade: validate ALL candidates regardless of league tier or fixture window.
-    // Budget is now 150/day (5,000/month) — enough to cover every candidate.
-    // No top-N slice, no second-division filter, no 48h restriction.
+    // Budget is now 3,300/day (100,000/month) — enough to cover every candidate.
 
     type OddsValidation = Awaited<ReturnType<typeof getOddspapiValidation>>;
 
     // Validate all candidates. Cache hits (from scheduled bulk prefetch) are free.
-    // Only cache misses trigger on-demand API calls, capped at 20/cycle to stay
-    // within our daily budget. Bulk prefetch crons (6am/12pm) cover the rest.
-    const MAX_ONDEMAND_PER_CYCLE = 20;
+    // On-demand API calls capped at 100/cycle with 100k monthly budget.
+    // Bulk prefetch crons (every 4 hours) cover most fixtures.
+    const MAX_ONDEMAND_PER_CYCLE = 100;
     const enhancedCandidates: Array<{ bet: typeof rankedForOddsPapi[number]; validation: OddsValidation | null; effectiveScore: number }> = [];
     let apiCallsThisCycle = 0;
 
@@ -549,6 +553,40 @@ export async function runTradingCycle(): Promise<{
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
+      let filterPassed = true;
+      try {
+        const filterResult = await pinnaclePreBetFilter({
+          matchId: candidate.matchId,
+          marketType: candidate.marketType,
+          selectionName: candidate.selectionName,
+          modelProbability: candidate.modelProbability,
+          marketOdds: backOdds,
+          opportunityScore: effectiveScore,
+          league: candidate.league,
+          pinnacleOdds: validation?.pinnacleOdds ?? null,
+          pinnacleImplied: validation?.pinnacleImplied ?? null,
+        });
+
+        if (!filterResult.passed) {
+          logger.info(
+            {
+              matchId: candidate.matchId,
+              market: candidate.marketType,
+              selection: candidate.selectionName,
+              edgePct: filterResult.edgePct.toFixed(2),
+              reason: filterResult.filterReason,
+              lineDirection: filterResult.lineDirection,
+            },
+            "Bet filtered out by Pinnacle pre-bet filter",
+          );
+          filterPassed = false;
+        }
+      } catch (filterErr) {
+        logger.error({ err: filterErr, matchId: candidate.matchId }, "Pinnacle pre-bet filter error — allowing bet through");
+      }
+
+      if (!filterPassed) continue;
+
       const result = await placePaperBet(
         candidate.matchId,
         candidate.marketType,
@@ -574,6 +612,8 @@ export async function runTradingCycle(): Promise<{
           originalOpportunityScore: candidate.originalOpportunityScore,
           boostedOpportunityScore: candidate.boostedOpportunityScore,
           syncEligible: candidate.syncEligible,
+          pinnacleEdgeCategory: filterResult.edgeCategory !== "filtered" ? filterResult.edgeCategory : null,
+          lineDirection: filterResult.lineDirection !== "unknown" ? filterResult.lineDirection : null,
         },
       );
 
@@ -848,27 +888,16 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("OddsPapi fixture mapping scheduler active — daily at 06:05 UTC");
 
-  // OddsPapi morning bulk prefetch: daily at 06:10 UTC
-  // Fetches 7 days of Pinnacle odds for all mapped fixtures (≤ 80 API calls).
-  // This is the main budget allocation — populates the DB snapshot cache for the day.
-  cron.schedule("10 6 * * *", () => {
-    logger.info("Morning OddsPapi bulk prefetch triggered (7-day window, 80 req max)");
-    void runDedicatedBulkPrefetch(7, 80)
-      .then((r) => logger.info(r, "Morning OddsPapi bulk prefetch complete"))
-      .catch((err) => logger.error({ err }, "Morning OddsPapi bulk prefetch failed"));
+  // OddsPapi bulk prefetch: every 4 hours (100k monthly budget)
+  // Fetches 7 days of Pinnacle odds for all mapped fixtures.
+  // With 100k/month budget, each run can afford up to 200 requests.
+  cron.schedule("10 */4 * * *", () => {
+    logger.info("OddsPapi bulk prefetch triggered (7-day window, 200 req max)");
+    void runDedicatedBulkPrefetch(7, 200)
+      .then((r) => logger.info(r, "OddsPapi bulk prefetch complete"))
+      .catch((err) => logger.error({ err }, "OddsPapi bulk prefetch failed"));
   }, { timezone: "UTC" });
-  logger.info("Morning OddsPapi bulk prefetch scheduler active — daily at 06:10 UTC (80 req max)");
-
-  // OddsPapi midday refresh: daily at 12:00 UTC
-  // Refreshes odds for fixtures kicking off in the next 48h (live line movement).
-  // Capped at 30 requests to stay well within daily budget.
-  cron.schedule("0 12 * * *", () => {
-    logger.info("Midday OddsPapi refresh triggered (2-day window, 30 req max)");
-    void runDedicatedBulkPrefetch(2, 30)
-      .then((r) => logger.info(r, "Midday OddsPapi refresh complete"))
-      .catch((err) => logger.warn({ err }, "Midday OddsPapi refresh failed — non-fatal"));
-  }, { timezone: "UTC" });
-  logger.info("Midday OddsPapi refresh scheduler active — daily at 12:00 UTC (30 req max)");
+  logger.info("OddsPapi bulk prefetch scheduler active — every 4 hours UTC (200 req max)");
 
   // OddsPapi budget summary: daily at 00:01 UTC
   cron.schedule("1 0 * * *", () => {
@@ -879,10 +908,10 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("OddsPapi budget summary scheduler active — daily at 00:01 UTC");
 
-  // Pre-kickoff CLV cron: every 30 minutes
+  // Pre-kickoff CLV cron: every 15 minutes (upgraded from 30 with 100k budget)
   // For any pending bet kicking off in the next 90 min, fetch Pinnacle closing odds
-  // and store as closing_pinnacle_odds → enables professional-grade CLV calculation
-  cron.schedule("*/30 * * * *", () => {
+  // and store as closing_pinnacle_odds → snapshot C for three-snapshot CLV system
+  cron.schedule("*/15 * * * *", () => {
     logger.info("Pre-kickoff CLV cron triggered — fetching Pinnacle closing odds");
     void fetchAndStoreClosingLineForPendingBets()
       .then((r) => {
@@ -894,7 +923,50 @@ export function startScheduler(): void {
         logger.warn({ err }, "Pre-kickoff CLV cron failed — non-fatal");
       });
   }, { timezone: "UTC" });
-  logger.info("Pre-kickoff CLV cron active — every 30 minutes (Pinnacle closing line)");
+  logger.info("Pre-kickoff CLV cron active — every 15 minutes (Pinnacle closing line + snapshot C)");
+
+  // Pre-kickoff snapshot B: every 15 minutes
+  // Captures Pinnacle odds 45-75 min before kickoff (1hr reference point)
+  cron.schedule("7,22,37,52 * * * *", () => {
+    void fetchPreKickoffSnapshots()
+      .then((r) => {
+        if (r.checked > 0) logger.info(r, "Pre-kickoff snapshot B cron complete");
+      })
+      .catch((err) => logger.warn({ err }, "Pre-kickoff snapshot B failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Pre-kickoff snapshot B cron active — every 15 minutes (1hr before kickoff)");
+
+  // Line movement tracker: every 4 hours
+  // Tracks how Pinnacle odds move for fixtures with pending bets
+  cron.schedule("30 */4 * * *", () => {
+    logger.info("Line movement tracker triggered");
+    void trackLineMovements()
+      .then((r) => logger.info(r, "Line movement tracking complete"))
+      .catch((err) => logger.warn({ err }, "Line movement tracking failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Line movement tracker active — every 4 hours");
+
+  // Filtered bet outcome backfill: daily at 02:00 UTC
+  // Checks whether bets we filtered out would have won or lost
+  cron.schedule("0 2 * * *", () => {
+    logger.info("Filtered bet outcome backfill triggered");
+    void backfillFilteredBetOutcomes()
+      .then((r) => logger.info(r, "Filtered bet outcome backfill complete"))
+      .catch((err) => logger.warn({ err }, "Filtered bet outcome backfill failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Filtered bet outcome backfill active — daily at 02:00 UTC");
+
+  // Sharp movement analysis: weekly Sunday 05:30 UTC
+  // Analyses whether model aligns with sharp money movements
+  cron.schedule("30 5 * * 0", () => {
+    logger.info("Sharp movement analysis triggered");
+    void analyseSharpMovements()
+      .then((r) => {
+        if (r.totalSharp > 0) logger.info(r, "Sharp movement analysis complete");
+      })
+      .catch((err) => logger.warn({ err }, "Sharp movement analysis failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Sharp movement analysis active — weekly Sunday 05:30 UTC");
 
   // Learning loop: daily at 03:00 UTC
   cron.schedule("0 3 * * *", () => {

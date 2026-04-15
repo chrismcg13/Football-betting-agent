@@ -47,7 +47,7 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
 *   **Betfair Exchange API:** Used for paper-trading and live trading football bets via VPS proxy (`BETFAIR_PROXY_URL`). Live trading uses `LIVE_BETFAIR_KEY` with real money placement through `betfairLive.ts` service.
 *   **API-Football v3 (via RapidAPI):** Primary source for real odds, match results, team statistics (yellow cards, corners, shots), and fixture data. Budget usage is tracked.
 *   **PostgreSQL:** The primary database for all application data.
-*   **OddsPapi:** Used for bulk prefetching and refreshing Pinnacle odds, with budget tracking and coverage reporting.
+*   **OddsPapi (100k/month):** Sharp-line validation & best-odds layer. 100,000 requests/month budget allocated by priority: P1 (40%) pre-bet validation, P2 (30%) line movement tracking, P3 (20%) CLV closing capture, P4 (10%) exploratory. Flexible daily cap (2,500–4,500) auto-adjusts based on monthly spend rate. Three-snapshot CLV system captures Pinnacle odds at identification, 1hr pre-kickoff, and closing. Pre-bet Pinnacle filter kills bets with <2% edge (<3% if line moving away). Line movement tracker (every 4hr) detects sharp movements (>3% implied shift). Filtered bets logged with outcome tracking. New tables: `pinnacle_odds_snapshots`, `line_movements`, `filtered_bets`. New columns on `paper_bets`: `pinnacle_edge_category`, `line_direction`, `pinnacle_snapshot_count`, `clv_data_quality`.
 *   **football-data.org:** (DISABLED) Previously used for data ingestion; now replaced by API-Football v3.
 *   **StatsBomb/Fotmob:** (Implicitly via internal feature engine) Data sources for Expected Goals (xG) which are then processed by the internal feature engine.
 

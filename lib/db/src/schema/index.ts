@@ -19,3 +19,6 @@ export * from "./promotionAuditLog";
 export * from "./experimentLearningJournal";
 export * from "./competitionConfig";
 export * from "./drawdownEvents";
+export * from "./pinnacleOddsSnapshots";
+export * from "./lineMovements";
+export * from "./filteredBets";

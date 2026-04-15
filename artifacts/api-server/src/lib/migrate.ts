@@ -408,6 +408,93 @@ export async function runMigrations() {
       ALTER TABLE paper_bets
         ADD COLUMN IF NOT EXISTS live_tier TEXT
     `);
+
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS pinnacle_edge_category TEXT,
+        ADD COLUMN IF NOT EXISTS line_direction TEXT,
+        ADD COLUMN IF NOT EXISTS pinnacle_snapshot_count INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS clv_data_quality TEXT DEFAULT 'incomplete'
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS pinnacle_odds_snapshots (
+        id SERIAL PRIMARY KEY,
+        bet_id INTEGER REFERENCES paper_bets(id),
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        snapshot_type TEXT NOT NULL,
+        pinnacle_odds NUMERIC(10,4) NOT NULL,
+        pinnacle_implied NUMERIC(8,6),
+        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_pinnacle_snapshots_bet
+        ON pinnacle_odds_snapshots(bet_id) WHERE bet_id IS NOT NULL
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_pinnacle_snapshots_match
+        ON pinnacle_odds_snapshots(match_id, market_type, selection_name)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS line_movements (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        bookmaker TEXT NOT NULL DEFAULT 'pinnacle',
+        odds NUMERIC(10,4) NOT NULL,
+        implied_prob NUMERIC(8,6),
+        previous_odds NUMERIC(10,4),
+        movement_pct NUMERIC(8,4),
+        is_sharp_movement BOOLEAN NOT NULL DEFAULT false,
+        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_line_movements_match
+        ON line_movements(match_id, market_type, selection_name, captured_at DESC)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS filtered_bets (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        model_prob NUMERIC(8,6) NOT NULL,
+        pinnacle_implied NUMERIC(8,6) NOT NULL,
+        pinnacle_odds NUMERIC(10,4),
+        edge_pct NUMERIC(8,4) NOT NULL,
+        filter_reason TEXT NOT NULL,
+        model_odds NUMERIC(10,4),
+        market_odds NUMERIC(10,4),
+        opportunity_score NUMERIC(6,2),
+        league TEXT,
+        actual_outcome TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_filtered_bets_match
+        ON filtered_bets(match_id)
+    `);
+
+    await db.execute(sql`
+      UPDATE paper_bets SET clv_data_quality = 'incomplete'
+      WHERE status IN ('won', 'lost') AND clv_pct IS NULL AND clv_data_quality IS NULL
+    `);
+    await db.execute(sql`
+      UPDATE paper_bets SET clv_data_quality = 'partial'
+      WHERE status IN ('won', 'lost') AND clv_pct IS NOT NULL AND closing_pinnacle_odds IS NULL AND clv_data_quality IS NULL
+    `);
+    await db.execute(sql`
+      UPDATE paper_bets SET clv_data_quality = 'complete'
+      WHERE status IN ('won', 'lost') AND closing_pinnacle_odds IS NOT NULL AND clv_data_quality IS NULL
+    `);
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS idx_paper_bets_live_tier
         ON paper_bets(live_tier) WHERE live_tier IS NOT NULL

@@ -2,8 +2,13 @@
  * OddsPapi Integration — Sharp-line validation & best-odds layer
  * Base URL: https://api.oddspapi.io/v4
  * Auth: query param apiKey={ODDSPAPI_KEY}
- * Budget: 5,000 requests/month | Cap: 4,800/month, 150/day
- * Allocation: ~80/day pre-match validation, ~20/day closing-line CLV, ~1/day mapping
+ * Budget: 100,000 requests/month
+ * Priority allocation:
+ *   P1 (40%) — Pre-bet validation for all fixtures evaluated
+ *   P2 (30%) — Line movement tracking for Tier 1 qualifying fixtures
+ *   P3 (20%) — Closing line capture for CLV measurement
+ *   P4 (10%) — Exploratory coverage of new leagues
+ * Throttle order: cut P4 first, then P2 frequency. Never cut P1 or P3.
  */
 
 import {
@@ -17,17 +22,25 @@ import {
   learningNarrativesTable,
   leagueEdgeScoresTable,
   oddspapiLeagueCoverageTable,
+  pinnacleOddsSnapshotsTable,
+  lineMovementsTable,
+  filteredBetsTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, sql, like, inArray, ne } from "drizzle-orm";
+import { eq, and, gte, lte, sql, like, inArray, ne, desc } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://api.oddspapi.io/v4";
-const DAILY_CAP = 300;
-const MONTHLY_CAP = 5000;
+const MONTHLY_CAP = 100_000;
+const DEFAULT_DAILY_CAP = 3_300;
 
-// DB-driven cap override — reads agent_config key "oddspapi_daily_cap_override"
-// Format: {"cap": 15, "expires": "2026-04-09"}  (expires = ISO date, inclusive)
-async function getEffectiveDailyCap(): Promise<number> {
+const PRIORITY_MONTHLY_BUDGETS: Record<string, number> = {
+  P1: 40_000,
+  P2: 30_000,
+  P3: 20_000,
+  P4: 10_000,
+};
+
+async function getFlexibleDailyCap(): Promise<number> {
   try {
     const { agentConfigTable: act } = await import("@workspace/db");
     const rows = await db.select().from(act).where(eq(act.key, "oddspapi_daily_cap_override")).limit(1);
@@ -39,8 +52,24 @@ async function getEffectiveDailyCap(): Promise<number> {
         return data.cap;
       }
     }
-  } catch { /* fall through to default */ }
-  return DAILY_CAP;
+  } catch { /* fall through */ }
+
+  const monthUsage = await getOddspapiUsageThisMonth();
+  const dayOfMonth = new Date().getDate();
+  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
+  const daysRemaining = daysInMonth - dayOfMonth + 1;
+  const budgetRemaining = MONTHLY_CAP - monthUsage;
+
+  if (daysRemaining <= 0) return DEFAULT_DAILY_CAP;
+
+  const avgNeeded = Math.floor(budgetRemaining / daysRemaining);
+  const flexCap = Math.max(2_500, Math.min(4_500, avgNeeded));
+
+  return flexCap;
+}
+
+async function getEffectiveDailyCap(): Promise<number> {
+  return getFlexibleDailyCap();
 }
 
 // ─── Market ID mapping ─────────────────────────────────────────────────────────
@@ -102,15 +131,24 @@ export async function getOddspapiUsageThisMonth(): Promise<number> {
   return Number(rows[0]?.total ?? 0);
 }
 
-async function trackOddspapiCall(endpoint: string, count = 1): Promise<void> {
+async function trackOddspapiCall(endpoint: string, count = 1, priority = "P1"): Promise<void> {
   await db.insert(apiUsageTable).values({
     date: todayStr(),
-    endpoint: `oddspapi_${endpoint}`,
+    endpoint: `oddspapi_${priority}_${endpoint}`,
     requestCount: count,
   });
 }
 
-async function canMakeOddspapiRequest(needed = 1): Promise<boolean> {
+async function getOddspapiUsageByPriority(priority: string): Promise<number> {
+  const month = monthStr();
+  const rows = await db
+    .select({ total: sql<number>`sum(${apiUsageTable.requestCount})::int` })
+    .from(apiUsageTable)
+    .where(and(like(apiUsageTable.date, `${month}%`), like(apiUsageTable.endpoint, `oddspapi_${priority}_%`)));
+  return Number(rows[0]?.total ?? 0);
+}
+
+async function canMakeOddspapiRequest(needed = 1, priority = "P1"): Promise<boolean> {
   const key = process.env.ODDSPAPI_KEY;
   if (!key) return false;
   const [daily, monthly, effectiveCap] = await Promise.all([
@@ -119,12 +157,26 @@ async function canMakeOddspapiRequest(needed = 1): Promise<boolean> {
     getEffectiveDailyCap(),
   ]);
   if (daily + needed > effectiveCap) {
-    logger.warn({ daily, cap: effectiveCap }, "OddsPapi daily budget exhausted");
+    logger.warn({ daily, cap: effectiveCap, priority }, "OddsPapi daily budget exhausted");
     return false;
   }
   if (monthly + needed > MONTHLY_CAP) {
-    logger.warn({ monthly, cap: MONTHLY_CAP }, "OddsPapi monthly budget exhausted");
+    logger.warn({ monthly, cap: MONTHLY_CAP, priority }, "OddsPapi monthly budget exhausted");
     return false;
+  }
+
+  const priorityBudget = PRIORITY_MONTHLY_BUDGETS[priority];
+  if (priorityBudget) {
+    const priorityUsage = await getOddspapiUsageByPriority(priority);
+    if (priorityUsage + needed > priorityBudget) {
+      if (priority === "P4") {
+        logger.warn({ priority, used: priorityUsage, budget: priorityBudget }, "OddsPapi priority budget exhausted — throttling P4");
+        return false;
+      }
+      if (priority === "P2") {
+        logger.warn({ priority, used: priorityUsage, budget: priorityBudget }, "OddsPapi P2 budget soft-limit reached — reducing frequency");
+      }
+    }
   }
   return true;
 }
@@ -135,14 +187,22 @@ export async function getOddspapiStatus(): Promise<{
   dailyCap: number;
   monthlyCap: number;
   enabled: boolean;
+  byPriority?: Record<string, number>;
 }> {
   const key = process.env.ODDSPAPI_KEY;
-  const [todayCount, monthCount, effectiveDailyCap] = await Promise.all([
+  const [todayCount, monthCount, effectiveDailyCap, p1, p2, p3, p4] = await Promise.all([
     getOddspapiUsageToday(),
     getOddspapiUsageThisMonth(),
     getEffectiveDailyCap(),
+    getOddspapiUsageByPriority("P1"),
+    getOddspapiUsageByPriority("P2"),
+    getOddspapiUsageByPriority("P3"),
+    getOddspapiUsageByPriority("P4"),
   ]);
-  return { todayCount, monthCount, dailyCap: effectiveDailyCap, monthlyCap: MONTHLY_CAP, enabled: !!key };
+  return {
+    todayCount, monthCount, dailyCap: effectiveDailyCap, monthlyCap: MONTHLY_CAP, enabled: !!key,
+    byPriority: { P1: p1, P2: p2, P3: p3, P4: p4 },
+  };
 }
 
 // ─── Core fetch ───────────────────────────────────────────────────────────────
@@ -151,6 +211,7 @@ async function fetchOddsPapi<T = unknown>(
   path: string,
   params: Record<string, string | number> = {},
   trackAs = "request",
+  priority = "P1",
 ): Promise<T | null> {
   const key = process.env.ODDSPAPI_KEY;
   if (!key) {
@@ -158,7 +219,7 @@ async function fetchOddsPapi<T = unknown>(
     return null;
   }
 
-  if (!(await canMakeOddspapiRequest())) return null;
+  if (!(await canMakeOddspapiRequest(1, priority))) return null;
 
   const url = new URL(`${BASE_URL}${path}`);
   url.searchParams.set("apiKey", key);
@@ -168,7 +229,7 @@ async function fetchOddsPapi<T = unknown>(
 
   try {
     const res = await fetch(url.toString());
-    await trackOddspapiCall(trackAs);
+    await trackOddspapiCall(trackAs, 1, priority);
 
     if (!res.ok) {
       logger.warn({ status: res.status, path }, "OddsPapi HTTP error");
@@ -696,22 +757,20 @@ export async function runOddspapiFixtureMapping(): Promise<{
     from: todayDate,
     to: plusSeven,
     hasOdds: "true",
-  }, "fixtures");
+  }, "fixtures", "P4");
 
   if (!rawFixtures || !Array.isArray(rawFixtures)) {
     logger.warn("OddsPapi fixture response was empty or unexpected format");
     return { total: 0, mapped: 0, newMappings: 0, unmatchedDb: 0, unmatchedOp: 0, perLeague: {} };
   }
 
-  // Secondary fetch: WITHOUT hasOdds filter — discover fixtures that may get odds later
-  // This costs 1 extra API call but can dramatically improve coverage for smaller leagues
   let discoveryFixtures: RawFixture[] = [];
-  if (await canMakeOddspapiRequest(1)) {
+  if (await canMakeOddspapiRequest(1, "P4")) {
     const disc = await fetchOddsPapi<RawFixture[]>("/fixtures", {
       sportId: 10,
       from: todayDate,
       to: plusSeven,
-    }, "fixtures_discovery");
+    }, "fixtures_discovery", "P4");
     if (disc && Array.isArray(disc)) {
       const existingIds = new Set(rawFixtures.map((f) => extractFixtureStringId(f)).filter(Boolean));
       discoveryFixtures = disc.filter((f) => {
@@ -974,7 +1033,7 @@ export async function runMatchDiagnostic(): Promise<{
 
   const rawFixtures = await fetchOddsPapi<RawFixture[]>("/fixtures", {
     sportId: 10, from: todayDate, to: plusSeven, hasOdds: "true",
-  }, "fixtures_diagnostic");
+  }, "fixtures_diagnostic", "P4");
 
   if (!rawFixtures || !Array.isArray(rawFixtures)) {
     return { totalUnmapped: 0, nearMisses: [], oddspapiFixtureCount: 0, leagueSummary: {} };
@@ -1148,6 +1207,28 @@ export interface OddspapiValidation {
   hasPinnacleData: boolean;
 }
 
+function normaliseSelectionToGenericKey(selectionName: string, marketType: string): string {
+  const s = selectionName.toLowerCase().trim();
+  if (s === "home" || s === "1") return "Home";
+  if (s === "draw" || s === "x") return "Draw";
+  if (s === "away" || s === "2") return "Away";
+  if (s === "yes" || s === "gg") return "Yes";
+  if (s === "no" || s === "ng") return "No";
+  if (s === "1x") return "1X";
+  if (s === "x2") return "X2";
+  if (s === "12") return "12";
+  if (s.includes("over")) return "Over";
+  if (s.includes("under")) return "Under";
+  return selectionName;
+}
+
+function getGenericSelectionKeys(marketType: string): string[] {
+  if (marketType === "MATCH_ODDS") return ["Home", "Draw", "Away"];
+  if (marketType === "BTTS") return ["Yes", "No"];
+  if (marketType === "DOUBLE_CHANCE") return ["1X", "X2", "12"];
+  return ["Home", "Draw", "Away", "Yes", "No", "Over", "Under", "1X", "X2", "12"];
+}
+
 function getSelectionOdds(
   selections: RawOddsSelection[],
   marketType: string,
@@ -1195,6 +1276,13 @@ function getSelectionOdds(
     if (marketType === "BTTS") {
       if (selectionName === "Yes" && (label === "yes" || label === "gg")) return odds;
       if (selectionName === "No" && (label === "no" || label === "ng")) return odds;
+    }
+
+    // ── Double Chance ──
+    if (marketType === "DOUBLE_CHANCE") {
+      if (selectionName === "1X" && (label === "1x" || label === "home or draw" || label === "home/draw")) return odds;
+      if (selectionName === "X2" && (label === "x2" || label === "draw or away" || label === "draw/away")) return odds;
+      if (selectionName === "12" && (label === "12" || label === "home or away" || label === "home/away")) return odds;
     }
 
     // ── Legacy array-format Over/Under (label: "over 2.5", "under", etc.) ──
@@ -1291,12 +1379,13 @@ export async function getOddspapiValidation(
   // The /odds endpoint returns ALL markets regardless of marketId; default to 101 (1x2)
   const marketId = MARKET_IDS[marketType] ?? 101;
 
-  if (!(await canMakeOddspapiRequest(1))) return noData;
+  if (!(await canMakeOddspapiRequest(1, "P1"))) return noData;
 
   const rawData = await fetchOddsPapi<RawOddsResponse>(
     "/odds",
     { fixtureId: oddspapiFixtureId, marketId },
     "odds",
+    "P1",
   );
 
   if (!rawData) return noData;
@@ -1518,15 +1607,15 @@ export async function prefetchAndStoreOddsPapiOdds(
     // Use MATCH_ODDS market ID — but OddsPapi returns ALL markets regardless.
     // One call per fixture gives us 1x2, goals O/U, corners O/U, BTTS, etc.
     const marketId = MARKET_IDS["MATCH_ODDS"] ?? 101;
-    if (!(await canMakeOddspapiRequest(1))) break;
+    if (!(await canMakeOddspapiRequest(1, "P1"))) break;
 
-    // Rate-limit guard: OddsPapi enforces ~1 req/s — wait between calls
     if (i > 0) await new Promise((r) => setTimeout(r, 1200));
 
     const rawData = await fetchOddsPapi<RawOddsResponse>(
       "/odds",
       { fixtureId, marketId },
       "prefetch_odds",
+      "P1",
     );
 
     if (!rawData) continue;
@@ -1758,27 +1847,34 @@ export async function runDedicatedBulkPrefetch(
 // ─── Log daily budget usage summary ──────────────────────────────────────────
 
 export async function logDailyBudgetSummary(): Promise<void> {
-  const [today, month] = await Promise.all([
+  const [today, month, effectiveCap, p1, p2, p3, p4] = await Promise.all([
     getOddspapiUsageToday(),
     getOddspapiUsageThisMonth(),
+    getEffectiveDailyCap(),
+    getOddspapiUsageByPriority("P1"),
+    getOddspapiUsageByPriority("P2"),
+    getOddspapiUsageByPriority("P3"),
+    getOddspapiUsageByPriority("P4"),
   ]);
+
+  const byPriority = { P1: p1, P2: p2, P3: p3, P4: p4 };
 
   await db.insert(complianceLogsTable).values({
     actionType: "oddspapi_daily_budget_summary",
-    details: { today, month, dailyCap: DAILY_CAP, monthlyCap: MONTHLY_CAP },
+    details: { today, month, dailyCap: effectiveCap, monthlyCap: MONTHLY_CAP, byPriority },
     timestamp: new Date(),
   });
 
-  if (month >= 4000) {
+  if (month >= 80_000) {
     await db.insert(learningNarrativesTable).values({
       narrativeType: "budget_alert",
       narrativeText: `OddsPapi monthly usage at ${month}/${MONTHLY_CAP} requests. Approaching limit — sharp-line validation will be throttled to protect remaining budget.`,
-      relatedData: { today, month, dailyCap: DAILY_CAP, monthlyCap: MONTHLY_CAP },
+      relatedData: { today, month, dailyCap: effectiveCap, monthlyCap: MONTHLY_CAP, byPriority },
       createdAt: new Date(),
     });
   }
 
-  logger.info({ today, month, dailyCap: DAILY_CAP, monthlyCap: MONTHLY_CAP }, "OddsPapi daily budget summary logged");
+  logger.info({ today, month, dailyCap: effectiveCap, monthlyCap: MONTHLY_CAP, byPriority }, "OddsPapi daily budget summary logged");
 }
 
 // ─── Closing-line CLV fetch ───────────────────────────────────────────────────
@@ -1849,8 +1945,8 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
     const matchOddsMarket = bets.some((b) => b.marketType === "MATCH_ODDS") ? "MATCH_ODDS" : bets[0]?.marketType;
     if (!matchOddsMarket) { skipped += bets.length; continue; }
 
-    if (!(await canMakeOddspapiRequest(1))) {
-      logger.warn("Pre-kickoff CLV cron: daily budget exhausted — stopping");
+    if (!(await canMakeOddspapiRequest(1, "P3"))) {
+      logger.warn("Pre-kickoff CLV cron: P3 budget exhausted — stopping");
       skipped += bets.length;
       break;
     }
@@ -1864,6 +1960,7 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
       "/odds",
       { fixtureId: oddspapiId, marketId },
       "closing_line",
+      "P3",
     );
 
     if (!rawData) { skipped += bets.length; continue; }
@@ -1877,7 +1974,7 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
       const slug = getBookmakerSlug(bm);
       if (!slug.includes("pinnacle")) continue;
       const selections = extractSelections(bm);
-      for (const selName of ["Home", "Draw", "Away", "Yes", "No", "Over", "Under"]) {
+      for (const selName of getGenericSelectionKeys(matchOddsMarket)) {
         const odds = getSelectionOdds(selections, matchOddsMarket, selName);
         if (odds) pinnacleBySelection[selName] = odds;
       }
@@ -1885,27 +1982,42 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
 
     // Store closing odds for each matching bet and compute CLV
     for (const bet of bets) {
-      const closingOdds = pinnacleBySelection[bet.selectionName] ?? null;
-      if (!closingOdds) { skipped++; continue; }
+      try {
+        const genericKey = normaliseSelectionToGenericKey(bet.selectionName, matchOddsMarket);
+        const closingOdds = pinnacleBySelection[genericKey] ?? null;
+        if (!closingOdds) { skipped++; continue; }
 
-      const placementOdds = Number(bet.oddsAtPlacement);
-      const clvPct = closingOdds > 1
-        ? Math.round(((placementOdds - closingOdds) / closingOdds) * 100 * 1000) / 1000
-        : null;
+        const placementOdds = Number(bet.oddsAtPlacement);
+        const clvPct = closingOdds > 1
+          ? Math.round(((placementOdds - closingOdds) / closingOdds) * 100 * 1000) / 1000
+          : null;
 
-      await db
-        .update(paperBetsTable)
-        .set({
-          closingPinnacleOdds: String(closingOdds),
-          ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
-        })
-        .where(eq(paperBetsTable.id, bet.id));
+        await db
+          .update(paperBetsTable)
+          .set({
+            closingPinnacleOdds: String(closingOdds),
+            ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
+          })
+          .where(eq(paperBetsTable.id, bet.id));
 
-      logger.info(
-        { betId: bet.id, matchId, selection: bet.selectionName, placementOdds, closingOdds, clvPct },
-        "Pre-kickoff CLV stored (Pinnacle closing line)",
-      );
-      updated++;
+        await storePinnacleSnapshot({
+          betId: bet.id,
+          matchId,
+          marketType: bet.marketType,
+          selectionName: bet.selectionName,
+          snapshotType: "closing",
+          pinnacleOdds: closingOdds,
+        });
+
+        logger.info(
+          { betId: bet.id, matchId, selection: bet.selectionName, placementOdds, closingOdds, clvPct },
+          "Pre-kickoff CLV stored (Pinnacle closing line) + snapshot C",
+        );
+        updated++;
+      } catch (err) {
+        logger.error({ err, betId: bet.id, matchId }, "Closing line snapshot error — skipping bet");
+        skipped++;
+      }
     }
   }
 
@@ -2028,4 +2140,555 @@ export async function buildPinnacleValidationFromApiFootball(
   );
 
   return cache;
+}
+
+// ─── Three-snapshot CLV system ─────────────────────────────────────────────────
+// Snapshot A: at bet identification (called from placePaperBet)
+// Snapshot B: 1 hour before kickoff (cron)
+// Snapshot C: at market close / kickoff (enhanced existing closing line cron)
+
+export async function storePinnacleSnapshot(params: {
+  betId: number | null;
+  matchId: number;
+  marketType: string;
+  selectionName: string;
+  snapshotType: "identification" | "pre_kickoff" | "closing";
+  pinnacleOdds: number;
+}): Promise<void> {
+  const pinnacleImplied = params.pinnacleOdds > 1 ? 1 / params.pinnacleOdds : null;
+
+  await db.insert(pinnacleOddsSnapshotsTable).values({
+    betId: params.betId,
+    matchId: params.matchId,
+    marketType: params.marketType,
+    selectionName: params.selectionName,
+    snapshotType: params.snapshotType,
+    pinnacleOdds: String(params.pinnacleOdds),
+    pinnacleImplied: pinnacleImplied ? String(pinnacleImplied) : null,
+    capturedAt: new Date(),
+  });
+
+  if (params.betId) {
+    const existing = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(pinnacleOddsSnapshotsTable)
+      .where(eq(pinnacleOddsSnapshotsTable.betId, params.betId));
+    const count = existing[0]?.count ?? 0;
+
+    const quality = count >= 3 ? "complete" : count >= 2 ? "partial" : "incomplete";
+    await db.update(paperBetsTable).set({
+      pinnacleSnapshotCount: count,
+      clvDataQuality: quality,
+    }).where(eq(paperBetsTable.id, params.betId));
+  }
+}
+
+export async function fetchPreKickoffSnapshots(): Promise<{
+  checked: number;
+  captured: number;
+  skipped: number;
+}> {
+  const key = process.env.ODDSPAPI_KEY;
+  if (!key) return { checked: 0, captured: 0, skipped: 0 };
+
+  const now = new Date();
+  const in45min = new Date(now.getTime() + 45 * 60 * 1000);
+  const in75min = new Date(now.getTime() + 75 * 60 * 1000);
+
+  const pendingBets = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+    })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        sql`${matchesTable.kickoffTime} >= ${in45min}`,
+        sql`${matchesTable.kickoffTime} <= ${in75min}`,
+      ),
+    );
+
+  if (pendingBets.length === 0) return { checked: 0, captured: 0, skipped: 0 };
+
+  const existingSnapshots = await db
+    .select({ betId: pinnacleOddsSnapshotsTable.betId })
+    .from(pinnacleOddsSnapshotsTable)
+    .where(
+      and(
+        inArray(pinnacleOddsSnapshotsTable.betId, pendingBets.map((b) => b.id)),
+        eq(pinnacleOddsSnapshotsTable.snapshotType, "pre_kickoff"),
+      ),
+    );
+  const alreadyCaptured = new Set(existingSnapshots.map((s) => s.betId));
+  const needCapture = pendingBets.filter((b) => !alreadyCaptured.has(b.id));
+
+  if (needCapture.length === 0) return { checked: pendingBets.length, captured: 0, skipped: 0 };
+
+  logger.info({ count: needCapture.length }, "Pre-kickoff snapshot B: capturing 1hr-before Pinnacle odds");
+
+  let captured = 0;
+  let skipped = 0;
+
+  const byMatch = new Map<number, typeof needCapture>();
+  for (const bet of needCapture) {
+    const group = byMatch.get(bet.matchId) ?? [];
+    group.push(bet);
+    byMatch.set(bet.matchId, group);
+  }
+
+  for (const [matchId, bets] of byMatch) {
+    const oddspapiId = await getOddspapiFixtureId(matchId);
+    if (!oddspapiId) { skipped += bets.length; continue; }
+
+    if (!(await canMakeOddspapiRequest(1, "P3"))) {
+      skipped += bets.length;
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, 1200));
+
+    const marketId = MARKET_IDS[bets[0]?.marketType ?? "MATCH_ODDS"] ?? 101;
+    const rawData = await fetchOddsPapi<RawOddsResponse>(
+      "/odds",
+      { fixtureId: oddspapiId, marketId },
+      "pre_kickoff_snapshot",
+      "P3",
+    );
+
+    if (!rawData) { skipped += bets.length; continue; }
+
+    const snapshotMarket = bets[0]?.marketType ?? "MATCH_ODDS";
+    const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+    const pinnacleBySelection: Record<string, number> = {};
+    for (const bm of bookmakers) {
+      const slug = getBookmakerSlug(bm);
+      if (!slug.includes("pinnacle")) continue;
+      const selections = extractSelections(bm);
+      for (const selName of getGenericSelectionKeys(snapshotMarket)) {
+        const odds = getSelectionOdds(selections, snapshotMarket, selName);
+        if (odds) pinnacleBySelection[selName] = odds;
+      }
+    }
+
+    for (const bet of bets) {
+      try {
+        const genericKey = normaliseSelectionToGenericKey(bet.selectionName, snapshotMarket);
+        const pinnOdds = pinnacleBySelection[genericKey];
+        if (!pinnOdds) { skipped++; continue; }
+
+        await storePinnacleSnapshot({
+          betId: bet.id,
+          matchId,
+          marketType: bet.marketType,
+          selectionName: bet.selectionName,
+          snapshotType: "pre_kickoff",
+          pinnacleOdds: pinnOdds,
+        });
+        captured++;
+      } catch (err) {
+        logger.error({ err, betId: bet.id, matchId }, "Pre-kickoff snapshot B error — skipping bet");
+        skipped++;
+      }
+    }
+  }
+
+  logger.info({ checked: pendingBets.length, captured, skipped }, "Pre-kickoff snapshot B complete");
+  return { checked: pendingBets.length, captured, skipped };
+}
+
+// ─── Line Movement Tracking ────────────────────────────────────────────────────
+
+export async function trackLineMovements(): Promise<{
+  fixturesChecked: number;
+  movementsRecorded: number;
+  sharpMovements: number;
+}> {
+  const key = process.env.ODDSPAPI_KEY;
+  if (!key) return { fixturesChecked: 0, movementsRecorded: 0, sharpMovements: 0 };
+
+  const now = new Date();
+  const in2h = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+  const in7d = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+  const upcoming = await db
+    .select({ id: matchesTable.id })
+    .from(matchesTable)
+    .where(
+      and(
+        eq(matchesTable.status, "scheduled"),
+        gte(matchesTable.kickoffTime, in2h),
+        lte(matchesTable.kickoffTime, in7d),
+      ),
+    );
+
+  if (upcoming.length === 0) return { fixturesChecked: 0, movementsRecorded: 0, sharpMovements: 0 };
+
+  const matchIds = upcoming.map((m) => m.id);
+
+  const hasPendingBets = await db
+    .select({ matchId: paperBetsTable.matchId })
+    .from(paperBetsTable)
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        inArray(paperBetsTable.matchId, matchIds),
+      ),
+    );
+  const betMatchIds = new Set(hasPendingBets.map((b) => b.matchId));
+
+  const matchesToTrack = upcoming.filter((m) => betMatchIds.has(m.id));
+  if (matchesToTrack.length === 0) return { fixturesChecked: 0, movementsRecorded: 0, sharpMovements: 0 };
+
+  logger.info({ count: matchesToTrack.length }, "Line movement tracker: checking Pinnacle lines");
+
+  let movementsRecorded = 0;
+  let sharpMovements = 0;
+  let fixturesChecked = 0;
+
+  for (const match of matchesToTrack) {
+    const oddspapiId = await getOddspapiFixtureId(match.id);
+    if (!oddspapiId) continue;
+
+    if (!(await canMakeOddspapiRequest(1, "P2"))) break;
+
+    await new Promise((r) => setTimeout(r, 1200));
+
+    const rawData = await fetchOddsPapi<RawOddsResponse>(
+      "/odds",
+      { fixtureId: oddspapiId, marketId: 101 },
+      "line_movement",
+      "P2",
+    );
+
+    if (!rawData) continue;
+    fixturesChecked++;
+
+    const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+
+    for (const bm of bookmakers) {
+      const slug = getBookmakerSlug(bm);
+      if (!slug.includes("pinnacle")) continue;
+
+      const selections = extractSelections(bm);
+      for (const selName of ["Home", "Draw", "Away"]) {
+        const odds = getSelectionOdds(selections, "MATCH_ODDS", selName);
+        if (!odds || odds <= 1.01) continue;
+
+        const impliedProb = 1 / odds;
+
+        const prevRows = await db
+          .select({ odds: lineMovementsTable.odds, impliedProb: lineMovementsTable.impliedProb })
+          .from(lineMovementsTable)
+          .where(
+            and(
+              eq(lineMovementsTable.matchId, match.id),
+              eq(lineMovementsTable.selectionName, selName),
+              eq(lineMovementsTable.bookmaker, "pinnacle"),
+            ),
+          )
+          .orderBy(desc(lineMovementsTable.capturedAt))
+          .limit(1);
+
+        const prevOdds = prevRows.length > 0 ? parseFloat(prevRows[0]!.odds) : null;
+        const prevImplied = prevRows.length > 0 && prevRows[0]!.impliedProb ? parseFloat(prevRows[0]!.impliedProb) : null;
+
+        let movementPct: number | null = null;
+        let isSharp = false;
+
+        if (prevImplied && prevImplied > 0) {
+          movementPct = Math.round(((impliedProb - prevImplied) / prevImplied) * 100 * 100) / 100;
+          isSharp = Math.abs((impliedProb - prevImplied) * 100) > 3;
+        }
+
+        await db.insert(lineMovementsTable).values({
+          matchId: match.id,
+          marketType: "MATCH_ODDS",
+          selectionName: selName,
+          bookmaker: "pinnacle",
+          odds: String(odds),
+          impliedProb: String(impliedProb),
+          previousOdds: prevOdds ? String(prevOdds) : null,
+          movementPct: movementPct ? String(movementPct) : null,
+          isSharpMovement: isSharp,
+          capturedAt: new Date(),
+        });
+
+        movementsRecorded++;
+        if (isSharp) {
+          sharpMovements++;
+          logger.info(
+            { matchId: match.id, selName, odds, prevOdds, movementPct },
+            "Sharp line movement detected (>3% implied shift)",
+          );
+        }
+      }
+    }
+  }
+
+  logger.info({ fixturesChecked, movementsRecorded, sharpMovements }, "Line movement tracking complete");
+  return { fixturesChecked, movementsRecorded, sharpMovements };
+}
+
+export async function getLineDirection(matchId: number, selectionName: string): Promise<"toward" | "away" | "stable" | "unknown"> {
+  const movements = await db
+    .select({ movementPct: lineMovementsTable.movementPct, capturedAt: lineMovementsTable.capturedAt })
+    .from(lineMovementsTable)
+    .where(
+      and(
+        eq(lineMovementsTable.matchId, matchId),
+        eq(lineMovementsTable.selectionName, selectionName),
+        eq(lineMovementsTable.bookmaker, "pinnacle"),
+      ),
+    )
+    .orderBy(desc(lineMovementsTable.capturedAt))
+    .limit(5);
+
+  if (movements.length < 2) return "unknown";
+
+  const recentMoves = movements
+    .filter((m) => m.movementPct !== null)
+    .map((m) => parseFloat(m.movementPct!));
+
+  if (recentMoves.length === 0) return "stable";
+
+  const avgMove = recentMoves.reduce((a, b) => a + b, 0) / recentMoves.length;
+
+  const oldest = movements[movements.length - 1]!.capturedAt;
+  const newest = movements[0]!.capturedAt;
+  const hoursSinceMove = (newest.getTime() - oldest.getTime()) / (1000 * 60 * 60);
+
+  if (hoursSinceMove >= 24 && Math.abs(avgMove) < 1) return "stable";
+
+  if (avgMove > 0.5) return "toward";
+  if (avgMove < -0.5) return "away";
+
+  return "stable";
+}
+
+// ─── Pre-bet Pinnacle filtering ────────────────────────────────────────────────
+
+export interface PinnacleFilterResult {
+  passed: boolean;
+  edgePct: number;
+  edgeCategory: "high_confidence" | "standard" | "filtered";
+  filterReason: string | null;
+  pinnacleOdds: number | null;
+  pinnacleImplied: number | null;
+  lineDirection: "toward" | "away" | "stable" | "unknown";
+  adjustedMinEdge: number;
+}
+
+export async function pinnaclePreBetFilter(params: {
+  matchId: number;
+  marketType: string;
+  selectionName: string;
+  modelProbability: number;
+  marketOdds: number;
+  opportunityScore: number;
+  league: string;
+  pinnacleOdds?: number | null;
+  pinnacleImplied?: number | null;
+}): Promise<PinnacleFilterResult> {
+  const lineDir = await getLineDirection(params.matchId, params.selectionName);
+
+  let pinnacleOdds = params.pinnacleOdds ?? null;
+  let pinnacleImplied = params.pinnacleImplied ?? null;
+
+  if (!pinnacleOdds || !pinnacleImplied) {
+    return {
+      passed: true,
+      edgePct: 0,
+      edgeCategory: "standard",
+      filterReason: null,
+      pinnacleOdds: null,
+      pinnacleImplied: null,
+      lineDirection: lineDir,
+      adjustedMinEdge: 2,
+    };
+  }
+
+  const edgePct = (params.modelProbability - pinnacleImplied) * 100;
+
+  let minEdge = 2;
+  if (lineDir === "away") {
+    minEdge = 3;
+  }
+
+  if (edgePct < minEdge) {
+    await db.insert(filteredBetsTable).values({
+      matchId: params.matchId,
+      marketType: params.marketType,
+      selectionName: params.selectionName,
+      modelProb: String(params.modelProbability),
+      pinnacleImplied: String(pinnacleImplied),
+      pinnacleOdds: String(pinnacleOdds),
+      edgePct: String(edgePct),
+      filterReason: lineDir === "away"
+        ? `Edge ${edgePct.toFixed(2)}% < 3% min (line moving away from position)`
+        : `Edge ${edgePct.toFixed(2)}% < 2% min vs Pinnacle implied`,
+      modelOdds: String(1 / params.modelProbability),
+      marketOdds: String(params.marketOdds),
+      opportunityScore: String(params.opportunityScore),
+      league: params.league,
+      createdAt: new Date(),
+    });
+
+    return {
+      passed: false,
+      edgePct,
+      edgeCategory: "filtered",
+      filterReason: lineDir === "away"
+        ? `Edge ${edgePct.toFixed(2)}% < 3% (line away)`
+        : `Edge ${edgePct.toFixed(2)}% < 2% vs Pinnacle`,
+      pinnacleOdds,
+      pinnacleImplied,
+      lineDirection: lineDir,
+      adjustedMinEdge: minEdge,
+    };
+  }
+
+  const edgeCategory = edgePct > 4 ? "high_confidence" : "standard";
+
+  return {
+    passed: true,
+    edgePct,
+    edgeCategory,
+    filterReason: null,
+    pinnacleOdds,
+    pinnacleImplied,
+    lineDirection: lineDir,
+    adjustedMinEdge: minEdge,
+  };
+}
+
+// ─── Backfill filtered bet outcomes ───────────────────────────────────────────
+
+export async function backfillFilteredBetOutcomes(): Promise<{ updated: number }> {
+  const unresolved = await db
+    .select({
+      id: filteredBetsTable.id,
+      matchId: filteredBetsTable.matchId,
+      selectionName: filteredBetsTable.selectionName,
+      marketType: filteredBetsTable.marketType,
+    })
+    .from(filteredBetsTable)
+    .innerJoin(matchesTable, eq(filteredBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        sql`${filteredBetsTable.actualOutcome} IS NULL`,
+        eq(matchesTable.status, "finished"),
+      ),
+    )
+    .limit(200);
+
+  if (unresolved.length === 0) return { updated: 0 };
+
+  let updated = 0;
+  for (const fb of unresolved) {
+    const match = await db.select().from(matchesTable).where(eq(matchesTable.id, fb.matchId)).limit(1);
+    if (!match[0] || match[0].homeScore === null || match[0].awayScore === null) continue;
+
+    const homeScore = match[0].homeScore!;
+    const awayScore = match[0].awayScore!;
+
+    let outcome = "unknown";
+    const genericKey = normaliseSelectionToGenericKey(fb.selectionName, fb.marketType);
+
+    if (fb.marketType === "MATCH_ODDS") {
+      if (genericKey === "Home") outcome = homeScore > awayScore ? "won" : "lost";
+      else if (genericKey === "Away") outcome = awayScore > homeScore ? "won" : "lost";
+      else if (genericKey === "Draw") outcome = homeScore === awayScore ? "won" : "lost";
+    } else if (fb.marketType.startsWith("OVER_UNDER_")) {
+      const line = parseFloat(fb.marketType.replace("OVER_UNDER_", "").replace(/(\d)(\d)$/, "$1.$2"));
+      const total = homeScore + awayScore;
+      if (genericKey === "Over") outcome = total > line ? "won" : "lost";
+      else if (genericKey === "Under") outcome = total < line ? "won" : "lost";
+    } else if (fb.marketType === "BTTS") {
+      const bothScored = homeScore > 0 && awayScore > 0;
+      if (genericKey === "Yes") outcome = bothScored ? "won" : "lost";
+      else if (genericKey === "No") outcome = !bothScored ? "won" : "lost";
+    } else if (fb.marketType === "DOUBLE_CHANCE") {
+      const homeWin = homeScore > awayScore;
+      const draw = homeScore === awayScore;
+      const awayWin = awayScore > homeScore;
+      if (genericKey === "1X") outcome = (homeWin || draw) ? "won" : "lost";
+      else if (genericKey === "X2") outcome = (draw || awayWin) ? "won" : "lost";
+      else if (genericKey === "12") outcome = (homeWin || awayWin) ? "won" : "lost";
+    }
+
+    if (outcome !== "unknown") {
+      await db.update(filteredBetsTable).set({ actualOutcome: outcome }).where(eq(filteredBetsTable.id, fb.id));
+      updated++;
+    }
+  }
+
+  logger.info({ updated }, "Backfilled filtered bet outcomes");
+  return { updated };
+}
+
+// ─── Sharp movement analysis ──────────────────────────────────────────────────
+
+export async function analyseSharpMovements(): Promise<{
+  totalSharp: number;
+  modelAligned: number;
+  modelContrarian: number;
+  alignmentRate: number;
+}> {
+  const recentSharp = await db
+    .select({
+      matchId: lineMovementsTable.matchId,
+      selectionName: lineMovementsTable.selectionName,
+      movementPct: lineMovementsTable.movementPct,
+    })
+    .from(lineMovementsTable)
+    .where(
+      and(
+        eq(lineMovementsTable.isSharpMovement, true),
+        gte(lineMovementsTable.capturedAt, new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)),
+      ),
+    );
+
+  if (recentSharp.length === 0) {
+    return { totalSharp: 0, modelAligned: 0, modelContrarian: 0, alignmentRate: 0 };
+  }
+
+  let modelAligned = 0;
+  let modelContrarian = 0;
+
+  for (const sm of recentSharp) {
+    const bets = await db
+      .select({ selectionName: paperBetsTable.selectionName })
+      .from(paperBetsTable)
+      .where(
+        and(
+          eq(paperBetsTable.matchId, sm.matchId),
+          eq(paperBetsTable.status, "pending"),
+        ),
+      );
+
+    if (bets.length === 0) continue;
+
+    const movePct = parseFloat(sm.movementPct ?? "0");
+    const sharpDirection = movePct > 0 ? sm.selectionName : null;
+
+    if (sharpDirection && bets.some((b) => b.selectionName === sharpDirection)) {
+      modelAligned++;
+    } else if (sharpDirection) {
+      modelContrarian++;
+    }
+  }
+
+  const total = modelAligned + modelContrarian;
+  const alignmentRate = total > 0 ? Math.round((modelAligned / total) * 100) : 0;
+
+  logger.info(
+    { totalSharp: recentSharp.length, modelAligned, modelContrarian, alignmentRate },
+    "Sharp movement analysis complete",
+  );
+
+  return { totalSharp: recentSharp.length, modelAligned, modelContrarian, alignmentRate };
 }

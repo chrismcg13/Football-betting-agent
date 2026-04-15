@@ -11,6 +11,9 @@ import {
   leagueEdgeScoresTable,
   oddspapiLeagueCoverageTable,
   oddspapiFixtureMapTable,
+  pinnacleOddsSnapshotsTable,
+  lineMovementsTable,
+  filteredBetsTable,
 } from "@workspace/db";
 import {
   eq,
@@ -1980,6 +1983,115 @@ router.get("/admin/coverage", async (_req, res) => {
   } catch (err) {
     logger.warn({ err }, "Coverage stats failed");
     res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─── Pinnacle Data Upgrade endpoints ──────────────────────────────────────────
+
+router.get("/dashboard/pinnacle-coverage", async (_req, res) => {
+  try {
+    const totalSettled = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(paperBetsTable)
+      .where(sql`${paperBetsTable.status} IN ('won', 'lost')`);
+
+    const withClv = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(paperBetsTable)
+      .where(and(sql`${paperBetsTable.status} IN ('won', 'lost')`, sql`${paperBetsTable.clvPct} IS NOT NULL`));
+
+    const withPinnacleClosing = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(paperBetsTable)
+      .where(and(sql`${paperBetsTable.status} IN ('won', 'lost')`, sql`${paperBetsTable.closingPinnacleOdds} IS NOT NULL`));
+
+    const byQuality = await db.execute(sql`
+      SELECT clv_data_quality, count(*)::int as count
+      FROM paper_bets
+      WHERE status IN ('won', 'lost')
+      GROUP BY clv_data_quality
+    `);
+
+    const snapshotCounts = await db
+      .select({
+        snapshotType: pinnacleOddsSnapshotsTable.snapshotType,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(pinnacleOddsSnapshotsTable)
+      .groupBy(pinnacleOddsSnapshotsTable.snapshotType);
+
+    const total = totalSettled[0]?.count ?? 0;
+    const clvCount = withClv[0]?.count ?? 0;
+    const pinnClosingCount = withPinnacleClosing[0]?.count ?? 0;
+
+    res.json({
+      settledBets: total,
+      withClv: clvCount,
+      withPinnacleClosing: pinnClosingCount,
+      clvCoveragePct: total > 0 ? Math.round((clvCount / total) * 100) : 0,
+      pinnacleCoveragePct: total > 0 ? Math.round((pinnClosingCount / total) * 100) : 0,
+      byDataQuality: byQuality,
+      snapshots: Object.fromEntries(snapshotCounts.map((s) => [s.snapshotType, s.count])),
+    });
+  } catch (err) {
+    logger.warn({ err }, "Pinnacle coverage endpoint failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/dashboard/filtered-bets", async (_req, res) => {
+  try {
+    const recent = await db
+      .select()
+      .from(filteredBetsTable)
+      .orderBy(desc(filteredBetsTable.createdAt))
+      .limit(50);
+
+    const summary = await db.execute(sql`
+      SELECT
+        filter_reason,
+        count(*)::int as total,
+        count(*) FILTER (WHERE actual_outcome = 'won')::int as would_have_won,
+        count(*) FILTER (WHERE actual_outcome = 'lost')::int as would_have_lost,
+        count(*) FILTER (WHERE actual_outcome IS NULL)::int as pending
+      FROM filtered_bets
+      GROUP BY filter_reason
+      ORDER BY total DESC
+    `);
+
+    res.json({ recent, summary });
+  } catch (err) {
+    logger.warn({ err }, "Filtered bets endpoint failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/dashboard/line-movements", async (_req, res) => {
+  try {
+    const recentSharp = await db
+      .select()
+      .from(lineMovementsTable)
+      .where(eq(lineMovementsTable.isSharpMovement, true))
+      .orderBy(desc(lineMovementsTable.capturedAt))
+      .limit(30);
+
+    const totalMovements = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(lineMovementsTable);
+
+    const sharpCount = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(lineMovementsTable)
+      .where(eq(lineMovementsTable.isSharpMovement, true));
+
+    res.json({
+      totalMovements: totalMovements[0]?.count ?? 0,
+      sharpMovements: sharpCount[0]?.count ?? 0,
+      recentSharp,
+    });
+  } catch (err) {
+    logger.warn({ err }, "Line movements endpoint failed");
+    res.status(500).json({ error: String(err) });
   }
 });
 
