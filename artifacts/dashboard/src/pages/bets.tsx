@@ -1,7 +1,7 @@
 import { Fragment, useState, useMemo } from "react";
-import { useBets, useBetsByLeague, useBetsByMarket } from "@/hooks/use-dashboard";
+import { useBets, useBetsByLeague, useBetsByMarket, useInPlayBets } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
-import { BetStatusBadge, OddsSourceBadge } from "@/components/layout";
+import { BetStatusBadge, OddsSourceBadge, LiveTierBadge } from "@/components/layout";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp } from "lucide-react";
@@ -131,9 +131,92 @@ function ExpandedReasoning({ bet }: { bet: any }) {
               <span className="text-slate-500 font-mono text-xs">Model: {bet.modelVersion}</span>
             )}
           </div>
+          {bet.betfairBetId && (
+            <div className="mt-3 pt-3 border-t flex flex-wrap gap-x-6 gap-y-2" style={{ borderColor: "#334155" }}>
+              <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Betfair Execution</span>
+              <span className="text-slate-300 text-xs">
+                Status: <span className="text-white font-semibold">
+                  {bet.betfairStatus === "EXECUTION_COMPLETE" ? "Fully Matched" : bet.betfairStatus === "EXECUTABLE" ? "Waiting for Match" : bet.betfairStatus === "CANCELLED" ? "Cancelled" : bet.betfairStatus ?? "—"}
+                </span>
+              </span>
+              {bet.betfairSizeMatched != null && (
+                <span className="text-slate-300 text-xs">
+                  Matched: <span className="text-white font-semibold font-mono">£{Number(bet.betfairSizeMatched).toFixed(2)}</span>
+                  {bet.stake && <span className="text-slate-500"> / £{Number(bet.stake).toFixed(2)}</span>}
+                </span>
+              )}
+              {bet.betfairAvgPriceMatched != null && (
+                <span className="text-slate-300 text-xs">
+                  Avg Price: <span className="text-white font-semibold font-mono">{Number(bet.betfairAvgPriceMatched).toFixed(2)}</span>
+                </span>
+              )}
+              {bet.betfairPnl != null && (
+                <span className="text-slate-300 text-xs">
+                  Betfair P&L: <span className={cn("font-semibold font-mono", Number(bet.betfairPnl) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                    {Number(bet.betfairPnl) >= 0 ? "+" : ""}£{Number(bet.betfairPnl).toFixed(2)}
+                  </span>
+                </span>
+              )}
+              <span className="text-slate-600 font-mono text-[10px]">ID: {bet.betfairBetId}</span>
+            </div>
+          )}
+          {bet.liveTier && (
+            <div className="mt-2">
+              <LiveTierBadge tier={bet.liveTier} />
+            </div>
+          )}
         </div>
       </td>
     </tr>
+  );
+}
+
+function InPlaySection() {
+  const { data: inPlayData } = useInPlayBets();
+  const bets = (inPlayData?.bets as any[]) ?? [];
+  if (bets.length === 0) return null;
+
+  return (
+    <div className="rounded-xl border overflow-hidden" style={{ background: "#1e293b", borderColor: "#334155" }}>
+      <div className="px-5 py-3 border-b flex items-center gap-3" style={{ borderColor: "#334155" }}>
+        <span className="relative flex h-2.5 w-2.5">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
+          <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500" />
+        </span>
+        <span className="text-sm font-semibold text-white">In-Play ({bets.length})</span>
+        <span className="text-xs text-slate-500">Matches currently being played</span>
+      </div>
+      <div className="divide-y" style={{ borderColor: "#334155" }}>
+        {bets.map((bet: any) => (
+          <div key={bet.id} className="px-5 py-3 hover:bg-slate-700/20 transition-colors flex items-center gap-4">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-white truncate">{bet.homeTeam} vs {bet.awayTeam}</span>
+                {bet.homeScore != null && bet.awayScore != null && (
+                  <span className="text-sm font-bold font-mono text-amber-400">{bet.homeScore} - {bet.awayScore}</span>
+                )}
+                <LiveTierBadge tier={bet.liveTier} />
+              </div>
+              <p className="text-[11px] text-slate-500 mt-0.5">
+                {bet.league} · <span className="text-blue-400">{formatMarketType(bet.marketType)}</span> · {bet.selectionName}
+              </p>
+            </div>
+            <div className="text-right shrink-0">
+              <p className="text-sm font-mono font-bold text-white">{bet.oddsAtPlacement?.toFixed(2)}</p>
+              <p className="text-xs text-slate-400 font-mono">{formatCurrency(bet.stake)}</p>
+            </div>
+            <div className="text-right shrink-0 w-16">
+              {bet.minutesInPlay != null && (
+                <p className="text-xs text-amber-400 font-mono">{bet.minutesInPlay}'</p>
+              )}
+              {bet.betfairStatus && (
+                <p className="text-[10px] text-slate-500">{bet.betfairStatus === "EXECUTION_COMPLETE" ? "Matched" : bet.betfairStatus === "EXECUTABLE" ? "Waiting" : bet.betfairStatus}</p>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -198,8 +281,11 @@ export default function Bets() {
     <div className="space-y-5 max-w-7xl mx-auto">
       <div>
         <h2 className="text-2xl font-bold text-white tracking-tight">Bet History</h2>
-        <p className="text-sm text-slate-500 mt-1">Full log of all paper bets with AI reasoning.</p>
+        <p className="text-sm text-slate-500 mt-1">Full log of all bets with AI reasoning and execution details.</p>
       </div>
+
+      {/* In-Play Section */}
+      <InPlaySection />
 
       {/* Filter Bar */}
       <div

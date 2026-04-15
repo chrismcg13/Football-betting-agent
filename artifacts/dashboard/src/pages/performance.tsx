@@ -1,747 +1,363 @@
-import { useState, useMemo } from "react";
-import { usePerformance, useBetsByLeague, useBetsByMarket, useModel, useBets, useClvStats, useLeagueEdgeScores } from "@/hooks/use-dashboard";
-import { formatCurrency, formatMarketType } from "@/lib/format";
-import { Skeleton } from "@/components/ui/skeleton";
+import { useMemo } from "react";
+import {
+  usePerformance, useSummary, useClvStats, useBetsByLeague, useBetsByMarket,
+  useExecutionMetrics, useLiveTierStats, useModelHealth,
+} from "@/hooks/use-dashboard";
+import { formatCurrency } from "@/lib/format";
+import { InfoTooltip } from "@/components/layout";
 import { cn } from "@/lib/utils";
 import {
-  Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, LineChart,
-  ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis, ZAxis,
+  Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer,
+  Tooltip as RechartsTooltip, XAxis, YAxis, ReferenceLine, Cell,
 } from "recharts";
 
-const TT = {
-  contentStyle: {
-    background: "#0f172a",
-    border: "1px solid #334155",
-    borderRadius: "8px",
-    fontSize: "12px",
-    color: "#e2e8f0",
-  },
+const TOOLTIP_STYLE = {
+  contentStyle: { background: "#0f172a", border: "1px solid #334155", borderRadius: "8px", fontSize: "12px", color: "#e2e8f0" },
   itemStyle: { color: "#94a3b8" },
   labelStyle: { color: "#64748b", fontWeight: 600 },
 };
 
-const AXIS = { stroke: "#475569", fontSize: 10, tickLine: false, axisLine: false };
-const GRID = { strokeDasharray: "3 3", stroke: "#1e3a5f", vertical: false as const };
-
-const DATE_RANGES = [
-  { label: "7d", days: 7 },
-  { label: "14d", days: 14 },
-  { label: "30d", days: 30 },
-  { label: "All", days: 9999 },
-];
-
-function Card({ children, className }: { children: React.ReactNode; className?: string }) {
+function StatCard({ label, value, sub, color, tooltip }: {
+  label: string; value: React.ReactNode; sub?: React.ReactNode;
+  color?: "green" | "red" | "amber" | "default"; tooltip?: string;
+}) {
+  const valueColor = color === "green" ? "text-emerald-400" : color === "red" ? "text-red-400" : color === "amber" ? "text-amber-400" : "text-white";
   return (
-    <div
-      className={cn("rounded-xl border", className)}
-      style={{ background: "#1e293b", borderColor: "#334155" }}
-    >
-      {children}
+    <div className="rounded-xl p-4 border flex flex-col gap-1.5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+      <p className="text-[10px] font-semibold uppercase tracking-widest text-slate-500 flex items-center">
+        {label}
+        {tooltip && <InfoTooltip text={tooltip} />}
+      </p>
+      <p className={cn("text-2xl font-bold font-mono leading-none", valueColor)}>{value}</p>
+      {sub && <p className="text-xs text-slate-500 leading-snug">{sub}</p>}
     </div>
-  );
-}
-
-function CardHead({ title, sub, right }: { title: string; sub?: string; right?: React.ReactNode }) {
-  return (
-    <div className="px-5 py-4 border-b flex items-center justify-between" style={{ borderColor: "#334155" }}>
-      <div>
-        <p className="text-sm font-semibold text-white">{title}</p>
-        {sub && <p className="text-xs text-slate-500 mt-0.5">{sub}</p>}
-      </div>
-      {right}
-    </div>
-  );
-}
-
-function DateRangeBtn({ value, onChange }: { value: number; onChange: (d: number) => void }) {
-  return (
-    <div className="flex items-center gap-0.5 rounded-lg p-0.5" style={{ background: "#0f172a" }}>
-      {DATE_RANGES.map(({ label, days }) => (
-        <button
-          key={days}
-          onClick={() => onChange(days)}
-          data-testid={`btn-range-${label}`}
-          className={cn(
-            "text-xs px-3 py-1.5 rounded-md font-medium transition-all",
-            value === days
-              ? "bg-blue-600 text-white"
-              : "text-slate-500 hover:text-slate-300",
-          )}
-        >
-          {label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function HorizBarChart({ data, xKey, valueKey }: { data: any[]; xKey: string; valueKey: string }) {
-  return (
-    <ResponsiveContainer width="100%" height="100%">
-      <BarChart data={data} layout="vertical" margin={{ top: 4, right: 16, left: 0, bottom: 4 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" horizontal={false} />
-        <XAxis type="number" {...AXIS} tickFormatter={(v) => `${v}%`} domain={["auto", "auto"]} />
-        <YAxis
-          type="category"
-          dataKey={xKey}
-          {...AXIS}
-          width={120}
-          tick={{ fontSize: 11, fill: "#94a3b8" }}
-        />
-        <Tooltip
-          {...TT}
-          formatter={(v: number) => [`${v.toFixed(1)}%`, "ROI"]}
-          cursor={{ fill: "rgba(255,255,255,0.03)" }}
-        />
-        <Bar dataKey={valueKey} radius={[0, 4, 4, 0]}>
-          {data.map((entry: any, idx: number) => (
-            <Cell
-              key={`cell-${idx}`}
-              fill={entry[valueKey] >= 0 ? "#10b981" : "#ef4444"}
-              fillOpacity={0.85}
-            />
-          ))}
-        </Bar>
-      </BarChart>
-    </ResponsiveContainer>
   );
 }
 
 export default function Performance() {
-  const [dateRange, setDateRange] = useState(30);
-  const { data: perfData, isLoading: perfLoading } = usePerformance();
-  const { data: byLeague, isLoading: leagueLoading } = useBetsByLeague();
-  const { data: byMarket, isLoading: marketLoading } = useBetsByMarket();
-  const { data: modelData, isLoading: modelLoading } = useModel();
-  const { data: allBetsData } = useBets(1, 200, "all");
-  const { data: clvData } = useClvStats();
-  const { data: leagueEdgeData } = useLeagueEdgeScores();
+  const { data: summary, isLoading: loadingSummary } = useSummary();
+  const { data: perfData, isLoading: loadingPerf } = usePerformance();
+  const { data: clvStats } = useClvStats();
+  const { data: leagueData } = useBetsByLeague();
+  const { data: marketData } = useBetsByMarket();
+  const { data: execMetrics } = useExecutionMetrics();
+  const { data: tierStats } = useLiveTierStats();
+  const { data: modelHealth } = useModelHealth();
+
+  const pnl = summary?.totalPnl ?? 0;
+  const roi = summary?.overallRoiPct ?? 0;
+  const wins = summary?.wins ?? 0;
+  const losses = summary?.losses ?? 0;
+  const settledBets = (summary as any)?.settledBets ?? 0;
+  const avgClv = (clvStats as any)?.count > 0 ? Number((clvStats as any).avgClv) : null;
 
   const chartData = useMemo(() => {
     const arr = (perfData?.cumulativeProfit as any[]) ?? [];
-    if (dateRange >= 9999) return arr;
-    return arr.slice(Math.max(0, arr.length - dateRange));
-  }, [perfData, dateRange]);
+    const sliced = arr.slice(-90);
+    if (sliced.length === 0) return [];
+    return [{ date: sliced[0].date, cumPnl: 0 }, ...sliced];
+  }, [perfData]);
 
-  const isProfit = useMemo(() => {
-    if (chartData.length === 0) return true;
-    return (chartData[chartData.length - 1]?.cumPnl ?? 0) >= 0;
-  }, [chartData]);
+  const currentPnl = chartData.length > 1 ? (chartData[chartData.length - 1]?.cumPnl ?? 0) : 0;
+  const isChartPositive = currentPnl >= 0;
 
-  const weeklyWin = useMemo(
-    () => ((perfData?.weeklyWinRate as any[]) ?? []).map((w: any) => ({ ...w, winRatePct: w.winRate })),
-    [perfData],
-  );
-
-  const accuracyHistory = useMemo(
-    () =>
-      ((modelData?.accuracyHistory as any[]) ?? []).map((h: any) => ({
-        label: h.version?.slice(0, 14) ?? "",
-        accuracy: h.accuracy != null ? Math.round(h.accuracy * 1000) / 10 : null,
-        calibration: h.calibration,
-      })),
-    [modelData],
-  );
-
-  const leagueROI = useMemo(() => [...((byLeague as any[]) ?? [])].sort((a, b) => b.roi - a.roi), [byLeague]);
-  const marketROI = useMemo(
-    () => [...((byMarket as any[]) ?? [])].sort((a, b) => b.roi - a.roi).map((m: any) => ({
-      ...m,
-      marketLabel: formatMarketType(m.marketType),
-    })),
-    [byMarket],
-  );
-
-  const statsTable = useMemo(() => {
-    const rows: any[] = [];
-    for (const l of (byLeague as any[]) ?? []) {
-      rows.push({
-        segment: l.league, type: "League",
-        count: l.count, wins: l.wins, losses: l.losses,
-        winPct: l.wins + l.losses > 0 ? (l.wins / (l.wins + l.losses)) * 100 : 0,
-        roi: l.roi, totalPnl: l.totalPnl,
-      });
-    }
-    for (const m of (byMarket as any[]) ?? []) {
-      rows.push({
-        segment: formatMarketType(m.marketType), type: "Market",
-        count: m.count, wins: m.wins, losses: m.losses,
-        winPct: m.wins + m.losses > 0 ? (m.wins / (m.wins + m.losses)) * 100 : 0,
-        roi: m.roi, totalPnl: m.totalPnl,
-      });
-    }
-    return rows.sort((a, b) => b.roi - a.roi);
-  }, [byLeague, byMarket]);
-
-  const scatterData = useMemo(() => {
-    const bets = (allBetsData?.bets as any[]) ?? [];
-    return bets
-      .filter((b: any) => b.opportunityScore != null && b.settlementPnl != null && (b.status === "won" || b.status === "lost"))
-      .map((b: any) => ({
-        score: Number(b.opportunityScore),
-        pnl: Number(b.settlementPnl),
-        status: b.status,
-        label: `${b.homeTeam} vs ${b.awayTeam}`,
+  const leagueChartData = useMemo(() => {
+    const leagues = (leagueData?.leagues as any[]) ?? [];
+    return leagues
+      .filter((l: any) => l.settled > 0)
+      .sort((a: any, b: any) => Number(b.pnl) - Number(a.pnl))
+      .slice(0, 10)
+      .map((l: any) => ({
+        name: l.league?.split(" - ").pop() ?? l.league,
+        pnl: Number(l.pnl),
+        roi: Number(l.roi),
+        bets: l.settled,
       }));
-  }, [allBetsData]);
+  }, [leagueData]);
 
-  const scatterWon = useMemo(() => scatterData.filter((d) => d.status === "won"), [scatterData]);
-  const scatterLost = useMemo(() => scatterData.filter((d) => d.status === "lost"), [scatterData]);
+  const marketChartData = useMemo(() => {
+    const markets = (marketData?.markets as any[]) ?? [];
+    return markets
+      .filter((m: any) => m.settled > 0)
+      .sort((a: any, b: any) => Number(b.pnl) - Number(a.pnl))
+      .map((m: any) => ({
+        name: m.marketType?.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase()) ?? m.marketType,
+        pnl: Number(m.pnl),
+        roi: Number(m.roi),
+        bets: m.settled,
+      }));
+  }, [marketData]);
 
-  if (perfLoading) {
-    return (
-      <div className="space-y-6 max-w-7xl mx-auto">
-        <Skeleton className="h-8 w-64" />
-        <Skeleton className="h-[420px] w-full rounded-xl" />
-        <div className="grid grid-cols-2 gap-6">
-          <Skeleton className="h-[300px] rounded-xl" />
-          <Skeleton className="h-[300px] rounded-xl" />
-        </div>
-      </div>
-    );
-  }
+  const tier1Stats = tierStats?.tiers?.tier1_real;
+  const tier2Stats = tierStats?.tiers?.tier2_paper;
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
       <div>
-        <h2 className="text-2xl font-bold text-white tracking-tight">Performance Analytics</h2>
-        <p className="text-sm text-slate-500 mt-1">Historical returns, edge analysis, and model health.</p>
+        <h2 className="text-2xl font-bold text-white tracking-tight">Live Performance</h2>
+        <p className="text-sm text-slate-500 mt-1">
+          Real-time P&L, execution quality, and model health
+        </p>
       </div>
 
-      {/* Cumulative P&L */}
-      <Card>
-        <CardHead
-          title="Cumulative P&L"
-          sub="Net profit after 2% Betfair commission"
-          right={<DateRangeBtn value={dateRange} onChange={setDateRange} />}
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+        <StatCard
+          label="Total P&L" value={loadingSummary ? "—" : formatCurrency(pnl)}
+          sub={`${settledBets} settled bets`}
+          color={!loadingSummary ? (pnl >= 0 ? "green" : "red") : "default"}
         />
-        <div className="p-5">
-          {chartData.length < 2 ? (
-            <div className="h-80 flex items-center justify-center text-sm text-slate-500">
-              Not enough data yet
+        <StatCard
+          label="ROI" value={loadingSummary ? "—" : `${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%`}
+          sub="Return on stakes"
+          color={!loadingSummary ? (roi >= 0 ? "green" : "red") : "default"}
+          tooltip="Return on Investment: your net profit divided by total amount staked. Positive means you're making money."
+        />
+        <StatCard
+          label="CLV" value={avgClv != null ? `${avgClv >= 0 ? "+" : ""}${avgClv.toFixed(2)}%` : "—"}
+          sub={(clvStats as any)?.count > 0 ? `${(clvStats as any).count} scored` : "Closing line value"}
+          color={avgClv != null ? (avgClv >= 2 ? "green" : avgClv >= 0 ? "amber" : "red") : "default"}
+          tooltip="Closing Line Value: measures if you got better odds than the market closing price. +2% is considered elite."
+        />
+        <StatCard
+          label="Win Rate" value={loadingSummary ? "—" : `${(summary?.winPercentage ?? 0).toFixed(1)}%`}
+          sub={`${wins}W – ${losses}L`}
+          color={!loadingSummary ? ((summary?.winPercentage ?? 0) >= 50 ? "green" : "amber") : "default"}
+        />
+        <StatCard
+          label="Today" value={loadingSummary ? "—" : formatCurrency(summary?.todayPnl ?? 0)}
+          sub={`This week: ${formatCurrency((summary as any)?.thisWeekPnl ?? 0)}`}
+          color={!loadingSummary ? ((summary?.todayPnl ?? 0) >= 0 ? "green" : "red") : "default"}
+        />
+      </div>
+
+      {tierStats && (tier1Stats || tier2Stats) && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {tier1Stats && (
+            <div className="rounded-xl border p-5" style={{ background: "#052e16", borderColor: "#166534" }}>
+              <p className="text-sm font-semibold text-emerald-300 mb-3">Tier 1 — Real Money</p>
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <p className="text-[10px] text-emerald-500/60 uppercase font-semibold">P&L</p>
+                  <p className={cn("text-lg font-bold font-mono", tier1Stats.pnl >= 0 ? "text-emerald-400" : "text-red-400")}>
+                    {formatCurrency(tier1Stats.pnl)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-emerald-500/60 uppercase font-semibold">ROI</p>
+                  <p className={cn("text-lg font-bold font-mono", tier1Stats.roi >= 0 ? "text-emerald-400" : "text-red-400")}>
+                    {tier1Stats.roi >= 0 ? "+" : ""}{tier1Stats.roi.toFixed(1)}%
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-emerald-500/60 uppercase font-semibold">Bets</p>
+                  <p className="text-lg font-bold font-mono text-emerald-300">{tier1Stats.settled} / {tier1Stats.total}</p>
+                </div>
+              </div>
+              {tier1Stats.avgClv != null && (
+                <p className="text-xs text-emerald-500/70 mt-2">CLV: {tier1Stats.avgClv >= 0 ? "+" : ""}{tier1Stats.avgClv.toFixed(2)}%</p>
+              )}
             </div>
-          ) : (
-            <div className="h-80">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chartData} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="perfGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.3} />
-                      <stop offset="95%" stopColor={isProfit ? "#10b981" : "#ef4444"} stopOpacity={0.02} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid {...GRID} />
-                  <XAxis
-                    dataKey="date"
-                    {...AXIS}
-                    tickFormatter={(v) =>
-                      new Date(v).toLocaleDateString("en-GB", { month: "short", day: "numeric" })
-                    }
-                  />
-                  <YAxis {...AXIS} tickFormatter={(v) => `£${v}`} width={52} />
-                  <Tooltip
-                    {...TT}
-                    formatter={(v: number) => [formatCurrency(v), "Cumulative P&L"]}
-                    labelFormatter={(l) =>
-                      new Date(l).toLocaleDateString("en-GB", { dateStyle: "long" })
-                    }
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="cumPnl"
-                    stroke={isProfit ? "#10b981" : "#ef4444"}
-                    strokeWidth={2.5}
-                    fill="url(#perfGrad)"
-                    dot={false}
-                    activeDot={{ r: 5, fill: isProfit ? "#10b981" : "#ef4444" }}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
+          )}
+          {tier2Stats && (
+            <div className="rounded-xl border p-5" style={{ background: "#1e1b4b", borderColor: "#4c1d95" }}>
+              <p className="text-sm font-semibold text-violet-300 mb-3">Tier 2 — Paper (Experiments)</p>
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <p className="text-[10px] text-violet-500/60 uppercase font-semibold">P&L</p>
+                  <p className={cn("text-lg font-bold font-mono", tier2Stats.pnl >= 0 ? "text-violet-400" : "text-red-400")}>
+                    {formatCurrency(tier2Stats.pnl)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-violet-500/60 uppercase font-semibold">ROI</p>
+                  <p className={cn("text-lg font-bold font-mono", tier2Stats.roi >= 0 ? "text-violet-400" : "text-red-400")}>
+                    {tier2Stats.roi >= 0 ? "+" : ""}{tier2Stats.roi.toFixed(1)}%
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-violet-500/60 uppercase font-semibold">Bets</p>
+                  <p className="text-lg font-bold font-mono text-violet-300">{tier2Stats.settled} / {tier2Stats.total}</p>
+                </div>
+              </div>
             </div>
           )}
         </div>
-      </Card>
+      )}
 
-      {/* ROI charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card>
-          <CardHead title="ROI by League" sub="Return on investment per competition" />
-          <div className="p-5">
-            {leagueLoading ? <Skeleton className="h-56 w-full" /> : (
-              <div className="h-56">
-                {leagueROI.length === 0
-                  ? <p className="h-full flex items-center justify-center text-sm text-slate-500">No data yet</p>
-                  : <HorizBarChart data={leagueROI} xKey="league" valueKey="roi" />}
-              </div>
-            )}
+      <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+        <div className="mb-4">
+          <h3 className="text-sm font-semibold text-white">P&L Over Time</h3>
+          <p className="text-xs text-slate-500 mt-0.5">Cumulative profit from all settled bets (last 90 days)</p>
+        </div>
+        {loadingPerf ? (
+          <div className="h-64 rounded-lg animate-pulse" style={{ background: "#0f172a" }} />
+        ) : chartData.length < 2 ? (
+          <div className="h-64 flex items-center justify-center text-sm text-slate-500">
+            No settled bets yet — chart appears after first settlement.
           </div>
-        </Card>
-
-        <Card>
-          <CardHead title="ROI by Market Type" sub="Return on investment per market" />
-          <div className="p-5">
-            {marketLoading ? <Skeleton className="h-56 w-full" /> : (
-              <div className="h-56">
-                {marketROI.length === 0
-                  ? <p className="h-full flex items-center justify-center text-sm text-slate-500">No data yet</p>
-                  : <HorizBarChart data={marketROI} xKey="marketLabel" valueKey="roi" />}
-              </div>
-            )}
+        ) : (
+          <div className="h-64">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="perfGradPos" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.35} />
+                    <stop offset="95%" stopColor="#10b981" stopOpacity={0.03} />
+                  </linearGradient>
+                  <linearGradient id="perfGradNeg" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#ef4444" stopOpacity={0.03} />
+                    <stop offset="95%" stopColor="#ef4444" stopOpacity={0.35} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" vertical={false} />
+                <ReferenceLine y={0} stroke="#475569" strokeDasharray="4 4" />
+                <XAxis dataKey="date" stroke="#475569" fontSize={10} tickLine={false} axisLine={false}
+                  tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", { month: "short", day: "numeric" })} />
+                <YAxis stroke="#475569" fontSize={10} tickLine={false} axisLine={false}
+                  tickFormatter={(v) => `£${v}`} width={50} />
+                <RechartsTooltip {...TOOLTIP_STYLE}
+                  formatter={(v: number) => [formatCurrency(v), "Cumulative P&L"]}
+                  labelFormatter={(l) => new Date(l).toLocaleDateString("en-GB", { dateStyle: "long" })} />
+                <Area type="monotone" dataKey="cumPnl"
+                  stroke={isChartPositive ? "#10b981" : "#ef4444"} strokeWidth={2}
+                  fill={isChartPositive ? "url(#perfGradPos)" : "url(#perfGradNeg)"}
+                  dot={false} activeDot={{ r: 4 }} />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
-        </Card>
+        )}
       </div>
 
-      {/* Win rate + Model accuracy */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card>
-          <CardHead title="Weekly Win Rate" sub="Win percentage by week" />
-          <div className="p-5">
-            <div className="h-56">
-              {weeklyWin.length < 2 ? (
-                <div className="h-full flex items-center justify-center text-sm text-slate-500">
-                  Needs more settled bets
-                </div>
-              ) : (
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={weeklyWin} margin={{ top: 8, right: 8, left: 0, bottom: 24 }}>
-                    <CartesianGrid {...GRID} />
-                    <XAxis
-                      dataKey="week"
-                      {...AXIS}
-                      tick={{ fontSize: 10, fill: "#64748b" }}
-                      angle={-30}
-                      textAnchor="end"
-                      height={40}
-                    />
-                    <YAxis {...AXIS} tickFormatter={(v) => `${v}%`} domain={[0, 100]} width={44} />
-                    <Tooltip
-                      {...TT}
-                      formatter={(v: number, name: string) => [
-                        name === "winRatePct" ? `${v.toFixed(1)}%` : v,
-                        name === "winRatePct" ? "Win Rate" : "Bets",
-                      ]}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="winRatePct"
-                      stroke="#10b981"
-                      strokeWidth={2.5}
-                      dot={{ r: 3, fill: "#10b981" }}
-                      activeDot={{ r: 5 }}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="bets"
-                      stroke="#475569"
-                      strokeWidth={1.5}
-                      strokeDasharray="4 3"
-                      dot={false}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              )}
-            </div>
-            <p className="text-xs text-slate-600 mt-2">Solid green = win rate (%) · dashed = bet count</p>
+        <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <div className="mb-4">
+            <h3 className="text-sm font-semibold text-white">P&L by League</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Top 10 leagues by profit</p>
           </div>
-        </Card>
-
-        <Card>
-          <CardHead title="Model Accuracy over Time" sub="Accuracy across retraining cycles" />
-          <div className="p-5">
-            {modelLoading ? (
-              <Skeleton className="h-56 w-full" />
-            ) : accuracyHistory.length < 2 ? (
-              <div className="h-56 flex items-center justify-center text-sm text-slate-500">
-                Model needs more retraining cycles
-              </div>
-            ) : (
-              <div className="h-56">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={accuracyHistory} margin={{ top: 8, right: 8, left: 0, bottom: 24 }}>
-                    <CartesianGrid {...GRID} />
-                    <XAxis
-                      dataKey="label"
-                      {...AXIS}
-                      tick={{ fontSize: 9, fill: "#64748b" }}
-                      angle={-20}
-                      textAnchor="end"
-                      height={40}
-                    />
-                    <YAxis {...AXIS} tickFormatter={(v) => `${v}%`} domain={[0, 100]} width={44} />
-                    <Tooltip
-                      {...TT}
-                      formatter={(v: number, name: string) => [
-                        `${v.toFixed(1)}%`,
-                        name === "accuracy" ? "Accuracy" : "Calibration",
-                      ]}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="accuracy"
-                      stroke="#3b82f6"
-                      strokeWidth={2.5}
-                      dot={{ r: 4, fill: "#3b82f6" }}
-                      activeDot={{ r: 6 }}
-                      connectNulls
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="calibration"
-                      stroke="#a78bfa"
-                      strokeWidth={1.5}
-                      strokeDasharray="4 3"
-                      dot={{ r: 3, fill: "#a78bfa" }}
-                      connectNulls
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-            <p className="text-xs text-slate-600 mt-2">Solid blue = accuracy · dashed purple = calibration</p>
-          </div>
-        </Card>
-      </div>
-
-      {/* Opportunity Score vs P&L Scatter */}
-      <Card>
-        <CardHead
-          title="Opportunity Score vs Outcome"
-          sub="Does a higher score actually predict wins? Each dot is a settled bet."
-        />
-        <div className="p-5">
-          {scatterData.length < 3 ? (
-            <div className="h-64 flex items-center justify-center text-sm text-slate-500">
-              Not enough scored bets to display — this chart populates as bets settle.
-            </div>
+          {leagueChartData.length === 0 ? (
+            <div className="h-48 flex items-center justify-center text-sm text-slate-500">No settled league data yet.</div>
           ) : (
             <div className="h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <ScatterChart margin={{ top: 8, right: 16, left: 4, bottom: 0 }}>
-                  <CartesianGrid {...GRID} />
-                  <XAxis
-                    type="number"
-                    dataKey="score"
-                    domain={[55, 100]}
-                    {...AXIS}
-                    label={{ value: "Opportunity Score", position: "insideBottom", offset: -2, fontSize: 10, fill: "#64748b" }}
-                  />
-                  <YAxis
-                    type="number"
-                    dataKey="pnl"
-                    {...AXIS}
-                    width={52}
-                    tickFormatter={(v) => `£${v}`}
-                  />
-                  <ZAxis range={[40, 40]} />
-                  <Tooltip
-                    {...TT}
-                    content={({ payload }: any) => {
-                      if (!payload?.length) return null;
-                      const d = payload[0]?.payload;
-                      return (
-                        <div style={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
-                          <p style={{ color: "#94a3b8", marginBottom: 4 }}>{d.label}</p>
-                          <p>Score: <span style={{ color: "#a78bfa", fontWeight: 700 }}>{d.score}</span></p>
-                          <p>P&L: <span style={{ color: d.pnl >= 0 ? "#10b981" : "#ef4444", fontWeight: 700 }}>£{d.pnl.toFixed(2)}</span></p>
-                        </div>
-                      );
-                    }}
-                  />
-                  {scatterWon.length > 0 && (
-                    <Scatter name="Won" data={scatterWon} fill="#10b981" fillOpacity={0.7} />
-                  )}
-                  {scatterLost.length > 0 && (
-                    <Scatter name="Lost" data={scatterLost} fill="#ef4444" fillOpacity={0.5} />
-                  )}
-                </ScatterChart>
+                <BarChart data={leagueChartData} layout="vertical" margin={{ top: 0, right: 10, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" horizontal={false} />
+                  <XAxis type="number" stroke="#475569" fontSize={10} tickLine={false} axisLine={false}
+                    tickFormatter={(v) => `£${v}`} />
+                  <YAxis type="category" dataKey="name" stroke="#475569" fontSize={10} tickLine={false}
+                    axisLine={false} width={100} />
+                  <RechartsTooltip {...TOOLTIP_STYLE}
+                    formatter={(v: number) => [formatCurrency(v), "P&L"]} />
+                  <Bar dataKey="pnl" radius={[0, 4, 4, 0]}>
+                    {leagueChartData.map((entry, idx) => (
+                      <Cell key={idx} fill={entry.pnl >= 0 ? "#10b981" : "#ef4444"} />
+                    ))}
+                  </Bar>
+                </BarChart>
               </ResponsiveContainer>
-              <div className="flex items-center gap-4 justify-center mt-2">
-                <span className="flex items-center gap-1.5 text-xs text-slate-400">
-                  <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: "#10b981" }} />
-                  Won ({scatterWon.length})
-                </span>
-                <span className="flex items-center gap-1.5 text-xs text-slate-400">
-                  <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: "#ef4444" }} />
-                  Lost ({scatterLost.length})
-                </span>
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <div className="mb-4">
+            <h3 className="text-sm font-semibold text-white">P&L by Market Type</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Performance across different bet types</p>
+          </div>
+          {marketChartData.length === 0 ? (
+            <div className="h-48 flex items-center justify-center text-sm text-slate-500">No settled market data yet.</div>
+          ) : (
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={marketChartData} layout="vertical" margin={{ top: 0, right: 10, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e3a5f" horizontal={false} />
+                  <XAxis type="number" stroke="#475569" fontSize={10} tickLine={false} axisLine={false}
+                    tickFormatter={(v) => `£${v}`} />
+                  <YAxis type="category" dataKey="name" stroke="#475569" fontSize={10} tickLine={false}
+                    axisLine={false} width={110} />
+                  <RechartsTooltip {...TOOLTIP_STYLE}
+                    formatter={(v: number) => [formatCurrency(v), "P&L"]} />
+                  <Bar dataKey="pnl" radius={[0, 4, 4, 0]}>
+                    {marketChartData.map((entry, idx) => (
+                      <Cell key={idx} fill={entry.pnl >= 0 ? "#3b82f6" : "#ef4444"} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {execMetrics && execMetrics.fillRate?.livePlaced > 0 && (
+        <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <h3 className="text-sm font-semibold text-white mb-4">Execution Quality</h3>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Live Orders</p>
+              <p className="text-xl font-bold font-mono text-white">{execMetrics.fillRate.livePlaced}</p>
+              <p className="text-[10px] text-slate-600">{execMetrics.fillRate.placed24h} in last 24h</p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Fill Rate</p>
+              <p className={cn("text-xl font-bold font-mono",
+                (execMetrics.fillRate.avgFillPct ?? 0) >= 90 ? "text-emerald-400" :
+                (execMetrics.fillRate.avgFillPct ?? 0) >= 70 ? "text-amber-400" : "text-red-400")}>
+                {execMetrics.fillRate.avgFillPct ?? "—"}%
+              </p>
+              <p className="text-[10px] text-slate-600">{execMetrics.fillRate.cancelled} cancelled</p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Signal Speed</p>
+              <p className="text-xl font-bold font-mono text-white">
+                {execMetrics.timing.avgSignalToPlaceSecs != null ? `${execMetrics.timing.avgSignalToPlaceSecs}s` : "—"}
+              </p>
+              <p className="text-[10px] text-slate-600">Signal to placement</p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">VPS Relay</p>
+              <p className={cn("text-xl font-bold font-mono",
+                execMetrics.relay.healthy ? "text-emerald-400" : execMetrics.relay.configured ? "text-red-400" : "text-slate-400")}>
+                {execMetrics.relay.configured ? (execMetrics.relay.healthy ? "Online" : "Offline") : "N/A"}
+              </p>
+              {execMetrics.relay.lastLatencyMs != null && (
+                <p className="text-[10px] text-slate-600">{execMetrics.relay.lastLatencyMs}ms latency</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modelHealth && (
+        <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <h3 className="text-sm font-semibold text-white mb-4">Model Health</h3>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            {(modelHealth as any).metrics && Object.entries((modelHealth as any).metrics).slice(0, 8).map(([key, val]: [string, any]) => (
+              <div key={key} className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+                <p className="text-[10px] text-slate-500 uppercase font-semibold">
+                  {key.replace(/([A-Z])/g, " $1").replace(/^./, s => s.toUpperCase()).trim()}
+                </p>
+                <p className={cn("text-lg font-bold font-mono",
+                  val?.status === "good" ? "text-emerald-400" :
+                  val?.status === "warning" ? "text-amber-400" :
+                  val?.status === "critical" ? "text-red-400" : "text-white")}>
+                  {typeof val === "object" ? (val?.value ?? val?.score ?? "—") : String(val)}
+                </p>
+              </div>
+            ))}
+          </div>
+          {(modelHealth as any).flags && (modelHealth as any).flags.length > 0 && (
+            <div className="mt-3 pt-3 border-t" style={{ borderColor: "#334155" }}>
+              <p className="text-xs text-slate-500 mb-2">Issues detected:</p>
+              <div className="space-y-1">
+                {(modelHealth as any).flags.map((flag: any, i: number) => (
+                  <p key={i} className="text-xs text-amber-400">
+                    {typeof flag === "string" ? flag : flag.message ?? JSON.stringify(flag)}
+                  </p>
+                ))}
               </div>
             </div>
           )}
         </div>
-      </Card>
-
-      {/* Segment Table */}
-      <Card>
-        <CardHead
-          title="Edge Analysis by Segment"
-          sub="Where is the agent finding value? Sorted by ROI."
-        />
-        <div className="overflow-x-auto">
-          {leagueLoading || marketLoading ? (
-            <div className="p-5 space-y-3">
-              {[...Array(6)].map((_, i) => <Skeleton key={i} className="h-9 w-full" />)}
-            </div>
-          ) : (
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b" style={{ borderColor: "#334155" }}>
-                  {["Segment", "Type", "Bets", "Wins", "Losses", "Win%", "ROI%", "Total P&L"].map((h, i) => (
-                    <th
-                      key={h}
-                      className={cn(
-                        "py-3 text-[11px] uppercase tracking-wider text-slate-500 font-semibold",
-                        i === 0 ? "text-left pl-5" : i >= 2 ? "text-right pr-5" : "text-left px-3",
-                      )}
-                    >
-                      {h}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {statsTable.length === 0 ? (
-                  <tr>
-                    <td colSpan={8} className="py-10 text-center text-sm text-slate-500">
-                      No settled bets yet
-                    </td>
-                  </tr>
-                ) : (
-                  statsTable.map((row, i) => (
-                    <tr
-                      key={i}
-                      className="border-b transition-colors hover:bg-slate-800/20"
-                      style={{ borderColor: "#1e3a5f" }}
-                    >
-                      <td className="py-3 pl-5 font-medium text-white">{row.segment}</td>
-                      <td className="py-3 px-3">
-                        <span
-                          className={cn(
-                            "text-[10px] font-mono px-2 py-0.5 rounded",
-                            row.type === "League"
-                              ? "bg-blue-950 text-blue-400 border border-blue-800"
-                              : "bg-purple-950 text-purple-400 border border-purple-800",
-                          )}
-                        >
-                          {row.type}
-                        </span>
-                      </td>
-                      <td className="py-3 text-right pr-5 font-mono text-slate-300">{row.count}</td>
-                      <td className="py-3 text-right pr-5 font-mono text-emerald-400">{row.wins}</td>
-                      <td className="py-3 text-right pr-5 font-mono text-red-400">{row.losses}</td>
-                      <td className="py-3 text-right pr-5 font-mono">
-                        <span className={row.winPct >= 50 ? "text-emerald-400" : "text-red-400"}>
-                          {row.winPct.toFixed(1)}%
-                        </span>
-                      </td>
-                      <td className="py-3 text-right pr-5 font-mono font-semibold">
-                        <span className={row.roi >= 0 ? "text-emerald-400" : "text-red-400"}>
-                          {row.roi >= 0 ? "+" : ""}{row.roi.toFixed(1)}%
-                        </span>
-                      </td>
-                      <td className="py-3 text-right pr-5 font-mono">
-                        <span className={row.totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}>
-                          {row.totalPnl >= 0 ? "+" : ""}{formatCurrency(row.totalPnl)}
-                        </span>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </Card>
-
-      {/* CLV Trend Chart */}
-      {((clvData as any)?.trend ?? []).length >= 2 && (
-        <Card>
-          <CardHead
-            title="Closing Line Value (CLV) Trend"
-            sub={`Avg CLV: ${Number((clvData as any).avgClv) >= 0 ? "+" : ""}${Number((clvData as any).avgClv ?? 0).toFixed(2)}% over ${(clvData as any).count} scored bets (${(clvData as any).totalSettled ?? (clvData as any).count} settled total)`}
-          />
-          <div className="p-5">
-            <div className="h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={(clvData as any).trend} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-                  <CartesianGrid {...GRID} />
-                  <XAxis dataKey="date" {...AXIS} tick={{ fill: "#475569", fontSize: 10 }} />
-                  <YAxis {...AXIS} tick={{ fill: "#475569", fontSize: 10 }} tickFormatter={(v) => `${v > 0 ? "+" : ""}${v.toFixed(1)}%`} />
-                  <Tooltip
-                    {...TT}
-                    formatter={(v: number) => [`${v >= 0 ? "+" : ""}${v.toFixed(2)}%`, "CLV"]}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="clv"
-                    stroke="#7c3aed"
-                    strokeWidth={2}
-                    dot={false}
-                    activeDot={{ r: 4, fill: "#7c3aed" }}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-slate-500">
-              <span>
-                <span className="font-semibold text-violet-400">{(clvData as any)?.pinnacleCount ?? 0}</span> Pinnacle-validated bets
-              </span>
-              <span>
-                <span className="font-semibold text-emerald-400">{(clvData as any)?.pinnacleClosingCount ?? 0}</span> Pinnacle closing-line CLV
-              </span>
-              <span>
-                <span className="font-semibold text-red-400">{(clvData as any)?.contrarianCount ?? 0}</span> contrarian bets
-              </span>
-              {((clvData as any)?.pinnacleClosingCoveragePct ?? 0) > 0 && (
-                <span>
-                  <span className="font-semibold text-sky-400">{(clvData as any).pinnacleClosingCoveragePct}%</span> Pinnacle closing coverage
-                </span>
-              )}
-            </div>
-          </div>
-        </Card>
-      )}
-
-      {/* Pinnacle-Aligned vs Contrarian Breakdown */}
-      {((clvData as any)?.pinnacleAlignedStats || (clvData as any)?.contrarianStats) && (
-        <Card>
-          <CardHead
-            title="Pinnacle-Aligned vs Contrarian"
-            sub="Does our model have genuine edge beyond sharp-market consensus?"
-          />
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b" style={{ borderColor: "#1e3a5f" }}>
-                  {["Category", "Bets", "Win Rate", "ROI", "Avg CLV", "Total P&L"].map((h) => (
-                    <th key={h} className="px-4 py-3 text-left font-medium text-slate-400">{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {[
-                  { label: "Pinnacle-Aligned", color: "#10b981", data: (clvData as any)?.pinnacleAlignedStats },
-                  { label: "Contrarian", color: "#f59e0b", data: (clvData as any)?.contrarianStats },
-                ].filter((row) => row.data != null).map(({ label, color, data }) => (
-                  <tr key={label} className="border-b hover:bg-slate-800/30 transition-colors" style={{ borderColor: "#1e293b" }}>
-                    <td className="px-4 py-3">
-                      <span className="font-semibold" style={{ color }}>{label}</span>
-                    </td>
-                    <td className="px-4 py-3 tabular-nums text-slate-300">{data.count}</td>
-                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.winRatePct >= 55 ? "#10b981" : data.winRatePct >= 45 ? "#f59e0b" : "#ef4444" }}>
-                      {data.winRatePct.toFixed(1)}%
-                    </td>
-                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.roiPct > 0 ? "#10b981" : data.roiPct < 0 ? "#ef4444" : "#94a3b8" }}>
-                      {data.roiPct > 0 ? "+" : ""}{data.roiPct.toFixed(1)}%
-                    </td>
-                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.avgClv > 0 ? "#10b981" : data.avgClv < 0 ? "#ef4444" : "#94a3b8" }}>
-                      {data.avgClv > 0 ? "+" : ""}{data.avgClv.toFixed(2)}%
-                    </td>
-                    <td className="px-4 py-3 tabular-nums font-medium" style={{ color: data.totalPnl > 0 ? "#10b981" : data.totalPnl < 0 ? "#ef4444" : "#94a3b8" }}>
-                      {data.totalPnl > 0 ? "+" : ""}£{Math.abs(data.totalPnl).toFixed(2)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {!(clvData as any)?.pinnacleAlignedStats && !(clvData as any)?.contrarianStats && (
-              <p className="px-4 py-6 text-xs text-slate-500 text-center">No Pinnacle-validated settled bets yet — data builds as more bets settle.</p>
-            )}
-          </div>
-        </Card>
-      )}
-
-      {/* League Performance & Edge Map */}
-      {(leagueEdgeData as any)?.rows?.length > 0 && (
-        <Card>
-          <CardHead
-            title="League Performance & Edge Map"
-            sub="Dynamic league prioritisation — higher edge scores get more OddsPapi budget"
-          />
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b" style={{ borderColor: "#1e3a5f" }}>
-                  {["League", "Edge Score", "Bonus", "Bets", "W/L", "ROI", "Avg CLV", "OddsPapi", "Source"].map((h) => (
-                    <th key={h} className="px-4 py-3 text-left font-medium text-slate-400">{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {((leagueEdgeData as any).rows as any[]).map((row: any, i: number) => {
-                  const isTop = i < 3;
-                  const roiColor = row.roiPct > 0 ? "#10b981" : row.roiPct < 0 ? "#ef4444" : "#94a3b8";
-                  const clvColor = row.avgClv > 0 ? "#10b981" : row.avgClv < 0 ? "#ef4444" : "#94a3b8";
-                  const bonusColor = row.leagueBonus > 0 ? "#10b981" : row.leagueBonus < 0 ? "#ef4444" : "#94a3b8";
-                  const coverageBadge =
-                    row.oddsPapiCoverage === "covered"
-                      ? { label: "Covered", bg: "#10b98122", color: "#10b981" }
-                      : row.oddsPapiCoverage === "no-coverage"
-                      ? { label: "No data", bg: "#ef444422", color: "#ef4444" }
-                      : { label: "Unknown", bg: "#33415533", color: "#64748b" };
-                  return (
-                    <tr
-                      key={`${row.league}-${i}`}
-                      className="border-b hover:bg-slate-800/30 transition-colors"
-                      style={{ borderColor: "#1e293b" }}
-                    >
-                      <td className="px-4 py-3 font-medium" style={{ color: isTop ? "#fbbf24" : "#e2e8f0" }}>
-                        {isTop && <span className="mr-1.5">★</span>}{row.league}
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-2">
-                          <div className="w-16 h-1.5 rounded-full bg-slate-700">
-                            <div
-                              className="h-1.5 rounded-full"
-                              style={{ width: `${row.confidenceScore}%`, background: isTop ? "#fbbf24" : "#3b82f6" }}
-                            />
-                          </div>
-                          <span className="text-white font-semibold">{row.confidenceScore.toFixed(0)}</span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 font-semibold tabular-nums" style={{ color: bonusColor }}>
-                        {row.leagueBonus > 0 ? `+${row.leagueBonus}` : row.leagueBonus}
-                      </td>
-                      <td className="px-4 py-3 text-slate-300 tabular-nums">{row.totalBets}</td>
-                      <td className="px-4 py-3 text-slate-300 tabular-nums">
-                        {row.totalBets > 0 ? `${row.wins}W / ${row.losses}L` : "—"}
-                      </td>
-                      <td className="px-4 py-3 font-semibold tabular-nums" style={{ color: roiColor }}>
-                        {row.totalBets > 0 ? `${row.roiPct >= 0 ? "+" : ""}${row.roiPct.toFixed(1)}%` : "—"}
-                      </td>
-                      <td className="px-4 py-3 font-medium tabular-nums" style={{ color: clvColor }}>
-                        {row.avgClv !== 0 ? `${row.avgClv >= 0 ? "+" : ""}${row.avgClv.toFixed(2)}%` : "—"}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span
-                          className="px-2 py-0.5 rounded-full text-xs font-medium"
-                          style={{ background: coverageBadge.bg, color: coverageBadge.color }}
-                        >
-                          {coverageBadge.label}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3">
-                        <span
-                          className="px-2 py-0.5 rounded text-xs"
-                          style={{
-                            background: row.isSeedData ? "#33415533" : "#7c3aed22",
-                            color: row.isSeedData ? "#64748b" : "#a78bfa",
-                          }}
-                        >
-                          {row.isSeedData ? "Seeded" : "Live"}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-          <div className="px-5 py-3 border-t text-xs text-slate-500" style={{ borderColor: "#334155" }}>
-            <span className="text-yellow-500 mr-1">★</span> Top 3 leagues get priority OddsPapi budget.
-            After 20 settled bets, edge scores switch from seeded to live performance data.
-            Scores above 65 give a positive opportunity bonus; below 50 gives a penalty.
-          </div>
-        </Card>
       )}
     </div>
   );

@@ -1,0 +1,72 @@
+DASHBOARD UPGRADES FOR LIVE TRADING
+
+The dashboard needs to reflect that we are now trading with real money. Every element should be clear, professional, and immediately understandable to someone who is not a developer.
+
+1. LIVE STATUS INDICATORS:
+   - Top of dashboard: prominent "LIVE TRADING" badge (green pulse animation)
+   - Show current Betfair balance (fetched from API) alongside internal tracking
+   - If there's any discrepancy between Betfair balance and internal tracking, show a warning icon
+   - Show current Exposure Level (1/2/3/4) with progress toward next level
+   - Show current opportunity score threshold (e.g., "Quality Gate: 68")
+
+2. IN-PLAY BETS DISPLAY:
+   - Add a dedicated "In Play" section to the Overview and Bet History pages
+   - In-play bets should show:
+     a) Match name and current score (if available from API)
+     b) Our bet (market type, selection, stake, odds)
+     c) Current match time/status
+     d) Live odds movement since we placed
+     e) Potential return
+   - Sort in-play bets by match kick-off time
+   - Visual indicator: amber/pulsing for in-play, green for upcoming, settled bets show result
+
+3. UPCOMING BETS:
+   - Show bets that have been identified and placed but the match hasn't started yet
+   - Show: fixture, kick-off time, our selection, stake, odds, opportunity score
+   - Countdown timer to kick-off
+
+4. VOID BETS — HUMAN-READABLE REASONS:
+   - Every voided bet must display a clear, plain English reason. Map Betfair void codes to readable text:
+     a) "Match postponed" (not "MATCH_POSTPONED" or "VOID_REASON_1")
+     b) "Player not in starting lineup" (for player-specific markets)
+     c) "Market removed by exchange"
+     d) "Match abandoned"
+     e) "Walkover / Team withdrawal"
+     f) "Rule 4 deduction applied" with the deduction amount shown
+   - If the void reason is unknown, show "Voided by exchange — reason not specified" rather than a code
+
+5. CLEAR DESCRIPTORS — PLAIN ENGLISH EVERYWHERE:
+   - Replace all technical jargon with human-readable labels:
+     a) "CLV" → "Closing Line Value (CLV)" with a tooltip: "How much better our odds were than the final market price. Positive = we got better odds than the market."
+     b) "ROI" → "Return on Investment" with tooltip: "Profit per £1 staked"
+     c) "Kelly" → "Stake Size" in user-facing displays  
+     d) "Exposure" → "Money at Risk" with tooltip: "Total amount currently staked on unsettled bets"
+     e) "Circuit Breaker" → "Safety Pause" in alerts
+     f) "Opportunity Score" → "Confidence Score" with tooltip: "How confident the model is in this bet (0-100). Higher = more confident."
+   - All monetary values in GBP (£) with 2 decimal places
+   - All percentages to 2 decimal places
+   - Dates in UK format (DD/MM/YYYY)
+
+6. AGENT RECOMMENDATIONS PANEL:
+   - New section on Overview page: "Agent Insights"
+   - Shows the model's self-advocacy recommendations (from Prompt 7)
+   - Each insight has: title, description, impact estimate, priority (high/medium/low)
+   - I can dismiss or acknowledge each insight
+
+7. GO-LIVE READINESS → LIVE PERFORMANCE:
+   - Replace the Go-Live Calculator page with a "Live Performance" page
+   - Show: live P&L chart (daily, weekly, monthly), exposure level progression, opportunity score threshold history, Tier 1 vs Tier 2 bet breakdown, settlement reconciliation status
+
+8. EXPERIMENT LAB:
+   - Keep the Experiment Lab page exactly as-is for Tier 2 monitoring
+   - Add a small indicator on experiments that are close to qualifying for Tier 1 (meeting data richness requirements and approaching promotion)
+
+9. EXECUTION METRICS:
+   - Add an execution health panel showing:
+     a) Average signal-to-placement time
+     b) Fill rate (% of bets fully matched)
+     c) Liquidity shortfall trend
+     d) Betfair API health / connectivity status
+     e) Current trading cron frequency
+
+All dashboard changes should maintain the existing dark theme and design language. The dashboard is for me — keep it clean, informative, and scannable.

@@ -1,7 +1,7 @@
 import { Link, useLocation } from "wouter";
-import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget, useScanStats } from "@/hooks/use-dashboard";
+import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget, useScanStats, useLiveSummary } from "@/hooks/use-dashboard";
 import {
-  BarChart2, BookOpen, Brain, FileText, FlaskConical, Play, Pause, Shield, Square, Target, Zap, Database,
+  BarChart2, BookOpen, Brain, FileText, FlaskConical, Play, Pause, Shield, Square, Target, Zap, Database, TrendingUp, Radio,
 } from "lucide-react";
 import { formatCurrency } from "@/lib/format";
 import { Button } from "@/components/ui/button";
@@ -33,9 +33,17 @@ function AgentStatusDot({ status }: { status: string }) {
   );
 }
 
+const RISK_LEVEL_LABELS: Record<number, { label: string; color: string }> = {
+  1: { label: "Conservative", color: "#3b82f6" },
+  2: { label: "Moderate", color: "#22c55e" },
+  3: { label: "Confident", color: "#f59e0b" },
+  4: { label: "Aggressive", color: "#ef4444" },
+};
+
 export function Layout({ children }: { children: React.ReactNode }) {
   const [location] = useLocation();
   const { data: summary } = useSummary();
+  const { data: liveSummary } = useLiveSummary();
   const agentControl = useAgentControl();
   const { data: budget } = useApiBudget();
   const { data: oddsBudget } = useOddspapiBudget();
@@ -44,8 +52,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const navItems = [
     { href: "/", label: "Overview", icon: Target },
     { href: "/bets", label: "Bet History", icon: BookOpen },
-    { href: "/performance", label: "Performance & Analysis", icon: BarChart2 },
-    { href: "/viability", label: "Go Live Calculator", icon: Zap },
+    { href: "/performance", label: "Live Performance", icon: TrendingUp },
     { href: "/learning", label: "Agent Brain", icon: Brain },
     { href: "/compliance", label: "Audit Trail", icon: Shield },
     { href: "/experiments", label: "Experiment Lab", icon: FlaskConical },
@@ -58,9 +65,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const pendingExposure = (summary as any)?.pendingExposure ?? 0;
   const maxExposure = (summary as any)?.maxExposure ?? 0;
   const exposurePct = (summary as any)?.exposurePct ?? 0;
-  // exposurePct is (unsettled / maxExposure)*100. maxExposure = 40% of bankroll.
-  // Green <25% bankroll (=62.5% of cap), amber 25-35% (=62.5-87.5%), red 35-40% (=87.5-100%)
   const exposureColor = exposurePct >= 87.5 ? "#ef4444" : exposurePct >= 62.5 ? "#f59e0b" : "#10b981";
+  const isLive = (summary as any)?.isLive === true;
+  const riskLevel = (summary as any)?.riskLevel ?? null;
+  const riskCfg = riskLevel ? RISK_LEVEL_LABELS[riskLevel] ?? { label: `Level ${riskLevel}`, color: "#64748b" } : null;
+  const bfBalance = (summary as any)?.betfairBalance ?? null;
 
   return (
     <div className="min-h-screen flex flex-col md:flex-row" style={{ background: "#0f172a" }}>
@@ -77,7 +86,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
             </div>
             <div>
               <h1 className="text-sm font-bold tracking-tight text-white">BET_AGENT_OS</h1>
-              <p className="text-[10px] text-slate-500">{(summary as any)?.tradingMode === "LIVE" ? "Live Trading v1.0" : "Paper Trading v1.0"}</p>
+              <p className="text-[10px] text-slate-500">{isLive ? "Live Trading" : "Paper Trading"}</p>
             </div>
           </div>
         </div>
@@ -85,17 +94,39 @@ export function Layout({ children }: { children: React.ReactNode }) {
         {/* Bankroll pill */}
         <div className="px-4 py-3 border-b" style={{ borderColor: "#334155" }}>
           <div className="rounded-lg px-4 py-3" style={{ background: "#0f172a" }}>
-            <p className="text-[10px] uppercase tracking-widest text-slate-500 font-semibold mb-1">Bankroll</p>
+            <div className="flex items-center justify-between mb-1">
+              <p className="text-[10px] uppercase tracking-widest text-slate-500 font-semibold">
+                {isLive && bfBalance ? "Betfair Balance" : "Bankroll"}
+              </p>
+              {isLive && bfBalance && bfBalance.stale && (
+                <span className="text-[8px] px-1 py-0.5 rounded bg-amber-900/50 text-amber-400">Stale</span>
+              )}
+            </div>
             <p className="text-xl font-bold font-mono text-white">
-              {summary ? formatCurrency(bankroll) : <span className="text-slate-600">——</span>}
+              {summary ? formatCurrency(isLive && bfBalance ? bfBalance.total : bankroll) : <span className="text-slate-600">——</span>}
             </p>
             {summary && (
               <p className={cn("text-xs font-mono mt-0.5", pnl >= 0 ? "text-emerald-400" : "text-red-400")}>
                 {pnl >= 0 ? "+" : ""}{formatCurrency(pnl)} total P&amp;L
               </p>
             )}
+            {isLive && bfBalance && (
+              <p className="text-[10px] text-slate-600 mt-0.5">
+                £{bfBalance.available.toFixed(2)} available · £{bfBalance.exposure.toFixed(2)} at risk
+              </p>
+            )}
           </div>
         </div>
+
+        {/* Risk level pill (live only) */}
+        {riskCfg && (
+          <div className="px-4 py-2 border-b" style={{ borderColor: "#334155" }}>
+            <div className="flex items-center justify-between">
+              <p className="text-[9px] uppercase tracking-wider font-semibold" style={{ color: riskCfg.color }}>Risk Level {riskLevel}</p>
+              <p className="text-[10px] font-semibold" style={{ color: riskCfg.color }}>{riskCfg.label}</p>
+            </div>
+          </div>
+        )}
 
         {/* Exposure pill */}
         <div className="px-4 py-2.5 border-b" style={{ borderColor: "#334155" }}>
@@ -307,17 +338,34 @@ export function Layout({ children }: { children: React.ReactNode }) {
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Top bar */}
         <header
-          className="h-12 border-b flex items-center px-6 shrink-0"
+          className="h-12 border-b flex items-center px-6 shrink-0 gap-4"
           style={{ background: "#1e293b", borderColor: "#334155" }}
         >
           <div className="flex-1" />
-          <div className="flex items-center gap-2">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+          {isLive ? (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-green-500/15 border border-green-500/30 text-green-400 text-[11px] font-bold tracking-wide">
+              <Radio className="w-3 h-3 animate-pulse" />
+              LIVE TRADING
             </span>
-            <span className="text-[11px] text-slate-500 font-mono uppercase tracking-wider">Live</span>
-          </div>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400 text-[11px] font-bold tracking-wide">
+              PAPER MODE
+            </span>
+          )}
+          {liveSummary?.relayConfigured && (
+            <span className={cn(
+              "inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded",
+              liveSummary.relayHealthy ? "bg-emerald-900/30 text-emerald-400" : "bg-red-900/30 text-red-400",
+            )}>
+              <span className={cn("w-1.5 h-1.5 rounded-full", liveSummary.relayHealthy ? "bg-emerald-400" : "bg-red-400")} />
+              VPS {liveSummary.relayHealthy ? "Connected" : "Offline"}
+            </span>
+          )}
+          {liveSummary?.qualityGate != null && (
+            <span className="text-[10px] text-slate-500 font-mono">
+              Quality Gate: {liveSummary.qualityGate}+
+            </span>
+          )}
         </header>
 
         <div className="flex-1 overflow-auto p-6">
@@ -392,6 +440,33 @@ export function BetStatusBadge({ status }: { status: string }) {
   return (
     <span className="inline-flex px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-800 text-slate-400 border border-slate-700">
       {status}
+    </span>
+  );
+}
+
+export function LiveTierBadge({ tier }: { tier?: string | null }) {
+  if (!tier) return null;
+  const styles: Record<string, { bg: string; text: string; label: string }> = {
+    "tier1_real": { bg: "#052e16", text: "#22c55e", label: "Tier 1 · Real Money" },
+    "tier2_paper": { bg: "#1e1b4b", text: "#c4b5fd", label: "Tier 2 · Paper" },
+  };
+  const s = styles[tier] ?? { bg: "#374151", text: "#9ca3af", label: tier };
+  return (
+    <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold" style={{ background: s.bg, color: s.text }}>
+      {s.label}
+    </span>
+  );
+}
+
+export function InfoTooltip({ text }: { text: string }) {
+  return (
+    <span className="relative group inline-flex ml-1 align-middle">
+      <span className="text-slate-500 hover:text-slate-300 cursor-help text-[10px]">?</span>
+      <span className="invisible group-hover:visible absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 z-50 rounded-lg border p-2 text-[11px] text-slate-300 leading-relaxed shadow-xl whitespace-normal"
+        style={{ background: "#0f172a", borderColor: "#334155", width: "220px" }}>
+        {text}
+        <span className="absolute top-full left-1/2 -translate-x-1/2 w-1.5 h-1.5 rotate-45 border-r border-b" style={{ background: "#0f172a", borderColor: "#334155" }} />
+      </span>
     </span>
   );
 }

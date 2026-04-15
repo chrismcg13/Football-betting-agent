@@ -247,6 +247,62 @@ export const useResumeAgent = () => {
   });
 };
 
+export const useExecutionMetrics = () => {
+  return useQuery({
+    queryKey: ["dashboard", "execution-metrics"],
+    queryFn: () => fetcher("/api/dashboard/execution-metrics"),
+    refetchInterval: 60000,
+  });
+};
+
+export const useInPlayBets = () => {
+  return useQuery({
+    queryKey: ["dashboard", "in-play"],
+    queryFn: () => fetcher("/api/dashboard/in-play"),
+    refetchInterval: 30000,
+  });
+};
+
+export const useUpcomingBets = () => {
+  return useQuery({
+    queryKey: ["dashboard", "upcoming-bets"],
+    queryFn: () => fetcher("/api/dashboard/upcoming-bets"),
+    refetchInterval: 30000,
+  });
+};
+
+export const useLiveSummary = () => {
+  return useQuery({
+    queryKey: ["dashboard", "live-summary"],
+    queryFn: () => fetcher("/api/dashboard/live-summary"),
+    refetchInterval: 30000,
+  });
+};
+
+export const useAgentRecommendations = () => {
+  return useQuery({
+    queryKey: ["dashboard", "agent-recommendations"],
+    queryFn: () => fetcher("/api/dashboard/agent-recommendations"),
+    refetchInterval: 120000,
+  });
+};
+
+export const useModelHealth = () => {
+  return useQuery({
+    queryKey: ["dashboard", "model-health"],
+    queryFn: () => fetcher("/api/dashboard/model-health"),
+    refetchInterval: 120000,
+  });
+};
+
+export const useLiveTierStats = () => {
+  return useQuery({
+    queryKey: ["admin", "live-tier-stats"],
+    queryFn: () => fetcher("/api/admin/live-tier-stats"),
+    refetchInterval: 120000,
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

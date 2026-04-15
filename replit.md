@@ -1,12 +1,8 @@
-# Workspace
+# Overview
 
-## Overview
+This project is an AI betting agent designed for paper-trading football bets, leveraging the Betfair Exchange Delayed API and API-Football v3 for data. Its primary goal is to identify value bets, manage a simulated bankroll, and continuously refine its betting strategy. The system includes a data ingestion pipeline, a feature engineering engine for machine learning models (logistic regression), risk management, and an experiment-to-promotion pipeline for strategy deployment. The agent aims for autonomous operation, continuous self-improvement, and transparent decision-making.
 
-This project is an AI betting agent designed for paper-trading football bets. It leverages the Betfair Exchange Delayed API for market data and API-Football v3 for real odds and match information. The agent's core purpose is to identify value bets, manage a simulated bankroll, and continuously learn and adapt its betting strategy based on performance.
-
-The system features a robust data ingestion pipeline, a sophisticated feature engineering engine for machine learning models, and a dynamic prediction engine that employs logistic regression models. It includes comprehensive risk management protocols, an opportunity scoring system to identify promising bets, and a sophisticated experiment-to-promotion pipeline for rigorously testing and deploying new betting strategies. The agent aims for autonomous operation, continuous self-improvement, and transparent auditability of all decisions.
-
-## User Preferences
+# User Preferences
 
 I prefer iterative development, with a focus on delivering small, functional increments.
 Please use clear and concise language in your explanations.
@@ -16,104 +12,59 @@ Ensure all database schema changes are clearly documented and backward-compatibl
 Do not make changes to files related to UI/UX unless explicitly requested.
 Do not make changes to folder `src/tests`.
 
-## System Architecture
+# System Architecture
 
-The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 24, and pnpm as the package manager. The backend API is built with Express 5, interacting with a PostgreSQL database via Drizzle ORM. Data validation is handled by Zod.
+The project is a pnpm monorepo using TypeScript 5.9, Node.js 24, and Express 5 for the backend API, interacting with a PostgreSQL database via Drizzle ORM. Zod handles data validation.
 
-**Key Features:**
+**Key Architectural Decisions & Features:**
 
-*   **Data Models:** A comprehensive database schema (PostgreSQL + Drizzle ORM) tracks matches, odds snapshots, computed ML features, paper bets, model states, learning narratives, compliance logs, agent configurations, and API usage.
-*   **Agent Configuration:** Runtime settings such as bankroll, stake limits, edge thresholds, and diversity rules are dynamically configurable.
-*   **API Endpoints:** A RESTful API provides endpoints for managing agent configuration, matches, paper bets, odds ingestion, feature computation, ML predictions, model management, value bet detection, learning narratives, compliance logs, data ingestion triggers, and a rich set of dashboard analytics.
-*   **Market Types & Models:** Supports various football market types (e.g., Match Odds, BTTS, Over/Under, Asian Handicap, Cards, Corners), each potentially leveraging specific ML models (e.g., Logistic Regression, Poisson).
-*   **Opportunity Scoring:** A 5-component scoring system (Edge, Confidence, Odds Sweet Spot, Market Quality, Form Alignment) identifies high-value betting opportunities, with real odds prioritized over synthetic ones.
-*   **Staking Strategy:** Implements Kelly Criterion-based staking tiers, adjusted by opportunity score and market type (e.g., 0.7x multiplier for cards/corners).
-*   **Diversity Rules:** Per-cycle limits on total bets, bets per league, and bets per market type to manage risk concentration.
-*   **Prediction Engine:** Employs logistic regression models for core predictions, with Poisson heuristics for specific markets. Models are bootstrapped from historical data, auto-loaded on startup, and retrained after significant new data accumulation.
-*   **Feature Engine:** Computes 17 machine learning features per upcoming match, including team form, goal averages, BTTS rates, H2H statistics, and league position differentials.
-*   **Scheduler:** Orchestrates automated jobs for data ingestion, feature computation, trading cycles, bet settlement, odds fetching, team stats updates, and a daily learning loop. **Trading cycle tiered**: NEAR (fixtures ≤48h) runs every 5 minutes, FAR (48h–168h) runs every 30 minutes. Previously 10-minute flat cycle. Signal/execution split: signal generation (value detection, Pinnacle validation, correlation filtering) produces structured BetOrder objects, then execution phase places bets immediately with per-bet timing tracking (signal→submit→confirm latency). Alert if avg execution >30s.
-*   **North Star Metrics & Continuous Learning (`modelHealthReport.ts`, `marketRegime.ts`, `edgeDecay.ts`, `agentRecommendations.ts`):**
-    - **Metric hierarchy:** CLV (leading indicator, 50% weight) > ROI (confirmation, 35%) > Win Rate (informational, 15%). Positive CLV + negative ROI = HEALTHY (variance). Negative CLV + positive ROI = LUCKY (investigate).
-    - **Weekly Model Health Report:** Generated as part of daily learning loop (03:00 UTC). CLV/ROI/WR trends (7d/30d/all-time), best/worst league-market combos (min 3 bets), calibration drift (RMSE across 8 probability buckets), feature importance changes between model versions, parameter adjustment recommendations. Stored in `learning_narratives` as `model_health_report` type.
-    - **Market Regime Detection:** Detects end-of-season, international breaks (with 2026 calendar), transfer windows, major tournaments, pre-season. Applies `stakeMultiplier` (0.6–0.9×) and `confidenceMultiplier` automatically during bet placement. Fixture volume anomaly detection (40%+ drop → assumed break).
-    - **Edge Decay Tracking:** Compares edge-at-identification vs CLV-at-close for each market family. Persistence score 0–100. Markets with >80% decay flagged for deprioritization. Current data: O/U edges *increase* to close (negative decay), Corners decay 78%.
-    - **Agent Recommendations & Self-Advocacy:** Resource utilization monitoring (API-Football 75k/month, OddsPapi 100k/month — alerts at 80%). Enhancement opportunities logged (weather data, referee data). Performance attribution by data source (Pinnacle-validated vs model-only CLV comparison). Never auto-increases risk limits — recommends only.
-    - **API:** `/api/dashboard/model-health`, `/api/dashboard/market-regime`, `/api/dashboard/edge-decay`, `/api/dashboard/agent-recommendations`.
-*   **Line Movement Tracking:** Monitors and logs significant odds changes (>5%) for compliance and analytical purposes, categorizing them as shortening or drifting.
-*   **League Coverage:** Tracks 1,021 competitions across three tiers (Tier 1: 39 international/continental, Tier 2: 406 top domestic/cups, Tier 3: 576 lower divisions) with a `competition_config` table storing coverage metadata (statistics, lineups, events, Pinnacle odds, polling frequency). ~156 active after monthly performance pruning (865 dormant). Known Pinnacle IDs include expansion targets: Poland (106), Czech (345), Romania (283), Serbia (286), Australia (188), Japan J1 (98), South Korea K-League (292), Finland (244), Brazil B (72). Fixture ingestion runs twice daily. Dashboard shows Competition Coverage panel with tier/type/gender breakdowns and API budget utilisation.
-*   **xG Intelligence:** Integrates Expected Goals (xG) data, derived from the internal feature engine, to inform predictions and team performance analysis.
-*   **Risk Management:** Dual-mode circuit breaker system. **Dev mode** (NODE_ENV≠production): log-only — agent never self-pauses, all would-have-triggered events logged to `drawdown_events` table with `would_have_triggered=true`. Legacy gross-loss/floor placement gates are also bypassed in dev. **Prod mode**: high-water-mark (HWM) drawdown model — daily pause at ≥10% drawdown (configurable), weekly at ≥20%, catastrophic stop at >50%. HWM tracked in `agent_config` (keys: `high_water_mark`, `hwm_updated_at`). `setConfigValue` uses upsert for safe persistence. Dashboard shows circuit breaker banner (mode, HWM, drawdown %, distance to limits) and recent event log. Endpoints: `/api/admin/circuit-breaker-status`, `/api/admin/resume-agent`.
-*   **Experiment Pipeline:** A robust system to manage betting strategies through experiment, candidate, and promoted tiers, with statistical evidence driving progression. This includes schema extensions for `paper_bets`, new tables (`experiment_registry`, `promotion_audit_log`, `experiment_learning_journal`), and a daily promotion engine. Candidate bets use reduced stakes, and in production, only promoted strategies are allowed to place bets.
-*   **Settlement Architecture:** Settlement cron runs every 2 minutes. `syncMatchResults` is scoped to leagues with pending bets only (via `getLeaguesWithPendingBets()` pre-filter), then fetches finished fixtures from API-Football and matches to DB using `apiFixtureId` (primary) then fuzzy team name matching (fallback). Backfill re-settles voided bets (all markets) only when voided >1hr after placement (protects dedup/admin voids). `apiFixtureId` stored during fixture ingestion for reliable matching.
-*   **Edge Concentration (`edgeConcentration.ts`):** Profit = Volume × Strike Rate × Average Edge × Stake Size. Segments bets by league × market family × odds range, classifies into `exploit` / `explore` / `avoid`. **Corners: KILLED** — all 5 TOTAL_CORNERS variants added to BANNED_MARKETS (90 settled bets, -42.5% ROI, CLV 7.6). **Odds floor: 1.80 for Tier 1** — odds <1.5 showed -35% ROI, 1.5-1.8 showed -2.2%. Segment Kelly multipliers: exploit=1.0×, explore=0.5×, avoid=0.25×. Over/Under at 2.0+ odds gets full Kelly (70.3% ROI, CLV 64.7). Cards gets 0.9× (78% ROI but no Pinnacle). Double Chance gets 0.7× (marginal 3.3% ROI). Opp score 80+ capped at 0.85× Kelly (model overconfidence). Weekly segment recalculation planned. Endpoints: `/api/dashboard/edge-segments`, `/api/admin/void-corners`.
-*   **Stats Coverage Guard:** Cards bets are blocked at placement for leagues where API-Football doesn't provide `statistics_fixtures` coverage (stored in `competition_config.has_statistics`). 144 leagues have stats coverage; ~870 don't. Prevents wasted stakes on unsettleable bets.
-*   **Environment Isolation:** Strict separation of development and production databases, with a controlled synchronization mechanism for promoted strategies.
-*   **Liquidity Tracking (`liquiditySnapshots.ts`, `logLiquiditySnapshot()`):** After each bet placement (when VPS relay is configured), logs Betfair order book depth — available at target price, within 1 tick, within 3 ticks, total market volume, and shortfall (desired stake – available). Stored in `liquidity_snapshots` table. Dashboard endpoint `/api/dashboard/liquidity` provides aggregate shortfall analysis by league/market type. Fire-and-forget — never blocks execution.
-*   **Order Management (`orderManager.ts`):** Cron every 2 minutes (when VPS relay configured). Monitors live Betfair orders for partial fills: >70% filled → accept partial and cancel remainder; 30–70% → wait 5 minutes then accept; <30% → cancel after 10 minutes. Near-kickoff (<2hr) reassessment: unmatched orders cancelled if price exceeds 2-tick chase limit on the Betfair tick ladder. Full tick ladder (1.01–1000) for precise distance calculation.
-*   **Startup Process:** Automated database migrations and agent configuration seeding on server startup.
+*   **Data Models:** Comprehensive schema for matches, odds, ML features, paper bets, model states, learning narratives, compliance, agent configurations, and API usage.
+*   **Agent Configuration:** Dynamic settings for bankroll, stake limits, edge thresholds, and diversity rules.
+*   **API Endpoints:** RESTful API for managing configurations, data, predictions, and analytics.
+*   **Market Types & Models:** Supports various football market types (Match Odds, BTTS, Over/Under, Asian Handicap, Cards, Corners) with specific ML models (e.g., Logistic Regression, Poisson).
+*   **Opportunity Scoring:** A 5-component system (Edge, Confidence, Odds Sweet Spot, Market Quality, Form Alignment) to identify high-value bets.
+*   **Staking Strategy:** Kelly Criterion-based tiers, adjusted by opportunity score and market type.
+*   **Diversity Rules:** Per-cycle limits on total bets, bets per league, and bets per market type.
+*   **Prediction Engine:** Uses logistic regression, bootstrapped from historical data, auto-loaded, and retrained.
+*   **Feature Engine:** Computes 17 ML features per upcoming match (e.g., team form, H2H stats).
+*   **Scheduler:** Orchestrates automated jobs for data ingestion, feature computation, trading cycles (tiered by fixture proximity), bet settlement, and daily learning loops.
+*   **North Star Metrics & Continuous Learning:** Tracks CLV, ROI, Win Rate. Generates weekly model health reports, detects market regimes, tracks edge decay, and provides agent recommendations for resource utilization and enhancement.
+*   **Line Movement Tracking:** Logs significant odds changes (>5%) for analysis and compliance.
+*   **League Coverage:** Tracks 1,021 competitions across three tiers with metadata for coverage and polling frequency.
+*   **xG Intelligence:** Integrates Expected Goals data from the internal feature engine.
+*   **Risk Management (Circuit Breaker):** Dual-mode system (Dev/Prod). Production mode implements a high-water-mark drawdown model for pausing/halting agent operation based on loss thresholds.
+*   **Experiment Pipeline:** Manages betting strategies through experiment, candidate, and promoted tiers, with statistical evidence driving progression and reduced stakes for unproven strategies.
+*   **Settlement Architecture:** Cron-based settlement of bets, scoped to leagues with pending bets, fetching results from API-Football.
+*   **Edge Concentration:** Segments bets by league, market family, and odds range to classify opportunities as `exploit`, `explore`, or `avoid`, applying segmented Kelly multipliers.
+*   **Stats Coverage Guard:** Blocks card bets for leagues without `statistics_fixtures` coverage in API-Football.
+*   **Environment Isolation:** Strict separation of development and production databases.
+*   **Liquidity Tracking:** Logs Betfair order book depth after bet placements for aggregate shortfall analysis.
+*   **Order Management:** Monitors live Betfair orders for partial fills, canceling unmatched orders near kickoff based on price chase limits.
+*   **Startup Process:** Automated database migrations and agent configuration seeding.
+*   **Production Safety:** Includes startup checks, quarantine of experiment/opportunity-boosted bets, dual-gate sync for dev-to-prod, reduced candidate stake, and a comprehensive live trading safety system (`liveRiskManager.ts`) with progressive risk levels, concentration limits, and multi-level circuit breakers. A two-tier live system differentiates between live-money bets (Tier 1) and paper-only bets (Tier 2) based on opportunity score, data richness, and Pinnacle validation.
 
-## External Dependencies
+# External Dependencies
 
-*   **Betfair Exchange API:** Used for paper-trading and live trading football bets via VPS relay (`VPS_RELAY_URL` → DigitalOcean VPS at 209.38.164.154). VPS relay (`vps-relay/`) is a lightweight Express service handling all Betfair API communication: bet placement, balance polling, settlement fetching, market ID caching, liquidity depth, session management. Replit handles signal generation; VPS handles execution. Relay authenticated via `VPS_RELAY_SECRET`. Endpoints: `/bet/place`, `/bet/status/:id`, `/bet/:id` (DELETE), `/balance`, `/market/:eventId`, `/market/:marketId/liquidity`, `/settlements`, `/health`, `/auth/refresh`. Health checked every 5min from Replit. Deploy via `vps-relay/deploy.sh`. Live trading uses `LIVE_BETFAIR_KEY` with real money placement through the relay.
-*   **API-Football v3 (via RapidAPI):** Primary source for real odds, match results, team statistics (yellow cards, corners, shots), and fixture data. Budget: 75,000 requests/month with flexible daily cap (1,500–4,000, auto-adjusted by monthly pace). Early-month multiplier (day≤10 → 1.3×). Tiered odds fetching: high-tier leagues every 2hr, medium every 6hr, low every 12hr, dormant skipped. League performance scoring (CLV×0.8 + ROI + data completeness + fixture frequency, sample-size weighted by √(n/30)) drives monthly league pruning — ~865 dormant leagues deactivated, ~156 active. Settlement scoped to leagues with pending bets only. Pre-kickoff lineup capture (15min cron, 30–90min before kickoff) stored in features table. Endpoints: `/api/dashboard/api-budget`, `/api/dashboard/league-scores`, `/api/admin/deactivate-low-value-leagues`, `/api/admin/capture-lineups`.
-*   **PostgreSQL:** The primary database for all application data.
-*   **OddsPapi (100k/month):** Sharp-line validation & best-odds layer. 100,000 requests/month budget allocated by priority: P1 (40%) pre-bet validation, P2 (30%) line movement tracking, P3 (20%) CLV closing capture, P4 (10%) exploratory. Flexible daily cap (2,500–4,500) auto-adjusts based on monthly spend rate. Three-snapshot CLV system captures Pinnacle odds at identification, 1hr pre-kickoff, and closing. Pre-bet Pinnacle filter kills bets with <2% edge (<3% if line moving away). Line movement tracker (every 4hr) detects sharp movements (>3% implied shift). Filtered bets logged with outcome tracking. New tables: `pinnacle_odds_snapshots`, `line_movements`, `filtered_bets`. New columns on `paper_bets`: `pinnacle_edge_category`, `line_direction`, `pinnacle_snapshot_count`, `clv_data_quality`.
-*   **football-data.org:** (DISABLED) Previously used for data ingestion; now replaced by API-Football v3.
-*   **StatsBomb/Fotmob:** (Implicitly via internal feature engine) Data sources for Expected Goals (xG) which are then processed by the internal feature engine.
+*   **Betfair Exchange API:** For paper and live trading, accessed via a VPS relay for bet placement, balance polling, and market data.
+*   **API-Football v3 (via RapidAPI):** Primary source for real odds, match results, team statistics, and fixture data. Features budget management and tiered fetching.
+*   **PostgreSQL:** The primary database.
+*   **OddsPapi:** Used for sharp-line validation, best-odds layering, and line movement tracking, with budget allocation based on priority. Implements a three-snapshot CLV system.
+*   **StatsBomb/Fotmob:** (Implicitly via internal feature engine) Provides Expected Goals (xG) data.
 
-## Production Safety
+# Dashboard (artifacts/dashboard)
 
-*   **Startup Safety Check:** In production (`ENVIRONMENT=production`), the server checks `DATABASE_URL` hostname against known dev hosts (`helium`, `localhost`, `127.0.0.1`). If it matches, the server aborts with a FATAL error. No dependency on `DEV_DATABASE_URL` being set.
-*   **Production Quarantine:** `placePaperBet()` blocks experiment-tier and opportunity-boosted bets in production. Only promoted-tier bets are allowed.
-*   **Sync Double-Gate:** `syncDevToProd.ts` requires both `sync_eligible=true AND data_tier='promoted'` to sync bets from dev to prod.
-*   **Candidate Stake Reduction:** Candidate-tier bets use 25% Kelly multiplier (configurable via `CANDIDATE_STAKE_MULTIPLIER` env var).
-*   **ENVIRONMENT env var:** Set to `"production"` in the artifact.toml production run config.
-*   **Live Trading Safety (`betfairLive.ts`):**
-    - `TRADING_MODE=PAPER` (dev) / `TRADING_MODE=LIVE` (prod). Live placement only when LIVE.
-    - Startup health checks must pass or schedulers/trading engine are disabled (hard-stop).
-    - Balance staleness: if cached balance is >1hr old, live bets are skipped (paper bet preserved).
-    - Non-retryable errors (INSUFFICIENT_FUNDS, MARKET_SUSPENDED, etc.) are never retried.
-    - £2 minimum stake enforced. Non-exchange markets (corners/cards) are paper-only.
-    - Live bankroll from Betfair account used for stake sizing in LIVE mode (falls back to config bankroll if unavailable).
-    - 30-min settlement reconciliation cron + 15-min balance refresh in LIVE mode.
-    - 12hr proactive session refresh with auto-retry on INVALID_SESSION.
-    - `paper_bets` table extended with `betfair_*` columns for tracking live bet state.
-    - API error rate tracking: 5 errors/hour triggers 30-min pause on all live placement.
-*   **Live Risk Management (`liveRiskManager.ts`):**
-    - **Progressive risk levels (1-4):** System starts at Level 1 with tighter limits. Earns its way to Level 4 based on track record. Paper mode (TRADING_MODE=PAPER) uses legacy limits unchanged; live mode overrides with level-based limits.
-    - **Level 1:** Max bet 2%, max exposure 25%, daily loss 5%, weekly loss 10%, Kelly 25%.
-    - **Level 2 (50+ settled, CLV>2%, ROI>3%, no breakers):** Max bet 2.5%, max exposure 30%, daily loss 6%, Kelly 30%.
-    - **Level 3 (150+ settled, CLV>2.5%, ROI>4%, no breakers 30d):** Max bet 3%, max exposure 35%, daily loss 7%.
-    - **Level 4 (300+ settled, CLV>3%, ROI>5%, 60+ days live):** Max bet 3.5%, max exposure 40%, daily loss 8%.
-    - **Demotion:** Rolling 30-day ROI<0% or CLV<0% drops one level immediately.
-    - **40%→25% transition:** Intentional tightening for live. Paper system allowed 40% because no real money. Live starts at 25% (Level 1) and model earns back to 40% at Level 4.
-    - **Concentration limits (live only):** Per-league 8%, per-market-type 10%, per-fixture 3% of live balance.
-    - **Circuit breakers:** 3 consecutive losses → 1hr pause (auto-resume). 5 → 6hr pause. 8 → HALT (manual restart). Bankroll floor → HALT ALL.
-    - **Starting deposit:** Cumulative total deposited (updates when adding funds). `starting_deposit` config key. Bankroll floor = 60% of cumulative deposits.
-    - **Kelly adjustment:** Level-based base fraction. Without Pinnacle data → halved. Max capped at 40%.
-    - **Slippage check:** >5% odds slippage between identification and placement → skip bet.
-    - **Daily level evaluation:** Cron at 04:15 UTC auto-promotes/demotes based on performance.
-    - **API:** `/api/admin/live-risk-status`, `/api/admin/live-risk-level` (evaluate/apply/set), `/api/admin/starting-deposit`.
-*   **Two-Tier Live System (`dataRichness.ts`, `liveThresholdReview.ts`):**
-    - **Tier 1 (live money):** Bets qualify if: opportunity score >= configurable threshold (default 68, floor 60), data richness >= 70%, Pinnacle odds available with >= 2% edge vs current Pinnacle implied, AND either (a) data-rich market path or (b) promoted strategy path. Experiment/candidate tier bets NEVER qualify.
-    - **Tier 2 (paper only):** All bets not meeting Tier 1 criteria stay in the experiment pipeline. No changes to experiment graduation gates.
-    - **Data richness scoring:** `data_richness_cache` table tracks league-market combos with composite score (Pinnacle coverage 30%, statistics 20%, lineups 10%, events 10%, fixture depth 15%, frequency 15%). Recalculated weekly (Sunday 04:30 UTC) + on startup.
-    - **Adaptive threshold:** Weekly review (Sunday 05:00 UTC) adjusts the opportunity score threshold based on 30-day rolling Tier 1 performance. Requires 50+ settled bets. Factors: CLV trend, ROI stability (stddev), market diversity (Herfindahl). Changes logged to `promotion_audit_log`.
-    - **`live_tier` column** on `paper_bets` (independent of `data_tier`) tracks tier1/tier2 assignment per bet.
-    - **API:** `/api/admin/live-tier-stats` returns threshold, tier breakdown, and data richness summary.
+React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn/ui. Dark theme throughout.
 
-## Experiment Pipeline
+**Pages:**
+*   **Overview** (`/dashboard/`): In-play bets with live scores, upcoming bets with countdown, agent recommendations, execution metrics, stat cards (Profit, ROI, Win Rate, CLV).
+*   **Bet History** (`/dashboard/bets`): In-play section at top, full bet table with Betfair execution details (fill status, matched size, avg price, P&L), CLV/Pinnacle columns, expandable reasoning with bet thesis. LiveTierBadge for Tier 1/2 classification.
+*   **Live Performance** (`/dashboard/performance`): P&L chart (cumulative, 90 days), league breakdown, market type breakdown, Tier 1 vs Tier 2 stats, execution quality panel, model health section.
+*   **Experiment Lab** (`/dashboard/experiments`): Tier pipeline (experiment → candidate → promoted), Tier 1 qualification badges, progress bars, distance-to-promotion, manual promotion controls, tooltips for CLV/ROI/p-value.
+*   **Agent Brain** (`/dashboard/agent-brain`): Learning narratives, self-generated insights.
+*   **Audit Trail** (`/dashboard/compliance`): Compliance and transparency logs.
 
-*   **Tag Format:** `{league-slug}-{market-type-slug}` (league-market granularity, NOT per-match)
-*   **Promotion Thresholds (env-var configurable):**
-    - Experiment → Candidate: ≥30 bets, ≥3% ROI, ≥1.5% CLV, ≥52% WR, ≤0.10 p-value, ≥3 weeks, ≥2% edge
-    - Candidate → Promoted: ≥20 bets, ≥2% ROI, ≥1% CLV, ≤0.05 p-value, ≥2 weeks
-    - Demotion (promoted→candidate): rolling 30-bet window, ROI<0% or CLV<0% or 3 consecutive negative weeks
-    - Demotion (candidate→experiment): ROI<-5% or CLV<0%
-    - Abandon: ≥50 bets, ROI<-10%, p-value≤0.10
-*   **Dashboard:** `/experiments` page shows experiments sorted by sample size (only those with ≥1 bet shown), with progress bars (Sample, ROI, CLV, Win Rate, P-Value, Edge), distance-to-promotion metrics, bets/week velocity, estimated weeks to evaluation, last bet timestamp, and manual promote/demote with full audit logging. Abandoned experiments shown greyed out with strikethrough at bottom. 4-column summary (Total Active, Experiments, Candidates, Promoted) + "Closest to Promotion" spotlight card.
-*   **Go Live Readiness Panel:** Overview page shows weighted readiness score (6 criteria: sample size 30%, promoted strategy 25%, CLV 15%, ROI 10%, win rate 10%, bankroll growth 10%). Includes pace estimate and estimated days to target. API: `/api/admin/go-live-readiness`.
-*   **Demo Day Panel:** Enhanced with pipeline snapshot (promoted/candidate/experiment counts) and betting pace estimate.
-*   **Crons:** Promotion engine daily at 04:00 UTC, experiment analysis Sundays at 04:00, dev→prod sync every 6 hours.
-*   **Excluded Markets (abandoned):** OVER_UNDER_05 (all leagues) — unfavourable risk/reward structure (~92% base win rate). 8 experiment tags set to `abandoned` tier. Historical bet data preserved for audit.
-*   **Production Schedulers:** All schedulers (betting, settlement, ML training, data ingestion) are DISABLED in production. Production only serves the dashboard API. Data flows exclusively via syncDevToProd pipeline.
+**Shared Components (layout.tsx):** `LiveTierBadge`, `InfoTooltip`, `BetStatusBadge`, `OddsSourceBadge`.
+
+**Hooks (use-dashboard.ts):** `useSummary`, `useBets`, `usePerformance`, `useClvStats`, `useBetsByLeague`, `useBetsByMarket`, `useInPlayBets`, `useUpcomingBets`, `useExecutionMetrics`, `useLiveSummary`, `useAgentRecommendations`, `useModelHealth`, `useLiveTierStats`, `useExperiments`, `useRunPromotionEngine`, `useManualPromote`.
+
+**API Endpoints consumed:** `/api/dashboard/summary`, `/api/dashboard/bets`, `/api/dashboard/performance`, `/api/dashboard/clv-stats`, `/api/dashboard/bets/by-league`, `/api/dashboard/bets/by-market`, `/api/dashboard/in-play`, `/api/dashboard/upcoming-bets`, `/api/dashboard/execution-metrics`, `/api/dashboard/live-summary`, `/api/dashboard/agent-recommendations`, `/api/admin/experiments`.

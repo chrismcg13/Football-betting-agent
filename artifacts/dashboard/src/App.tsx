@@ -8,7 +8,6 @@ import { Layout } from "@/components/layout";
 import Overview from "@/pages/overview";
 import Bets from "@/pages/bets";
 import Performance from "@/pages/performance";
-import Viability from "@/pages/viability";
 import Learning from "@/pages/learning";
 import Compliance from "@/pages/compliance";
 import Experiments from "@/pages/experiments";
@@ -30,7 +29,6 @@ function Router() {
         <Route path="/" component={Overview} />
         <Route path="/bets" component={Bets} />
         <Route path="/performance" component={Performance} />
-        <Route path="/viability" component={Viability} />
         <Route path="/learning" component={Learning} />
         <Route path="/compliance" component={Compliance} />
         <Route path="/experiments" component={Experiments} />

@@ -201,6 +201,14 @@ router.get("/dashboard/summary", async (req, res) => {
         ) / 10
       : null;
 
+  const tradingMode = process.env["TRADING_MODE"] ?? "PAPER";
+  const balance = getCachedBalance();
+  let riskLevel = null;
+  try {
+    const { getCurrentLiveRiskLevel } = await import("../services/liveRiskManager");
+    riskLevel = await getCurrentLiveRiskLevel();
+  } catch {}
+
   res.json({
     currentBankroll: Math.round(bankroll * 100) / 100,
     startingBankroll: STARTING_BANKROLL,
@@ -218,7 +226,8 @@ router.get("/dashboard/summary", async (req, res) => {
     pending: allPending.length,
     betsToday,
     paperMode,
-    tradingMode: process.env["TRADING_MODE"] ?? "PAPER",
+    tradingMode,
+    isLive: tradingMode === "LIVE",
     winPercentage:
       wins + losses > 0
         ? Math.round((wins / (wins + losses)) * 10000) / 100
@@ -234,6 +243,13 @@ router.get("/dashboard/summary", async (req, res) => {
     pendingExposure,
     maxExposure,
     exposurePct,
+    betfairBalance: balance ? {
+      available: balance.available,
+      exposure: balance.exposure,
+      total: balance.total,
+      stale: (Date.now() - balance.fetchedAt) > 300000,
+    } : null,
+    riskLevel,
   });
 });
 
@@ -493,6 +509,18 @@ router.get("/dashboard/bets", async (req, res) => {
         placedAt: paperBetsTable.placedAt,
         settledAt: paperBetsTable.settledAt,
         oddsSource: paperBetsTable.oddsSource,
+        liveTier: paperBetsTable.liveTier,
+        betfairBetId: paperBetsTable.betfairBetId,
+        betfairStatus: paperBetsTable.betfairStatus,
+        betfairSizeMatched: paperBetsTable.betfairSizeMatched,
+        betfairAvgPriceMatched: paperBetsTable.betfairAvgPriceMatched,
+        betfairPnl: paperBetsTable.betfairPnl,
+        dataTier: paperBetsTable.dataTier,
+        experimentTag: paperBetsTable.experimentTag,
+        clvPct: paperBetsTable.clvPct,
+        pinnacleOdds: paperBetsTable.pinnacleOdds,
+        isContrarian: paperBetsTable.isContrarian,
+        betThesis: paperBetsTable.betThesis,
       })
       .from(paperBetsTable)
       .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
@@ -525,6 +553,11 @@ router.get("/dashboard/bets", async (req, res) => {
       calculatedEdge: b.calculatedEdge ? Number(b.calculatedEdge) : null,
       opportunityScore: b.opportunityScore ? Number(b.opportunityScore) : null,
       settlementPnl: b.settlementPnl ? Number(b.settlementPnl) : null,
+      betfairSizeMatched: b.betfairSizeMatched ? Number(b.betfairSizeMatched) : null,
+      betfairAvgPriceMatched: b.betfairAvgPriceMatched ? Number(b.betfairAvgPriceMatched) : null,
+      betfairPnl: b.betfairPnl ? Number(b.betfairPnl) : null,
+      clvPct: b.clvPct ? Number(b.clvPct) : null,
+      pinnacleOdds: b.pinnacleOdds ? Number(b.pinnacleOdds) : null,
     })),
   });
 });
@@ -2354,6 +2387,240 @@ router.get("/dashboard/agent-recommendations", async (_req, res) => {
     res.json(report);
   } catch (err) {
     logger.warn({ err }, "Agent recommendations failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/dashboard/execution-metrics", async (_req, res) => {
+  try {
+    const now = new Date();
+    const dayAgo = new Date(now.getTime() - 86400000);
+    const weekAgo = new Date(now.getTime() - 7 * 86400000);
+
+    const [fillStats, timingStats, recentBets] = await Promise.all([
+      db.execute(sql`
+        SELECT
+          COUNT(*) FILTER (WHERE betfair_bet_id IS NOT NULL)::int AS live_placed,
+          COUNT(*) FILTER (WHERE betfair_status = 'EXECUTION_COMPLETE')::int AS fully_filled,
+          COUNT(*) FILTER (WHERE betfair_status = 'EXECUTABLE' AND betfair_size_matched::numeric > 0)::int AS partial_filled,
+          COUNT(*) FILTER (WHERE betfair_status = 'CANCELLED')::int AS cancelled,
+          ROUND(AVG(CASE WHEN betfair_size_matched IS NOT NULL AND stake::numeric > 0
+            THEN (betfair_size_matched::numeric / stake::numeric) * 100 END)::numeric, 1) AS avg_fill_pct,
+          COUNT(*) FILTER (WHERE placed_at >= ${dayAgo} AND betfair_bet_id IS NOT NULL)::int AS placed_24h
+        FROM paper_bets
+        WHERE betfair_bet_id IS NOT NULL
+      `),
+      db.execute(sql`
+        SELECT
+          ROUND(AVG(EXTRACT(EPOCH FROM (betfair_placed_at - placed_at)))::numeric, 1) AS avg_signal_to_place_secs,
+          ROUND(AVG(CASE WHEN betfair_settled_at IS NOT NULL
+            THEN EXTRACT(EPOCH FROM (betfair_settled_at - betfair_placed_at)) END)::numeric, 0) AS avg_time_to_settle_secs
+        FROM paper_bets
+        WHERE betfair_placed_at IS NOT NULL
+      `),
+      db.execute(sql`
+        SELECT COUNT(*)::int AS week_bets,
+          COUNT(*) FILTER (WHERE status IN ('won','lost'))::int AS week_settled
+        FROM paper_bets
+        WHERE placed_at >= ${weekAgo}
+      `),
+    ]);
+
+    const fill = (fillStats as any).rows?.[0] ?? {};
+    const timing = (timingStats as any).rows?.[0] ?? {};
+    const recent = (recentBets as any).rows?.[0] ?? {};
+
+    const { getRelayStatus, checkRelayHealth } = await import("../services/vpsRelay");
+    const relayStatus = getRelayStatus();
+    let relayHealth = null;
+    if (relayStatus.configured) {
+      try { relayHealth = await checkRelayHealth(); } catch {}
+    }
+
+    res.json({
+      fillRate: {
+        livePlaced: Number(fill.live_placed ?? 0),
+        fullyFilled: Number(fill.fully_filled ?? 0),
+        partialFilled: Number(fill.partial_filled ?? 0),
+        cancelled: Number(fill.cancelled ?? 0),
+        avgFillPct: fill.avg_fill_pct != null ? Number(fill.avg_fill_pct) : null,
+        placed24h: Number(fill.placed_24h ?? 0),
+      },
+      timing: {
+        avgSignalToPlaceSecs: timing.avg_signal_to_place_secs != null ? Number(timing.avg_signal_to_place_secs) : null,
+        avgTimeToSettleSecs: timing.avg_time_to_settle_secs != null ? Number(timing.avg_time_to_settle_secs) : null,
+      },
+      weekActivity: {
+        bets: Number(recent.week_bets ?? 0),
+        settled: Number(recent.week_settled ?? 0),
+      },
+      relay: {
+        configured: relayStatus.configured,
+        healthy: relayStatus.healthy,
+        lastLatencyMs: relayStatus.lastLatencyMs ?? null,
+        betfairConnected: relayHealth?.betfairConnected ?? null,
+      },
+    });
+  } catch (err) {
+    logger.warn({ err }, "Execution metrics failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/dashboard/in-play", async (_req, res) => {
+  try {
+    const now = new Date();
+    const bets = await db
+      .select({
+        id: paperBetsTable.id,
+        matchId: paperBetsTable.matchId,
+        homeTeam: matchesTable.homeTeam,
+        awayTeam: matchesTable.awayTeam,
+        league: matchesTable.league,
+        kickoffTime: matchesTable.kickoffTime,
+        homeScore: matchesTable.homeScore,
+        awayScore: matchesTable.awayScore,
+        matchStatus: matchesTable.status,
+        marketType: paperBetsTable.marketType,
+        selectionName: paperBetsTable.selectionName,
+        oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+        stake: paperBetsTable.stake,
+        potentialProfit: paperBetsTable.potentialProfit,
+        calculatedEdge: paperBetsTable.calculatedEdge,
+        opportunityScore: paperBetsTable.opportunityScore,
+        placedAt: paperBetsTable.placedAt,
+        liveTier: paperBetsTable.liveTier,
+        betfairBetId: paperBetsTable.betfairBetId,
+        betfairStatus: paperBetsTable.betfairStatus,
+        betfairSizeMatched: paperBetsTable.betfairSizeMatched,
+      })
+      .from(paperBetsTable)
+      .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+      .where(
+        and(
+          eq(paperBetsTable.status, "pending"),
+          lte(matchesTable.kickoffTime, now),
+        ),
+      )
+      .orderBy(desc(matchesTable.kickoffTime));
+
+    res.json({
+      count: bets.length,
+      bets: bets.map((b) => ({
+        ...b,
+        oddsAtPlacement: Number(b.oddsAtPlacement),
+        stake: Number(b.stake),
+        potentialProfit: b.potentialProfit ? Number(b.potentialProfit) : null,
+        calculatedEdge: b.calculatedEdge ? Number(b.calculatedEdge) : null,
+        opportunityScore: b.opportunityScore ? Number(b.opportunityScore) : null,
+        betfairSizeMatched: b.betfairSizeMatched ? Number(b.betfairSizeMatched) : null,
+        minutesInPlay: b.kickoffTime ? Math.max(0, Math.round((now.getTime() - new Date(b.kickoffTime).getTime()) / 60000)) : null,
+      })),
+    });
+  } catch (err) {
+    logger.warn({ err }, "In-play bets failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/dashboard/upcoming-bets", async (_req, res) => {
+  try {
+    const now = new Date();
+    const bets = await db
+      .select({
+        id: paperBetsTable.id,
+        matchId: paperBetsTable.matchId,
+        homeTeam: matchesTable.homeTeam,
+        awayTeam: matchesTable.awayTeam,
+        league: matchesTable.league,
+        kickoffTime: matchesTable.kickoffTime,
+        marketType: paperBetsTable.marketType,
+        selectionName: paperBetsTable.selectionName,
+        oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+        stake: paperBetsTable.stake,
+        potentialProfit: paperBetsTable.potentialProfit,
+        calculatedEdge: paperBetsTable.calculatedEdge,
+        opportunityScore: paperBetsTable.opportunityScore,
+        placedAt: paperBetsTable.placedAt,
+        liveTier: paperBetsTable.liveTier,
+        betfairBetId: paperBetsTable.betfairBetId,
+        betfairStatus: paperBetsTable.betfairStatus,
+      })
+      .from(paperBetsTable)
+      .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+      .where(
+        and(
+          eq(paperBetsTable.status, "pending"),
+          gte(matchesTable.kickoffTime, now),
+        ),
+      )
+      .orderBy(asc(matchesTable.kickoffTime));
+
+    res.json({
+      count: bets.length,
+      bets: bets.map((b) => {
+        const ko = b.kickoffTime ? new Date(b.kickoffTime) : null;
+        const minsUntil = ko ? Math.max(0, Math.round((ko.getTime() - now.getTime()) / 60000)) : null;
+        return {
+          ...b,
+          oddsAtPlacement: Number(b.oddsAtPlacement),
+          stake: Number(b.stake),
+          potentialProfit: b.potentialProfit ? Number(b.potentialProfit) : null,
+          calculatedEdge: b.calculatedEdge ? Number(b.calculatedEdge) : null,
+          opportunityScore: b.opportunityScore ? Number(b.opportunityScore) : null,
+          minutesUntilKickoff: minsUntil,
+          countdownLabel: minsUntil != null
+            ? minsUntil < 60 ? `${minsUntil}min`
+            : minsUntil < 1440 ? `${Math.floor(minsUntil / 60)}h ${minsUntil % 60}m`
+            : `${Math.floor(minsUntil / 1440)}d ${Math.floor((minsUntil % 1440) / 60)}h`
+            : null,
+        };
+      }),
+    });
+  } catch (err) {
+    logger.warn({ err }, "Upcoming bets failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/dashboard/live-summary", async (_req, res) => {
+  try {
+    const tradingMode = process.env["TRADING_MODE"] ?? "PAPER";
+
+    const balance = getCachedBalance();
+
+    let riskStatus = null;
+    try {
+      const { getLiveRiskStatus } = await import("../services/liveRiskManager");
+      riskStatus = await getLiveRiskStatus();
+    } catch {}
+
+    let threshold = null;
+    try {
+      threshold = await getLiveOppScoreThreshold();
+    } catch {}
+
+    const { getRelayStatus } = await import("../services/vpsRelay");
+    const relay = getRelayStatus();
+
+    res.json({
+      tradingMode,
+      isLive: tradingMode === "LIVE",
+      betfairBalance: balance ? {
+        available: balance.available,
+        exposure: balance.exposure,
+        total: balance.total,
+        fetchedAt: new Date(balance.fetchedAt).toISOString(),
+        stale: (Date.now() - balance.fetchedAt) > 300000,
+      } : null,
+      riskLevel: riskStatus?.level ?? null,
+      riskLimits: riskStatus?.limits ?? null,
+      qualityGate: threshold,
+      relayHealthy: relay.healthy,
+      relayConfigured: relay.configured,
+    });
+  } catch (err) {
+    logger.warn({ err }, "Live summary failed");
     res.status(500).json({ error: String(err) });
   }
 });

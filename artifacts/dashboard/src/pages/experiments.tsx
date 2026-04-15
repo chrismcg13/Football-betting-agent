@@ -1,6 +1,8 @@
 import { useState, useMemo } from "react";
 import { useExperiments, useRunPromotionEngine, useManualPromote } from "@/hooks/use-dashboard";
 import { cn } from "@/lib/utils";
+import { formatCurrency } from "@/lib/format";
+import { InfoTooltip } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
@@ -116,6 +118,16 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
           )}
         </div>
         <div className="flex items-center gap-3 text-xs shrink-0">
+          {tier === "promoted" && (
+            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 border border-emerald-700">
+              Tier 1 Ready
+            </span>
+          )}
+          {tier === "candidate" && exp.progress?.overall >= 80 && (
+            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-300 border border-amber-700">
+              Near Tier 1
+            </span>
+          )}
           <span className={cn("font-mono", Number(exp.roi) >= 0 ? "text-emerald-400" : "text-red-400")}>
             ROI: {roi}%
           </span>
@@ -128,17 +140,17 @@ function ExperimentRow({ exp, tier }: { exp: any; tier: string }) {
         <div className="mt-3 pt-3 border-t" style={{ borderColor: "#334155" }}>
           <div className="grid grid-cols-2 md:grid-cols-6 gap-3 text-xs mb-3">
             <div>
-              <span className="text-slate-500 block">Sample Size</span>
+              <span className="text-slate-500 flex items-center">Sample Size <InfoTooltip text="Number of settled bets in this experiment. More bets = more statistical confidence." /></span>
               <span className="text-white font-mono">{exp.sampleSize ?? 0}</span>
             </div>
             <div>
-              <span className="text-slate-500 block">P-Value</span>
+              <span className="text-slate-500 flex items-center">P-Value <InfoTooltip text="Statistical significance. Below 0.1 means the results are unlikely to be due to chance. Lower is better." /></span>
               <span className={cn("font-mono", Number(exp.pValue) <= 0.1 ? "text-emerald-400" : "text-amber-400")}>
                 {hasBets ? Number(exp.pValue).toFixed(3) : "—"}
               </span>
             </div>
             <div>
-              <span className="text-slate-500 block">Edge</span>
+              <span className="text-slate-500 flex items-center">Edge <InfoTooltip text="How much better your odds are vs the true probability. Higher edge = more profitable long-term." /></span>
               <span className="text-white font-mono">{hasBets ? Number(exp.edge).toFixed(1) + "%" : "—"}</span>
             </div>
             <div>
@@ -242,7 +254,7 @@ export default function Experiments() {
         <div>
           <h2 className="text-2xl font-bold text-white tracking-tight">Experiment Lab</h2>
           <p className="text-sm text-slate-500 mt-1">
-            Track experiments through the pipeline: experiment → candidate → promoted.
+            Track experiments through the pipeline: experiment → candidate → promoted (Tier 1 real money).
           </p>
         </div>
         <Button
@@ -273,9 +285,9 @@ export default function Experiments() {
           <p className="text-[10px] text-slate-600 mt-0.5">awaiting validation</p>
         </div>
         <div className="rounded-xl border p-4" style={{ background: "#052e16", borderColor: "#166534" }}>
-          <span className="text-xs text-emerald-500 uppercase tracking-wider font-semibold">Promoted</span>
+          <span className="text-xs text-emerald-500 uppercase tracking-wider font-semibold flex items-center">Tier 1 / Promoted <InfoTooltip text="Promoted experiments qualify for Tier 1 real-money trading via Betfair. They've passed all statistical thresholds." /></span>
           <p className="text-2xl font-bold text-emerald-400 mt-1">{grouped.promoted?.length ?? 0}</p>
-          <p className="text-[10px] text-emerald-700 mt-0.5">production-ready</p>
+          <p className="text-[10px] text-emerald-700 mt-0.5">real money ready</p>
         </div>
       </div>
 
