@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useLeagueDiscoveryStats, useGoLiveReadiness, useExperiments, useCoverage } from "@/hooks/use-dashboard";
+import { useSummary, useBets, useNarratives, usePerformance, useClvStats, useLeagueDiscoveryStats, useGoLiveReadiness, useExperiments, useCoverage, useCircuitBreakerStatus } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge } from "@/components/layout";
 import { cn } from "@/lib/utils";
@@ -193,6 +193,7 @@ export default function Overview() {
   const { data: readiness } = useGoLiveReadiness();
   const { data: experimentsData } = useExperiments();
   const { data: coverageData } = useCoverage();
+  const { data: cbStatus } = useCircuitBreakerStatus();
 
   // ── Derived values ──────────────────────────────────────────────────────────
   const pnl = summary?.totalPnl ?? 0;
@@ -289,6 +290,70 @@ export default function Overview() {
           )}
         </div>
       </div>
+
+      {/* ── CIRCUIT BREAKER BANNER ──────────────────────────────────────────── */}
+      {cbStatus && (
+        <div className={cn(
+          "rounded-lg border px-4 py-3",
+          cbStatus.mode === "paper"
+            ? "bg-emerald-500/10 border-emerald-500/30"
+            : cbStatus.currentDrawdownPct >= cbStatus.weeklyLimit * 0.8
+              ? "bg-red-500/10 border-red-500/30"
+              : "bg-blue-500/10 border-blue-500/30"
+        )}>
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-3">
+              <span className={cn(
+                "text-xs font-bold px-2 py-0.5 rounded",
+                cbStatus.mode === "paper" ? "bg-emerald-500/20 text-emerald-400" : "bg-blue-500/20 text-blue-400"
+              )}>
+                {cbStatus.mode === "paper" ? "PAPER MODE" : "LIVE"}
+              </span>
+              <span className="text-sm text-slate-300">
+                {cbStatus.mode === "paper"
+                  ? "Circuit breakers disabled — logging only. Agent will never self-pause."
+                  : `High-Water Mark: ${formatCurrency(cbStatus.highWaterMark)} · Drawdown: ${cbStatus.currentDrawdownPct.toFixed(1)}%`
+                }
+              </span>
+            </div>
+            {cbStatus.mode !== "paper" && (
+              <div className="flex items-center gap-4 text-xs text-slate-400">
+                <span>Daily limit: {cbStatus.dailyLimit}%</span>
+                <span>Weekly limit: {cbStatus.weeklyLimit}%</span>
+              </div>
+            )}
+          </div>
+          {cbStatus.recentEvents.length > 0 && (
+            <div className="mt-3 border-t border-slate-700/50 pt-2">
+              <p className="text-xs font-medium text-slate-400 mb-1.5">
+                Recent Circuit Breaker Events
+              </p>
+              <div className="space-y-1 max-h-32 overflow-y-auto">
+                {cbStatus.recentEvents.slice(0, 5).map((evt: any) => (
+                  <div key={evt.id} className="flex items-center gap-2 text-xs">
+                    <span className={cn(
+                      "w-1.5 h-1.5 rounded-full flex-shrink-0",
+                      evt.wouldHaveTriggered ? "bg-amber-400" : "bg-red-400"
+                    )} />
+                    <span className="text-slate-400">
+                      {new Date(evt.createdAt).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                    <span className="text-slate-300">
+                      {evt.eventType.replace(/_/g, " ")}
+                    </span>
+                    <span className="text-slate-500">
+                      {evt.wouldHaveTriggered ? "(log only)" : "(triggered)"}
+                    </span>
+                    <span className="text-slate-400 ml-auto">
+                      {evt.drawdownPct.toFixed(1)}% drawdown
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── PRIMARY METRICS ─────────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">

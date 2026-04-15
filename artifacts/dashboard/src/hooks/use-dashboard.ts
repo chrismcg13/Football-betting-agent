@@ -227,6 +227,26 @@ export const useManualPromote = () => {
   });
 };
 
+export const useCircuitBreakerStatus = () => {
+  return useQuery({
+    queryKey: ["admin", "circuit-breaker"],
+    queryFn: () => fetcher("/api/admin/circuit-breaker-status"),
+    refetchInterval: 30000,
+  });
+};
+
+export const useResumeAgent = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      fetcher("/api/admin/resume-agent", { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["admin", "circuit-breaker"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard", "summary"] });
+    },
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

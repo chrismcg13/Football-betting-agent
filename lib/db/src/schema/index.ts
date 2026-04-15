@@ -18,3 +18,4 @@ export * from "./experimentRegistry";
 export * from "./promotionAuditLog";
 export * from "./experimentLearningJournal";
 export * from "./competitionConfig";
+export * from "./drawdownEvents";

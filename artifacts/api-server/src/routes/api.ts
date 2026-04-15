@@ -47,6 +47,7 @@ import {
 } from "../services/scheduler";
 import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
+import { getCircuitBreakerStatus, resumeAgent } from "../services/riskManager";
 import {
   getOddspapiStatus,
   prefetchAndStoreOddsPapiOdds,
@@ -1712,6 +1713,27 @@ router.get("/admin/promotion-log", async (_req, res) => {
     const log = await getPromotionLog();
     res.json({ success: true, log });
   } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/circuit-breaker-status", async (_req, res) => {
+  try {
+    const status = await getCircuitBreakerStatus();
+    res.json({ success: true, ...status });
+  } catch (err) {
+    logger.error({ err }, "Failed to get circuit breaker status");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/resume-agent", async (_req, res) => {
+  try {
+    await resumeAgent();
+    const status = await getAgentStatus();
+    res.json({ success: true, agentStatus: status });
+  } catch (err) {
+    logger.error({ err }, "Failed to resume agent");
     res.status(500).json({ success: false, message: String(err) });
   }
 });

@@ -4,6 +4,7 @@ import {
   complianceLogsTable,
   learningNarrativesTable,
   agentConfigTable,
+  drawdownEventsTable,
 } from "@workspace/db";
 import { eq, inArray, desc, gte, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -14,7 +15,8 @@ import {
   getAgentStatus,
 } from "./paperTrading";
 
-// ===================== Helpers =====================
+const currentEnv = process.env["ENVIRONMENT"] ?? "development";
+const isDevMode = currentEnv !== "production";
 
 async function setAgentStatus(
   status: string,
@@ -22,7 +24,7 @@ async function setAgentStatus(
   details: Record<string, unknown>,
 ): Promise<void> {
   const previous = await getAgentStatus();
-  if (previous === status) return; // already in this state
+  if (previous === status) return;
 
   await setConfigValue("agent_status", status);
 
@@ -44,6 +46,43 @@ async function setAgentStatus(
   });
 
   logger.warn({ previous, newStatus: status, reason }, "Circuit breaker fired");
+}
+
+async function logDrawdownEvent(
+  eventType: string,
+  hwm: number,
+  bankroll: number,
+  drawdownPct: number,
+  limitPct: number,
+  wouldHaveTriggered: boolean,
+  details: Record<string, unknown> = {},
+): Promise<void> {
+  await db.insert(drawdownEventsTable).values({
+    environment: currentEnv,
+    eventType,
+    highWaterMark: String(hwm),
+    currentBankroll: String(bankroll),
+    drawdownPct: String(drawdownPct),
+    limitPct: String(limitPct),
+    wouldHaveTriggered: wouldHaveTriggered ? "true" : "false",
+    details,
+  });
+}
+
+async function getHighWaterMark(): Promise<number> {
+  const val = await getConfigValue("high_water_mark");
+  return val ? Number(val) : 5000;
+}
+
+async function updateHighWaterMark(bankroll: number): Promise<number> {
+  const current = await getHighWaterMark();
+  if (bankroll > current) {
+    await setConfigValue("high_water_mark", String(bankroll));
+    await setConfigValue("hwm_updated_at", new Date().toISOString());
+    logger.info({ oldHwm: current, newHwm: bankroll }, "High-water mark updated");
+    return bankroll;
+  }
+  return current;
 }
 
 async function getTodaysSettledLoss(): Promise<number> {
@@ -73,57 +112,140 @@ async function getWeeklySettledLoss(): Promise<number> {
   return result[0]?.total ?? 0;
 }
 
-// ===================== Individual checks =====================
+async function getTodaysNetPnl(): Promise<number> {
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const result = await db
+    .select({
+      total: sql<number>`COALESCE(SUM(${paperBetsTable.settlementPnl}::numeric), 0)`,
+    })
+    .from(paperBetsTable)
+    .where(gte(paperBetsTable.settledAt, todayStart));
+  return Number(result[0]?.total ?? 0);
+}
+
+async function getWeeklyNetPnl(): Promise<number> {
+  const weekStart = new Date();
+  const day = weekStart.getUTCDay();
+  const daysToMonday = day === 0 ? 6 : day - 1;
+  weekStart.setUTCDate(weekStart.getUTCDate() - daysToMonday);
+  weekStart.setUTCHours(0, 0, 0, 0);
+  const result = await db
+    .select({
+      total: sql<number>`COALESCE(SUM(${paperBetsTable.settlementPnl}::numeric), 0)`,
+    })
+    .from(paperBetsTable)
+    .where(gte(paperBetsTable.settledAt, weekStart));
+  return Number(result[0]?.total ?? 0);
+}
 
 export async function checkDailyLoss(): Promise<boolean> {
   const bankroll = await getBankroll();
-  const limitPct = Number(
-    (await getConfigValue("daily_loss_limit_pct")) ?? "0.05",
-  );
-  const dailyLossLimit = bankroll * limitPct;
-  const dailyLoss = await getTodaysSettledLoss();
 
-  if (dailyLoss >= dailyLossLimit) {
-    await setAgentStatus("paused_daily", "Daily loss limit reached", {
-      dailyLoss,
-      dailyLossLimit,
-      limitPct,
-      bankroll,
-    });
-    return true; // circuit breaker fired
+  if (isDevMode) {
+    const limitPct = Number((await getConfigValue("daily_loss_limit_pct")) ?? "0.15");
+    const dailyLossLimit = bankroll * limitPct;
+    const dailyLoss = await getTodaysSettledLoss();
+    if (dailyLoss >= dailyLossLimit) {
+      logger.warn(
+        { dailyLoss, dailyLossLimit, limitPct, bankroll, mode: "paper" },
+        "DEV: Daily loss limit WOULD have triggered — logging only, not pausing",
+      );
+      await logDrawdownEvent("daily_gross_loss", await getHighWaterMark(), bankroll,
+        (dailyLoss / bankroll) * 100, limitPct * 100, true,
+        { dailyLoss, dailyLossLimit });
+    }
+    return false;
+  }
+
+  const hwm = await updateHighWaterMark(bankroll);
+  const drawdown = hwm > 0 ? ((hwm - bankroll) / hwm) * 100 : 0;
+  const dailyLimitPct = Number((await getConfigValue("daily_drawdown_limit_pct")) ?? "10");
+
+  if (drawdown >= dailyLimitPct) {
+    const todayNet = await getTodaysNetPnl();
+    if (todayNet < 0) {
+      await setAgentStatus("paused_daily", "Daily net drawdown limit reached", {
+        highWaterMark: hwm,
+        currentBankroll: bankroll,
+        drawdownPct: drawdown,
+        dailyLimitPct,
+        todayNetPnl: todayNet,
+      });
+      await logDrawdownEvent("daily_drawdown_trigger", hwm, bankroll, drawdown, dailyLimitPct, false,
+        { todayNetPnl: todayNet });
+      return true;
+    }
   }
   return false;
 }
 
 export async function checkWeeklyLoss(): Promise<boolean> {
   const bankroll = await getBankroll();
-  const limitPct = Number(
-    (await getConfigValue("weekly_loss_limit_pct")) ?? "0.10",
-  );
-  const weeklyLossLimit = bankroll * limitPct;
-  const weeklyLoss = await getWeeklySettledLoss();
 
-  if (weeklyLoss >= weeklyLossLimit) {
-    await setAgentStatus("paused_weekly", "Weekly loss limit reached", {
-      weeklyLoss,
-      weeklyLossLimit,
-      limitPct,
-      bankroll,
-    });
-    return true;
+  if (isDevMode) {
+    const limitPct = Number((await getConfigValue("weekly_loss_limit_pct")) ?? "0.30");
+    const weeklyLossLimit = bankroll * limitPct;
+    const weeklyLoss = await getWeeklySettledLoss();
+    if (weeklyLoss >= weeklyLossLimit) {
+      logger.warn(
+        { weeklyLoss, weeklyLossLimit, limitPct, bankroll, mode: "paper" },
+        "DEV: Weekly loss limit WOULD have triggered — logging only, not pausing",
+      );
+      await logDrawdownEvent("weekly_gross_loss", await getHighWaterMark(), bankroll,
+        (weeklyLoss / bankroll) * 100, limitPct * 100, true,
+        { weeklyLoss, weeklyLossLimit });
+    }
+    return false;
+  }
+
+  const hwm = await updateHighWaterMark(bankroll);
+  const drawdown = hwm > 0 ? ((hwm - bankroll) / hwm) * 100 : 0;
+  const weeklyLimitPct = Number((await getConfigValue("weekly_drawdown_limit_pct")) ?? "20");
+
+  if (drawdown >= weeklyLimitPct) {
+    const weeklyNet = await getWeeklyNetPnl();
+    if (weeklyNet < 0) {
+      await setAgentStatus("paused_weekly", "Weekly net drawdown limit reached", {
+        highWaterMark: hwm,
+        currentBankroll: bankroll,
+        drawdownPct: drawdown,
+        weeklyLimitPct,
+        weeklyNetPnl: weeklyNet,
+      });
+      await logDrawdownEvent("weekly_drawdown_trigger", hwm, bankroll, drawdown, weeklyLimitPct, false,
+        { weeklyNetPnl: weeklyNet });
+      return true;
+    }
   }
   return false;
 }
 
 export async function checkBankrollFloor(): Promise<boolean> {
   const bankroll = await getBankroll();
-  const floor = Number((await getConfigValue("bankroll_floor")) ?? "200");
 
-  if (bankroll <= floor) {
-    await setAgentStatus("stopped", "Bankroll at or below floor", {
-      bankroll,
-      floor,
+  if (isDevMode) {
+    const floor = Number((await getConfigValue("bankroll_floor")) ?? "150");
+    if (bankroll <= floor) {
+      logger.warn(
+        { bankroll, floor, mode: "paper" },
+        "DEV: Bankroll floor WOULD have triggered — logging only, not pausing",
+      );
+      await logDrawdownEvent("bankroll_floor", await getHighWaterMark(), bankroll,
+        100, 0, true, { bankroll, floor });
+    }
+    return false;
+  }
+
+  const hwm = await updateHighWaterMark(bankroll);
+  const drawdown = hwm > 0 ? ((hwm - bankroll) / hwm) * 100 : 0;
+  if (drawdown >= 50) {
+    await setAgentStatus("stopped", "Catastrophic drawdown: >50% from high-water mark", {
+      highWaterMark: hwm,
+      currentBankroll: bankroll,
+      drawdownPct: drawdown,
     });
+    await logDrawdownEvent("catastrophic_drawdown", hwm, bankroll, drawdown, 50, false);
     return true;
   }
   return false;
@@ -140,7 +262,7 @@ export async function checkConsecutiveLosses(): Promise<boolean> {
     .orderBy(desc(paperBetsTable.settledAt))
     .limit(5);
 
-  if (lastFive.length < 5) return false; // not enough history
+  if (lastFive.length < 5) return false;
 
   const allLost = lastFive.every((b) => b.status === "lost");
   if (allLost) {
@@ -148,20 +270,28 @@ export async function checkConsecutiveLosses(): Promise<boolean> {
       (sum, b) => sum + Math.abs(Number(b.settlementPnl ?? 0)),
       0,
     );
+
+    if (isDevMode) {
+      logger.warn(
+        { consecutiveLosses: 5, totalLossInStreak: totalLoss, mode: "paper" },
+        "DEV: 5 consecutive losses WOULD have triggered — logging only, not pausing",
+      );
+      const bankroll = await getBankroll();
+      await logDrawdownEvent("consecutive_losses", await getHighWaterMark(), bankroll,
+        (totalLoss / bankroll) * 100, 0, true,
+        { consecutiveLosses: 5, totalLossInStreak: totalLoss });
+      return false;
+    }
+
     await setAgentStatus(
       "paused_streak",
       "5 consecutive losses detected",
-      {
-        consecutiveLosses: 5,
-        totalLossInStreak: totalLoss,
-      },
+      { consecutiveLosses: 5, totalLossInStreak: totalLoss },
     );
     return true;
   }
   return false;
 }
-
-// ===================== Run all checks =====================
 
 export interface RiskCheckResult {
   bankrollFloor: boolean;
@@ -172,7 +302,16 @@ export interface RiskCheckResult {
 }
 
 export async function runAllRiskChecks(): Promise<RiskCheckResult> {
-  logger.debug("Running risk checks");
+  logger.debug({ environment: currentEnv, isDevMode }, "Running risk checks");
+
+  if (isDevMode) {
+    const agentStatus = await getAgentStatus();
+    if (agentStatus !== "running") {
+      logger.info({ agentStatus }, "DEV: Auto-resuming agent (circuit breakers disabled in dev)");
+      await setConfigValue("agent_status", "running");
+    }
+  }
+
   const [bankrollFloor, dailyLoss, weeklyLoss, consecutiveLosses] =
     await Promise.all([
       checkBankrollFloor(),
@@ -186,21 +325,24 @@ export async function runAllRiskChecks(): Promise<RiskCheckResult> {
 
   if (anyTriggered) {
     logger.warn(
-      { bankrollFloor, dailyLoss, weeklyLoss, consecutiveLosses },
+      { bankrollFloor, dailyLoss, weeklyLoss, consecutiveLosses, environment: currentEnv },
       "Risk check triggered a circuit breaker",
     );
+  }
+
+  if (isDevMode) {
+    await updateHighWaterMark(await getBankroll());
   }
 
   return { bankrollFloor, dailyLoss, weeklyLoss, consecutiveLosses, anyTriggered };
 }
 
-// ===================== Resume agent =====================
-
 export async function resumeAgent(): Promise<void> {
   const currentStatus = await getAgentStatus();
   if (currentStatus === "running") return;
-  if (currentStatus === "stopped") {
-    logger.warn("Cannot resume a stopped agent — bankroll below floor");
+
+  if (currentStatus === "stopped" && !isDevMode) {
+    logger.warn("Cannot resume a stopped agent in prod — catastrophic drawdown");
     return;
   }
 
@@ -224,3 +366,84 @@ export async function resumeAgent(): Promise<void> {
 
   logger.info({ previousStatus: currentStatus }, "Agent resumed");
 }
+
+export async function getCircuitBreakerStatus(): Promise<{
+  mode: string;
+  environment: string;
+  agentStatus: string;
+  bankroll: number;
+  highWaterMark: number;
+  hwmUpdatedAt: string | null;
+  currentDrawdownPct: number;
+  dailyLimit: number;
+  weeklyLimit: number;
+  todayGrossLoss: number;
+  weeklyGrossLoss: number;
+  todayNetPnl: number;
+  weeklyNetPnl: number;
+  recentEvents: Array<Record<string, unknown>>;
+}> {
+  const [bankroll, hwm, hwmUpdatedAt, agentStatus] = await Promise.all([
+    getBankroll(),
+    getHighWaterMark(),
+    getConfigValue("hwm_updated_at"),
+    getAgentStatus(),
+  ]);
+
+  const drawdown = hwm > 0 ? ((hwm - bankroll) / hwm) * 100 : 0;
+
+  const [todayGross, weeklyGross, todayNet, weeklyNet] = await Promise.all([
+    getTodaysSettledLoss(),
+    getWeeklySettledLoss(),
+    getTodaysNetPnl(),
+    getWeeklyNetPnl(),
+  ]);
+
+  const dailyLimit = isDevMode
+    ? Number((await getConfigValue("daily_loss_limit_pct")) ?? "0.15") * 100
+    : Number((await getConfigValue("daily_drawdown_limit_pct")) ?? "10");
+  const weeklyLimit = isDevMode
+    ? Number((await getConfigValue("weekly_loss_limit_pct")) ?? "0.30") * 100
+    : Number((await getConfigValue("weekly_drawdown_limit_pct")) ?? "20");
+
+  const recentEvents = await db
+    .select()
+    .from(drawdownEventsTable)
+    .where(eq(drawdownEventsTable.environment, currentEnv))
+    .orderBy(desc(drawdownEventsTable.createdAt))
+    .limit(20);
+
+  const distanceToDailyLimit = Math.max(0, dailyLimit - Math.round(drawdown * 100) / 100);
+  const distanceToWeeklyLimit = Math.max(0, weeklyLimit - Math.round(drawdown * 100) / 100);
+
+  return {
+    mode: isDevMode ? "paper" : "live",
+    environment: currentEnv,
+    agentStatus,
+    bankroll,
+    highWaterMark: hwm,
+    hwmUpdatedAt,
+    currentDrawdownPct: Math.round(drawdown * 100) / 100,
+    dailyLimit,
+    weeklyLimit,
+    distanceToDailyLimit: Math.round(distanceToDailyLimit * 100) / 100,
+    distanceToWeeklyLimit: Math.round(distanceToWeeklyLimit * 100) / 100,
+    todayGrossLoss: Number(todayGross),
+    weeklyGrossLoss: Number(weeklyGross),
+    todayNetPnl: todayNet,
+    weeklyNetPnl: weeklyNet,
+    recentEvents: recentEvents.map((e) => ({
+      id: e.id,
+      eventType: e.eventType,
+      highWaterMark: Number(e.highWaterMark),
+      currentBankroll: Number(e.currentBankroll),
+      drawdownPct: Number(e.drawdownPct),
+      limitPct: Number(e.limitPct),
+      wouldHaveTriggered: e.wouldHaveTriggered === "true",
+      details: e.details,
+      createdAt: e.createdAt,
+    })),
+  };
+}
+
+export { getHighWaterMark, updateHighWaterMark };

@@ -1,0 +1,40 @@
+The weekly loss circuit breaker has paused the dev agent (paused_weekly since yesterday). The system settled 244 bets this week with £1,554 net profit, but gross losses of £3,157 exceeded the 30% weekly limit (£2,007). This is blocking data generation for the experiment pipeline. We need changes to BOTH dev and prod circuit breaker logic.
+Changes needed:
+1. Dev environment — disable all loss circuit breakers for paper trading.
+
+Daily loss limit, weekly loss limit, and bankroll floor checks should be completely bypassed in dev/paper mode
+The agent should NEVER self-pause in dev
+Use an environment flag like PAPER_MODE=true or detect from the existing environment config
+Keep all circuit breaker LOGGING active — log when limits would have triggered, but don't pause the agent
+Reset the current agent status from paused_weekly to running immediately
+
+2. Prod environment — switch from gross loss to net drawdown model.
+
+Replace the current gross loss circuit breakers with a HIGH-WATER MARK drawdown system
+Track the peak bankroll value (high-water mark) and measure losses as net drawdown from that peak
+New prod limits: 10% daily net drawdown from high-water mark, 20% weekly net drawdown from high-water mark
+Remove the £200 bankroll floor — replace with the drawdown model
+Keep the 2% max stake per bet (this stays as individual bet sizing, not a circuit breaker)
+If the drawdown breaker triggers in prod, pause the agent and log the event with full context (high-water mark value, current bankroll, drawdown %, triggering bet details)
+The high-water mark should reset at a sensible interval (e.g. monthly or configurable) so that after a drawdown recovery, the system isn't permanently anchored to an old peak
+
+3. Database changes needed:
+
+Add a high_water_mark field to track peak bankroll (with timestamp of when it was set)
+Add a drawdown_events log table for when breakers trigger in prod
+Ensure dev database changes don't sync to prod
+
+4. Dashboard updates:
+
+Dev Overview: show "Paper Mode — Circuit Breakers Disabled (Logging Only)" banner
+Prod Overview: show current high-water mark, current drawdown %, and distance to daily/weekly limits
+Both: show a "Circuit Breaker Log" section showing recent would-have-triggered (dev) and actual trigger (prod) events
+
+5. Verification required:
+
+Confirm dev changes only affect dev by checking DATABASE_URL hosts (dev = helium/Replit Postgres, prod = Neon)
+Show me the before/after of the circuit breaker check function for both environments
+Show me the high-water mark tracking logic
+Do NOT modify any tables or logic in the prod sync pipeline — circuit breaker changes are local to each environment's runtime only
+
+Important context: The system is currently net profitable. The goal is to let the model scale without artificial volume-based restrictions while still having a genuine safety net against model regression or data feed errors. Gross loss limits punish high-volume profitability — net drawdown limits only trigger on actual sustained losses.

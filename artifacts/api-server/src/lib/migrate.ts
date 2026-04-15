@@ -363,6 +363,25 @@ export async function runMigrations() {
         ON competition_config(polling_frequency)
     `);
 
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS drawdown_events (
+        id SERIAL PRIMARY KEY,
+        environment TEXT NOT NULL DEFAULT 'development',
+        event_type TEXT NOT NULL,
+        high_water_mark NUMERIC NOT NULL,
+        current_bankroll NUMERIC NOT NULL,
+        drawdown_pct NUMERIC NOT NULL,
+        limit_pct NUMERIC NOT NULL,
+        would_have_triggered TEXT NOT NULL DEFAULT 'false',
+        details JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_drawdown_events_env_created
+        ON drawdown_events(environment, created_at DESC)
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
