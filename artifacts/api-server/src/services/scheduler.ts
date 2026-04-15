@@ -46,6 +46,9 @@ import { syncDevToProd } from "./syncDevToProd";
 import { reconcileSettlements, isLiveMode, getAccountFunds } from "./betfairLive";
 import { recalculateAllDataRichness } from "./dataRichness";
 import { reviewLiveThreshold } from "./liveThresholdReview";
+import { checkRelayHealth, isRelayConfigured, relayGetLiquidity, relayGetMarket } from "./vpsRelay";
+import { runOrderManagement, getTicksWithin } from "./orderManager";
+import { liquiditySnapshotsTable } from "@workspace/db";
 
 // ===================== Status tracking =====================
 
@@ -143,6 +146,83 @@ async function safeRunOddspapiMapping(): Promise<void> {
   }
 }
 
+// ===================== Liquidity snapshot helper =====================
+
+async function logLiquiditySnapshot(
+  matchId: number,
+  marketType: string,
+  selectionName: string,
+  targetOdds: number,
+  desiredStake: number,
+): Promise<void> {
+  try {
+    const match = await db
+      .select({ betfairEventId: matchesTable.betfairEventId })
+      .from(matchesTable)
+      .where(eq(matchesTable.id, matchId))
+      .limit(1);
+
+    const eventId = match[0]?.betfairEventId;
+    if (!eventId) return;
+
+    const marketData = await relayGetMarket(eventId);
+    if (!marketData?.markets?.length) return;
+
+    const relevantMarket = marketData.markets.find((m) =>
+      m.marketType === marketType || m.marketName?.toUpperCase().includes(marketType.replace("_", " ")),
+    ) ?? marketData.markets[0];
+
+    const liquidity = await relayGetLiquidity(relevantMarket.marketId);
+    if (!liquidity?.runners?.length) return;
+
+    const runner = relevantMarket.runners?.find(
+      (r) => r.name?.toUpperCase().includes(selectionName.toUpperCase()),
+    );
+    const runnerData = runner
+      ? liquidity.runners.find((r) => r.selectionId === runner.selectionId)
+      : liquidity.runners[0];
+
+    if (!runnerData) return;
+
+    const backPrices = runnerData.backPrices ?? [];
+    const atPrice = backPrices.find((p) => Math.abs(p.price - targetOdds) < 0.005)?.size ?? 0;
+    const tick1Range = getTicksWithin(targetOdds, 1);
+    const tick3Range = getTicksWithin(targetOdds, 3);
+    const within1 = backPrices
+      .filter((p) => p.price >= tick1Range.min && p.price <= tick1Range.max)
+      .reduce((s, p) => s + p.size, 0);
+    const within3 = backPrices
+      .filter((p) => p.price >= tick3Range.min && p.price <= tick3Range.max)
+      .reduce((s, p) => s + p.size, 0);
+    const shortfall = Math.max(0, desiredStake - within3);
+
+    await db.insert(liquiditySnapshotsTable).values({
+      matchId,
+      marketType,
+      selectionName,
+      betfairMarketId: relevantMarket.marketId,
+      selectionId: runner?.selectionId ?? null,
+      targetOdds: String(targetOdds),
+      availableAtPrice: String(atPrice),
+      availableWithin1Tick: String(within1),
+      availableWithin3Ticks: String(within3),
+      totalMarketVolume: String(liquidity.totalMatched ?? 0),
+      desiredStake: String(desiredStake),
+      liquidityShortfall: String(shortfall),
+      depthData: { back: backPrices.slice(0, 5), lay: (runnerData.layPrices ?? []).slice(0, 5) },
+    });
+
+    if (shortfall > 0) {
+      logger.info(
+        { matchId, marketType, selectionName, shortfall: shortfall.toFixed(2), available: within3.toFixed(2), desired: desiredStake },
+        "Liquidity shortfall detected for bet",
+      );
+    }
+  } catch (err) {
+    logger.debug({ err, matchId }, "Liquidity snapshot logging failed — non-blocking");
+  }
+}
+
 // ===================== Trading cycle =====================
 
 const TRADING_LOCK_ID = 100001;
@@ -176,29 +256,41 @@ async function releaseAdvisoryLock(lockId: number): Promise<void> {
   }
 }
 
-export async function runTradingCycle(): Promise<{
+export async function runTradingCycle(options?: {
+  maxHoursAhead?: number;
+  minHoursAhead?: number;
+  tier?: "near" | "far";
+}): Promise<{
   betsPlaced: number;
   betsSettled: number;
   riskTriggered: boolean;
+  tier: string;
+  fixtureWindowHours: number;
+  signalGeneratedAt?: string;
 }> {
+  const tier = options?.tier ?? "near";
+  const minHours = options?.minHoursAhead ?? 1;
+  const maxHours = options?.maxHoursAhead ?? (tier === "near" ? 48 : 168);
+  const cycleStartedAt = Date.now();
+
   if (tradingCycleRunning) {
-    logger.warn("Trading cycle already in progress — skipping this run");
+    logger.warn({ tier }, "Trading cycle already in progress — skipping this run");
     markRun("trading", "skipped");
-    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
+    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   }
 
   const lockAcquired = await tryAdvisoryLock(TRADING_LOCK_ID);
   if (!lockAcquired) {
-    logger.warn("Trading cycle locked by another instance — skipping");
+    logger.warn({ tier }, "Trading cycle locked by another instance — skipping");
     markRun("trading", "skipped");
-    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
+    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   }
 
   tradingCycleRunning = true;
   markStart("trading");
 
   try {
-    logger.info("Starting trading cycle");
+    logger.info({ tier, minHours, maxHours }, "Starting trading cycle");
 
     // 1. Settle any finished bets first
     const settlement = await settleBets();
@@ -210,31 +302,31 @@ export async function runTradingCycle(): Promise<{
     // 2. Run risk checks
     const riskResult = await runAllRiskChecks();
     if (riskResult.anyTriggered) {
-      logger.warn("Risk check triggered — skipping bet placement this cycle");
+      logger.warn({ tier }, "Risk check triggered — skipping bet placement this cycle");
       markRun("trading", "success");
-      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: true };
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: true, tier, fixtureWindowHours: maxHours };
     }
 
     // 3. Check agent is running
     const agentStatus = await getAgentStatus();
     if (agentStatus !== "running") {
-      logger.info({ agentStatus }, "Agent not running — skipping bet placement");
+      logger.info({ agentStatus, tier }, "Agent not running — skipping bet placement");
       markRun("trading", "skipped");
-      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
 
     // 4. Check model is available
     const modelVersion = getModelVersion();
     if (!modelVersion) {
-      logger.info("No model loaded — skipping value detection");
+      logger.info({ tier }, "No model loaded — skipping value detection");
       markRun("trading", "skipped");
-      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
 
-    // 5. Detect value bets for matches kicking off in 1h–168h (full week)
+    // 5. Detect value bets within the specified kickoff window
     const now = new Date();
-    const earliest = new Date(now.getTime() + 1 * 60 * 60 * 1000);
-    const latest   = new Date(now.getTime() + 168 * 60 * 60 * 1000);
+    const earliest = new Date(now.getTime() + minHours * 60 * 60 * 1000);
+    const latest   = new Date(now.getTime() + maxHours * 60 * 60 * 1000);
 
     // 5a. Load pre-fetched OddsPapi odds from DB snapshots (no API calls here).
     //     The scheduled 6am bulk prefetch and 12pm midday refresh populate the DB.
@@ -542,14 +634,55 @@ export async function runTradingCycle(): Promise<{
 
     if (preCorrelation.length === 0) {
       markRun("trading", "success");
-      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
 
     // 10. Correlation detection
     const { selectedBets } = await applyCorrelationDetection(preCorrelation, bankroll);
 
-    // 11. Place the final bets
-    let betsPlaced = 0;
+    // ═══════════════════════════════════════════════════════════════════
+    // PHASE 2: SIGNAL → EXECUTION SPLIT
+    // Signal generation is complete. Now build structured bet orders,
+    // then execute them as fast as possible with timing tracking.
+    // ═══════════════════════════════════════════════════════════════════
+
+    const signalCompleteAt = Date.now();
+    const signalDurationMs = signalCompleteAt - cycleStartedAt;
+    logger.info(
+      { tier, signalDurationMs, candidates: selectedBets.length },
+      "Signal generation complete — entering execution phase",
+    );
+
+    // 11a. Build bet orders (pre-filter through Pinnacle)
+    interface BetOrder {
+      matchId: number;
+      homeTeam: string;
+      awayTeam: string;
+      marketType: string;
+      selectionName: string;
+      backOdds: number;
+      modelProbability: number;
+      edge: number;
+      effectiveScore: number;
+      isContrarian: boolean;
+      validation: Awaited<ReturnType<typeof getOddspapiValidation>> | null;
+      thesis: string | undefined;
+      stakeMultiplier: number;
+      experimentTag?: string;
+      dataTier?: string;
+      opportunityBoosted?: boolean;
+      originalOpportunityScore?: number;
+      boostedOpportunityScore?: number;
+      syncEligible?: boolean;
+      pinnacleEdgeCategory: string | null;
+      lineDirection: string | null;
+      oddsSource: string;
+      enhanced: boolean;
+      signalGeneratedAt: number;
+    }
+
+    const betOrders: BetOrder[] = [];
+
     for (const candidate of selectedBets) {
       const extra = candidate as BetCandidate & Record<string, unknown>;
       const validation = extra._validation as Awaited<ReturnType<typeof getOddspapiValidation>> | null;
@@ -597,67 +730,149 @@ export async function runTradingCycle(): Promise<{
 
       if (!filterPassed) continue;
 
-      const result = await placePaperBet(
-        candidate.matchId,
-        candidate.marketType,
-        candidate.selectionName,
+      betOrders.push({
+        matchId: candidate.matchId,
+        homeTeam: candidate.homeTeam,
+        awayTeam: candidate.awayTeam,
+        marketType: candidate.marketType,
+        selectionName: candidate.selectionName,
         backOdds,
-        candidate.modelProbability,
-        candidate.edge,
+        modelProbability: candidate.modelProbability,
+        edge: candidate.edge,
+        effectiveScore,
+        isContrarian,
+        validation,
+        thesis,
+        stakeMultiplier: candidate.stakeMultiplier,
+        experimentTag: candidate.experimentTag,
+        dataTier: candidate.dataTier,
+        opportunityBoosted: candidate.opportunityBoosted,
+        originalOpportunityScore: candidate.originalOpportunityScore,
+        boostedOpportunityScore: candidate.boostedOpportunityScore,
+        syncEligible: candidate.syncEligible,
+        pinnacleEdgeCategory: filterEdgeCategory,
+        lineDirection: filterLineDirection,
+        oddsSource: candidate.oddsSource,
+        enhanced: candidate.enhanced ?? false,
+        signalGeneratedAt: signalCompleteAt,
+      });
+    }
+
+    if (betOrders.length > 0) {
+      logger.info(
+        { orders: betOrders.length, tier },
+        "Bet orders built — executing immediately",
+      );
+    }
+
+    // 11b. EXECUTE bet orders — fast path, no heavy computation
+    let betsPlaced = 0;
+    const executionTimings: Array<{ matchId: number; market: string; executionMs: number }> = [];
+
+    for (const order of betOrders) {
+      const execStartMs = Date.now();
+
+      const result = await placePaperBet(
+        order.matchId,
+        order.marketType,
+        order.selectionName,
+        order.backOdds,
+        order.modelProbability,
+        order.edge,
         {
           modelVersion: modelVersion ?? undefined,
-          opportunityScore: effectiveScore,
-          oddsSource: candidate.oddsSource,
-          enhancedOpportunityScore: validation?.hasPinnacleData ? effectiveScore : null,
-          pinnacleOdds: validation?.pinnacleOdds ?? null,
-          pinnacleImplied: validation?.pinnacleImplied ?? null,
-          bestOdds: validation?.bestOdds ?? backOdds,
-          bestBookmaker: validation?.bestBookmaker ?? null,
-          betThesis: thesis,
-          isContrarian,
-          stakeMultiplier: candidate.stakeMultiplier,
-          experimentTag: candidate.experimentTag,
-          dataTier: candidate.dataTier,
-          opportunityBoosted: candidate.opportunityBoosted,
-          originalOpportunityScore: candidate.originalOpportunityScore,
-          boostedOpportunityScore: candidate.boostedOpportunityScore,
-          syncEligible: candidate.syncEligible,
-          pinnacleEdgeCategory: filterEdgeCategory,
-          lineDirection: filterLineDirection,
+          opportunityScore: order.effectiveScore,
+          oddsSource: order.oddsSource,
+          enhancedOpportunityScore: order.validation?.hasPinnacleData ? order.effectiveScore : null,
+          pinnacleOdds: order.validation?.pinnacleOdds ?? null,
+          pinnacleImplied: order.validation?.pinnacleImplied ?? null,
+          bestOdds: order.validation?.bestOdds ?? order.backOdds,
+          bestBookmaker: order.validation?.bestBookmaker ?? null,
+          betThesis: order.thesis,
+          isContrarian: order.isContrarian,
+          stakeMultiplier: order.stakeMultiplier,
+          experimentTag: order.experimentTag,
+          dataTier: order.dataTier,
+          opportunityBoosted: order.opportunityBoosted,
+          originalOpportunityScore: order.originalOpportunityScore,
+          boostedOpportunityScore: order.boostedOpportunityScore,
+          syncEligible: order.syncEligible,
+          pinnacleEdgeCategory: order.pinnacleEdgeCategory,
+          lineDirection: order.lineDirection,
         },
       );
 
+      const execMs = Date.now() - execStartMs;
+      const signalToExecMs = Date.now() - order.signalGeneratedAt;
+
       if (result.placed) {
         betsPlaced++;
+        executionTimings.push({ matchId: order.matchId, market: order.marketType, executionMs: execMs });
         logger.info(
           {
-            matchId: candidate.matchId,
-            homeTeam: candidate.homeTeam,
-            awayTeam: candidate.awayTeam,
-            marketType: candidate.marketType,
-            selectionName: candidate.selectionName,
-            backOdds: backOdds.toFixed(2),
-            edge: candidate.edge.toFixed(4),
+            matchId: order.matchId,
+            homeTeam: order.homeTeam,
+            awayTeam: order.awayTeam,
+            marketType: order.marketType,
+            selectionName: order.selectionName,
+            backOdds: order.backOdds.toFixed(2),
+            edge: order.edge.toFixed(4),
             stake: result.stake,
-            oddsSource: candidate.oddsSource,
-            opportunityScore: effectiveScore,
-            enhanced: candidate.enhanced,
-            pinnacleAligned: validation?.pinnacleAligned ?? false,
-            isContrarian,
-            stakeMultiplier: candidate.stakeMultiplier,
+            oddsSource: order.oddsSource,
+            opportunityScore: order.effectiveScore,
+            enhanced: order.enhanced,
+            pinnacleAligned: order.validation?.pinnacleAligned ?? false,
+            isContrarian: order.isContrarian,
+            stakeMultiplier: order.stakeMultiplier,
+            executionMs: execMs,
+            signalToExecMs,
           },
           "Automated bet placed",
+        );
+
+        // Fire-and-forget: log liquidity snapshot for this bet (non-blocking)
+        if (isRelayConfigured()) {
+          void logLiquiditySnapshot(order.matchId, order.marketType, order.selectionName, order.backOdds, result.stake ?? 0)
+            .catch((err) => logger.debug({ err, matchId: order.matchId }, "Liquidity snapshot failed — non-fatal"));
+        }
+      }
+    }
+
+    // 11c. Execution timing summary & alerts
+    if (executionTimings.length > 0) {
+      const avgExecMs = Math.round(executionTimings.reduce((s, t) => s + t.executionMs, 0) / executionTimings.length);
+      const maxExecMs = Math.max(...executionTimings.map((t) => t.executionMs));
+      const totalSignalToLastExecMs = Date.now() - signalCompleteAt;
+      logger.info(
+        { avgExecMs, maxExecMs, totalSignalToLastExecMs, betsExecuted: executionTimings.length, tier },
+        "Execution timing summary",
+      );
+      if (avgExecMs > 30000) {
+        logger.warn(
+          { avgExecMs, threshold: 30000 },
+          "EXECUTION SPEED ALERT — average execution time exceeds 30 seconds",
         );
       }
     }
 
-    logger.info({ betsPlaced, betsSettled: settlement.settled }, "Trading cycle complete");
+    const cycleDurationMs = Date.now() - cycleStartedAt;
+    logger.info(
+      { betsPlaced, betsSettled: settlement.settled, tier, maxHours, cycleDurationMs },
+      "Trading cycle complete",
+    );
     markRun("trading", "success");
-    return { betsPlaced, betsSettled: settlement.settled, riskTriggered: false };
+    return {
+      betsPlaced,
+      betsSettled: settlement.settled,
+      riskTriggered: false,
+      tier,
+      fixtureWindowHours: maxHours,
+      signalGeneratedAt: new Date().toISOString(),
+    };
   } catch (err) {
-    logger.error({ err }, "Trading cycle failed");
+    logger.error({ err, tier }, "Trading cycle failed");
     markRun("trading", "error");
-    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false };
+    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   } finally {
     tradingCycleRunning = false;
     await releaseAdvisoryLock(TRADING_LOCK_ID);
@@ -876,14 +1091,26 @@ export function startScheduler(): void {
   cron.schedule("0 */6 * * *", () => { void safeRunFeatures(); }, { timezone: "UTC" });
   logger.info("Feature scheduler active — every 6 hours UTC");
 
-  // Trading cycle: every 10 minutes (increased frequency for paper data collection)
-  // Runs deduplication after each cycle to catch any cross-cycle duplicates.
-  cron.schedule("*/10 * * * *", () => {
-    void runTradingCycle().then(() => deduplicatePendingBets()).catch((err) => {
-      logger.warn({ err }, "Post-trading-cycle dedup failed — non-fatal");
-    });
+  // Trading cycle — TIERED:
+  // NEAR tier: every 5 minutes for fixtures ≤48h (where speed matters most for edge capture)
+  // FAR tier: every 30 minutes for fixtures 48h–168h (discovery — no urgency)
+  cron.schedule("*/5 * * * *", () => {
+    void runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 })
+      .then(() => deduplicatePendingBets())
+      .catch((err) => {
+        logger.warn({ err }, "Post-trading-cycle dedup failed — non-fatal");
+      });
   }, { timezone: "UTC" });
-  logger.info("Trading cycle scheduler active — every 10 minutes (with post-cycle dedup)");
+  logger.info("Trading cycle (NEAR) scheduler active — every 5 minutes, fixtures ≤48h");
+
+  cron.schedule("2,32 * * * *", () => {
+    void runTradingCycle({ tier: "far", minHoursAhead: 48, maxHoursAhead: 168 })
+      .then(() => deduplicatePendingBets())
+      .catch((err) => {
+        logger.warn({ err }, "Post-trading-cycle dedup failed — non-fatal");
+      });
+  }, { timezone: "UTC" });
+  logger.info("Trading cycle (FAR) scheduler active — every 30 minutes, fixtures 48h–168h");
 
   // API-Football: fetch real odds every 2 hours — fresh odds for every trading cycle
   // With 75,000 req/day budget, each scan uses ~30-50 reqs, plenty of headroom
@@ -1117,24 +1344,55 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Monthly league scoring active — 1st of month 03:00 UTC");
 
-  // Startup trading cycle: fire 3 minutes after server start so any restart
-  // doesn't leave the cycle dormant for up to 15 minutes.
+  // VPS relay health check: every 5 minutes (if relay is configured)
+  if (isRelayConfigured()) {
+    cron.schedule("*/5 * * * *", () => {
+      void checkRelayHealth()
+        .then((result) => {
+          if (result.healthy) {
+            logger.debug({ latencyMs: result.latencyMs, uptime: result.uptime }, "VPS relay healthy");
+          }
+        })
+        .catch((err) => logger.error({ err }, "VPS relay health check error"));
+    }, { timezone: "UTC" });
+    logger.info("VPS relay health check active — every 5 minutes");
+  } else {
+    logger.info("VPS relay not configured (VPS_RELAY_URL not set) — health check skipped");
+  }
+
+  // Order management: every 2 minutes when relay is configured (live mode)
+  // Checks partial fills, handles cancellation timeouts, near-kickoff reassessment
+  if (isRelayConfigured()) {
+    cron.schedule("*/2 * * * *", () => {
+      void runOrderManagement()
+        .then((r) => {
+          if (r.checked > 0) {
+            logger.info(r, "Order management cycle complete");
+          }
+        })
+        .catch((err) => logger.warn({ err }, "Order management cycle failed — non-fatal"));
+    }, { timezone: "UTC" });
+    logger.info("Order management cron active — every 2 minutes (partial fills, cancellations, reassessment)");
+  }
+
+  // Startup trading cycle: fire 2 minutes after server start so any restart
+  // doesn't leave the cycle dormant for up to 5 minutes.
   // Also refresh odds first so the cycle has fresh market data.
   setTimeout(() => {
     logger.info("Startup odds refresh triggered (post-restart warmup)");
     void fetchAndStoreOddsForAllUpcoming()
       .then(() => {
-        logger.info("Startup odds refresh complete — running trading cycle");
-        return runTradingCycle();
+        logger.info("Startup odds refresh complete — running near-term trading cycle");
+        return runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 });
       })
       .then((result) => {
-        logger.info(result, "Startup trading cycle complete");
+        logger.info(result, "Startup near trading cycle complete");
       })
       .catch((err) => {
         logger.warn({ err }, "Startup warmup sequence failed — non-fatal, cron will retry");
       });
-  }, 3 * 60 * 1000); // 3 minutes after start
-  logger.info("Startup warmup scheduled — odds refresh + trading cycle in 3 min");
+  }, 2 * 60 * 1000); // 2 minutes after start
+  logger.info("Startup warmup scheduled — odds refresh + near trading cycle in 2 min");
 
   // Seed baseline leagues + competition config at startup (idempotent — uses onConflictDoNothing)
   void seedBaselineLeagues().catch((err) => logger.warn({ err }, "Baseline league seed failed — non-fatal"));

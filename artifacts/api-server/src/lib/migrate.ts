@@ -501,6 +501,30 @@ export async function runMigrations() {
     `);
 
     await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS liquidity_snapshots (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        betfair_market_id TEXT,
+        selection_id INTEGER,
+        target_odds NUMERIC(10,4),
+        available_at_price NUMERIC(12,2),
+        available_within_1_tick NUMERIC(12,2),
+        available_within_3_ticks NUMERIC(12,2),
+        total_market_volume NUMERIC(14,2),
+        desired_stake NUMERIC(10,2),
+        liquidity_shortfall NUMERIC(10,2),
+        depth_data JSONB,
+        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_liquidity_snapshots_match
+        ON liquidity_snapshots(match_id, market_type)
+    `);
+
+    await db.execute(sql`
       CREATE TABLE IF NOT EXISTS data_richness_cache (
         id SERIAL PRIMARY KEY,
         league TEXT NOT NULL,

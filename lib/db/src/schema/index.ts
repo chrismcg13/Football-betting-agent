@@ -22,3 +22,4 @@ export * from "./drawdownEvents";
 export * from "./pinnacleOddsSnapshots";
 export * from "./lineMovements";
 export * from "./filteredBets";
+export * from "./liquiditySnapshots";

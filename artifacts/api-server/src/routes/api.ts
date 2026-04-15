@@ -2252,6 +2252,57 @@ router.post("/admin/starting-deposit", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// GET /api/dashboard/liquidity — liquidity snapshot summary
+// ─────────────────────────────────────────────
+router.get("/dashboard/liquidity", async (req, res) => {
+  try {
+    const days = Number(req.query.days ?? 7);
+    const result = await db.execute(sql`
+      SELECT
+        ls.market_type,
+        m.league,
+        COUNT(*)::int AS snapshots,
+        ROUND(AVG(ls.available_at_price::numeric), 2) AS avg_available,
+        ROUND(AVG(ls.liquidity_shortfall::numeric), 2) AS avg_shortfall,
+        ROUND(AVG(ls.total_market_volume::numeric), 0) AS avg_volume,
+        COUNT(*) FILTER (WHERE ls.liquidity_shortfall::numeric > 0)::int AS shortfall_count
+      FROM liquidity_snapshots ls
+      JOIN matches m ON m.id = ls.match_id
+      WHERE ls.captured_at > NOW() - INTERVAL '1 day' * ${days}
+      GROUP BY ls.market_type, m.league
+      ORDER BY avg_shortfall DESC NULLS LAST
+      LIMIT 50
+    `);
+    res.json({
+      days,
+      summary: result.rows,
+      totalSnapshots: result.rows.reduce((s: number, r: any) => s + (r.snapshots ?? 0), 0),
+    });
+  } catch (err) {
+    logger.warn({ err }, "Liquidity dashboard failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/vps-relay — VPS relay status
+// ─────────────────────────────────────────────
+router.get("/dashboard/vps-relay", async (_req, res) => {
+  try {
+    const { getRelayStatus, checkRelayHealth, isRelayConfigured } = await import("../services/vpsRelay");
+    const status = getRelayStatus();
+    if (!status.configured) {
+      return res.json({ ...status, message: "VPS relay not configured — set VPS_RELAY_URL" });
+    }
+    const health = await checkRelayHealth();
+    res.json({ ...status, ...health });
+  } catch (err) {
+    logger.warn({ err }, "VPS relay status check failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
 // GET /api/dashboard/model-health — latest model health report
 // ─────────────────────────────────────────────
 router.get("/dashboard/model-health", async (_req, res) => {
