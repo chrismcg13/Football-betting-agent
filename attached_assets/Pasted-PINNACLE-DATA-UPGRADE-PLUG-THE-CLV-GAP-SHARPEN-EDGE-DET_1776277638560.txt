@@ -1,0 +1,66 @@
+PINNACLE DATA UPGRADE — PLUG THE CLV GAP & SHARPEN EDGE DETECTION
+
+The OddsPapi budget has been massively increased from 250 requests/month to 100,000 requests/month. This changes everything about how we validate bets and measure edge. Use this budget aggressively — it exists to make the model elite.
+
+Currently CLV data is incomplete (only measured on 112 of 309 settled bets). This is unacceptable for live trading. Every single Tier 1 bet must have complete Pinnacle data. No gaps.
+
+1. COMPLETE CLV COVERAGE — NON-NEGOTIABLE:
+   - Fetch Pinnacle odds for EVERY fixture the model evaluates, not just a sample
+   - At minimum, capture Pinnacle odds at these timestamps for each bet:
+     a) At time of bet identification (our entry price vs Pinnacle's current line)
+     b) At 1 hour before kick-off (mid-point reference)
+     c) At market close / kick-off (the closing line — this is the CLV benchmark)
+   - Store all three snapshots per bet. CLV = (our_odds - closing_odds) / closing_odds
+   - Historical CLV data must be backfilled where possible for existing paper bets
+   - Target: 100% CLV coverage on all Tier 1 bets from day one of live trading. Zero gaps.
+
+2. PRE-BET PINNACLE FILTERING — KILL WEAK BETS BEFORE THEY'RE PLACED:
+   - Before ANY bet is placed (Tier 1 or Tier 2), compare our model's predicted probability against the Pinnacle line
+   - Pinnacle's line is the sharpest in the market — it's the closest thing to a "true" probability
+   - Calculate the implied probability from Pinnacle's odds (removing the overround/vig)
+   - If our model's edge over Pinnacle's implied probability is less than 2%, DO NOT place the bet — the edge is too thin to survive commission and variance
+   - If our model's edge over Pinnacle is 2-4%, this is a standard bet — place with normal Kelly sizing
+   - If our model's edge over Pinnacle is >4%, this is a high-confidence bet — flag it as such in the bet record
+   - Log every bet that gets filtered OUT by Pinnacle validation, with the reason and the edge calculation. This is critical data for the learning system — we want to know if filtered bets would have won or lost.
+   - This filter alone will dramatically improve bet quality by weeding out bets where our "edge" is actually just noise
+
+3. LINE MOVEMENT INTELLIGENCE:
+   - With 100k requests, we can now track how Pinnacle odds move over time for every fixture
+   - Implement line movement tracking:
+     a) First capture: when the market opens (as early as odds are available)
+     b) Periodic captures: every 4-6 hours until kick-off
+     c) Final capture: at kick-off (closing line)
+   - Use line movement to inform bet timing:
+     a) If our model identifies an edge and Pinnacle's line is moving TOWARD our position, this confirms the edge — place immediately before the line moves further
+     b) If Pinnacle's line is moving AWAY from our position, this is a warning — the sharp money disagrees. Increase the minimum edge threshold to 3% for these bets.
+     c) If the line has been stable for 24+ hours, the market is settled — our edge calculation is more reliable
+   - Store all line movement data. Over time this becomes a goldmine for the learning system to understand when the model is early vs wrong.
+
+4. REVERSE CLV ANALYSIS — LEARN FROM THE SHARPS:
+   - When Pinnacle's line moves significantly (>3% implied probability shift), log it as a "sharp movement"
+   - Analyse: does our model tend to be on the same side as sharp movements? If yes, we're thinking like the sharps. If no, investigate why.
+   - Track "early edge" — bets where we identify value before Pinnacle's line moves. These are the most valuable bets because we're capturing edge that the market hasn't priced in yet.
+   - This data feeds directly into the weekly learning job (Prompt 7) for model improvement.
+
+5. PINNACLE COVERAGE MAPPING:
+   - Not all leagues have deep Pinnacle markets. Map which leagues and market types have reliable Pinnacle coverage.
+   - Leagues WITH strong Pinnacle coverage: these are Tier 1 candidates with high-quality CLV data
+   - Leagues WITHOUT Pinnacle coverage: these cannot have reliable CLV measurement and should remain Tier 2 until promoted through the experiment pipeline using other validation methods
+   - Update the data_richness_score from Prompt 2 to heavily weight Pinnacle availability
+
+6. BUDGET MANAGEMENT (100,000 requests/month):
+   - 100k is generous but not infinite. Allocate intelligently:
+     a) Priority 1: Pre-bet validation for all fixtures the model is evaluating (~40% of budget)
+     b) Priority 2: Line movement tracking for Tier 1 qualifying fixtures (~30% of budget)
+     c) Priority 3: Closing line capture for CLV measurement (~20% of budget)
+     d) Priority 4: Exploratory coverage of new leagues (~10% of budget)
+   - Track daily usage. If projecting over budget, reduce Priority 4 first, then Priority 2 frequency
+   - Never cut Priority 1 or Priority 3 — these are non-negotiable for bet quality and performance measurement
+
+7. IMPACT ON PROMOTION PIPELINE:
+   - With complete CLV data, the experiment pipeline's statistical confidence will build MUCH faster
+   - The 30-bet requirement for Experiment→Candidate can now have CLV measured on every single bet, not a partial sample
+   - This means experiments will reach statistical significance faster and the pipeline will flow more efficiently
+   - Do NOT change the promotion thresholds — just ensure every bet has complete data to be evaluated against
+
+Show me the OddsPapi integration plan and budget allocation before implementing.
