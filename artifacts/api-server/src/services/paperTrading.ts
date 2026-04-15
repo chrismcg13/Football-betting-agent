@@ -26,6 +26,7 @@ import {
   checkLiveCircuitBreakers,
   isBetfairApiPaused,
 } from "./liveRiskManager";
+import { detectCurrentRegime } from "./marketRegime";
 
 // ===================== Config helpers =====================
 
@@ -501,6 +502,16 @@ export async function placePaperBet(
     logger.info(
       { matchId, marketType, backOdds, segmentMultiplier, preSegStake, postSegStake: stake, marketFamily: getMarketFamily(marketType) },
       "Edge concentration: segment Kelly modifier applied",
+    );
+  }
+
+  const regime = await detectCurrentRegime();
+  if (regime.stakeMultiplier < 1.0) {
+    const preRegimeStake = stake;
+    stake = Math.round(stake * regime.stakeMultiplier * 100) / 100;
+    logger.info(
+      { matchId, marketType, regime: regime.current, stakeMultiplier: regime.stakeMultiplier, preRegimeStake, postRegimeStake: stake },
+      "Market regime stake adjustment applied",
     );
   }
 

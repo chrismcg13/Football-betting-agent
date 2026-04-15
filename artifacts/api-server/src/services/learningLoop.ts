@@ -391,6 +391,42 @@ export async function runLearningLoop(): Promise<LearningLoopResult> {
       previousFeatureImportances,
     );
 
+    // 6. Generate model health report (weekly deep analysis)
+    try {
+      const { generateModelHealthReport } = await import("./modelHealthReport");
+      const healthReport = await generateModelHealthReport();
+      logger.info(
+        { calibration: healthReport.calibrationScore, verdict: healthReport.northStarVerdict.diagnosis.slice(0, 40) },
+        "Model health report generated as part of learning loop",
+      );
+    } catch (err) {
+      logger.error({ err }, "Model health report generation failed (non-blocking)");
+    }
+
+    // 7. Edge decay analysis
+    try {
+      const { analyzeEdgeDecay } = await import("./edgeDecay");
+      const edgeDecay = await analyzeEdgeDecay();
+      logger.info(
+        { overallDecay: edgeDecay.overallAvgDecay, fastDecaying: edgeDecay.fastDecayingMarkets.length },
+        "Edge decay analysis complete as part of learning loop",
+      );
+    } catch (err) {
+      logger.error({ err }, "Edge decay analysis failed (non-blocking)");
+    }
+
+    // 8. Agent recommendations
+    try {
+      const { generateAgentRecommendations } = await import("./agentRecommendations");
+      const recs = await generateAgentRecommendations();
+      logger.info(
+        { recommendations: recs.recommendations.length },
+        "Agent recommendations generated as part of learning loop",
+      );
+    } catch (err) {
+      logger.error({ err }, "Agent recommendations generation failed (non-blocking)");
+    }
+
     logger.info(
       {
         version: retrainResult.version,

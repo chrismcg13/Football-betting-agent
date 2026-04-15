@@ -1,0 +1,60 @@
+NORTH STAR METRICS & CONTINUOUS LEARNING SYSTEM
+
+The agent's entire decision-making framework must be weighted by these metrics in this exact priority order:
+
+1. CLV (Closing Line Value) — THE leading indicator
+2. ROI (Return on Investment) — THE confirmation metric  
+3. Win Rate — informational only, never optimise for this directly
+
+METRIC WEIGHTING IN MODEL DECISIONS:
+- When evaluating whether to place a bet: CLV signal carries 50% weight, expected ROI carries 35%, win probability carries 15%
+- When evaluating model performance: CLV is the primary health metric. A model with positive CLV but temporary negative ROI is HEALTHY. A model with negative CLV but positive ROI is LUCKY and needs investigation.
+- When the weekly learning job runs: optimise prediction adjustments to maximise CLV first, then check ROI impact. If an adjustment improves CLV but reduces short-term ROI, it should still be made. If an adjustment improves ROI but reduces CLV, reject it.
+
+CONTINUOUS DEEP LEARNING & SELF-OPTIMISATION:
+
+1. WEEKLY MODEL REVIEW (expand the existing 3am Sunday learning job):
+   - Analyse which features are contributing most to CLV-positive bets vs CLV-negative bets
+   - Identify market types where the model has genuine edge vs where it's noise
+   - Recalibrate probability estimates using actual settlement data
+   - Track prediction calibration: are bets predicted at 60% winning ~60% of the time?
+   - Generate a weekly "Model Health Report" stored in the learning journal with:
+     a) CLV trend (7-day, 30-day, all-time)
+     b) ROI trend (7-day, 30-day, all-time)
+     c) Best and worst performing league-market combinations
+     d) Feature importance changes
+     e) Calibration drift
+     f) Recommendation for any parameter adjustments (opportunity score, Kelly fraction, market focus)
+   - Feed edge segmentation data from Prompt 5 into the weekly review — the model should be learning which segments to expand and which to contract.
+
+2. MARKET REGIME DETECTION:
+   - The model should detect when market conditions are changing:
+     a) End of season vs mid-season (different dynamics)
+     b) International break periods (reduced fixtures, different market behaviour)  
+     c) Transfer windows (team quality shifts)
+     d) Major tournament periods (World Cup 2026 is June — huge opportunity)
+   - Adjust confidence and stake sizing based on regime. New or unusual regimes should trigger more conservative betting until the model has enough data.
+
+3. EDGE DECAY TRACKING:
+   - For each bet, track how long the edge persists between identification and market close
+   - If the model identifies that edges are decaying faster (market becoming more efficient for certain bet types), flag this
+   - Use edge decay data to optimise bet timing — place bets when the edge is largest
+   - If a market type shows consistent edge decay to zero before we can place, consider deprioritising that market
+
+4. SELF-ADVOCACY & RESOURCE OPTIMISATION:
+   - The model should actively monitor its own resource constraints and flag when improvements are needed:
+     a) API budget utilisation: if approaching 80% of API-Football's 75k/month, flag it with a recommendation
+     b) If OddsPapi budget utilisation is constraining Pinnacle coverage, flag it with impact analysis
+     c) If processing time for features/predictions is increasing, flag potential need for more compute
+     d) If new data sources could improve predictions (e.g., weather data, referee data, expected goals providers), log these as "Enhancement Opportunities" in the learning journal
+   - Create an "Agent Recommendations" section on the dashboard that surfaces these insights
+   - Each recommendation must include: what it is, why it matters, estimated impact on CLV/ROI, estimated cost
+   - The agent should NEVER automatically increase its own risk limits or bypass safety controls. It recommends, I decide.
+
+5. PERFORMANCE ATTRIBUTION:
+   - Track which model features are driving profitable bets
+   - Track which data sources contribute most to edge (Pinnacle odds? Form data? Lineup info?)
+   - Use this to prioritise where to invest in data quality and API budget
+   - If a data source is not contributing to CLV, consider reallocating that API budget
+
+The agent's personality is: an elite quantitative trader who respects risk management, is obsessively focused on finding and maintaining edge, is transparent about uncertainty, and proactively communicates what it needs to perform at its best. It maximises risk-adjusted returns within its framework — it never pushes to relax the framework itself.

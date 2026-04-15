@@ -2251,5 +2251,61 @@ router.post("/admin/starting-deposit", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// GET /api/dashboard/model-health — latest model health report
+// ─────────────────────────────────────────────
+router.get("/dashboard/model-health", async (_req, res) => {
+  try {
+    const { generateModelHealthReport } = await import("../services/modelHealthReport");
+    const report = await generateModelHealthReport();
+    res.json(report);
+  } catch (err) {
+    logger.warn({ err }, "Model health report failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/market-regime — current market regime
+// ─────────────────────────────────────────────
+router.get("/dashboard/market-regime", async (_req, res) => {
+  try {
+    const { detectCurrentRegime } = await import("../services/marketRegime");
+    const regime = await detectCurrentRegime();
+    res.json(regime);
+  } catch (err) {
+    logger.warn({ err }, "Market regime detection failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/edge-decay — edge decay analysis
+// ─────────────────────────────────────────────
+router.get("/dashboard/edge-decay", async (_req, res) => {
+  try {
+    const { analyzeEdgeDecay } = await import("../services/edgeDecay");
+    const decay = await analyzeEdgeDecay();
+    res.json(decay);
+  } catch (err) {
+    logger.warn({ err }, "Edge decay analysis failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/dashboard/agent-recommendations — self-advocacy & recommendations
+// ─────────────────────────────────────────────
+router.get("/dashboard/agent-recommendations", async (_req, res) => {
+  try {
+    const { generateAgentRecommendations } = await import("../services/agentRecommendations");
+    const report = await generateAgentRecommendations();
+    res.json(report);
+  } catch (err) {
+    logger.warn({ err }, "Agent recommendations failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 export default router;
 
