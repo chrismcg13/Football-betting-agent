@@ -1227,6 +1227,24 @@ router.get("/dashboard/commission", async (_req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// GET /api/dashboard/tournament — tournament mode & seasonal awareness
+// ─────────────────────────────────────────────
+router.get("/dashboard/tournament", async (_req, res) => {
+  try {
+    const { getTournamentStatus, isTransferWindowActive, getTransferWindowUncertainty } = await import("../services/tournamentMode");
+    const status = await getTournamentStatus();
+    const transferWindow = {
+      isActive: isTransferWindowActive(),
+      ...getTransferWindowUncertainty(),
+    };
+    res.json({ ...status, transferWindow });
+  } catch (err) {
+    logger.error({ err }, "Failed to fetch tournament status");
+    res.status(500).json({ error: "Failed to fetch tournament status" });
+  }
+});
+
+// ─────────────────────────────────────────────
 // POST /api/odds/fetch — trigger API-Football odds ingestion
 // ─────────────────────────────────────────────
 router.post("/odds/fetch", async (_req, res) => {

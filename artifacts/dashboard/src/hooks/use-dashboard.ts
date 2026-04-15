@@ -126,6 +126,14 @@ export const useCommissionStats = () => {
   });
 };
 
+export const useTournamentStatus = () => {
+  return useQuery({
+    queryKey: ["dashboard", "tournament"],
+    queryFn: () => fetcher("/api/dashboard/tournament"),
+    refetchInterval: 300000,
+  });
+};
+
 export const useClvStats = () => {
   return useQuery({
     queryKey: ["dashboard", "clv-stats"],

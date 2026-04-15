@@ -27,3 +27,4 @@ export * from "./alerts";
 export * from "./cronExecutions";
 export * from "./exchanges";
 export * from "./commissionTracking";
+export * from "./tournamentConfig";

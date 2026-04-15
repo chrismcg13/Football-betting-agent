@@ -695,6 +695,87 @@ export async function runMigrations() {
       WHERE gross_pnl IS NULL AND status IN ('won', 'lost', 'void')
     `);
 
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS tournament_config (
+        id SERIAL PRIMARY KEY,
+        tournament_id INTEGER NOT NULL UNIQUE,
+        tournament_name TEXT NOT NULL,
+        tournament_type TEXT NOT NULL DEFAULT 'international',
+        start_date TIMESTAMPTZ,
+        end_date TIMESTAMPTZ,
+        is_active BOOLEAN NOT NULL DEFAULT false,
+        polling_multiplier REAL NOT NULL DEFAULT 1,
+        soft_line_nations JSONB DEFAULT '[]'::jsonb,
+        model_adjustments JSONB DEFAULT '{}'::jsonb,
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await db.execute(sql`
+      ALTER TABLE tournament_config
+        DROP CONSTRAINT IF EXISTS tournament_config_tournament_id_key
+    `);
+    await db.execute(sql`
+      ALTER TABLE tournament_config
+        ADD CONSTRAINT tournament_config_tournament_id_key UNIQUE (tournament_id)
+    `);
+
+    await db.execute(sql`
+      INSERT INTO tournament_config (tournament_id, tournament_name, tournament_type, start_date, end_date, is_active, polling_multiplier, soft_line_nations, model_adjustments, notes)
+      VALUES
+        (1, 'FIFA World Cup 2026', 'world_cup', '2026-06-11T00:00:00Z', '2026-07-19T00:00:00Z', false, 3,
+         '["Saudi Arabia","Japan","South Korea","Australia","Iran","Qatar","UAE","Iraq","Uzbekistan","Jordan","Morocco","Tunisia","Senegal","Nigeria","Cameroon","Ghana","Algeria","Egypt","Ivory Coast","Mali","Canada","Costa Rica","Honduras","El Salvador","Jamaica","Panama","New Zealand","Peru","Ecuador","Paraguay","Bolivia","Venezuela","Indonesia","Thailand","Palestine","Bahrain","Oman","China"]',
+         '{"home_advantage_reduced": true, "form_weight_reduced": 0.7, "international_break_factor": 1.15, "squad_depth_important": true, "neutral_venue_adjustment": true}',
+         'FIFA World Cup 2026 — USA/Canada/Mexico. 48 teams, expanded format. Soft lines expected on non-traditional nations in group stage.'),
+        (5, 'UEFA Nations League 2024-25', 'continental', '2024-09-01T00:00:00Z', '2025-06-30T00:00:00Z', false, 1.5,
+         '[]',
+         '{"form_weight_reduced": 0.8, "international_break_factor": 1.1}',
+         'Nations League — lower motivation in some matches, squad rotation common.'),
+        (9, 'Copa America 2028', 'continental', null, null, false, 2,
+         '["Venezuela","Bolivia","Paraguay","Peru","Ecuador"]',
+         '{"home_advantage_reduced": true, "neutral_venue_adjustment": true}',
+         'Future Copa America — placeholder for forward planning.'),
+        (15, 'WCQ - UEFA', 'qualifier', '2024-03-01T00:00:00Z', '2026-03-31T00:00:00Z', true, 2,
+         '["Georgia","North Macedonia","Kosovo","Armenia","Azerbaijan","Kazakhstan","Faroe Islands","Gibraltar","Andorra","San Marino","Liechtenstein","Moldova","Belarus","Luxembourg"]',
+         '{"international_break_factor": 1.1, "qualifying_motivation_high": true}',
+         'UEFA World Cup 2026 qualifiers — active now. Smaller nations have softer lines.'),
+        (29, 'WCQ - CONMEBOL', 'qualifier', '2023-09-01T00:00:00Z', '2026-03-31T00:00:00Z', true, 2,
+         '["Bolivia","Venezuela","Paraguay","Peru"]',
+         '{"international_break_factor": 1.1, "altitude_factor": true}',
+         'CONMEBOL qualifiers — active. Bolivia home altitude advantage significant.'),
+        (31, 'WCQ - CONCACAF', 'qualifier', '2024-06-01T00:00:00Z', '2026-03-31T00:00:00Z', true, 2,
+         '["El Salvador","Honduras","Jamaica","Panama","Trinidad and Tobago","Guatemala","Suriname","Curacao","Haiti"]',
+         '{"international_break_factor": 1.1}',
+         'CONCACAF qualifiers — soft lines on Central American/Caribbean nations.'),
+        (33, 'WCQ - CAF', 'qualifier', '2023-11-01T00:00:00Z', '2025-11-30T00:00:00Z', true, 2,
+         '["Tanzania","Mozambique","Benin","Central African Republic","Rwanda","Burkina Faso","Guinea","Comoros","Mauritania","Cape Verde","Namibia","Zimbabwe","Zambia","Malawi","Uganda","Kenya","Libya","Sudan"]',
+         '{"international_break_factor": 1.15, "data_sparse": true}',
+         'CAF qualifiers — very soft lines, but data sparsity is a concern.'),
+        (30, 'WCQ - AFC', 'qualifier', '2023-10-01T00:00:00Z', '2026-03-31T00:00:00Z', true, 2,
+         '["Uzbekistan","Jordan","Oman","Bahrain","Palestine","Thailand","Indonesia","Vietnam","Malaysia","Philippines","India","China","Tajikistan","Kyrgyzstan","Turkmenistan"]',
+         '{"international_break_factor": 1.1}',
+         'AFC qualifiers — active. Middle East/SE Asia have soft lines.')
+      ON CONFLICT (tournament_id) DO UPDATE SET
+        tournament_name = EXCLUDED.tournament_name,
+        tournament_type = EXCLUDED.tournament_type,
+        start_date = EXCLUDED.start_date,
+        end_date = EXCLUDED.end_date,
+        is_active = EXCLUDED.is_active,
+        polling_multiplier = EXCLUDED.polling_multiplier,
+        soft_line_nations = EXCLUDED.soft_line_nations,
+        model_adjustments = EXCLUDED.model_adjustments,
+        notes = EXCLUDED.notes,
+        updated_at = NOW()
+    `);
+
+    await db.execute(sql`
+      ALTER TABLE competition_config
+        ADD COLUMN IF NOT EXISTS competition_type TEXT NOT NULL DEFAULT 'league',
+        ADD COLUMN IF NOT EXISTS seasonal_phase TEXT NOT NULL DEFAULT 'unknown'
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

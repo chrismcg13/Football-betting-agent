@@ -3,7 +3,7 @@ import {
   useSummary, useBets, useNarratives, usePerformance, useClvStats,
   useLeagueDiscoveryStats, useGoLiveReadiness, useExperiments, useCoverage,
   useCircuitBreakerStatus, useInPlayBets, useUpcomingBets, useExecutionMetrics,
-  useAgentRecommendations,
+  useAgentRecommendations, useTournamentStatus,
 } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge, LiveTierBadge, InfoTooltip } from "@/components/layout";
@@ -134,6 +134,7 @@ export default function Overview() {
   const { data: readiness } = useGoLiveReadiness();
   const { data: experimentsData } = useExperiments();
   const { data: cbStatus } = useCircuitBreakerStatus();
+  const { data: tournamentData } = useTournamentStatus();
   const { data: inPlayData } = useInPlayBets();
   const { data: upcomingData } = useUpcomingBets();
   const { data: execMetrics } = useExecutionMetrics();
@@ -409,6 +410,85 @@ export default function Overview() {
           </div>
         )}
       </div>
+
+      {/* World Cup 2026 Readiness */}
+      {tournamentData && (
+        <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <div className="flex items-start justify-between gap-4 mb-3 flex-wrap">
+            <div>
+              <p className="text-sm font-semibold text-white">World Cup 2026 Preparation</p>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {(tournamentData as any).worldCup2026?.phase === "live"
+                  ? "TOURNAMENT LIVE — increased polling and soft-line targeting active"
+                  : (tournamentData as any).worldCup2026?.phase === "pre_tournament"
+                  ? "Pre-tournament phase — early market lines available"
+                  : `Preparation phase — ${(tournamentData as any).worldCup2026?.daysUntilStart ?? "?"} days until kickoff`}
+              </p>
+            </div>
+            <div className="rounded-lg px-3 py-2 text-center border shrink-0" style={{ background: "#0f172a", borderColor: "#334155" }}>
+              <p className={cn("text-2xl font-bold font-mono",
+                ((tournamentData as any).worldCup2026?.daysUntilStart ?? 999) <= 30 ? "text-amber-400" :
+                ((tournamentData as any).worldCup2026?.daysUntilStart ?? 999) <= 7 ? "text-red-400" : "text-blue-400")}>
+                {(tournamentData as any).worldCup2026?.daysUntilStart ?? "?"}
+              </p>
+              <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">days to WC</p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Qualifiers Ingested</p>
+              <p className="text-lg font-bold font-mono text-white">{(tournamentData as any).worldCup2026?.dataReadiness?.qualificationFixturesIngested ?? 0}</p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Soft-Line Nations</p>
+              <p className="text-lg font-bold font-mono text-emerald-400">{(tournamentData as any).worldCup2026?.dataReadiness?.softLineNationsTracked ?? 0}</p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Friendlies Tracked</p>
+              <p className="text-lg font-bold font-mono text-white">{(tournamentData as any).worldCup2026?.dataReadiness?.friendliesTracked ?? 0}</p>
+            </div>
+            <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Active Qualifiers</p>
+              <p className="text-lg font-bold font-mono text-white">
+                {(tournamentData as any).activeTournaments?.filter((t: any) => t.type === "qualifier").length ?? 0}
+                <span className="text-xs text-slate-500 ml-1">running</span>
+              </p>
+            </div>
+          </div>
+
+          {((tournamentData as any).activeTournaments ?? []).length > 0 && (
+            <div className="space-y-1">
+              {((tournamentData as any).activeTournaments ?? []).map((t: any) => (
+                <div key={t.id} className="flex items-center justify-between text-xs px-2 py-1 rounded" style={{ background: "#0f172a" }}>
+                  <span className="text-slate-300 font-medium">{t.name}</span>
+                  <span className="flex items-center gap-2">
+                    {t.isLive && <span className="text-emerald-400 font-bold text-[10px] uppercase">LIVE</span>}
+                    {t.softLineNationCount > 0 && (
+                      <span className="text-amber-400 text-[10px]">{t.softLineNationCount} soft-line nations</span>
+                    )}
+                    <span className="text-slate-500">{t.pollingMultiplier}x poll</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(tournamentData as any).transferWindow?.isActive && (
+            <div className="mt-2 rounded-lg border px-3 py-2 bg-amber-500/10 border-amber-500/30">
+              <p className="text-xs text-amber-300">{(tournamentData as any).transferWindow?.note}</p>
+            </div>
+          )}
+
+          {((tournamentData as any).seasonalWarnings ?? []).length > 0 && (
+            <div className="mt-2 space-y-1">
+              {((tournamentData as any).seasonalWarnings ?? []).map((w: any, i: number) => (
+                <p key={i} className="text-xs text-amber-400">{w.message}</p>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Profit Chart */}
       <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>

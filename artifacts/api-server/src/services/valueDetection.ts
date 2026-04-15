@@ -287,6 +287,25 @@ function computeOpportunityScore(params: {
   return score;
 }
 
+const leagueIdCache = new Map<string, number>();
+
+async function getLeagueIdForMatch(leagueName: string): Promise<number> {
+  if (leagueIdCache.has(leagueName)) return leagueIdCache.get(leagueName)!;
+  try {
+    const { competitionConfigTable } = await import("@workspace/db");
+    const rows = await db
+      .select({ apiFootballId: competitionConfigTable.apiFootballId })
+      .from(competitionConfigTable)
+      .where(eq(competitionConfigTable.name, leagueName))
+      .limit(1);
+    const id = rows.length > 0 ? rows[0]!.apiFootballId : 0;
+    leagueIdCache.set(leagueName, id);
+    return id;
+  } catch {
+    return 0;
+  }
+}
+
 const DISCOVERY_LEAGUES = new Set([
   "EFL League One", "EFL League Two",
   "South Africa PSL", "Saudi Pro League", "Ukrainian Premier League",
@@ -678,6 +697,27 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
   const byMarketType: Record<string, number> = {};
 
   for (const match of matches) {
+    const { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } = await import("./tournamentMode");
+
+    const matchLeagueId = await getLeagueIdForMatch(match.league);
+    let seasonalPhase: "active" | "off_season" | "pre_season" | "playoff" | "unknown" = "unknown";
+    try {
+      const { competitionConfigTable } = await import("@workspace/db");
+      const [ccRow] = await db
+        .select({ seasonalStart: competitionConfigTable.seasonalStart, seasonalEnd: competitionConfigTable.seasonalEnd })
+        .from(competitionConfigTable)
+        .where(eq(competitionConfigTable.name, match.league))
+        .limit(1);
+      if (ccRow) {
+        seasonalPhase = detectSeasonalPhase(ccRow.seasonalStart, ccRow.seasonalEnd, match.league);
+      }
+    } catch {}
+    const blockCheck = shouldBlockBet(matchLeagueId, match.league, seasonalPhase);
+    if (blockCheck.blocked) {
+      logger.debug({ matchId: match.id, league: match.league, seasonalPhase, reason: blockCheck.reason }, "Skipping match — seasonal/friendly block");
+      continue;
+    }
+
     const oddsRows = await db
       .select()
       .from(oddsSnapshotsTable)
@@ -792,10 +832,15 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         marketSpread,
         bookmakerCount,
       });
-      const opportunityScore = Math.min(baseOpportunityScore + discoveryBonus, 100);
-      const wasBoosted = discoveryBonus > 0;
-      if (wasBoosted) {
+      const softLine = await getSoftLineBonus(match.homeTeam, match.awayTeam, matchLeagueId, match.kickoffTime);
+      const totalBonus = discoveryBonus + softLine.bonus;
+      const opportunityScore = Math.min(baseOpportunityScore + totalBonus, 100);
+      const wasBoosted = totalBonus > 0;
+      if (discoveryBonus > 0) {
         logger.info({ matchId: match.id, league: match.league, marketType: oddsRow.marketType, baseScore: baseOpportunityScore, discoveryBonus, finalScore: opportunityScore }, "Discovery bonus applied");
+      }
+      if (softLine.bonus > 0) {
+        logger.info({ matchId: match.id, league: match.league, homeTeam: match.homeTeam, awayTeam: match.awayTeam, softLineBonus: softLine.bonus, reason: softLine.reason, finalScore: opportunityScore }, "Soft-line bonus applied");
       }
 
       const expTag = `${(match.league ?? "unknown").toLowerCase().replace(/[^a-z0-9]/g, "-")}-${oddsRow.marketType.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;

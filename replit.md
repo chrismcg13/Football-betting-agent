@@ -103,3 +103,13 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 **Integration points:** Value detection (`valueDetection.ts`) skips bets with positive gross EV but negative net EV after commission. Potential profit in `paperTrading.ts` uses commission-adjusted calculation. Settlement paths track gross/net separately. Summary endpoint includes `totalGrossPnl`, `totalCommission`, `grossRoiPct`.
 
 **Dashboard:** Overview shows "Net Profit" with gross/commission breakdown in subtitle. Performance page has Commission & Costs section with 4 stat cards, weekly/today breakdowns, exchange list with active indicators, and Premium Charge warning banners.
+
+# World Cup 2026 Preparation
+
+**Schema:** `tournament_config` table (`lib/db/src/schema/tournamentConfig.ts`) with UNIQUE constraint on `tournament_id`. Seeded with WC 2026 (June 11 – July 19) and 5 active qualifiers (UEFA/CONMEBOL/CONCACAF/CAF/AFC). Each tournament has `soft_line_nations` (JSONB array), `model_adjustments` (JSONB), `polling_multiplier`, and `is_active` flag. Migration uses `ON CONFLICT (tournament_id) DO UPDATE` for idempotent seeding.
+
+**Service (`tournamentMode.ts`):** Competition type classification, seasonal phase detection (handles MM-DD and YYYY-MM-DD formats), friendly match blocking (`FRIENDLY_LEAGUE_IDS = [10, 22, 666]`), soft-line bonus scoring (+8 one soft-line team, +12 both; ×1.5 tournament live, ×1.2 within 30 days; +3 early market <72h; capped at +20), transfer window uncertainty (0.85× summer Jul/Aug, 0.90× January), tournament status aggregation, polling multiplier.
+
+**Integration:** `valueDetection.ts` looks up `competition_config` for seasonal phase, calls `shouldBlockBet()` (blocks friendlies and pre-season matches), applies `getSoftLineBonus()` to opportunity scores for international qualifier matches.
+
+**Dashboard:** Overview "World Cup 2026 Preparation" section with days-to-WC counter, qualifier/soft-line/friendly stats, active tournament list with polling multipliers. API: `/api/dashboard/tournament`. Hook: `useTournamentStatus`.

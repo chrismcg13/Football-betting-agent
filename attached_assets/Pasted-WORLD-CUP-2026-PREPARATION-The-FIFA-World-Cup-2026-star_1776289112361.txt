@@ -1,0 +1,42 @@
+WORLD CUP 2026 PREPARATION
+
+The FIFA World Cup 2026 starts in June. This is a major data and betting opportunity — and specifically an edge opportunity. Smaller nations' qualifying fixtures and group-stage matches involving non-traditional football nations tend to have softer bookmaker lines. The model should be positioned to exploit this.
+
+1. TOURNAMENT MODE:
+   - Detect when a major tournament is active (World Cup, Euros, Copa America, Champions League knockout stages)
+   - During tournaments:
+     a) Increase data ingestion frequency for tournament fixtures
+     b) Apply international football-specific model adjustments (different dynamics than league football)
+     c) Track tournament-specific performance separately in the learning journal
+   - The model should recognise that international tournament betting may have different edge characteristics than league betting
+
+2. DATA PREPARATION:
+   - Begin ingesting World Cup 2026 qualification data, host nation data (USA/Canada/Mexico), and historical World Cup match data
+   - Build team strength profiles for all 48 qualifying nations
+   - Track pre-tournament friendlies for form data
+   - Ensure API-Football coverage of WC 2026 is mapped and ready
+   - Pay SPECIAL attention to data on non-traditional football nations (Middle East, Asia, Central America, Africa) — these are where the soft lines will be
+
+3. SOFT LINE TARGETING FOR WORLD CUP:
+   - Group stage matches involving teams with less global betting market attention (e.g., Saudi Arabia, Japan, Morocco, Canada, New Zealand) will likely have softer lines
+   - The model should:
+     a) Build form profiles for these teams using qualifying data and friendlies
+     b) Track Pinnacle's market formation for these fixtures — early lines will be softer
+     c) Identify fixtures where our data-driven assessment diverges significantly from early market prices
+     d) Be prepared to bet EARLY on these markets before lines sharpen
+   - This aligns perfectly with the Prompt 5 edge concentration strategy: World Cup soft-line markets are a time-limited but high-value edge segment
+
+4. MARKET EXPANSION READINESS:
+   - As new leagues and tournaments become available in our data sources, automatically assess their data richness
+   - Qualify new league-market combinations for Tier 1 as they meet thresholds
+   - The summer transfer window (July-August) will cause squad changes — the model should flag increased uncertainty for affected teams and be more conservative until new season data accumulates
+
+5. SEASONAL AWARENESS:
+   - Different leagues have different seasons. Track which leagues are:
+     a) Mid-season (active)
+     b) Off-season (no fixtures)
+     c) Pre-season (friendlies — low confidence, don't bet)
+     d) Playoff/relegation phase (different dynamics — flag but don't exclude)
+   - Adjust the model's expectations based on seasonal phase. End-of-season matches (dead rubbers) are fundamentally different from title/relegation deciders.
+
+This should be implemented as forward planning infrastructure, not something that needs manual intervention when the World Cup starts.
