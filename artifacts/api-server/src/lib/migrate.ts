@@ -176,6 +176,12 @@ export async function runMigrations() {
       ON CONFLICT (key) DO UPDATE SET value = '58', updated_at = NOW()
     `);
 
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value, updated_at)
+      VALUES ('live_opp_score_threshold', '68', NOW())
+      ON CONFLICT (key) DO NOTHING
+    `);
+
     // ── xG data layer tables (additive — do not modify existing tables)
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS xg_match_data (
@@ -396,6 +402,38 @@ export async function runMigrations() {
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS idx_paper_bets_betfair_bet_id
         ON paper_bets(betfair_bet_id) WHERE betfair_bet_id IS NOT NULL
+    `);
+
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS live_tier TEXT
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_live_tier
+        ON paper_bets(live_tier) WHERE live_tier IS NOT NULL
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS data_richness_cache (
+        id SERIAL PRIMARY KEY,
+        league TEXT NOT NULL,
+        country TEXT NOT NULL,
+        market_type TEXT NOT NULL,
+        pinnacle_coverage_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+        api_football_depth INTEGER NOT NULL DEFAULT 0,
+        has_statistics BOOLEAN NOT NULL DEFAULT false,
+        has_lineups BOOLEAN NOT NULL DEFAULT false,
+        has_events BOOLEAN NOT NULL DEFAULT false,
+        fixture_frequency NUMERIC(8,2) NOT NULL DEFAULT 0,
+        overall_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+        tier1_eligible BOOLEAN NOT NULL DEFAULT false,
+        calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(league, country, market_type)
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_data_richness_tier1
+        ON data_richness_cache(tier1_eligible) WHERE tier1_eligible = true
     `);
 
     logger.info("Migrations complete");

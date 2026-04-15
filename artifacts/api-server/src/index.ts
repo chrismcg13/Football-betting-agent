@@ -5,6 +5,7 @@ import { startScheduler, startSettlementCron, runIngestionNow, runFeaturesNow } 
 import { seedBaselineLeagues } from "./services/leagueDiscovery";
 import { loadLatestModel, bootstrapModels } from "./services/predictionEngine";
 import { runStartupHealthCheck, isLiveMode } from "./services/betfairLive";
+import { recalculateAllDataRichness } from "./services/dataRichness";
 import { db, complianceLogsTable, matchesTable, leagueEdgeScoresTable } from "@workspace/db";
 import { sql, count } from "drizzle-orm";
 
@@ -301,6 +302,10 @@ async function main() {
     }
 
     void bootstrapDataIfEmpty();
+
+    void recalculateAllDataRichness().catch((err) =>
+      logger.warn({ err }, "Startup data richness calculation failed — will run on next Sunday cron"),
+    );
   } else {
     logger.info("PRODUCTION MODE — schedulers, settlement, ML training, and data ingestion DISABLED");
     logger.info("Production serves dashboard API only. Data arrives via syncDevToProd pipeline.");

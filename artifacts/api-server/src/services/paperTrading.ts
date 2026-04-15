@@ -13,6 +13,8 @@ import { retrainIfNeeded } from "./predictionEngine";
 import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch } from "./apiFootball";
 import { getThresholdCategory } from "./correlationDetector";
 import { isLiveMode, placeLiveBetOnBetfair, isBalanceStale, getLiveBankroll } from "./betfairLive";
+import { isLeagueMarketTier1Eligible } from "./dataRichness";
+import { getLiveOppScoreThreshold } from "./liveThresholdReview";
 
 // ===================== Config helpers =====================
 
@@ -132,6 +134,68 @@ function calculateDynamicKellyStake(
   stake = Math.max(stake, 2);
 
   return Math.round(stake * 100) / 100;
+}
+
+// ===================== Tier 1 live qualification =====================
+
+const MIN_PINNACLE_EDGE_PCT = 2;
+
+interface Tier1CheckResult {
+  qualifies: boolean;
+  reason: string;
+  path?: "data_richness" | "promoted";
+}
+
+async function qualifiesForTier1(opts: {
+  opportunityScore: number;
+  dataTier: string;
+  marketType: string;
+  league: string;
+  country: string;
+  pinnacleOdds: number | null;
+  pinnacleImplied: number | null;
+  modelProbability: number;
+}): Promise<Tier1CheckResult> {
+  if (opts.dataTier === "candidate" || opts.dataTier === "experiment" || opts.dataTier === "abandoned" || opts.dataTier === "demoted") {
+    return { qualifies: false, reason: `${opts.dataTier}-tier bets never qualify for Tier 1` };
+  }
+
+  const threshold = await getLiveOppScoreThreshold();
+
+  if (opts.opportunityScore < threshold) {
+    return { qualifies: false, reason: `Opportunity score ${opts.opportunityScore} < threshold ${threshold}` };
+  }
+
+  if (opts.pinnacleOdds == null || opts.pinnacleImplied == null) {
+    return { qualifies: false, reason: "No Pinnacle odds available — cannot validate edge" };
+  }
+
+  const pinnacleImpliedProb = opts.pinnacleImplied;
+  const ourImpliedProb = opts.modelProbability;
+  const edgeVsPinnacle = (ourImpliedProb - pinnacleImpliedProb) * 100;
+
+  if (edgeVsPinnacle < MIN_PINNACLE_EDGE_PCT) {
+    return { qualifies: false, reason: `Pinnacle edge ${edgeVsPinnacle.toFixed(2)}% < minimum ${MIN_PINNACLE_EDGE_PCT}%` };
+  }
+
+  if (opts.dataTier === "promoted") {
+    return {
+      qualifies: true,
+      reason: `Promoted strategy: score=${opts.opportunityScore} >= ${threshold}, Pinnacle edge=${edgeVsPinnacle.toFixed(2)}%`,
+      path: "promoted",
+    };
+  }
+
+  const isRichData = await isLeagueMarketTier1Eligible(opts.league, opts.country, opts.marketType);
+  if (!isRichData) {
+    return { qualifies: false, reason: `League-market ${opts.league} (${opts.country}) / ${opts.marketType} data richness < 70%` };
+  }
+
+  return {
+    qualifies: true,
+    reason: `Data-rich market: score=${opts.opportunityScore} >= ${threshold}, Pinnacle edge=${edgeVsPinnacle.toFixed(2)}%, data richness >= 70%`,
+    path: "data_richness",
+  };
 }
 
 // ===================== Place paper bet =====================
@@ -486,25 +550,47 @@ export async function placePaperBet(
   );
 
   if (isLiveMode() && bet?.id) {
-    try {
-      if (isBalanceStale()) {
-        logger.warn(
-          { betId: bet.id },
-          "LIVE: Skipping Betfair placement — balance is stale (>1hr)",
-        );
-      } else {
-        const matchData = await db
-          .select({
-            homeTeam: matchesTable.homeTeam,
-            awayTeam: matchesTable.awayTeam,
-            betfairEventId: matchesTable.betfairEventId,
-          })
-          .from(matchesTable)
-          .where(eq(matchesTable.id, matchId))
-          .limit(1);
+    const matchData = await db
+      .select({
+        homeTeam: matchesTable.homeTeam,
+        awayTeam: matchesTable.awayTeam,
+        betfairEventId: matchesTable.betfairEventId,
+        league: matchesTable.league,
+        country: matchesTable.country,
+      })
+      .from(matchesTable)
+      .where(eq(matchesTable.id, matchId))
+      .limit(1);
 
-        const match = matchData[0];
-        if (match?.betfairEventId) {
+    const match = matchData[0];
+
+    const tier1Check = await qualifiesForTier1({
+      opportunityScore: score,
+      dataTier,
+      marketType,
+      league: match?.league ?? "",
+      country: match?.country ?? "",
+      pinnacleOdds: pinnacleOdds ?? null,
+      pinnacleImplied: pinnacleImplied ?? null,
+      modelProbability,
+    });
+
+    const liveTier = tier1Check.qualifies ? "tier1" : "tier2";
+    await db.update(paperBetsTable).set({ liveTier }).where(eq(paperBetsTable.id, bet.id));
+
+    if (tier1Check.qualifies) {
+      logger.info(
+        { betId: bet.id, liveTier, path: tier1Check.path, reason: tier1Check.reason },
+        "TIER 1: Bet qualifies for live placement",
+      );
+
+      try {
+        if (isBalanceStale()) {
+          logger.warn(
+            { betId: bet.id },
+            "LIVE: Skipping Betfair placement — balance is stale (>1hr)",
+          );
+        } else if (match?.betfairEventId) {
           const liveResult = await placeLiveBetOnBetfair({
             internalBetId: bet.id,
             betfairEventId: match.betfairEventId,
@@ -528,11 +614,16 @@ export async function placePaperBet(
             "LIVE: No betfairEventId for match — paper bet only",
           );
         }
+      } catch (err) {
+        logger.error(
+          { err, betId: bet.id },
+          "LIVE: Unexpected error during Betfair placement — paper bet preserved",
+        );
       }
-    } catch (err) {
-      logger.error(
-        { err, betId: bet.id },
-        "LIVE: Unexpected error during Betfair placement — paper bet preserved",
+    } else {
+      logger.info(
+        { betId: bet.id, liveTier, reason: tier1Check.reason },
+        "TIER 2: Bet does not qualify for live placement — paper only",
       );
     }
   }

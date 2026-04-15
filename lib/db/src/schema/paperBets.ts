@@ -59,6 +59,7 @@ export const paperBetsTable = pgTable("paper_bets", {
   syncEligible: boolean("sync_eligible").notNull().default(false),
   promotedAt: timestamp("promoted_at", { withTimezone: true }),
   promotionAuditId: text("promotion_audit_id"),
+  liveTier: text("live_tier"),
   betfairBetId: text("betfair_bet_id"),
   betfairMarketId: text("betfair_market_id"),
   betfairStatus: text("betfair_status"),

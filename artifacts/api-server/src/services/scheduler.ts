@@ -34,6 +34,8 @@ import { runPromotionEngine } from "./promotionEngine";
 import { runWeeklyExperimentAnalysis } from "./experimentAnalysis";
 import { syncDevToProd } from "./syncDevToProd";
 import { reconcileSettlements, isLiveMode, getAccountFunds } from "./betfairLive";
+import { recalculateAllDataRichness } from "./dataRichness";
+import { reviewLiveThreshold } from "./liveThresholdReview";
 
 // ===================== Status tracking =====================
 
@@ -959,6 +961,22 @@ export function startScheduler(): void {
     });
   }, { timezone: "UTC" });
   logger.info("Weekly experiment analysis scheduler active — Sunday 04:00 UTC");
+
+  cron.schedule("30 4 * * 0", () => {
+    logger.info("Data richness recalculation triggered (Sunday 04:30 UTC)");
+    void recalculateAllDataRichness().catch((err) => {
+      logger.error({ err }, "Data richness recalculation failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Data richness recalculation scheduler active — Sunday 04:30 UTC");
+
+  cron.schedule("0 5 * * 0", () => {
+    logger.info("Live threshold review triggered (Sunday 05:00 UTC)");
+    void reviewLiveThreshold().catch((err) => {
+      logger.error({ err }, "Live threshold review failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Live threshold review scheduler active — Sunday 05:00 UTC");
 
   cron.schedule("0 */6 * * *", () => {
     logger.info("Dev→Prod sync triggered (every 6 hours)");

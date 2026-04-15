@@ -49,6 +49,8 @@ import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } 
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import { getCircuitBreakerStatus, resumeAgent } from "../services/riskManager";
 import { getCachedBalance, isLiveMode } from "../services/betfairLive";
+import { getDataRichnessSummary } from "../services/dataRichness";
+import { getLiveOppScoreThreshold } from "../services/liveThresholdReview";
 import {
   getOddspapiStatus,
   prefetchAndStoreOddsPapiOdds,
@@ -1756,6 +1758,47 @@ router.get("/admin/live-balance", async (_req, res) => {
             ageSeconds: Math.round((Date.now() - balance.fetchedAt) / 1000),
           }
         : null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/live-tier-stats", async (_req, res) => {
+  try {
+    const threshold = await getLiveOppScoreThreshold();
+    const richnessSummary = await getDataRichnessSummary();
+
+    const tierCounts = await db.execute(sql`
+      SELECT
+        live_tier,
+        COUNT(*) as count,
+        COUNT(*) FILTER (WHERE status IN ('won', 'lost')) as settled,
+        ROUND(COALESCE(SUM(CASE WHEN status IN ('won','lost') THEN settlement_pnl::numeric ELSE 0 END), 0)::numeric, 2) as pnl,
+        ROUND(COALESCE(SUM(CASE WHEN status IN ('won','lost') THEN stake::numeric ELSE 0 END), 0)::numeric, 2) as staked,
+        ROUND(AVG(CASE WHEN status IN ('won','lost') AND clv_pct IS NOT NULL THEN clv_pct::numeric END)::numeric, 2) as avg_clv
+      FROM paper_bets
+      WHERE live_tier IS NOT NULL
+      GROUP BY live_tier
+    `);
+    const tiers = ((tierCounts as any).rows ?? tierCounts).reduce((acc: any, r: any) => {
+      acc[r.live_tier] = {
+        total: Number(r.count),
+        settled: Number(r.settled),
+        pnl: Number(r.pnl),
+        staked: Number(r.staked),
+        roi: Number(r.staked) > 0 ? Math.round((Number(r.pnl) / Number(r.staked)) * 10000) / 100 : 0,
+        avgClv: r.avg_clv != null ? Number(r.avg_clv) : null,
+      };
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      tradingMode: process.env["TRADING_MODE"] ?? "PAPER",
+      currentThreshold: threshold,
+      tiers,
+      dataRichness: richnessSummary,
     });
   } catch (err) {
     res.status(500).json({ success: false, message: String(err) });

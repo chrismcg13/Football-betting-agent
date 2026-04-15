@@ -68,6 +68,13 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
     - 30-min settlement reconciliation cron + 15-min balance refresh in LIVE mode.
     - 12hr proactive session refresh with auto-retry on INVALID_SESSION.
     - `paper_bets` table extended with `betfair_*` columns for tracking live bet state.
+*   **Two-Tier Live System (`dataRichness.ts`, `liveThresholdReview.ts`):**
+    - **Tier 1 (live money):** Bets qualify if: opportunity score >= configurable threshold (default 68, floor 60), data richness >= 70%, Pinnacle odds available with >= 2% edge vs current Pinnacle implied, AND either (a) data-rich market path or (b) promoted strategy path. Experiment/candidate tier bets NEVER qualify.
+    - **Tier 2 (paper only):** All bets not meeting Tier 1 criteria stay in the experiment pipeline. No changes to experiment graduation gates.
+    - **Data richness scoring:** `data_richness_cache` table tracks league-market combos with composite score (Pinnacle coverage 30%, statistics 20%, lineups 10%, events 10%, fixture depth 15%, frequency 15%). Recalculated weekly (Sunday 04:30 UTC) + on startup.
+    - **Adaptive threshold:** Weekly review (Sunday 05:00 UTC) adjusts the opportunity score threshold based on 30-day rolling Tier 1 performance. Requires 50+ settled bets. Factors: CLV trend, ROI stability (stddev), market diversity (Herfindahl). Changes logged to `promotion_audit_log`.
+    - **`live_tier` column** on `paper_bets` (independent of `data_tier`) tracks tier1/tier2 assignment per bet.
+    - **API:** `/api/admin/live-tier-stats` returns threshold, tier breakdown, and data richness summary.
 
 ## Experiment Pipeline
 
