@@ -1,0 +1,64 @@
+ALERTING & ANOMALY DETECTION SYSTEM
+
+Implement a comprehensive alerting system for live trading. I need to know immediately when something needs attention. Alerts should be surfaced on the dashboard AND (if possible) via a webhook I can connect to notifications.
+
+1. CRITICAL ALERTS (immediate — something is wrong):
+   - Betfair API authentication failure
+   - Betfair connectivity lost (VPS down or VPS→Betfair link broken)
+   - Bet placement failure after all retries
+   - Bankroll below floor (60% of deposit)
+   - Weekly loss limit hit
+   - 8+ consecutive losses (circuit breaker triggered)
+   - Settlement discrepancy between Betfair and internal records
+   - Database connection failure
+   - TRADING_MODE changed or system restart detected
+   - Live balance fetch failed for 1+ hours
+   - Trading cron missed 2+ consecutive runs
+
+2. WARNING ALERTS (attention needed but not urgent):
+   - No new bets placed in 24 hours
+   - No new bets placed in 48 hours (escalate from warning to critical)
+   - Daily loss limit hit
+   - 5 consecutive losses
+   - CLV drops below 0% on 7-day rolling window
+   - ROI drops below 0% on 14-day rolling window
+   - API budget utilisation above 80% (API-Football or OddsPapi)
+   - Void rate exceeds 10% over rolling 50 bets
+   - Average slippage exceeds 3% over rolling 50 bets
+   - Average execution time exceeds 30 seconds
+   - Liquidity shortfall rate exceeds 20% of bets
+   - Exposure level demotion
+   - Opportunity score threshold increased (tightened) by auto-adjustment
+
+3. INFORMATIONAL ALERTS (good to know):
+   - Exposure level promotion (Level 1 → 2, etc.)
+   - Opportunity score threshold decreased (loosened) — model gaining confidence
+   - New experiment tag reaching Candidate tier
+   - Experiment tag reaching Promoted tier
+   - Weekly model health report generated
+   - Milestone alerts: first 50 live bets settled, first 100, first £100 profit, etc.
+   - New league qualified for Tier 1 (data richness threshold met)
+
+4. NO-BET DETECTION:
+   - Track the timestamp of the last bet placed
+   - If no bet placed in 12 hours during an active fixture period (matches are being played), log a warning
+   - If no bet placed in 24 hours, alert me with context: were there fixtures? Did the model evaluate any? Why were they rejected?
+   - If no bet placed in 48 hours, this is critical — something may be broken
+   - During known quiet periods (no fixtures), suppress no-bet alerts but log that the system is aware it's a quiet period
+
+5. ANOMALY DETECTION:
+   - Implement rolling statistical monitoring:
+     a) If daily bet volume deviates more than 2 standard deviations from the 30-day average, flag it
+     b) If average stake size changes significantly (>20% from 30-day average), flag it
+     c) If the distribution of bet types shifts suddenly (e.g., suddenly placing 80% BTTS when historical average is 30%), flag it
+     d) If a single league accounts for more than 40% of all bets, flag potential over-concentration
+   - These flags go to the dashboard "Agent Insights" panel, not as critical alerts
+
+6. ALERT INFRASTRUCTURE:
+   - Store all alerts in a dedicated alerts table with: timestamp, severity (critical/warning/info), category, message, acknowledged (boolean), acknowledged_at
+   - Dashboard shows unacknowledged alerts with a notification badge
+   - I can acknowledge/dismiss alerts from the dashboard
+   - Retain alert history for 90 days
+   - If a webhook URL is configured (store as environment variable ALERT_WEBHOOK_URL), POST alert data to it for each critical and warning alert
+
+Show me the alert schema and detection logic before implementing.
