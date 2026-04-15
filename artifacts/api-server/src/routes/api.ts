@@ -2128,5 +2128,52 @@ router.post("/admin/capture-lineups", async (_req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// GET /api/dashboard/edge-segments — edge concentration segmentation
+// ─────────────────────────────────────────────
+router.get("/dashboard/edge-segments", async (_req, res) => {
+  try {
+    const { calculateEdgeSegments, calculateOddsRangeSegments } = await import("../services/edgeConcentration");
+    const [segments, oddsRanges] = await Promise.all([
+      calculateEdgeSegments(),
+      calculateOddsRangeSegments(),
+    ]);
+
+    const exploit = segments.filter(s => s.segmentClass === "exploit");
+    const explore = segments.filter(s => s.segmentClass === "explore");
+    const avoid = segments.filter(s => s.segmentClass === "avoid");
+
+    res.json({
+      segments,
+      oddsRanges,
+      summary: {
+        totalSegments: segments.length,
+        exploit: exploit.length,
+        explore: explore.length,
+        avoid: avoid.length,
+        exploitPnl: Math.round(exploit.reduce((s, e) => s + e.totalPnl, 0) * 100) / 100,
+        avoidPnl: Math.round(avoid.reduce((s, e) => s + e.totalPnl, 0) * 100) / 100,
+      },
+    });
+  } catch (err) {
+    logger.warn({ err }, "Edge segment calculation failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/void-corners — void all pending corners bets
+// ─────────────────────────────────────────────
+router.post("/admin/void-corners", async (_req, res) => {
+  try {
+    const { voidPendingCornersBets } = await import("../services/edgeConcentration");
+    const result = await voidPendingCornersBets();
+    res.json(result);
+  } catch (err) {
+    logger.warn({ err }, "Corners voiding failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 export default router;
 

@@ -16,6 +16,7 @@ import { isLiveMode, placeLiveBetOnBetfair, isBalanceStale, getLiveBankroll } fr
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
 import { getLiveOppScoreThreshold } from "./liveThresholdReview";
 import { storePinnacleSnapshot } from "./oddsPapi";
+import { shouldBlockBet, getSegmentKellyMultiplier, getMarketFamily } from "./edgeConcentration";
 
 // ===================== Config helpers =====================
 
@@ -228,6 +229,7 @@ export interface PaperBetOptions {
   syncEligible?: boolean;
   pinnacleEdgeCategory?: "high_confidence" | "standard" | "filtered" | null;
   lineDirection?: "toward" | "away" | "stable" | "unknown" | null;
+  liveTier?: string | null;
 }
 
 export async function placePaperBet(
@@ -289,14 +291,30 @@ export async function placePaperBet(
     "OVER_UNDER_15",     // ~75% win rate — no edge signal
     "TOTAL_CARDS_55",    // ~85% win rate — no edge signal
     "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
-    "TOTAL_CORNERS_85",  // Too predictable; only 9.5/10.5 retained
-    "TOTAL_CORNERS_115", // Too predictable; only 9.5/10.5 retained
+    "TOTAL_CORNERS_75",  // Edge concentration: ALL corners suspended — 90 bets, -42.5% ROI
+    "TOTAL_CORNERS_85",  // Edge concentration: ALL corners suspended
+    "TOTAL_CORNERS_95",  // Edge concentration: ALL corners suspended
+    "TOTAL_CORNERS_105", // Edge concentration: ALL corners suspended
+    "TOTAL_CORNERS_115", // Edge concentration: ALL corners suspended
     "FIRST_HALF_OU_05",  // Too easy; FIRST_HALF_OU_15 retained instead
   ]);
   if (BANNED_MARKETS.has(marketType)) {
     logger.warn({ matchId, marketType, selectionName }, "HARDSTOP: Banned market — bet blocked at placement");
     return logReject(`Banned market: ${marketType}`);
   }
+
+  // ── Edge concentration gates ─────────────────────────────────────────────
+  {
+    const blockCheck = shouldBlockBet(marketType, backOdds, options.liveTier ?? null);
+    if (blockCheck.blocked) {
+      logger.warn(
+        { matchId, marketType, selectionName, backOdds, reason: blockCheck.reason },
+        "EDGE CONCENTRATION: bet blocked",
+      );
+      return logReject(blockCheck.reason!);
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
 
   if (CORNERS_CARDS_MARKETS.has(marketType)) {
     const [match] = await db
@@ -438,6 +456,16 @@ export async function placePaperBet(
     score,
     marketType,
   );
+
+  const segmentMultiplier = getSegmentKellyMultiplier(marketType, backOdds, score);
+  if (segmentMultiplier < 1.0) {
+    const preSegStake = stake;
+    stake = Math.round(stake * segmentMultiplier * 100) / 100;
+    logger.info(
+      { matchId, marketType, backOdds, segmentMultiplier, preSegStake, postSegStake: stake, marketFamily: getMarketFamily(marketType) },
+      "Edge concentration: segment Kelly modifier applied",
+    );
+  }
 
   if (isContrarian) stake = Math.round(stake * 0.6 * 100) / 100;
   if (stakeMultiplier !== 1.0) stake = Math.round(stake * stakeMultiplier * 100) / 100;
@@ -1287,7 +1315,10 @@ export async function voidBetsOnBannedMarkets(): Promise<{
     "OVER_UNDER_15",
     "TOTAL_CARDS_55",
     "TOTAL_CARDS_45",
+    "TOTAL_CORNERS_75",
     "TOTAL_CORNERS_85",
+    "TOTAL_CORNERS_95",
+    "TOTAL_CORNERS_105",
     "TOTAL_CORNERS_115",
     "FIRST_HALF_OU_05",
   ];
