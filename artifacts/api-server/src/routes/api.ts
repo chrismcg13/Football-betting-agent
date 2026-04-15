@@ -48,6 +48,7 @@ import {
 import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import { getCircuitBreakerStatus, resumeAgent } from "../services/riskManager";
+import { getCachedBalance, isLiveMode } from "../services/betfairLive";
 import {
   getOddspapiStatus,
   prefetchAndStoreOddsPapiOdds,
@@ -209,6 +210,7 @@ router.get("/dashboard/summary", async (req, res) => {
     pending: allPending.length,
     betsToday,
     paperMode,
+    tradingMode: process.env["TRADING_MODE"] ?? "PAPER",
     winPercentage:
       wins + losses > 0
         ? Math.round((wins / (wins + losses)) * 10000) / 100
@@ -1734,6 +1736,28 @@ router.post("/admin/resume-agent", async (_req, res) => {
     res.json({ success: true, agentStatus: status });
   } catch (err) {
     logger.error({ err }, "Failed to resume agent");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/live-balance", async (_req, res) => {
+  try {
+    const balance = getCachedBalance();
+    res.json({
+      success: true,
+      isLive: isLiveMode(),
+      tradingMode: process.env["TRADING_MODE"] ?? "PAPER",
+      balance: balance
+        ? {
+            available: balance.available,
+            exposure: balance.exposure,
+            total: balance.total,
+            fetchedAt: new Date(balance.fetchedAt).toISOString(),
+            ageSeconds: Math.round((Date.now() - balance.fetchedAt) / 1000),
+          }
+        : null,
+    });
+  } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
   }
 });

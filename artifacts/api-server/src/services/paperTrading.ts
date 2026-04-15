@@ -12,6 +12,7 @@ import { logger } from "../lib/logger";
 import { retrainIfNeeded } from "./predictionEngine";
 import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch } from "./apiFootball";
 import { getThresholdCategory } from "./correlationDetector";
+import { isLiveMode, placeLiveBetOnBetfair, isBalanceStale, getLiveBankroll } from "./betfairLive";
 
 // ===================== Config helpers =====================
 
@@ -37,6 +38,15 @@ export async function setConfigValue(
 }
 
 export async function getBankroll(): Promise<number> {
+  if (isLiveMode()) {
+    try {
+      const liveBankroll = await getLiveBankroll();
+      if (liveBankroll > 0) {
+        return liveBankroll;
+      }
+    } catch {
+    }
+  }
   const v = await getConfigValue("bankroll");
   return Number(v ?? "500");
 }
@@ -474,6 +484,58 @@ export async function placePaperBet(
     },
     "Paper bet placed",
   );
+
+  if (isLiveMode() && bet?.id) {
+    try {
+      if (isBalanceStale()) {
+        logger.warn(
+          { betId: bet.id },
+          "LIVE: Skipping Betfair placement — balance is stale (>1hr)",
+        );
+      } else {
+        const matchData = await db
+          .select({
+            homeTeam: matchesTable.homeTeam,
+            awayTeam: matchesTable.awayTeam,
+            betfairEventId: matchesTable.betfairEventId,
+          })
+          .from(matchesTable)
+          .where(eq(matchesTable.id, matchId))
+          .limit(1);
+
+        const match = matchData[0];
+        if (match?.betfairEventId) {
+          const liveResult = await placeLiveBetOnBetfair({
+            internalBetId: bet.id,
+            betfairEventId: match.betfairEventId,
+            marketType,
+            selectionName,
+            odds: backOdds,
+            stake,
+            homeTeam: match.homeTeam,
+            awayTeam: match.awayTeam,
+          });
+
+          if (!liveResult.success) {
+            logger.warn(
+              { betId: bet.id, error: liveResult.error },
+              "LIVE: Betfair placement failed — paper bet recorded but no live bet",
+            );
+          }
+        } else {
+          logger.warn(
+            { betId: bet.id, matchId },
+            "LIVE: No betfairEventId for match — paper bet only",
+          );
+        }
+      }
+    } catch (err) {
+      logger.error(
+        { err, betId: bet.id },
+        "LIVE: Unexpected error during Betfair placement — paper bet preserved",
+      );
+    }
+  }
 
   return { placed: true, betId: bet?.id, stake };
 }

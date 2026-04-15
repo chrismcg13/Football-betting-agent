@@ -4,6 +4,7 @@ import { runMigrations } from "./lib/migrate";
 import { startScheduler, startSettlementCron, runIngestionNow, runFeaturesNow } from "./services/scheduler";
 import { seedBaselineLeagues } from "./services/leagueDiscovery";
 import { loadLatestModel, bootstrapModels } from "./services/predictionEngine";
+import { runStartupHealthCheck, isLiveMode } from "./services/betfairLive";
 import { db, complianceLogsTable, matchesTable, leagueEdgeScoresTable } from "@workspace/db";
 import { sql, count } from "drizzle-orm";
 
@@ -217,6 +218,35 @@ async function main() {
     process.exit(1);
   }
 
+  // 2b. Live trading health check
+  const tradingMode = process.env["TRADING_MODE"] ?? "PAPER";
+  logger.info({ tradingMode }, `Trading mode: ${tradingMode}`);
+  let liveHealthPassed = true;
+  if (tradingMode === "LIVE") {
+    const healthCheck = await runStartupHealthCheck();
+    liveHealthPassed = healthCheck.passed;
+    if (!healthCheck.passed) {
+      logger.error(
+        { checks: healthCheck.checks },
+        "CRITICAL: Live trading health checks FAILED — trading engine will NOT start",
+      );
+      await db.insert(complianceLogsTable).values({
+        actionType: "live_startup_health_check_failed",
+        details: { checks: healthCheck.checks },
+        timestamp: new Date(),
+      });
+    } else {
+      logger.info("All live trading health checks PASSED");
+      await db.insert(complianceLogsTable).values({
+        actionType: "live_startup_health_check_passed",
+        details: { checks: healthCheck.checks },
+        timestamp: new Date(),
+      });
+    }
+  } else {
+    logger.info("PAPER MODE — Betfair live trading health checks skipped");
+  }
+
   // 3. Production database hygiene
   // On first production deploy, clear any stale data that leaked from dev.
   // Production data should ONLY come via the syncDevToProd pipeline.
@@ -253,7 +283,9 @@ async function main() {
   // betting, settlement, and ML training happen exclusively in the dev environment.
   // Data flows to production ONLY via the syncDevToProd pipeline after promotion.
   let modelLoaded = false;
-  if (ENVIRONMENT !== "production") {
+  if (ENVIRONMENT !== "production" && !liveHealthPassed) {
+    logger.error("LIVE health checks failed — schedulers and trading engine DISABLED. Server will only serve API.");
+  } else if (ENVIRONMENT !== "production") {
     startSettlementCron();
     logger.info("Settlement cron started (every 5 min)");
 

@@ -92,6 +92,8 @@ BETFAIR_IDENTITY_PROXY_URL = "http://209.38.164.154:3001/identity"
 SHARED_DATABASE_URL = ""
 ENVIRONMENT = "production"
 DEV_DATABASE_URL = "postgresql://postgres:password@helium/heliumdb?sslmode=disable"
+TRADING_MODE = "LIVE"
 
 [userenv.development]
 ENVIRONMENT = "development"
+TRADING_MODE = "PAPER"

@@ -77,7 +77,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
             </div>
             <div>
               <h1 className="text-sm font-bold tracking-tight text-white">BET_AGENT_OS</h1>
-              <p className="text-[10px] text-slate-500">Paper Trading v1.0</p>
+              <p className="text-[10px] text-slate-500">{(summary as any)?.tradingMode === "LIVE" ? "Live Trading v1.0" : "Paper Trading v1.0"}</p>
             </div>
           </div>
         </div>

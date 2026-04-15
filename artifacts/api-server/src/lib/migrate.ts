@@ -382,6 +382,22 @@ export async function runMigrations() {
         ON drawdown_events(environment, created_at DESC)
     `);
 
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS betfair_bet_id TEXT,
+        ADD COLUMN IF NOT EXISTS betfair_market_id TEXT,
+        ADD COLUMN IF NOT EXISTS betfair_status TEXT,
+        ADD COLUMN IF NOT EXISTS betfair_size_matched NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS betfair_avg_price_matched NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS betfair_placed_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS betfair_settled_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS betfair_pnl NUMERIC(12,2)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_betfair_bet_id
+        ON paper_bets(betfair_bet_id) WHERE betfair_bet_id IS NOT NULL
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

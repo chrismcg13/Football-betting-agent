@@ -33,6 +33,7 @@ import { eq, and, inArray, sql } from "drizzle-orm";
 import { runPromotionEngine } from "./promotionEngine";
 import { runWeeklyExperimentAnalysis } from "./experimentAnalysis";
 import { syncDevToProd } from "./syncDevToProd";
+import { reconcileSettlements, isLiveMode, getAccountFunds } from "./betfairLive";
 
 // ===================== Status tracking =====================
 
@@ -778,6 +779,23 @@ export function startSettlementCron(): void {
     logger.info("Startup settlement triggered (15s after boot)");
     void runSettlementPipeline(true);
   }, 15_000);
+
+  if (isLiveMode()) {
+    cron.schedule("*/30 * * * *", () => {
+      logger.info("Betfair settlement reconciliation triggered");
+      void reconcileSettlements().catch((err) =>
+        logger.warn({ err }, "Betfair reconciliation failed — non-fatal"),
+      );
+    }, { timezone: "UTC" });
+    logger.info("Betfair settlement reconciliation active — every 30 minutes");
+
+    cron.schedule("*/15 * * * *", () => {
+      void getAccountFunds().catch((err) =>
+        logger.warn({ err }, "Betfair balance refresh failed — non-fatal"),
+      );
+    }, { timezone: "UTC" });
+    logger.info("Betfair balance refresh active — every 15 minutes");
+  }
 }
 
 // ===================== Scheduler =====================

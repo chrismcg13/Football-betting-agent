@@ -59,6 +59,14 @@ export const paperBetsTable = pgTable("paper_bets", {
   syncEligible: boolean("sync_eligible").notNull().default(false),
   promotedAt: timestamp("promoted_at", { withTimezone: true }),
   promotionAuditId: text("promotion_audit_id"),
+  betfairBetId: text("betfair_bet_id"),
+  betfairMarketId: text("betfair_market_id"),
+  betfairStatus: text("betfair_status"),
+  betfairSizeMatched: numeric("betfair_size_matched", { precision: 12, scale: 2 }),
+  betfairAvgPriceMatched: numeric("betfair_avg_price_matched", { precision: 10, scale: 4 }),
+  betfairPlacedAt: timestamp("betfair_placed_at", { withTimezone: true }),
+  betfairSettledAt: timestamp("betfair_settled_at", { withTimezone: true }),
+  betfairPnl: numeric("betfair_pnl", { precision: 12, scale: 2 }),
 });
 
 export const insertPaperBetSchema = createInsertSchema(paperBetsTable).omit({

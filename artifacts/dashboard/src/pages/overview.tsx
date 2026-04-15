@@ -206,7 +206,9 @@ export default function Overview() {
   const settledBets = (summary as any)?.settledBets ?? 0;
   const winPercentage = summary?.winPercentage ?? 0;
   const avgScore = summary?.avgOpportunityScore ?? null;
-  const paperMode = (summary as any)?.paperMode ?? false;
+  const tradingMode = (summary as any)?.tradingMode ?? "PAPER";
+  const isLive = tradingMode === "LIVE";
+  const paperMode = !isLive;
   const betsToday = (summary as any)?.betsToday ?? 0;
 
   const avgClv: number | null = (clvStats as any)?.count > 0 ? Number((clvStats as any).avgClv) : null;
@@ -274,10 +276,15 @@ export default function Overview() {
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
           <h2 className="text-2xl font-bold text-white tracking-tight">Overview</h2>
-          <p className="text-sm text-slate-500 mt-1">Mission control for the paper trading agent.</p>
+          <p className="text-sm text-slate-500 mt-1">Mission control for the {isLive ? "live" : "paper"} trading agent.</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          {paperMode && (
+          {isLive ? (
+            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-green-500/15 border border-green-500/30 text-green-400 text-xs font-semibold tracking-wide">
+              <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+              LIVE MODE
+            </span>
+          ) : (
             <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400 text-xs font-semibold tracking-wide">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
               PAPER MODE

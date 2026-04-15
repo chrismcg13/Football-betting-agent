@@ -44,7 +44,7 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
 
 ## External Dependencies
 
-*   **Betfair Exchange Delayed API:** Used for paper-trading football bets.
+*   **Betfair Exchange API:** Used for paper-trading and live trading football bets via VPS proxy (`BETFAIR_PROXY_URL`). Live trading uses `LIVE_BETFAIR_KEY` with real money placement through `betfairLive.ts` service.
 *   **API-Football v3 (via RapidAPI):** Primary source for real odds, match results, team statistics (yellow cards, corners, shots), and fixture data. Budget usage is tracked.
 *   **PostgreSQL:** The primary database for all application data.
 *   **OddsPapi:** Used for bulk prefetching and refreshing Pinnacle odds, with budget tracking and coverage reporting.
@@ -58,6 +58,16 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
 *   **Sync Double-Gate:** `syncDevToProd.ts` requires both `sync_eligible=true AND data_tier='promoted'` to sync bets from dev to prod.
 *   **Candidate Stake Reduction:** Candidate-tier bets use 25% Kelly multiplier (configurable via `CANDIDATE_STAKE_MULTIPLIER` env var).
 *   **ENVIRONMENT env var:** Set to `"production"` in the artifact.toml production run config.
+*   **Live Trading Safety (`betfairLive.ts`):**
+    - `TRADING_MODE=PAPER` (dev) / `TRADING_MODE=LIVE` (prod). Live placement only when LIVE.
+    - Startup health checks must pass or schedulers/trading engine are disabled (hard-stop).
+    - Balance staleness: if cached balance is >1hr old, live bets are skipped (paper bet preserved).
+    - Non-retryable errors (INSUFFICIENT_FUNDS, MARKET_SUSPENDED, etc.) are never retried.
+    - £2 minimum stake enforced. Non-exchange markets (corners/cards) are paper-only.
+    - Live bankroll from Betfair account used for stake sizing in LIVE mode (falls back to config bankroll if unavailable).
+    - 30-min settlement reconciliation cron + 15-min balance refresh in LIVE mode.
+    - 12hr proactive session refresh with auto-retry on INVALID_SESSION.
+    - `paper_bets` table extended with `betfair_*` columns for tracking live bet state.
 
 ## Experiment Pipeline
 
