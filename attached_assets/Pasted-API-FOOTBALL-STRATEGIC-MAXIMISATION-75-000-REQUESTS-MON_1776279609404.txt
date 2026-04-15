@@ -1,0 +1,68 @@
+API-FOOTBALL STRATEGIC MAXIMISATION — 75,000 REQUESTS/MONTH
+
+The API-Football budget is 75,000 requests/month. Every request must serve the profit equation: Profit = Volume × Strike Rate × Average Edge × Stake Size. No wasted calls on data that doesn't move the needle.
+
+1. REQUEST AUDIT & OPTIMISATION:
+   - Audit every current API-Football call across all cron jobs
+   - For each endpoint, calculate: requests consumed per month, what data it provides, which model features it feeds, impact on prediction accuracy
+   - Identify and eliminate waste:
+     a) Duplicate calls (same data fetched by multiple jobs)
+     b) Low-value calls (historical data for leagues we don't bet on)
+     c) Over-frequency calls (data that doesn't change hourly being fetched hourly)
+   - Implement intelligent caching: if data hasn't changed since last fetch, don't re-fetch
+   - Target: reduce current consumption by 20-30% through optimisation alone, freeing budget for expansion
+
+2. HIGH-IMPACT DATA PRIORITISATION:
+   - Rank every data type by its contribution to the profit equation:
+     a) CRITICAL (must have for every bet): current form, head-to-head, league standings, team stats, recent results
+     b) HIGH VALUE (significantly improves predictions): lineups (when available), injuries/suspensions, home/away splits, goals scored/conceded trends
+     c) MEDIUM VALUE (marginal improvement): referee stats, venue data, weather conditions, time-of-day effects
+     d) LOW VALUE (nice to have): historical seasons beyond 2 years, pre-season results, youth team data
+   - Allocate budget proportionally. CRITICAL data gets fetched for every fixture. HIGH VALUE for Tier 1 fixtures. MEDIUM VALUE only if budget allows. LOW VALUE only as exploration.
+
+3. TARGETED LEAGUE EXPANSION — INEFFICIENCY-TO-DATA RATIO:
+   - Not all leagues are created equal. Expand coverage deliberately into leagues where:
+     a) Bookmaker lines are likely to be SOFT (less sharp money, less efficient pricing)
+     b) API-Football data coverage is GOOD (enough stats to build meaningful features)
+     c) Pinnacle offers odds (so we can measure CLV — see Prompt 3)
+     d) Betfair has sufficient liquidity (so we can actually get bets on — see Prompt 8)
+   - PRIORITY EXPANSION TARGETS (investigate these first):
+     a) Scandinavian leagues (Norway, Sweden, Denmark, Finland) — decent data, often soft lines, Pinnacle covers them
+     b) Eastern European leagues (Poland, Czech Republic, Romania, Serbia) — softer lines, growing data coverage
+     c) South American leagues (Brazil Serie A/B, Argentina) — soft lines on smaller markets like BTTS/corners
+     d) Asian leagues (Japan J-League, South Korea K-League, Australia A-League) — different timezone means less European sharp money
+     e) African qualifiers and tournaments — very soft lines but data can be thin
+     f) FIFA World Cup 2026 qualifying fixtures — smaller nations have soft lines AND data is available
+   - AVOID (not worth the API budget):
+     a) Top 5 European leagues ONLY for match result markets — these are the most efficient markets in the world. Edge is thin. HOWEVER, secondary markets (BTTS, corners, cards, over/under goals) in these leagues CAN have edge because they get less attention.
+     b) Leagues with no Pinnacle coverage AND thin Betfair liquidity — we can't validate edge or get bets on
+
+4. LEAGUE PERFORMANCE SCORING:
+   - For each league the model covers, calculate and track:
+     a) Average CLV achieved (are we finding edge here?)
+     b) ROI by league
+     c) Data completeness score (what % of features are available?)
+     d) Fixture frequency (more fixtures = more betting opportunities = faster learning)
+     e) Betfair liquidity level (can we get money on?)
+   - Composite score: leagues that score high on CLV + data completeness + liquidity get more API budget allocation
+   - Leagues that score low get budget reduced or cut entirely
+   - Review this monthly. The model should be LEARNING which leagues are profitable and reallocating resources accordingly.
+
+5. FEATURE ENGINEERING FROM API-FOOTBALL:
+   - The raw data is only as good as the features you build from it. Ensure the model is extracting maximum value:
+     a) Form momentum (not just last 5 results, but weighted by opponent strength and recency)
+     b) Goal expectancy models (xG-like metrics derived from shots, shots on target, big chances)
+     c) Defensive solidity metrics (clean sheets, goals conceded patterns, set piece vulnerability)
+     d) Home/away performance divergence (some teams are dramatically different home vs away)
+     e) Head-to-head contextual features (not just who won, but the nature of the matches)
+     f) Fatigue/congestion indicators (matches played in last 7/14/30 days, travel distance)
+     g) Seasonal position pressure (fighting for title vs mid-table vs relegation threatened — different motivations)
+   - Track which features contribute most to CLV-positive bets. Double down on those. Deprioritise features that don't help.
+
+6. REAL-TIME DATA FOR LIVE FIXTURES:
+   - For matches that are approaching kick-off (within 3 hours), increase data fetch frequency
+   - Capture confirmed lineups as soon as published (usually 1 hour before kick-off) — this is HIGH VALUE data that can significantly change predictions
+   - If a key player is unexpectedly missing, the model should reassess and potentially withdraw a bet if the edge has evaporated
+   - Late team news is one of the biggest informational edges available — capture it faster than the market adjusts
+
+Show me the API budget allocation plan and league prioritisation before implementing.
