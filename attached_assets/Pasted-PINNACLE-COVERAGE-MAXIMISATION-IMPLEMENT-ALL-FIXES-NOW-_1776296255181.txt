@@ -1,0 +1,72 @@
+PINNACLE COVERAGE MAXIMISATION — IMPLEMENT ALL FIXES NOW
+
+The diagnosis is clear. Implement all five fixes in priority order. This is the most important work before launch — without Pinnacle coverage, the Tier 1 gate has nothing to work with.
+
+FIX 1: DERIVE PINNACLE DOUBLE CHANCE ODDS FROM MATCH_ODDS (highest impact, zero API cost)
+
+- For every fixture where we have Pinnacle MATCH_ODDS (home/draw/away), derive the Double Chance implied odds:
+  - DC "1X" (Home or Draw) = 1 / (implied_home + implied_draw)
+  - DC "X2" (Draw or Away) = 1 / (implied_draw + implied_away)  
+  - DC "12" (Home or Away) = 1 / (implied_home + implied_away)
+- Remove the Pinnacle overround/vig before deriving (use the standard vig removal: divide each implied probability by the sum of all three)
+- Store these derived odds in the same unified Pinnacle layer as direct odds, tagged with source "derived_from_match_odds"
+- The pre-bet filter and CLV calculation should treat derived DC odds identically to direct Pinnacle odds — they're mathematically equivalent
+- Run this derivation for ALL 689 matches with AF Pinnacle MATCH_ODDS data
+- Backfill onto all 169 open DC bets immediately
+- Report: how many DC bets now have Pinnacle coverage?
+
+FIX 2: AGGRESSIVE ODDSPAPI BUDGET UTILISATION
+
+The system is using 1.5% of a 100,000 monthly budget. This is absurd. Open the taps:
+- Increase the per-run fetch limit from 200 to 1,000
+- Increase the daily cap to at least 5,000 (we can afford 3,300/day average and burst higher)
+- Run an IMMEDIATE bulk backfill right now for all 604 OddsPapi-mapped fixtures that don't yet have Pinnacle odds
+- Prioritise by: Tier 1 qualifying leagues first, then leagues with open bets, then everything else
+- For BTTS markets specifically: ensure OddsPapi market ID 103 is being queried for every fixture. If BTTS Pinnacle data exists on OddsPapi, we need to be capturing it.
+- After the bulk backfill, report: how many of the 604 mapped fixtures now have Pinnacle odds? Which markets are covered?
+
+FIX 3: SELECTION NAME NORMALISATION — COMPLETE FIX
+
+- Audit every selection name format across all three data sources (our bets, AF Pinnacle, OddsPapi)
+- Build a comprehensive normalisation mapping that handles ALL variants:
+  - "Under 3.5" ↔ "Under 3.5 Goals" ↔ "Under 3.5"
+  - "Over 2.5" ↔ "Over 2.5 Goals" ↔ "Over 2.5"
+  - "Yes" ↔ "BTTS Yes" ↔ "Both Teams Score - Yes"
+  - "Home" ↔ "1" ↔ team name
+  - Any other variants you find
+- Apply this normalisation everywhere Pinnacle odds are matched to bets: backfill, pre-bet filter, CLV calculation, line movement tracking
+- This is a one-time fix but it must be comprehensive — every future bet needs clean matching
+- Report: how many previously unmatched bets now have Pinnacle data after normalisation fix?
+
+FIX 4: EXPAND FIXTURE MAPPING FREQUENCY AND COVERAGE
+
+- The daily OddsPapi fixture mapper should run more frequently — at least every 6 hours
+- Ensure it covers ALL active leagues, not just a subset
+- For any league where we have active bets or experiments, fixture mapping is mandatory
+- After expanding: report how many of the 2,052 scheduled matches now have OddsPapi fixture IDs (target: 80%+ for Pinnacle-covered leagues)
+
+FIX 5: UNIFIED PINNACLE DATA LAYER
+
+- Create a single function that returns the best available Pinnacle odds for any fixture/market/selection
+- Data sources checked in order: (1) OddsPapi direct, (2) API-Football Pinnacle, (3) Derived from MATCH_ODDS
+- Store the source on each record: "oddspapi", "api_football_pinnacle", "derived_from_match_odds"
+- All consumers (pre-bet filter, CLV, line movement, backfill) use this unified layer
+- This means if OddsPapi has BTTS but not DC, and API-Football has MATCH_ODDS for deriving DC, we get coverage from both without duplication
+
+AFTER ALL FIXES — RUN THE FULL ASSESSMENT:
+
+1. Pinnacle coverage report:
+   - Before: 8.9% (21/235 open bets)
+   - After: X% — broken down by market type and source
+   - By league: which leagues have full coverage now?
+
+2. Full launch dry-run scan at opportunity score 68:
+   - How many bets pass ALL Tier 1 gates now?
+   - For each qualifying bet: fixture, league, market, selection, opp score, Pinnacle edge %, data richness, stake, odds
+   - Total exposure
+
+3. Step-down: qualifying bets at 68 vs 67 vs 66 vs 65 vs 64 vs 63 vs 62
+
+4. If bets qualify: are they in leagues and markets where we have genuine historical edge? Cross-reference with the edge segmentation data from the earlier analysis.
+
+Work through Fixes 1-5 in order. Fix 1 should be fast and will have the biggest immediate impact. Don't stop until all five are done and the coverage report is complete.

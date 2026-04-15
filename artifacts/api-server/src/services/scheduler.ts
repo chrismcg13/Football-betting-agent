@@ -35,6 +35,8 @@ import {
   backfillFilteredBetOutcomes,
   analyseSharpMovements,
   selectionNameVariants,
+  derivePinnacleDCFromMatchOdds,
+  backfillPinnacleUnified,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets } from "./apiFootball";
@@ -1192,23 +1194,28 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("API-Football team stats scheduler active — every 12 hours UTC");
 
-  // OddsPapi fixture mapping: daily at 06:05 UTC (5 min after ingestion starts)
-  cron.schedule("5 6 * * *", () => {
+  // OddsPapi fixture mapping: every 6 hours (00:05, 06:05, 12:05, 18:05 UTC)
+  cron.schedule("5 */6 * * *", () => {
     logger.info("OddsPapi fixture mapping triggered by scheduler");
     void safeRunOddspapiMapping();
   }, { timezone: "UTC" });
-  logger.info("OddsPapi fixture mapping scheduler active — daily at 06:05 UTC");
+  logger.info("OddsPapi fixture mapping scheduler active — every 6 hours UTC");
 
   // OddsPapi bulk prefetch: every 4 hours (100k monthly budget)
   // Fetches 7 days of Pinnacle odds for all mapped fixtures.
-  // With 100k/month budget, each run can afford up to 200 requests.
   cron.schedule("10 */4 * * *", () => {
-    logger.info("OddsPapi bulk prefetch triggered (7-day window, 200 req max)");
-    void runDedicatedBulkPrefetch(7, 200)
-      .then((r) => logger.info(r, "OddsPapi bulk prefetch complete"))
-      .catch((err) => logger.error({ err }, "OddsPapi bulk prefetch failed"));
+    logger.info("OddsPapi bulk prefetch triggered (7-day window, 1000 req max)");
+    void runDedicatedBulkPrefetch(7, 1000)
+      .then(async (r) => {
+        logger.info(r, "OddsPapi bulk prefetch complete");
+        const dc = await derivePinnacleDCFromMatchOdds();
+        logger.info(dc, "Post-prefetch DC derivation complete");
+        const unified = await backfillPinnacleUnified();
+        logger.info({ unified }, "Post-prefetch unified Pinnacle backfill complete");
+      })
+      .catch((err) => logger.error({ err }, "OddsPapi bulk prefetch pipeline failed"));
   }, { timezone: "UTC" });
-  logger.info("OddsPapi bulk prefetch scheduler active — every 4 hours UTC (200 req max)");
+  logger.info("OddsPapi bulk prefetch scheduler active — every 4 hours UTC (1000 req max)");
 
   // OddsPapi budget summary: daily at 00:01 UTC
   cron.schedule("1 0 * * *", () => {

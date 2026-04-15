@@ -113,3 +113,15 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 **Integration:** `valueDetection.ts` looks up `competition_config` for seasonal phase, calls `shouldBlockBet()` (blocks friendlies and pre-season matches), applies `getSoftLineBonus()` to opportunity scores for international qualifier matches.
 
 **Dashboard:** Overview "World Cup 2026 Preparation" section with days-to-WC counter, qualifier/soft-line/friendly stats, active tournament list with polling multipliers. API: `/api/dashboard/tournament`. Hook: `useTournamentStatus`.
+
+# Pinnacle Validation Pipeline
+
+**Three-source unified layer** (`backfillPinnacleUnified`): Priority: oddspapi → api_football_real:Pinnacle → derived_from_match_odds. Source tag stored in `pinnacle_edge_category` column.
+
+**DC Derivation** (`derivePinnacleDCFromMatchOdds`): Derives DOUBLE_CHANCE Pinnacle odds from MATCH_ODDS via vig-removed implied probability. `1X = 1/(fairHome+fairDraw)`, `X2 = 1/(fairDraw+fairAway)`, `12 = 1/(fairHome+fairAway)`. Runs after each bulk prefetch in scheduler.
+
+**Coverage (as of April 15, 2026):** Overall 76.6% (180/235). DOUBLE_CHANCE 91.1%, OVER_UNDER_35 80.0%. BTTS remains structural gap (Pinnacle doesn't offer BTTS via any source).
+
+**Admin Endpoint Protection:** All `/api/launch-activation/*` endpoints gated by `requireDevEnvironment` middleware — returns 403 in production (`ENVIRONMENT=production`).
+
+**Tier 1 Gate:** PATH 1 (promoted + opp≥68 + Pinnacle 2%+ edge) or PATH 2 (any active tier + opp≥68 + Pinnacle 2%+ edge + data richness ≥70%). At threshold 68: 9 qualifying bets, $1,521 total stake.

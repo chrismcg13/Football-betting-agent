@@ -33,7 +33,7 @@ import { resilientFetch, isCircuitOpen } from "./resilientFetch";
 const BASE_URL = "https://api.oddspapi.io/v4";
 const ODDSPAPI_SERVICE = "oddspapi";
 const MONTHLY_CAP = 100_000;
-const DEFAULT_DAILY_CAP = 3_300;
+const DEFAULT_DAILY_CAP = 5_000;
 
 const GOALS_OU_ALIASES: Record<string, string> = {
   "Over 0.5": "Over 0.5 Goals",
@@ -54,10 +54,27 @@ const REVERSE_GOALS_ALIASES: Record<string, string> = Object.fromEntries(
 );
 
 export function selectionNameVariants(name: string): string[] {
-  const variants = [name];
-  if (GOALS_OU_ALIASES[name]) variants.push(GOALS_OU_ALIASES[name]);
-  if (REVERSE_GOALS_ALIASES[name]) variants.push(REVERSE_GOALS_ALIASES[name]);
-  return variants;
+  const set = new Set<string>([name]);
+  if (GOALS_OU_ALIASES[name]) set.add(GOALS_OU_ALIASES[name]);
+  if (REVERSE_GOALS_ALIASES[name]) set.add(REVERSE_GOALS_ALIASES[name]);
+
+  const BTTS_YES = ["Yes", "BTTS Yes", "Both Teams Score - Yes", "GG"];
+  const BTTS_NO = ["No", "BTTS No", "Both Teams Score - No", "NG"];
+  const MO_HOME = ["Home", "1"];
+  const MO_DRAW = ["Draw", "X"];
+  const MO_AWAY = ["Away", "2"];
+  const DC_1X = ["1X", "Home or Draw"];
+  const DC_X2 = ["X2", "Draw or Away"];
+  const DC_12 = ["12", "Home or Away"];
+
+  const groups = [BTTS_YES, BTTS_NO, MO_HOME, MO_DRAW, MO_AWAY, DC_1X, DC_X2, DC_12];
+  for (const group of groups) {
+    if (group.some((v) => v.toLowerCase() === name.toLowerCase())) {
+      for (const v of group) set.add(v);
+    }
+  }
+
+  return [...set];
 }
 
 export function canonicalSelectionName(name: string): string {
@@ -94,7 +111,7 @@ async function getFlexibleDailyCap(): Promise<number> {
   if (daysRemaining <= 0) return DEFAULT_DAILY_CAP;
 
   const avgNeeded = Math.floor(budgetRemaining / daysRemaining);
-  const flexCap = Math.max(2_500, Math.min(4_500, avgNeeded));
+  const flexCap = Math.max(4_000, Math.min(6_500, avgNeeded));
 
   return flexCap;
 }
@@ -2116,7 +2133,7 @@ export async function buildPinnacleValidationFromApiFootball(
     .innerJoin(matchesTable, eq(oddsSnapshotsTable.matchId, matchesTable.id))
     .where(
       and(
-        like(oddsSnapshotsTable.source, "api_football_real%"),
+        sql`(${oddsSnapshotsTable.source} LIKE 'api_football_real%' OR ${oddsSnapshotsTable.source} = 'derived_from_match_odds')`,
         inArray(oddsSnapshotsTable.marketType, RELEVANT_MARKETS),
         eq(matchesTable.status, "scheduled"),
         gte(matchesTable.kickoffTime, earliestKickoff),
@@ -2143,9 +2160,8 @@ export async function buildPinnacleValidationFromApiFootball(
     }
     const sel = selMap.get(row.selectionName)!;
 
-    // Track Pinnacle odds
-    if (row.source === "api_football_real:Pinnacle") {
-      sel.pinnacle = odds;
+    if (row.source === "api_football_real:Pinnacle" || row.source === "derived_from_match_odds") {
+      if (sel.pinnacle === null || odds > sel.pinnacle) sel.pinnacle = odds;
     }
 
     // Track best odds across all bookmakers
@@ -2273,6 +2289,276 @@ export async function backfillPinnacleOnPendingBets(): Promise<{ updated: number
 
   logger.info({ checked: pending.length, updated }, "Backfilled Pinnacle odds on pending bets");
   return { updated, checked: pending.length };
+}
+
+// ─── FIX 1: Derive Pinnacle DC odds from MATCH_ODDS ────────────────────────────
+
+export async function derivePinnacleDCFromMatchOdds(): Promise<{
+  matchesProcessed: number;
+  dcSelectionsCreated: number;
+  betsUpdated: number;
+}> {
+  const pinnMO = await db
+    .select({
+      matchId: oddsSnapshotsTable.matchId,
+      selectionName: oddsSnapshotsTable.selectionName,
+      backOdds: oddsSnapshotsTable.backOdds,
+      snapshotTime: oddsSnapshotsTable.snapshotTime,
+    })
+    .from(oddsSnapshotsTable)
+    .innerJoin(matchesTable, eq(oddsSnapshotsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
+        eq(oddsSnapshotsTable.marketType, "MATCH_ODDS"),
+        eq(matchesTable.status, "scheduled"),
+      ),
+    )
+    .orderBy(desc(oddsSnapshotsTable.snapshotTime));
+
+  const matchMap = new Map<number, { home: number; draw: number; away: number }>();
+  const matchSeen = new Map<number, Set<string>>();
+  for (const row of pinnMO) {
+    const odds = parseFloat(row.backOdds ?? "0");
+    if (odds <= 1.01) continue;
+    const sel = row.selectionName.toLowerCase();
+    let canonical: "home" | "draw" | "away" | null = null;
+    if (sel === "home" || sel === "1") canonical = "home";
+    else if (sel === "draw" || sel === "x") canonical = "draw";
+    else if (sel === "away" || sel === "2") canonical = "away";
+    if (!canonical) continue;
+
+    if (!matchSeen.has(row.matchId)) matchSeen.set(row.matchId, new Set());
+    const seen = matchSeen.get(row.matchId)!;
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+
+    if (!matchMap.has(row.matchId)) matchMap.set(row.matchId, { home: 0, draw: 0, away: 0 });
+    matchMap.get(row.matchId)![canonical] = odds;
+  }
+
+  let matchesProcessed = 0;
+  let dcSelectionsCreated = 0;
+  const now = new Date();
+
+  const allMatchIds = [...matchMap.keys()].filter((mid) => {
+    const mo = matchMap.get(mid)!;
+    return mo.home > 1.01 && mo.draw > 1.01 && mo.away > 1.01;
+  });
+
+  type DerivedRow = {
+    matchId: number;
+    marketType: string;
+    selectionName: string;
+    backOdds: string;
+    layOdds: null;
+    snapshotTime: Date;
+    source: string;
+  };
+  const allInserts: DerivedRow[] = [];
+
+  for (const matchId of allMatchIds) {
+    const mo = matchMap.get(matchId)!;
+
+    const implHome = 1 / mo.home;
+    const implDraw = 1 / mo.draw;
+    const implAway = 1 / mo.away;
+    const totalImplied = implHome + implDraw + implAway;
+    const fairHome = implHome / totalImplied;
+    const fairDraw = implDraw / totalImplied;
+    const fairAway = implAway / totalImplied;
+
+    const dcOdds = {
+      "1X": 1 / (fairHome + fairDraw),
+      "X2": 1 / (fairDraw + fairAway),
+      "12": 1 / (fairHome + fairAway),
+    };
+
+    for (const [selName, odds] of Object.entries(dcOdds)) {
+      if (odds <= 1.01 || !isFinite(odds)) continue;
+      allInserts.push({
+        matchId,
+        marketType: "DOUBLE_CHANCE",
+        selectionName: selName,
+        backOdds: String(Math.round(odds * 10000) / 10000),
+        layOdds: null,
+        snapshotTime: now,
+        source: "derived_from_match_odds",
+      });
+      dcSelectionsCreated++;
+    }
+    matchesProcessed++;
+  }
+
+  await db.transaction(async (tx) => {
+    if (allMatchIds.length > 0) {
+      await tx
+        .delete(oddsSnapshotsTable)
+        .where(
+          and(
+            inArray(oddsSnapshotsTable.matchId, allMatchIds),
+            eq(oddsSnapshotsTable.marketType, "DOUBLE_CHANCE"),
+            eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
+          ),
+        );
+    }
+    const BATCH_SIZE = 100;
+    for (let i = 0; i < allInserts.length; i += BATCH_SIZE) {
+      await tx.insert(oddsSnapshotsTable).values(allInserts.slice(i, i + BATCH_SIZE));
+    }
+  });
+
+  const betsUpdated = await backfillPinnacleUnified();
+
+  logger.info(
+    { matchesProcessed, dcSelectionsCreated, betsUpdated },
+    "Derived Pinnacle DC odds from MATCH_ODDS and backfilled bets",
+  );
+  return { matchesProcessed, dcSelectionsCreated, betsUpdated };
+}
+
+// ─── FIX 5: Unified Pinnacle data layer ──────────────────────────────────────
+
+export interface UnifiedPinnacleOdds {
+  odds: number;
+  implied: number;
+  source: "oddspapi" | "api_football_pinnacle" | "derived_from_match_odds";
+}
+
+export async function getUnifiedPinnacleOdds(
+  matchId: number,
+  marketType: string,
+  selectionName: string,
+): Promise<UnifiedPinnacleOdds | null> {
+  const variants = selectionNameVariants(selectionName);
+
+  const sources: Array<{ dbSource: string; tag: UnifiedPinnacleOdds["source"] }> = [
+    { dbSource: "oddspapi", tag: "oddspapi" },
+    { dbSource: "api_football_real:Pinnacle", tag: "api_football_pinnacle" },
+    { dbSource: "derived_from_match_odds", tag: "derived_from_match_odds" },
+  ];
+
+  for (const { dbSource, tag } of sources) {
+    const rows = await db
+      .select({ backOdds: oddsSnapshotsTable.backOdds })
+      .from(oddsSnapshotsTable)
+      .where(
+        and(
+          eq(oddsSnapshotsTable.matchId, matchId),
+          eq(oddsSnapshotsTable.marketType, marketType),
+          inArray(oddsSnapshotsTable.selectionName, variants),
+          eq(oddsSnapshotsTable.source, dbSource),
+        ),
+      )
+      .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+      .limit(1);
+
+    if (rows.length > 0) {
+      const odds = parseFloat(rows[0]!.backOdds ?? "0");
+      if (odds > 1.01) {
+        return { odds, implied: 1 / odds, source: tag };
+      }
+    }
+  }
+
+  return null;
+}
+
+export async function backfillPinnacleUnified(): Promise<number> {
+  const pending = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      pinnacleOdds: paperBetsTable.pinnacleOdds,
+    })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        sql`${paperBetsTable.deletedAt} IS NULL`,
+        gte(matchesTable.kickoffTime, new Date()),
+      ),
+    );
+
+  if (pending.length === 0) return 0;
+
+  const matchIds = [...new Set(pending.map((b) => b.matchId))];
+
+  const allSnaps = await db
+    .select({
+      matchId: oddsSnapshotsTable.matchId,
+      marketType: oddsSnapshotsTable.marketType,
+      selectionName: oddsSnapshotsTable.selectionName,
+      source: oddsSnapshotsTable.source,
+      backOdds: oddsSnapshotsTable.backOdds,
+    })
+    .from(oddsSnapshotsTable)
+    .where(
+      and(
+        inArray(oddsSnapshotsTable.matchId, matchIds),
+        inArray(oddsSnapshotsTable.source, [
+          "oddspapi",
+          "api_football_real:Pinnacle",
+          "derived_from_match_odds",
+        ]),
+      ),
+    );
+
+  type SnapRecord = { odds: number; priority: number; source: string };
+  const snapMap = new Map<string, SnapRecord>();
+  const SOURCE_PRIORITY: Record<string, number> = {
+    oddspapi: 1,
+    "api_football_real:Pinnacle": 2,
+    derived_from_match_odds: 3,
+  };
+
+  for (const s of allSnaps) {
+    const odds = parseFloat(s.backOdds ?? "0");
+    if (odds <= 1.01) continue;
+    const pri = SOURCE_PRIORITY[s.source] ?? 99;
+
+    for (const variant of selectionNameVariants(s.selectionName)) {
+      const key = `${s.matchId}:${s.marketType}:${variant}`;
+      const existing = snapMap.get(key);
+      if (!existing || pri < existing.priority || (pri === existing.priority && odds > existing.odds)) {
+        snapMap.set(key, { odds, priority: pri, source: s.source });
+      }
+    }
+  }
+
+  let updated = 0;
+  for (const bet of pending) {
+    const variants = selectionNameVariants(bet.selectionName);
+    let best: SnapRecord | null = null;
+    for (const v of variants) {
+      const key = `${bet.matchId}:${bet.marketType}:${v}`;
+      const s = snapMap.get(key);
+      if (s && (!best || s.priority < best.priority || (s.priority === best.priority && s.odds > best.odds))) {
+        best = s;
+      }
+    }
+    if (best && best.odds > 1.01) {
+      const existingOdds = parseFloat(String(bet.pinnacleOdds ?? "0"));
+      if (Math.abs(existingOdds - best.odds) > 0.001) {
+        const sourceTag = best.source === "api_football_real:Pinnacle" ? "api_football_pinnacle" : best.source;
+        await db
+          .update(paperBetsTable)
+          .set({
+            pinnacleOdds: String(best.odds),
+            pinnacleImplied: String(1 / best.odds),
+            pinnacleEdgeCategory: sourceTag,
+          })
+          .where(eq(paperBetsTable.id, bet.id));
+        updated++;
+      }
+    }
+  }
+
+  logger.info({ checked: pending.length, updated }, "Unified Pinnacle backfill complete");
+  return updated;
 }
 
 // ─── Three-snapshot CLV system ─────────────────────────────────────────────────
