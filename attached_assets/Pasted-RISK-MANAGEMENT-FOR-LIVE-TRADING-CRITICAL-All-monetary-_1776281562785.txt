@@ -1,0 +1,65 @@
+RISK MANAGEMENT FOR LIVE TRADING — CRITICAL
+
+All monetary values below are expressed as PERCENTAGES OF LIVE BETFAIR BALANCE. Nothing is hardcoded to a pound amount. The system reads the live balance and calculates all limits dynamically.
+
+EXPOSURE LIMITS (starting values — the model will earn higher limits):
+
+1. STARTING EXPOSURE FRAMEWORK:
+   - Maximum single bet stake: 2% of live balance
+   - Maximum total open exposure: 25% of live balance  
+   - Maximum daily loss limit: 5% of live balance
+   - Maximum weekly loss limit: 10% of live balance
+   - Maximum exposure per league: 8% of live balance
+   - Maximum exposure per market type: 10% of live balance
+   - Bankroll floor: 60% of starting deposit (if balance drops below this, halt all betting and alert me)
+
+2. PROGRESSIVE EXPOSURE SCALING:
+   The model earns the right to increase exposure over time. Implement a confidence-based scaling system:
+   
+   - LEVEL 1 (Week 1-2, or first 50 live bets): Starting limits as above
+   - LEVEL 2 (requires: 50+ settled live bets, CLV > 2%, ROI > 3%, no circuit breaker triggers):
+     - Max single bet: 2.5%
+     - Max open exposure: 30%
+     - Max daily loss: 6%
+   - LEVEL 3 (requires: 150+ settled live bets, CLV > 2.5%, ROI > 4%, no circuit breakers in 30 days):
+     - Max single bet: 3%
+     - Max open exposure: 35%
+     - Max daily loss: 7%
+   - LEVEL 4 (requires: 300+ settled live bets, CLV > 3%, ROI > 5%, model has been live 60+ days):
+     - Max single bet: 3.5%
+     - Max open exposure: 40%
+     - Max daily loss: 8%
+   
+   - Demotion: If at any level, rolling 30-day ROI drops below 0% or CLV drops below 0%, drop back one level immediately. Log the demotion. Alert me.
+   - The model cannot skip levels.
+   - Level transitions are logged in the audit trail with full performance context.
+
+3. CIRCUIT BREAKERS (live-specific):
+   - If 3 consecutive bets lose: pause for 1 hour, log it, continue automatically
+   - If 5 consecutive bets lose: pause for 6 hours, alert me, continue automatically
+   - If 8 consecutive bets lose: halt all betting, alert me, require manual restart
+   - If daily loss limit is hit: halt betting for remainder of the day
+   - If weekly loss limit is hit: halt betting for remainder of the week, alert me
+   - If bankroll drops below floor: halt ALL betting immediately, alert me with full performance report
+   - If Betfair API errors exceed 5 in an hour: pause betting for 30 minutes, alert me
+   
+4. CORRELATION RISK MANAGEMENT:
+   - Track correlation between open bets. If multiple bets depend on the same match outcome, count them as correlated exposure
+   - Maximum correlated exposure on a single fixture: 3% of balance
+   - If the model identifies the same fixture appearing across multiple market types (e.g., BTTS + Over 2.5 on the same match), apply the correlation limit
+   - Log all correlation calculations
+
+5. KELLY CRITERION ADJUSTMENTS FOR LIVE:
+   - Use fractional Kelly: 25% Kelly for all Tier 1 bets (this is conservative and correct for live)
+   - As confidence levels increase (Level 2+), the model may increase to 30% Kelly but NEVER above 40%
+   - Kelly calculation must use the Pinnacle closing line as the true probability anchor where available
+   - If Pinnacle data is unavailable for a specific bet, reduce Kelly fraction by 50% for that bet
+
+6. SLIPPAGE AWARENESS:
+   - Track the difference between the odds at time of bet identification and the odds at time of actual placement
+   - If average slippage exceeds 3% over a rolling 50-bet window, alert me — this may indicate we need to place bets faster or adjust timing
+   - If a specific bet's available odds have moved more than 5% from our identified price, skip the bet rather than accepting worse value
+
+All existing risk controls from paper trading remain active. These live-specific controls are ADDITIONAL layers, not replacements. 
+
+Show me the risk management schema before implementing.
