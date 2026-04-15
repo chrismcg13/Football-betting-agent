@@ -1,0 +1,78 @@
+CRITICAL SYSTEM CHANGE: We are transitioning from Paper Trading to Live Trading. This is the most important change we will ever make to this system. Real money is at stake. Every line of code you write must be defensive, validated, and tested.
+
+BETFAIR LIVE API CREDENTIALS:
+- API Key: Already stored as Replit Secret LIVE_BETFAIR_KEY
+- Betfair Username: [YOUR BETFAIR USERNAME — store as Replit Secret BETFAIR_USERNAME]
+- Betfair Password: [YOUR BETFAIR PASSWORD — store as Replit Secret BETFAIR_PASSWORD]
+
+REQUIREMENTS:
+
+1. CREDENTIAL MANAGEMENT:
+   - Store all Betfair credentials as Replit Secrets (environment variables), never hardcoded:
+     a) LIVE_BETFAIR_KEY — already stored, this is the API key
+     b) BETFAIR_USERNAME — create this secret with your Betfair login username
+     c) BETFAIR_PASSWORD — create this secret with your Betfair login password
+   - Keep the existing delayed API key secrets intact as fallback
+   - Add a TRADING_MODE environment variable set to "LIVE"
+   - The system must check TRADING_MODE on every startup and log clearly whether it is in LIVE or PAPER mode
+
+   SESSION TOKEN (SSOID) — AUTOMATIC MANAGEMENT:
+   - Do NOT store a static session token. Sessions expire (~20 hours idle). The system must manage sessions automatically.
+   - All Betfair API communication runs through the DigitalOcean VPS (see Prompt 8). The VPS handles session management:
+     a) On VPS startup: authenticate with Betfair using the interactive login endpoint:
+        POST https://identitysso.betfair.com/api/login
+        Headers: X-Application: {LIVE_BETFAIR_KEY}, Content-Type: application/x-www-form-urlencoded
+        Body: username={BETFAIR_USERNAME}&password={BETFAIR_PASSWORD}
+        Response contains sessionToken — this is the SSOID
+     b) Cache the session token in memory on the VPS
+     c) Before every Betfair API call, check if the session is still valid. If any call returns INVALID_SESSION_INFORMATION, immediately re-authenticate and retry the original call once.
+     d) Proactively refresh the session every 12 hours (well before the ~20 hour expiry) to avoid any gap
+     e) If authentication fails (wrong credentials, account locked, Betfair down): halt all trading immediately and alert me as CRITICAL
+     f) Log every authentication and session refresh event with timestamp
+   - FUTURE UPGRADE: Consider generating an SSL certificate for certificate-based login (POST https://identitysso-cert.betfair.com/api/certlogin). This is more robust for automated systems — no password transmission, less likely to trigger CAPTCHA or security blocks. Not required for launch but recommended once live trading is stable.
+
+2. BANKROLL SOURCE — CRITICAL:
+   - The prod bankroll must NEVER be hardcoded
+   - On every trading cycle, fetch the actual account balance from the Betfair API (use the Account Operations endpoint: /account/getAccountFunds/)
+   - Cache the balance locally with a timestamp, refresh every 15 minutes minimum
+   - If the API balance fetch fails, use the last cached value but log a warning
+   - If the cached value is older than 1 hour, halt all new bet placement until balance is refreshed
+   - All stake calculations, exposure limits, and Kelly fractions must reference this live balance
+   - This means if I deposit more money, the system immediately scales up. If I withdraw profits, it scales down. Zero manual intervention needed.
+
+3. BET PLACEMENT — SWITCH FROM SIMULATED TO REAL:
+   - Replace all paper trade simulation logic in prod with actual Betfair API bet placement calls
+   - Use the Betfair Exchange API placeOrders endpoint
+   - Every bet placement must:
+     a) Verify sufficient funds before placing
+     b) Log the full API request and response
+     c) Store the Betfair betId against our internal bet record
+     d) Confirm the bet was matched (handle UNMATCHED and PARTIALLY_MATCHED states)
+     e) Implement retry logic with exponential backoff for transient failures (max 3 retries)
+     f) NEVER retry on insufficient funds or market closed errors
+   - If a bet fails to place after retries, log it as PLACEMENT_FAILED with the full error, alert me, and move on
+
+4. SETTLEMENT RECONCILIATION:
+   - After each bet settles on Betfair, reconcile the settlement against our internal prediction
+   - Fetch settled bets from Betfair API (listClearedOrders) every 30 minutes
+   - Cross-reference Betfair settlement with our internal bet records
+   - If any discrepancy is found between expected and actual settlement, flag it immediately in the audit log and alert me
+   - Track actual P&L from Betfair alongside our internally calculated P&L — these should always match
+
+5. STARTUP SAFETY:
+   - On prod startup, run a comprehensive health check:
+     a) Verify TRADING_MODE is set
+     b) Verify Betfair API credentials are valid (make a test account balance call)
+     c) Verify prod database is the Neon database (NOT dev)
+     d) Verify the bankroll can be fetched from Betfair
+     e) Log all checks with PASS/FAIL
+   - If ANY check fails, do not start the trading engine. Log the failure and alert me.
+
+6. UPDATE DASHBOARD HEADER:
+   - Change "Paper Trading v1.0" to "Live Trading v1.0"
+   - Change the PAPER MODE badge to show "LIVE MODE" with a green indicator
+   - Display the live Betfair balance prominently alongside internal tracking
+
+Do NOT change any model logic, prediction algorithms, or experiment pipeline in this prompt. Only infrastructure and API integration.
+
+Verify all changes by running the startup health check and showing me the output.
