@@ -23,10 +23,11 @@ import { resilientFetch, isCircuitOpen } from "./resilientFetch";
 
 const BASE_URL = "https://v3.football.api-sports.io";
 const API_FOOTBALL_SERVICE = "api-football";
-const MONTHLY_CAP = 75_000;
-const DEFAULT_DAILY_CAP = 2_500;
-const MIN_DAILY_CAP = 1_500;
-const MAX_DAILY_CAP = 4_000;
+const MONTHLY_CAP = 75_000 * 30;
+const DAILY_CAP = 75_000;
+const DEFAULT_DAILY_CAP = 75_000;
+const MIN_DAILY_CAP = 50_000;
+const MAX_DAILY_CAP = 75_000;
 
 // ─── Comprehensive league ID mapping ─────────────────────────────────────────
 export const LEAGUE_IDS: Record<string, number> = {
