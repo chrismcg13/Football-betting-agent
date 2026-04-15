@@ -1,0 +1,49 @@
+PRODUCTION BETTING CRITERIA — TWO-TIER LIVE SYSTEM
+
+We are implementing a two-tier approach to live betting. This is the core strategy for which bets go live and which stay in the experiment pipeline.
+
+TIER 1: LIVE BETTING (placed with real money immediately)
+A bet qualifies for live placement if ALL of the following are true:
+- Opportunity score >= 68
+- The market has FULL data coverage, defined as:
+  a) Pinnacle odds are available for this fixture (via OddsPapi)
+  b) API-Football data is available with full match stats, lineups, and form data
+  c) The league is covered by football-data.org OR has 50+ historical fixtures in our API-Football dataset
+- The bet has been validated against Pinnacle closing/current line with positive CLV (see Prompt 3)
+- The bet passes all existing risk management checks (Kelly sizing, exposure limits, circuit breakers)
+- The market is NOT in quarantine or flagged by circuit breakers
+
+TIER 2: EXPERIMENT PIPELINE (paper traded, building confidence)
+All bets that do NOT meet Tier 1 criteria continue through the existing experiment pipeline:
+- Experiment → Candidate → Promoted graduation path
+- Same statistical gates as before (30+ settled, ROI>3%, CLV>1.5%, p<0.10 etc.)
+- When an experiment tag gets Promoted, its bets automatically qualify for Tier 1 IF they also meet the opportunity score threshold
+- Experiment and Candidate tier bets are NEVER placed with real money regardless of opportunity score
+
+OPPORTUNITY SCORE ADAPTIVE THRESHOLD:
+- Starting threshold: 68
+- Store this as a configurable parameter in the database (not hardcoded)
+- Implement a weekly review job (run Sunday 5am alongside existing weekly jobs):
+  a) Analyse the last 7 days of Tier 1 live bet performance
+  b) Calculate rolling 30-day CLV and ROI for Tier 1 bets specifically
+  c) If rolling 30-day CLV > 3% AND ROI > 5% AND 50+ Tier 1 bets settled:
+     - The model MAY reduce the opportunity score threshold by up to 2 points (minimum floor: 60)
+     - Log the reasoning for any adjustment
+  d) If rolling 30-day CLV < 1% OR ROI < 0%:
+     - Increase the threshold by 3 points (no maximum ceiling)
+     - Log the reasoning
+  e) If data is insufficient (fewer than 50 settled Tier 1 bets), make no adjustment
+  f) Every threshold change must be logged in the promotion_audit_log with full context
+  g) The model should factor in: CLV trend (improving or declining?), ROI stability (volatile or consistent?), and market diversity (are we profitable across markets or dependent on one?)
+- The goal is NOT to blindly lower the threshold. The goal is to find the optimal threshold that maximises CLV > ROI while allowing appropriate scale. If reducing the threshold would dilute edge, don't reduce it.
+
+DATA RICHNESS CLASSIFICATION:
+- Create a data_richness_score for each league-market combination
+- Factors: Pinnacle coverage %, API-Football historical depth, football-data.org availability, fixture frequency, odds movement data availability
+- A league-market must score above 70% data richness to qualify for Tier 1
+- Recalculate data richness weekly
+- Log which leagues qualify and which don't
+
+IMPORTANT: The existing experiment pipeline for Tier 2 markets is UNCHANGED. Do not modify any experiment graduation gates, statistical thresholds, or the promotion engine. The experiment pipeline continues to run exactly as built.
+
+Show me the implementation plan before writing code.
