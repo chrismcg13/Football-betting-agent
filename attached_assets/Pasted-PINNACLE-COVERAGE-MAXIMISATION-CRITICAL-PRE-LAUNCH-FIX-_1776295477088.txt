@@ -1,0 +1,79 @@
+PINNACLE COVERAGE MAXIMISATION — CRITICAL PRE-LAUNCH FIX
+
+Current Pinnacle coverage on open bets is 6.6%. This is unacceptable. We have 100,000 OddsPapi requests/month and we're barely using them. The system needs to be matching far more fixtures to Pinnacle odds. Fix this now.
+
+STEP 1: DIAGNOSE THE MAPPING GAP
+
+Analyse the current fixture-to-Pinnacle matching pipeline end to end. For every step where fixtures can fail to get Pinnacle data, report:
+- How many fixtures enter that step
+- How many successfully pass through
+- How many drop out and WHY
+- Show specific examples of dropped fixtures (e.g., "Liverpool vs Arsenal, Premier League — dropped because [reason]")
+
+Common failure modes to investigate:
+- Team name mismatches between our fixture data and OddsPapi/Pinnacle naming conventions (e.g., "Man United" vs "Manchester United" vs "Manchester Utd")
+- League name/ID mismatches between our system and OddsPapi
+- Missing or incorrect sport/competition IDs in OddsPapi queries
+- Fixtures not being submitted for Pinnacle lookup at all (scheduler not covering them)
+- Timing issues — are we querying too early (no market yet) or too late (market closed)?
+- API response parsing issues — are Pinnacle odds coming back but not being stored correctly?
+
+For each failure mode found, quantify how many fixtures it affects.
+
+STEP 2: DUAL-SOURCE PINNACLE ARCHITECTURE
+
+We have TWO potential sources of Pinnacle odds:
+1. OddsPapi — dedicated Pinnacle/sharp odds API (100k requests/month)
+2. API-Football — has some Pinnacle odds via their /odds endpoint (already using 75k requests/month)
+
+These need to work together, not independently:
+- Build a unified Pinnacle data layer that accepts odds from EITHER source
+- OddsPapi is the PRIMARY source (more reliable, dedicated to sharp lines)
+- API-Football is the SECONDARY/fallback source — if OddsPapi doesn't have Pinnacle for a fixture, check if API-Football captured it
+- When both sources have data for the same fixture, prefer OddsPapi (more likely to be current)
+- Store the source alongside each Pinnacle odds record so we know where it came from
+- The pre-bet Pinnacle filter, CLV calculation, and line movement tracker should all consume from this unified layer — they don't care where the data came from
+
+STEP 3: FIX EVERY MAPPING ISSUE FOUND
+
+Based on the diagnosis in Step 1, fix each failure mode:
+- If it's team name matching: implement fuzzy matching or build a name mapping table
+- If it's league ID mapping: extend the OddsPapi league mapping to cover all our active leagues
+- If it's scheduling: ensure every fixture in a Tier 1 qualifying league gets submitted for Pinnacle lookup
+- If it's parsing: fix the response handling
+- Whatever else you find: fix it
+
+STEP 4: AGGRESSIVE BACKFILL
+
+After fixing the mapping:
+- Run an immediate backfill of Pinnacle odds for ALL open/upcoming bets that currently lack Pinnacle data
+- Prioritise Tier 1 qualifying leagues (data richness ≥ 70%): Premier League, Serie A, Bundesliga, Ligue 1, La Liga, Primeira Liga, Championship, EFL leagues, MLS, Brazilian Serie A
+- Run the pre-bet Pinnacle filter and line movement tracker on all newly matched fixtures
+- Report the new coverage rate
+
+STEP 5: COVERAGE REPORT
+
+After all fixes and backfill, show me:
+- Pinnacle coverage BEFORE fix: X% of open bets (the 6.6% baseline)
+- Pinnacle coverage AFTER fix: X% of open bets
+- Breakdown by league: which leagues now have coverage, which still don't, and why
+- Breakdown by source: how many from OddsPapi, how many from API-Football fallback
+- Any leagues that SHOULD have Pinnacle data but still don't — what's blocking them?
+
+STEP 6: LIVE LAUNCH DRY-RUN
+
+With the improved Pinnacle coverage, run the full launch dry-run scan again (same as before):
+- Opportunity score threshold: 68 (don't change this)
+- All Tier 1 gates active (Pinnacle 2% edge, data richness ≥ 70%, risk management)
+- Show me every bet that would qualify for Tier 1
+- For each qualifying bet: fixture, league, market type, selection, opportunity score, Pinnacle edge %, data richness, recommended stake, odds
+- Total exposure if all qualifying bets were placed
+- Compare to the previous dry-run (0 qualifying bets) — what changed?
+
+Also run the step-down comparison: how many qualify at 68 vs 67 vs 66 vs 65?
+
+If bets now qualify at 68, we launch at 68. If meaningful bets only appear at 65-67, show me the quality data (CLV history, edge size) so I can make an informed decision on the launch threshold.
+
+The goal is maximum Pinnacle coverage so the Tier 1 gate has real data to work with. Every fixture in a Pinnacle-covered league should have Pinnacle odds. No excuses.
+
+Show me the diagnosis first before implementing fixes.
