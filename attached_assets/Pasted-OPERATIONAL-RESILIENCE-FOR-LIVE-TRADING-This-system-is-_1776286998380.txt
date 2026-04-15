@@ -1,0 +1,59 @@
+OPERATIONAL RESILIENCE FOR LIVE TRADING
+
+This system is managing real money. It needs to be production-hardened. Review and implement the following:
+
+1. ERROR HANDLING & RECOVERY:
+   - Every external API call (Betfair, API-Football, OddsPapi, football-data.org) must have:
+     a) Timeout limits (30 seconds max)
+     b) Retry logic with exponential backoff (1s, 2s, 4s — max 3 retries)
+     c) Circuit breaker pattern: if an API fails 5 times in 10 minutes, stop calling it for 15 minutes, then retry once. If still failing, alert me.
+     d) Graceful degradation: if API-Football is down, the system continues with available data but tightens opportunity score requirement by +5 points
+   - Never let an unhandled exception crash the trading engine. Wrap all critical paths in try/catch. Log the error. Continue operating.
+
+2. DATA INTEGRITY:
+   - Every bet placed must be written to the database BEFORE the Betfair API call is made (status: PENDING_PLACEMENT)
+   - After successful placement, update to PLACED with the Betfair betId
+   - After failed placement, update to PLACEMENT_FAILED with error detail
+   - This ensures we never lose track of a bet even if the system crashes mid-placement
+   - Run a reconciliation check every hour: any bet in PENDING_PLACEMENT for more than 10 minutes should be investigated (check Betfair for matching orders)
+
+3. CRON JOB MONITORING:
+   - Track execution of every cron job: start time, end time, success/failure, records processed
+   - If any cron job fails to run within 2x its expected interval, alert me
+   - If the trading cron (5-minute cycle) misses 2 consecutive runs, alert as critical
+   - Log cron execution history for the dashboard Audit Trail
+
+4. DATABASE SAFETY:
+   - Maintain the strict dev/prod database separation
+   - The prod startup check must verify DATABASE_URL does NOT point to any known dev database host
+   - All database writes in prod must be wrapped in transactions
+   - Implement soft deletes — never hard delete bet records or audit logs
+   - Daily database backup reminder (even if backups are manual on the Replit/Neon side, log a reminder)
+
+5. RATE LIMITING & API BUDGET:
+   - API-Football: 75,000 requests/month. Track usage daily. If projected monthly usage exceeds 90%, reduce non-essential calls (prioritise live fixture data over historical enrichment)
+   - OddsPapi: 100,000 requests/month. Track usage daily. Allocate per the priority framework in Prompt 3.
+   - Betfair API: monitor rate limits per their documentation. Implement request queuing if approaching limits.
+   - Log all API usage daily with projections
+
+6. TIMEZONE HANDLING:
+   - All internal timestamps in UTC
+   - Dashboard displays in UK time (GMT/BST, auto-adjusting for daylight savings)
+   - Betfair API returns UTC — ensure no timezone conversion bugs in settlement times
+   - Match kick-off times must be correctly converted for comparison with trading windows
+
+7. LOGGING STANDARDS:
+   - Every log entry must include: timestamp (UTC), component name, severity, message, relevant IDs (bet_id, fixture_id, etc.)
+   - Structured JSON logging where possible
+   - Retain logs for 90 days minimum
+   - Sensitive data (API keys, session tokens) must NEVER appear in logs — mask them
+
+8. GRACEFUL SHUTDOWN:
+   - If the Replit deployment restarts, the system must:
+     a) Complete any in-progress bet placement before shutting down (or mark it for reconciliation)
+     b) On restart, run the full health check (Prompt 1)
+     c) Reconcile any PENDING_PLACEMENT bets
+     d) Resume normal operation
+   - Log every shutdown and startup with context
+
+This is non-negotiable production infrastructure. Show me the implementation approach before writing code.
