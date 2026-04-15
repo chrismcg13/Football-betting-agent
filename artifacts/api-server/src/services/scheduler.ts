@@ -1375,6 +1375,47 @@ export function startScheduler(): void {
     logger.info("Order management cron active — every 2 minutes (partial fills, cancellations, reassessment)");
   }
 
+  // Alert detection: every 5 minutes — check for critical/warning conditions
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const { runAlertDetection, checkMilestones } = await import("./alertDetection");
+        await runAlertDetection();
+        await checkMilestones();
+      } catch (err) {
+        logger.error({ err }, "Alert detection cron failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Alert detection active — every 5 minutes");
+
+  // Anomaly detection: daily at 04:30 UTC
+  cron.schedule("30 4 * * *", () => {
+    void (async () => {
+      try {
+        const { runAnomalyDetection } = await import("./alertDetection");
+        await runAnomalyDetection();
+      } catch (err) {
+        logger.error({ err }, "Anomaly detection cron failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Anomaly detection active — daily 04:30 UTC");
+
+  // Alert cleanup: weekly Sunday 06:00 — remove alerts older than 90 days
+  cron.schedule("0 6 * * 0", () => {
+    void (async () => {
+      try {
+        const { cleanupOldAlerts } = await import("./alerting");
+        const removed = await cleanupOldAlerts(90);
+        if (removed > 0) logger.info({ removed }, "Old alerts cleaned up");
+      } catch (err) {
+        logger.error({ err }, "Alert cleanup failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Alert cleanup active — Sunday 06:00 UTC (90-day retention)");
+
   // Startup trading cycle: fire 2 minutes after server start so any restart
   // doesn't leave the cycle dormant for up to 5 minutes.
   // Also refresh odds first so the cycle has fresh market data.

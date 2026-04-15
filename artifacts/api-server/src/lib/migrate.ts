@@ -547,6 +547,34 @@ export async function runMigrations() {
         ON data_richness_cache(tier1_eligible) WHERE tier1_eligible = true
     `);
 
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS alerts (
+        id SERIAL PRIMARY KEY,
+        severity TEXT NOT NULL,
+        category TEXT NOT NULL,
+        code TEXT NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        metadata JSONB,
+        acknowledged BOOLEAN NOT NULL DEFAULT false,
+        acknowledged_at TIMESTAMPTZ,
+        webhook_sent BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_alerts_severity_ack
+        ON alerts(severity, acknowledged)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_alerts_created_at
+        ON alerts(created_at DESC)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_alerts_code
+        ON alerts(code)
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

@@ -11,6 +11,7 @@ import Performance from "@/pages/performance";
 import Learning from "@/pages/learning";
 import Compliance from "@/pages/compliance";
 import Experiments from "@/pages/experiments";
+import Alerts from "@/pages/alerts";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -32,6 +33,7 @@ function Router() {
         <Route path="/learning" component={Learning} />
         <Route path="/compliance" component={Compliance} />
         <Route path="/experiments" component={Experiments} />
+        <Route path="/alerts" component={Alerts} />
         <Route component={NotFound} />
       </Switch>
     </Layout>

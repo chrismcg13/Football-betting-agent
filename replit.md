@@ -62,9 +62,20 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 *   **Experiment Lab** (`/dashboard/experiments`): Tier pipeline (experiment → candidate → promoted), Tier 1 qualification badges, progress bars, distance-to-promotion, manual promotion controls, tooltips for CLV/ROI/p-value.
 *   **Agent Brain** (`/dashboard/agent-brain`): Learning narratives, self-generated insights.
 *   **Audit Trail** (`/dashboard/compliance`): Compliance and transparency logs.
+*   **Alerts** (`/dashboard/alerts`): System alerts with severity filtering (critical/warning/info), dismiss/dismiss-all, test alert firing, detection runner. Notification badge in sidebar shows unread count with red (critical) or amber (warning) coloring. Summary cards show per-severity breakdown.
 
 **Shared Components (layout.tsx):** `LiveTierBadge`, `InfoTooltip`, `BetStatusBadge`, `OddsSourceBadge`.
 
-**Hooks (use-dashboard.ts):** `useSummary`, `useBets`, `usePerformance`, `useClvStats`, `useBetsByLeague`, `useBetsByMarket`, `useInPlayBets`, `useUpcomingBets`, `useExecutionMetrics`, `useLiveSummary`, `useAgentRecommendations`, `useModelHealth`, `useLiveTierStats`, `useExperiments`, `useRunPromotionEngine`, `useManualPromote`.
+**Hooks (use-dashboard.ts):** `useSummary`, `useBets`, `usePerformance`, `useClvStats`, `useBetsByLeague`, `useBetsByMarket`, `useInPlayBets`, `useUpcomingBets`, `useExecutionMetrics`, `useLiveSummary`, `useAgentRecommendations`, `useModelHealth`, `useLiveTierStats`, `useExperiments`, `useRunPromotionEngine`, `useManualPromote`, `useAlerts`, `useUnreadAlertCount`, `useAcknowledgeAlert`, `useAcknowledgeAllAlerts`, `useFireTestAlert`, `useRunAlertDetection`.
 
-**API Endpoints consumed:** `/api/dashboard/summary`, `/api/dashboard/bets`, `/api/dashboard/performance`, `/api/dashboard/clv-stats`, `/api/dashboard/bets/by-league`, `/api/dashboard/bets/by-market`, `/api/dashboard/in-play`, `/api/dashboard/upcoming-bets`, `/api/dashboard/execution-metrics`, `/api/dashboard/live-summary`, `/api/dashboard/agent-recommendations`, `/api/admin/experiments`.
+**API Endpoints consumed:** `/api/dashboard/summary`, `/api/dashboard/bets`, `/api/dashboard/performance`, `/api/dashboard/clv-stats`, `/api/dashboard/bets/by-league`, `/api/dashboard/bets/by-market`, `/api/dashboard/in-play`, `/api/dashboard/upcoming-bets`, `/api/dashboard/execution-metrics`, `/api/dashboard/live-summary`, `/api/dashboard/agent-recommendations`, `/api/admin/experiments`, `/api/alerts`, `/api/alerts/unread-count`, `/api/alerts/:id/acknowledge`, `/api/alerts/acknowledge-all`, `/api/alerts/test`, `/api/alerts/run-detection`.
+
+# Alerting System
+
+**Schema:** `lib/db/src/schema/alerts.ts` — `alerts` table with severity, category, code, title, message, metadata (JSONB), acknowledged flag, webhook delivery tracking. Deduplication via cooldown windows (critical=1h, warning=4h, info=24h).
+
+**Services:**
+*   `alerting.ts`: Core CRUD (createAlert with dedup, acknowledge, getAlerts with pagination/filtering, getUnreadCount with per-severity breakdown, cleanupOldAlerts with 90-day retention, webhook delivery).
+*   `alertDetection.ts`: 20+ detection checks across categories: connectivity (Betfair/API-Football/VPS), risk (drawdown, exposure, consecutive losses), performance (CLV decay, ROI decline, win rate), execution (fill rate, latency), anomaly (statistical outliers), milestone (bet count, profit targets), system (API budget, no-bet detection).
+
+**Scheduler crons:** Alert detection every 5 min, anomaly detection daily 04:30 UTC, cleanup weekly Sunday 06:00 UTC.

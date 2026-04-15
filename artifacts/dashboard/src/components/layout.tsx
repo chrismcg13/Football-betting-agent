@@ -1,7 +1,7 @@
 import { Link, useLocation } from "wouter";
-import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget, useScanStats, useLiveSummary } from "@/hooks/use-dashboard";
+import { useSummary, useAgentControl, useApiBudget, useOddspapiBudget, useScanStats, useLiveSummary, useUnreadAlertCount } from "@/hooks/use-dashboard";
 import {
-  BarChart2, BookOpen, Brain, FileText, FlaskConical, Play, Pause, Shield, Square, Target, Zap, Database, TrendingUp, Radio,
+  BarChart2, Bell, BookOpen, Brain, FileText, FlaskConical, Play, Pause, Shield, Square, Target, Zap, Database, TrendingUp, Radio,
 } from "lucide-react";
 import { formatCurrency } from "@/lib/format";
 import { Button } from "@/components/ui/button";
@@ -48,6 +48,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const { data: budget } = useApiBudget();
   const { data: oddsBudget } = useOddspapiBudget();
   const { data: scanStats } = useScanStats();
+  const { data: unreadAlerts } = useUnreadAlertCount();
 
   const navItems = [
     { href: "/", label: "Overview", icon: Target },
@@ -56,6 +57,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
     { href: "/learning", label: "Agent Brain", icon: Brain },
     { href: "/compliance", label: "Audit Trail", icon: Shield },
     { href: "/experiments", label: "Experiment Lab", icon: FlaskConical },
+    { href: "/alerts", label: "Alerts", icon: Bell, badge: unreadAlerts?.total ?? 0 },
   ];
 
   const pnl = summary?.totalPnl ?? 0;
@@ -253,6 +255,14 @@ export function Layout({ children }: { children: React.ReactNode }) {
               >
                 <Icon className="w-4 h-4 shrink-0" />
                 {item.label}
+                {(item as any).badge > 0 && (
+                  <span className={cn(
+                    "ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[20px] text-center",
+                    (unreadAlerts?.critical ?? 0) > 0 ? "bg-red-600 text-white" : "bg-amber-600 text-white",
+                  )}>
+                    {(item as any).badge}
+                  </span>
+                )}
               </Link>
             );
           })}

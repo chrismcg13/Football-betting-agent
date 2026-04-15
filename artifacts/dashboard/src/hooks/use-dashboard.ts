@@ -303,6 +303,74 @@ export const useLiveTierStats = () => {
   });
 };
 
+export const useAlerts = (opts: { page?: number; limit?: number; severity?: string; acknowledged?: boolean } = {}) => {
+  const { page = 1, limit = 50, severity, acknowledged } = opts;
+  const params = new URLSearchParams();
+  params.set("page", String(page));
+  params.set("limit", String(limit));
+  if (severity) params.set("severity", severity);
+  if (acknowledged !== undefined) params.set("acknowledged", String(acknowledged));
+  return useQuery({
+    queryKey: ["alerts", { page, limit, severity, acknowledged }],
+    queryFn: () => fetcher(`/api/alerts?${params.toString()}`),
+    refetchInterval: 15000,
+  });
+};
+
+export const useUnreadAlertCount = () => {
+  return useQuery({
+    queryKey: ["alerts", "unread-count"],
+    queryFn: () => fetcher("/api/alerts/unread-count"),
+    refetchInterval: 15000,
+  });
+};
+
+export const useAcknowledgeAlert = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) =>
+      fetcher(`/api/alerts/${id}/acknowledge`, { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    },
+  });
+};
+
+export const useAcknowledgeAllAlerts = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => fetcher("/api/alerts/acknowledge-all", { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    },
+  });
+};
+
+export const useFireTestAlert = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (severity: string) =>
+      fetcher("/api/alerts/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ severity }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    },
+  });
+};
+
+export const useRunAlertDetection = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => fetcher("/api/alerts/run-detection", { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    },
+  });
+};
+
 export const useAgentControl = () => {
   const queryClient = useQueryClient();
   return useMutation({

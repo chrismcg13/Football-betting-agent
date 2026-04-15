@@ -2625,5 +2625,92 @@ router.get("/dashboard/live-summary", async (_req, res) => {
   }
 });
 
+// ===================== Alerts =====================
+
+import {
+  getAlerts,
+  getUnreadCount,
+  acknowledgeAlert,
+  acknowledgeAllAlerts,
+} from "../services/alerting";
+import {
+  runAlertDetection,
+  runAnomalyDetection,
+  fireTestAlert,
+} from "../services/alertDetection";
+
+router.get("/alerts", async (req, res) => {
+  try {
+    const page = parseInt(String(req.query["page"] ?? "1"), 10);
+    const limit = parseInt(String(req.query["limit"] ?? "50"), 10);
+    const severity = req.query["severity"] as string | undefined;
+    const ackParam = req.query["acknowledged"] as string | undefined;
+    const acknowledged = ackParam === "true" ? true : ackParam === "false" ? false : undefined;
+
+    const result = await getAlerts({ page, limit, severity, acknowledged });
+    res.json(result);
+  } catch (err) {
+    logger.warn({ err }, "Fetch alerts failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/alerts/unread-count", async (_req, res) => {
+  try {
+    const counts = await getUnreadCount();
+    res.json(counts);
+  } catch (err) {
+    logger.warn({ err }, "Unread count failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/alerts/:id/acknowledge", async (req, res) => {
+  try {
+    const id = parseInt(req.params["id"]!, 10);
+    const ok = await acknowledgeAlert(id);
+    res.json({ acknowledged: ok });
+  } catch (err) {
+    logger.warn({ err }, "Acknowledge alert failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/alerts/acknowledge-all", async (_req, res) => {
+  try {
+    const count = await acknowledgeAllAlerts();
+    res.json({ acknowledged: count });
+  } catch (err) {
+    logger.warn({ err }, "Acknowledge all alerts failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/alerts/test", async (req, res) => {
+  try {
+    const severity = (req.body as any)?.severity ?? "info";
+    if (!["critical", "warning", "info"].includes(severity)) {
+      res.status(400).json({ error: "Invalid severity" });
+      return;
+    }
+    const id = await fireTestAlert(severity);
+    res.json({ alertId: id, severity });
+  } catch (err) {
+    logger.warn({ err }, "Fire test alert failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/alerts/run-detection", async (_req, res) => {
+  try {
+    await runAlertDetection();
+    await runAnomalyDetection();
+    res.json({ ok: true });
+  } catch (err) {
+    logger.warn({ err }, "Manual alert detection failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 export default router;
 
