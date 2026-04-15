@@ -1,0 +1,82 @@
+COMMISSION TRACKING & MULTI-EXCHANGE BACKEND
+
+The system needs to track exchange commissions accurately and be architected from the start to support multiple exchanges in the future. For launch, Betfair is the only active exchange — but the backend must not be coupled to Betfair.
+
+1. MULTI-EXCHANGE DATA MODEL:
+   - Create an `exchanges` table:
+     a) exchange_id (primary key)
+     b) exchange_name (e.g., "betfair", "smarkets", "betdaq", "matchbook")
+     c) is_active (boolean — only Betfair is active at launch)
+     d) api_base_url
+     e) commission_structure (JSON — stores the exchange's commission model, see below)
+     f) created_at, updated_at
+   - Every bet record must have an exchange_id foreign key. No bet exists without an exchange association.
+   - Every settlement record must store:
+     a) gross_profit (profit before commission)
+     b) commission_amount (the actual commission deducted)
+     c) commission_rate (the rate applied for this specific settlement)
+     d) net_profit (gross_profit - commission_amount)
+   - P&L calculations throughout the system must support THREE views:
+     a) GROSS P&L — profit before any exchange commission (this is the "tipster view" — what a subscriber following your tips would see on their own account with their own commission rate)
+     b) NET P&L — profit after exchange commission (this is YOUR actual profit)
+     c) Per-exchange P&L — breakdown by exchange when multiple are active
+   - The dashboard should show NET P&L as the primary figure (this is real money), with GROSS P&L available as a secondary view toggle. Label clearly: "Net Profit (after commission)" and "Gross Profit (before commission)"
+
+2. BETFAIR COMMISSION STRUCTURE:
+   - Betfair uses a tiered commission system based on "Betfair Points" / Market Base Rate (MBR):
+     a) Standard commission: typically 5% on net market winnings (but varies by market and jurisdiction)
+     b) The rate can be lower for high-volume users (discount tiers)
+     c) Betfair Premium Charge: applies to consistently profitable accounts — up to 20% (or 60% for highest earners) on lifetime profits above a threshold
+   - Implementation for launch:
+     a) Store my current Betfair commission rate as a configurable parameter (start with 5% — I'll update this if my rate changes)
+     b) Calculate commission on each WINNING settlement: commission = net_market_winnings * commission_rate
+     c) On losing bets, commission is zero (Betfair only charges on net winnings per market)
+     d) Track cumulative commission paid: daily, weekly, monthly, all-time
+     e) Track my effective commission rate over time (total_commission_paid / total_gross_profit) — this shows my true cost of trading
+   - Premium Charge awareness:
+     a) Track my lifetime profit on Betfair
+     b) If lifetime profit exceeds £1,000, add a dashboard warning: "Approaching Premium Charge territory — consider diversifying to other exchanges"
+     c) Track the ratio: total_commission / total_gross_profit. If this starts rising above 7-8%, it may indicate Premium Charge is being applied. Alert me.
+
+3. COMMISSION-AWARE BET EVALUATION:
+   - The model's expected value calculation must factor in commission BEFORE deciding to place a bet
+   - A bet with positive EV before commission but negative EV after commission should NOT be placed
+   - Formula: adjusted_EV = (probability * (odds - 1) * (1 - commission_rate)) - (1 - probability)
+   - This is critical: edges are often thin. A 5% commission on winnings can flip a marginal positive-EV bet to negative-EV
+   - The CLV calculation should also be tracked both gross and net for completeness, but the primary CLV metric remains gross (since CLV measures edge against the market, not profit after costs)
+
+4. DASHBOARD COMMISSION VIEW:
+   - Add a "Commission & Costs" section to the Performance & Analysis page:
+     a) Total commission paid (all time, this month, this week)
+     b) Effective commission rate (actual % you're paying)
+     c) Commission as % of gross profit — this is the key metric for deciding when to diversify exchanges
+     d) Projected monthly commission at current volume
+     e) Chart: commission rate over time (to spot if Premium Charge kicks in)
+   - On the Overview page, the main P&L cards should show:
+     a) Primary: Net Profit (after commission) — this is the real number
+     b) Secondary (smaller text or tooltip): Gross Profit (before commission)
+
+5. FUTURE EXCHANGE READINESS:
+   - The exchange abstraction layer should define a standard interface:
+     a) authenticate()
+     b) getBalance()
+     c) placeBet(market, selection, stake, odds)
+     d) getSettledBets(dateRange)
+     e) getOpenBets()
+     f) calculateCommission(grossProfit)
+   - Each exchange implements this interface with its own API specifics
+   - The trading engine calls the interface, not Betfair directly
+   - When I add a second exchange (e.g., Smarkets at 2% commission), I just:
+     a) Add the exchange to the exchanges table
+     b) Implement the interface for that exchange
+     c) Configure which markets route to which exchange
+   - FUTURE: The model will eventually optimise which exchange to place each bet on based on: best available odds, lowest commission, and liquidity. But this is NOT for launch — just ensure the architecture supports it.
+
+6. TIPSTER SERVICE DATA LAYER (future-proofing):
+   - All reporting queries must accept a parameter: include_commission (boolean)
+   - When include_commission = false, return gross figures only
+   - This means when I launch a tipster service, I can show subscribers: "Following these tips would have returned X% ROI" without my personal commission affecting their projected returns
+   - Subscribers will have their own commission rates on their own accounts
+   - Store this as a reporting concern only — it does not affect live trading decisions (those always use net/commission-adjusted EV)
+
+For launch: implement Betfair commission tracking at 5% on net winnings, the multi-exchange schema, and the commission-aware EV adjustment. Show me the schema before implementing.
