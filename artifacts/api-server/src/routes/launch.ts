@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { runLaunchActivation } from "../services/launchActivation";
+import { runThresholdAssessment } from "../services/thresholdAssessment";
 import { logger } from "../lib/logger";
 
 const router = Router();
@@ -36,6 +37,19 @@ router.get("/launch-activation/preflight", async (_req, res) => {
       limits,
     });
   } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/launch-activation/threshold-assessment", async (req, res) => {
+  const low = Number(req.query.low ?? 65);
+  const high = Number(req.query.high ?? 68);
+  logger.info({ low, high }, "Threshold assessment requested");
+  try {
+    const result = await runThresholdAssessment(low, high);
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "Threshold assessment failed");
     res.status(500).json({ error: String(err) });
   }
 });
