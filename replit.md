@@ -69,6 +69,22 @@ The project is structured as a pnpm monorepo utilizing TypeScript 5.9, Node.js 2
     - 30-min settlement reconciliation cron + 15-min balance refresh in LIVE mode.
     - 12hr proactive session refresh with auto-retry on INVALID_SESSION.
     - `paper_bets` table extended with `betfair_*` columns for tracking live bet state.
+    - API error rate tracking: 5 errors/hour triggers 30-min pause on all live placement.
+*   **Live Risk Management (`liveRiskManager.ts`):**
+    - **Progressive risk levels (1-4):** System starts at Level 1 with tighter limits. Earns its way to Level 4 based on track record. Paper mode (TRADING_MODE=PAPER) uses legacy limits unchanged; live mode overrides with level-based limits.
+    - **Level 1:** Max bet 2%, max exposure 25%, daily loss 5%, weekly loss 10%, Kelly 25%.
+    - **Level 2 (50+ settled, CLV>2%, ROI>3%, no breakers):** Max bet 2.5%, max exposure 30%, daily loss 6%, Kelly 30%.
+    - **Level 3 (150+ settled, CLV>2.5%, ROI>4%, no breakers 30d):** Max bet 3%, max exposure 35%, daily loss 7%.
+    - **Level 4 (300+ settled, CLV>3%, ROI>5%, 60+ days live):** Max bet 3.5%, max exposure 40%, daily loss 8%.
+    - **Demotion:** Rolling 30-day ROI<0% or CLV<0% drops one level immediately.
+    - **40%→25% transition:** Intentional tightening for live. Paper system allowed 40% because no real money. Live starts at 25% (Level 1) and model earns back to 40% at Level 4.
+    - **Concentration limits (live only):** Per-league 8%, per-market-type 10%, per-fixture 3% of live balance.
+    - **Circuit breakers:** 3 consecutive losses → 1hr pause (auto-resume). 5 → 6hr pause. 8 → HALT (manual restart). Bankroll floor → HALT ALL.
+    - **Starting deposit:** Cumulative total deposited (updates when adding funds). `starting_deposit` config key. Bankroll floor = 60% of cumulative deposits.
+    - **Kelly adjustment:** Level-based base fraction. Without Pinnacle data → halved. Max capped at 40%.
+    - **Slippage check:** >5% odds slippage between identification and placement → skip bet.
+    - **Daily level evaluation:** Cron at 04:15 UTC auto-promotes/demotes based on performance.
+    - **API:** `/api/admin/live-risk-status`, `/api/admin/live-risk-level` (evaluate/apply/set), `/api/admin/starting-deposit`.
 *   **Two-Tier Live System (`dataRichness.ts`, `liveThresholdReview.ts`):**
     - **Tier 1 (live money):** Bets qualify if: opportunity score >= configurable threshold (default 68, floor 60), data richness >= 70%, Pinnacle odds available with >= 2% edge vs current Pinnacle implied, AND either (a) data-rich market path or (b) promoted strategy path. Experiment/candidate tier bets NEVER qualify.
     - **Tier 2 (paper only):** All bets not meeting Tier 1 criteria stay in the experiment pipeline. No changes to experiment graduation gates.

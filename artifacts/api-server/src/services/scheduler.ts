@@ -1049,6 +1049,20 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Promotion engine scheduler active — daily at 04:00 UTC");
 
+  cron.schedule("15 4 * * *", () => {
+    logger.info("Live risk level evaluation triggered (daily 04:15 UTC)");
+    void (async () => {
+      try {
+        const { applyLevelTransition } = await import("./liveRiskManager");
+        const result = await applyLevelTransition();
+        logger.info({ result }, "Live risk level evaluation complete");
+      } catch (err) {
+        logger.error({ err }, "Live risk level evaluation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Live risk level evaluation scheduler active — daily at 04:15 UTC");
+
   cron.schedule("0 4 * * 0", () => {
     logger.info("Weekly experiment self-analysis triggered (Sunday 04:00 UTC)");
     void runWeeklyExperimentAnalysis().catch((err) => {

@@ -17,6 +17,15 @@ import { isLeagueMarketTier1Eligible } from "./dataRichness";
 import { getLiveOppScoreThreshold } from "./liveThresholdReview";
 import { storePinnacleSnapshot } from "./oddsPapi";
 import { shouldBlockBet, getSegmentKellyMultiplier, getMarketFamily } from "./edgeConcentration";
+import {
+  getEffectiveLimits,
+  runLiveConcentrationChecks,
+  getLiveKellyFraction,
+  getCurrentLiveRiskLevel,
+  checkSlippage,
+  checkLiveCircuitBreakers,
+  isBetfairApiPaused,
+} from "./liveRiskManager";
 
 // ===================== Config helpers =====================
 
@@ -361,38 +370,53 @@ export async function placePaperBet(
     return logReject(`Agent is not running (status: ${status})`);
   }
 
+  if (isLiveMode() && isBetfairApiPaused()) {
+    return logReject("Betfair API error rate pause active — skipping bet placement");
+  }
+
+  const liveCircuitBreaker = await checkLiveCircuitBreakers();
+  if (liveCircuitBreaker.triggered) {
+    const action = liveCircuitBreaker.action;
+    if (action === "halt" || action === "floor_halt") {
+      await setConfigValue("agent_status", "paused");
+    }
+    return logReject(`Live circuit breaker: ${liveCircuitBreaker.reason}`);
+  }
+
   const bankroll = await getBankroll();
   const isDev = process.env.NODE_ENV !== "production";
+  const liveLimits = isLiveMode() ? await getEffectiveLimits() : null;
 
   if (!isDev) {
-    const bankrollFloor = Number(
-      (await getConfigValue("bankroll_floor")) ?? "200",
-    );
-    if (bankroll <= bankrollFloor) {
+    const effectiveBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
+    const bankrollFloor = liveLimits
+      ? liveLimits.bankrollFloor
+      : Number((await getConfigValue("bankroll_floor")) ?? "200");
+    if (effectiveBankroll <= bankrollFloor) {
       return logReject(
-        `Bankroll £${bankroll.toFixed(2)} at or below floor £${bankrollFloor}`,
+        `Bankroll £${effectiveBankroll.toFixed(2)} at or below floor £${bankrollFloor} ${liveLimits ? "(60% of total deposits)" : ""}`,
       );
     }
 
-    const dailyLossLimitPct = Number(
-      (await getConfigValue("daily_loss_limit_pct")) ?? "0.05",
-    );
+    const dailyLossLimitPct = liveLimits
+      ? liveLimits.config.maxDailyLossPct
+      : Number((await getConfigValue("daily_loss_limit_pct")) ?? "0.05");
     const dailyLoss = await getTodaysLoss();
-    const dailyLossLimit = bankroll * dailyLossLimitPct;
+    const dailyLossLimit = effectiveBankroll * dailyLossLimitPct;
     if (dailyLoss >= dailyLossLimit) {
       return logReject(
-        `Daily loss limit hit: £${dailyLoss.toFixed(2)} >= £${dailyLossLimit.toFixed(2)}`,
+        `Daily loss limit hit: £${dailyLoss.toFixed(2)} >= £${dailyLossLimit.toFixed(2)} (${(dailyLossLimitPct * 100).toFixed(0)}% of ${liveLimits ? "live" : "paper"} balance)`,
       );
     }
 
-    const weeklyLossLimitPct = Number(
-      (await getConfigValue("weekly_loss_limit_pct")) ?? "0.10",
-    );
+    const weeklyLossLimitPct = liveLimits
+      ? liveLimits.config.maxWeeklyLossPct
+      : Number((await getConfigValue("weekly_loss_limit_pct")) ?? "0.10");
     const weeklyLoss = await getWeeklyLoss();
-    const weeklyLossLimit = bankroll * weeklyLossLimitPct;
+    const weeklyLossLimit = effectiveBankroll * weeklyLossLimitPct;
     if (weeklyLoss >= weeklyLossLimit) {
       return logReject(
-        `Weekly loss limit hit: £${weeklyLoss.toFixed(2)} >= £${weeklyLossLimit.toFixed(2)}`,
+        `Weekly loss limit hit: £${weeklyLoss.toFixed(2)} >= £${weeklyLossLimit.toFixed(2)} (${(weeklyLossLimitPct * 100).toFixed(0)}% of ${liveLimits ? "live" : "paper"} balance)`,
       );
     }
   }
@@ -445,17 +469,30 @@ export async function placePaperBet(
     }
   }
 
-  const maxStakePct = Number(
-    (await getConfigValue("max_stake_pct")) ?? "0.02",
-  );
+  const maxStakePct = liveLimits
+    ? liveLimits.config.maxSingleBetPct
+    : Number((await getConfigValue("max_stake_pct")) ?? "0.02");
+  const stakingBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
   let stake = calculateDynamicKellyStake(
-    bankroll,
+    stakingBankroll,
     edge,
     backOdds,
     maxStakePct,
     score,
     marketType,
   );
+
+  if (liveLimits) {
+    const liveKelly = getLiveKellyFraction(
+      liveLimits.level,
+      !!(pinnacleOdds && pinnacleOdds > 0),
+    );
+    stake = Math.round(stake * (liveKelly / 0.25) * 100) / 100;
+    logger.info(
+      { matchId, marketType, liveLevel: liveLimits.level, liveKelly, hasPinnacle: !!(pinnacleOdds && pinnacleOdds > 0) },
+      "Live Kelly fraction applied",
+    );
+  }
 
   const segmentMultiplier = getSegmentKellyMultiplier(marketType, backOdds, score);
   if (segmentMultiplier < 1.0) {
@@ -476,29 +513,54 @@ export async function placePaperBet(
     logger.info({ matchId, marketType, dataTier, originalStake, reducedStake: stake, multiplier: CANDIDATE_STAKE_MULT }, "Candidate-tier stake reduction applied");
   }
 
+  if (liveLimits) {
+    const hardCap = Math.round(liveLimits.liveBalance * liveLimits.config.maxSingleBetPct * 100) / 100;
+    if (stake > hardCap) {
+      logger.info(
+        { matchId, marketType, preCapStake: stake, hardCap, level: liveLimits.level },
+        "Live stake hard-capped to maxSingleBetPct after all multipliers",
+      );
+      stake = hardCap;
+    }
+  }
+
   if (stake < 2) {
     return logReject(`Calculated stake £${stake} is below minimum £2`);
   }
 
+  if (isLiveMode()) {
+    const slippageResult = checkSlippage(backOdds, backOdds);
+    if (slippageResult.blocked) {
+      return logReject(`Slippage guard: ${slippageResult.reason}`);
+    }
+  }
+
   // ── Exposure-based risk gate ─────────────────────────────────────────────
-  // Applied in all modes (paper and live). Limits total unsettled exposure to
-  // max_unsettled_exposure_pct of current bankroll (default 40%).
+  // In LIVE mode: uses progressive level limits (Level 1 starts at 25%, earns up to 40% at Level 4)
+  // In PAPER mode: uses legacy 40% default from agent_config
   let exposureAtPlacement: { current: number; max: number; pct: number } = { current: 0, max: 0, pct: 0 };
   {
-    const maxExposurePct = Number(
-      (await getConfigValue("max_unsettled_exposure_pct")) ?? "0.40",
-    );
+    const maxExposurePct = liveLimits
+      ? liveLimits.config.maxOpenExposurePct
+      : Number((await getConfigValue("max_unsettled_exposure_pct")) ?? "0.40");
     const currentExposure = await getTotalPendingExposure();
-    const maxExposure = bankroll * maxExposurePct;
+    const effectiveBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
+    const maxExposure = effectiveBankroll * maxExposurePct;
     if (currentExposure + stake > maxExposure) {
-      const matchLabel = `${matchId}`;
       return logReject(
-        `Exposure limit reached (£${(currentExposure + stake).toFixed(0)}/£${maxExposure.toFixed(0)}). Skipping bet on match ${matchLabel} to protect bankroll.`,
+        `Exposure limit reached (£${(currentExposure + stake).toFixed(0)}/£${maxExposure.toFixed(0)} = ${(maxExposurePct * 100).toFixed(0)}% of ${liveLimits ? `live balance, Level ${liveLimits.level}` : "paper bankroll"}). Skipping bet on match ${matchId}.`,
       );
     }
 
-    // Capture exposure snapshot for compliance log below
     exposureAtPlacement = { current: currentExposure, max: maxExposure, pct: Math.round((currentExposure / maxExposure) * 1000) / 10 };
+  }
+
+  // ── Live concentration limits (per-league, per-market-type, per-fixture) ──
+  if (isLiveMode()) {
+    const concentrationCheck = await runLiveConcentrationChecks(matchId, marketType, stake);
+    if (!concentrationCheck.passed) {
+      return logReject(`Live concentration limit: ${concentrationCheck.reason}`);
+    }
   }
 
   const potentialProfit =

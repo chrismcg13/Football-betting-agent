@@ -2175,5 +2175,81 @@ router.post("/admin/void-corners", async (_req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// GET /api/admin/live-risk-status — full live risk management status
+// ─────────────────────────────────────────────
+router.get("/admin/live-risk-status", async (_req, res) => {
+  try {
+    const { getLiveRiskStatus } = await import("../services/liveRiskManager");
+    const status = await getLiveRiskStatus();
+    res.json(status);
+  } catch (err) {
+    logger.warn({ err }, "Live risk status failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/live-risk-level — manually set or evaluate risk level
+// ─────────────────────────────────────────────
+router.post("/admin/live-risk-level", async (req, res) => {
+  try {
+    const { action, level } = req.body as { action?: string; level?: number };
+    const {
+      applyLevelTransition,
+      evaluateLevelProgression,
+      getCurrentLiveRiskLevel,
+    } = await import("../services/liveRiskManager");
+    const { setConfigValue } = await import("../services/paperTrading");
+
+    if (action === "evaluate") {
+      const result = await evaluateLevelProgression();
+      res.json(result);
+    } else if (action === "apply") {
+      const result = await applyLevelTransition();
+      res.json(result);
+    } else if (action === "set" && typeof level === "number" && level >= 1 && level <= 4) {
+      await setConfigValue("live_risk_level", String(level));
+      res.json({ success: true, level, message: `Risk level manually set to ${level}` });
+    } else {
+      const current = await getCurrentLiveRiskLevel();
+      res.json({ currentLevel: current, usage: "POST with action: 'evaluate' | 'apply' | 'set' (with level 1-4)" });
+    }
+  } catch (err) {
+    logger.warn({ err }, "Live risk level action failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/starting-deposit — set/update cumulative total deposited
+// ─────────────────────────────────────────────
+router.post("/admin/starting-deposit", async (req, res) => {
+  try {
+    const { amount } = req.body as { amount?: number };
+    if (typeof amount !== "number" || amount <= 0) {
+      return res.status(400).json({ error: "amount must be a positive number" });
+    }
+    const { setConfigValue } = await import("../services/paperTrading");
+    const { getStartingDeposit, getBankrollFloorFromDeposit } = await import("../services/liveRiskManager");
+
+    const currentDeposit = await getStartingDeposit();
+    const newTotal = currentDeposit + amount;
+    await setConfigValue("starting_deposit", String(newTotal));
+
+    const newFloor = await getBankrollFloorFromDeposit();
+    res.json({
+      previousDeposit: currentDeposit,
+      added: amount,
+      newTotalDeposit: newTotal,
+      newBankrollFloor: newFloor,
+      floorPct: "60%",
+    });
+  } catch (err) {
+    logger.warn({ err }, "Starting deposit update failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 export default router;
 

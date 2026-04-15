@@ -1044,6 +1044,11 @@ export async function placeLiveBetOnBetfair(params: {
     const msg = `Live bet placement exception: ${err instanceof Error ? err.message : String(err)}`;
     logger.error({ err, internalBetId }, msg);
 
+    try {
+      const { recordBetfairApiError } = await import("./liveRiskManager");
+      recordBetfairApiError();
+    } catch { /* avoid circular import issues */ }
+
     await db.insert(complianceLogsTable).values({
       actionType: "live_bet_placement_failed",
       details: {
