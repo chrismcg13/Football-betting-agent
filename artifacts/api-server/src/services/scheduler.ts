@@ -34,6 +34,7 @@ import {
   trackLineMovements,
   backfillFilteredBetOutcomes,
   analyseSharpMovements,
+  selectionNameVariants,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets } from "./apiFootball";
@@ -454,8 +455,8 @@ export async function runTradingCycle(options?: {
 
         const cachedMatch = oddsPapiCache.get(bet.matchId);
         if (cachedMatch) {
-          // Cache is flat: selectionName → validation (covers all market types)
-          const raw = cachedMatch[bet.selectionName];
+          const variants = selectionNameVariants(bet.selectionName);
+          const raw = variants.reduce<import("./oddsPapi").OddspapiValidation | undefined>((found, v) => found ?? cachedMatch[v], undefined);
           if (raw) {
             // Compute pinnacleAligned from cached Pinnacle implied probability vs model
             let pinnacleAligned = false;

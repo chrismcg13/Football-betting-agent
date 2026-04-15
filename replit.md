@@ -26,7 +26,7 @@ The project is a pnpm monorepo using TypeScript 5.9, Node.js 24, and Express 5 f
 *   **Staking Strategy:** Kelly Criterion-based tiers, adjusted by opportunity score and market type.
 *   **Diversity Rules:** Per-cycle limits on total bets, bets per league, and bets per market type.
 *   **Prediction Engine:** Uses logistic regression, bootstrapped from historical data, auto-loaded, and retrained.
-*   **Feature Engine:** Computes 17 ML features per upcoming match (e.g., team form, H2H stats).
+*   **Feature Engine:** Computes 30+ ML features per upcoming match. Uses API-Football team stats (`home_af_goals_scored_avg`, `home_af_form_last10`, etc.) as primary source when DB match history is insufficient (<3 home/away matches). Derives BTTS rate, Over 2.5 rate, clean sheet rate from team goals when no DB history exists. Falls back to reasonable defaults (not zeros) when no data source is available.
 *   **Scheduler:** Orchestrates automated jobs for data ingestion, feature computation, trading cycles (tiered by fixture proximity), bet settlement, and daily learning loops.
 *   **North Star Metrics & Continuous Learning:** Tracks CLV, ROI, Win Rate. Generates weekly model health reports, detects market regimes, tracks edge decay, and provides agent recommendations for resource utilization and enhancement.
 *   **Line Movement Tracking:** Logs significant odds changes (>5%) for analysis and compliance.

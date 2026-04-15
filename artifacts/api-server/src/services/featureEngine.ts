@@ -502,40 +502,13 @@ async function computeFeaturesFromDb(
   awayTeam: string,
   league: string,
 ): Promise<void> {
-  logger.info({ matchId, homeTeam, awayTeam }, "Computing features from DB history");
+  logger.info({ matchId, homeTeam, awayTeam }, "Computing features from DB history + AF stats");
 
   const homeTeamId = 1;
   const awayTeamId = 2;
 
   const homeMatches = await getDbTeamMatches(homeTeam, 20);
   const awayMatches = await getDbTeamMatches(awayTeam, 20);
-
-  const homeForm5 = computeForm(homeMatches, homeTeamId, "home", 5);
-  const awayForm5 = computeForm(awayMatches, awayTeamId, "away", 5);
-
-  const homeGoals = computeGoalAverages(homeMatches, homeTeamId, "home", 10);
-  const awayGoals = computeGoalAverages(awayMatches, awayTeamId, "away", 10);
-
-  const homeBtts = computeBttsRate(homeMatches, homeTeamId, "home", 10);
-  const awayBtts = computeBttsRate(awayMatches, awayTeamId, "away", 10);
-
-  const homeOver25 = computeOver25Rate(homeMatches, homeTeamId, "home", 10);
-  const awayOver25 = computeOver25Rate(awayMatches, awayTeamId, "away", 10);
-
-  const h2hHomeWinRate = 0.4;
-
-  const homeCleanSheets = computeCleanSheetRate(homeMatches, homeTeamId, "home", 5);
-  const awayCleanSheets = computeCleanSheetRate(awayMatches, awayTeamId, "away", 5);
-
-  const homePointsTraj = computePointsTrajectory(homeMatches, homeTeamId, 10);
-  const awayPointsTraj = computePointsTrajectory(awayMatches, awayTeamId, 10);
-
-  const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
-  const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
-
-  const homeXg = computeXgProxy(homeMatches, homeTeamId, "home", 10);
-  const awayXg = computeXgProxy(awayMatches, awayTeamId, "away", 10);
-  const xgDiff = homeXg - awayXg;
 
   const storedFeatures = await db
     .select({ featureName: featuresTable.featureName, featureValue: featuresTable.featureValue })
@@ -547,13 +520,71 @@ async function computeFeaturesFromDb(
     stored[f.featureName] = Number(f.featureValue);
   }
 
+  const homeHistCount = homeMatches.filter(m => m.homeTeam?.id === homeTeamId).length;
+  const awayHistCount = awayMatches.filter(m => m.awayTeam?.id === awayTeamId).length;
+  const hasDbHistory = homeHistCount >= 3 && awayHistCount >= 3;
+
+  const homeFormDb = computeForm(homeMatches, homeTeamId, "home", 5);
+  const awayFormDb = computeForm(awayMatches, awayTeamId, "away", 5);
+  const homeGoalsDb = computeGoalAverages(homeMatches, homeTeamId, "home", 10);
+  const awayGoalsDb = computeGoalAverages(awayMatches, awayTeamId, "away", 10);
+
+  const homeAfGoalsFor = stored["home_af_goals_scored_avg"];
+  const homeAfGoalsAgainst = stored["home_af_goals_conceded_avg"];
+  const awayAfGoalsFor = stored["away_af_goals_scored_avg"];
+  const awayAfGoalsAgainst = stored["away_af_goals_conceded_avg"];
+  const homeAfForm = stored["home_af_form_last10"];
+  const awayAfForm = stored["away_af_form_last10"];
+
+  const homeForm5 = hasDbHistory ? homeFormDb : (homeAfForm ?? 0.5);
+  const awayForm5 = hasDbHistory ? awayFormDb : (awayAfForm ?? 0.5);
+  const homeGoalsScored = hasDbHistory ? homeGoalsDb.scored : (homeAfGoalsFor ?? 1.3);
+  const homeGoalsConceded = hasDbHistory ? homeGoalsDb.conceded : (homeAfGoalsAgainst ?? 1.1);
+  const awayGoalsScored = hasDbHistory ? awayGoalsDb.scored : (awayAfGoalsFor ?? 1.0);
+  const awayGoalsConceded = hasDbHistory ? awayGoalsDb.conceded : (awayAfGoalsAgainst ?? 1.3);
+
+  const totalGoalsAvg = homeGoalsScored + awayGoalsScored;
+
+  const homeBttsDb = computeBttsRate(homeMatches, homeTeamId, "home", 10);
+  const awayBttsDb = computeBttsRate(awayMatches, awayTeamId, "away", 10);
+  const homeBtts = hasDbHistory ? homeBttsDb :
+    (homeGoalsScored > 0 && homeGoalsConceded > 0 ? Math.min(0.85, (homeGoalsScored * homeGoalsConceded) / 2.5) : 0.5);
+  const awayBtts = hasDbHistory ? awayBttsDb :
+    (awayGoalsScored > 0 && awayGoalsConceded > 0 ? Math.min(0.85, (awayGoalsScored * awayGoalsConceded) / 2.5) : 0.5);
+
+  const homeOver25Db = computeOver25Rate(homeMatches, homeTeamId, "home", 10);
+  const awayOver25Db = computeOver25Rate(awayMatches, awayTeamId, "away", 10);
+  const homeOver25 = hasDbHistory ? homeOver25Db :
+    Math.min(0.9, Math.max(0.1, (totalGoalsAvg - 2.0) * 0.35 + 0.5));
+  const awayOver25 = hasDbHistory ? awayOver25Db :
+    Math.min(0.9, Math.max(0.1, (totalGoalsAvg - 2.0) * 0.35 + 0.5));
+
+  const h2hHomeWinRate = 0.4;
+
+  const homeCleanSheets = hasDbHistory ? computeCleanSheetRate(homeMatches, homeTeamId, "home", 5) :
+    Math.max(0.05, 1 - (awayGoalsScored / 1.5));
+  const awayCleanSheets = hasDbHistory ? computeCleanSheetRate(awayMatches, awayTeamId, "away", 5) :
+    Math.max(0.05, 1 - (homeGoalsScored / 1.5));
+
+  const homePointsTraj = computePointsTrajectory(homeMatches, homeTeamId, 10);
+  const awayPointsTraj = computePointsTrajectory(awayMatches, awayTeamId, 10);
+
+  const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
+  const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
+
+  const homeXgDb = computeXgProxy(homeMatches, homeTeamId, "home", 10);
+  const awayXgDb = computeXgProxy(awayMatches, awayTeamId, "away", 10);
+  const homeXg = hasDbHistory ? homeXgDb : homeGoalsScored;
+  const awayXg = hasDbHistory ? awayXgDb : awayGoalsScored;
+  const xgDiff = homeXg - awayXg;
+
   const homeYellowCards = stored["home_yellow_cards_avg"] ?? 1.8;
   const awayYellowCards = stored["away_yellow_cards_avg"] ?? 1.6;
   const combinedCardsPrediction = homeYellowCards + awayYellowCards;
   const homeShotsOnTargetAvg = stored["home_shots_on_target_avg"] ?? (homeXg * 5);
   const awayShotsOnTargetAvg = stored["away_shots_on_target_avg"] ?? (awayXg * 5);
-  const homeConversionRate = homeShotsOnTargetAvg > 0 ? homeGoals.scored / homeShotsOnTargetAvg : 0.2;
-  const awayConversionRate = awayShotsOnTargetAvg > 0 ? awayGoals.scored / awayShotsOnTargetAvg : 0.2;
+  const homeConversionRate = homeShotsOnTargetAvg > 0 ? homeGoalsScored / homeShotsOnTargetAvg : 0.2;
+  const awayConversionRate = awayShotsOnTargetAvg > 0 ? awayGoalsScored / awayShotsOnTargetAvg : 0.2;
   const homeCornersAvg = stored["home_corners_avg"] ?? Math.round(homeXg * 3.5 * 10) / 10;
   const awayCornersAvg = stored["away_corners_avg"] ?? Math.round(awayXg * 3.0 * 10) / 10;
   const combinedCornersPrediction = homeCornersAvg + awayCornersAvg;
@@ -565,10 +596,10 @@ async function computeFeaturesFromDb(
   const features: Array<[string, number]> = [
     ["home_form_last5", homeForm5],
     ["away_form_last5", awayForm5],
-    ["home_goals_scored_avg", homeGoals.scored],
-    ["home_goals_conceded_avg", homeGoals.conceded],
-    ["away_goals_scored_avg", awayGoals.scored],
-    ["away_goals_conceded_avg", awayGoals.conceded],
+    ["home_goals_scored_avg", homeGoalsScored],
+    ["home_goals_conceded_avg", homeGoalsConceded],
+    ["away_goals_scored_avg", awayGoalsScored],
+    ["away_goals_conceded_avg", awayGoalsConceded],
     ["h2h_home_win_rate", h2hHomeWinRate],
     ["league_position_diff", leaguePositionDiff],
     ["home_btts_rate", homeBtts],
@@ -602,15 +633,19 @@ async function computeFeaturesFromDb(
     await upsertFeature(matchId, name, value);
   }
 
-  logger.info({ matchId, featureCount: features.length }, "Features saved (DB-backed)");
+  logger.info(
+    { matchId, featureCount: features.length, hasDbHistory, homeHistCount, awayHistCount,
+      usedAfStats: !hasDbHistory && (homeAfGoalsFor !== undefined || awayAfGoalsFor !== undefined) },
+    "Features saved (DB-backed + AF enriched)",
+  );
 }
 
-export async function runFeatureEngineForUpcomingMatches(): Promise<{
+export async function runFeatureEngineForUpcomingMatches(force = false): Promise<{
   processed: number;
   skipped: number;
   failed: number;
 }> {
-  logger.info("Starting feature computation run for upcoming matches");
+  logger.info({ force }, "Starting feature computation run for upcoming matches");
 
   const upcomingMatches = await db
     .select()
@@ -630,20 +665,22 @@ export async function runFeatureEngineForUpcomingMatches(): Promise<{
   const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
 
   for (const match of upcomingMatches) {
-    const existingFeature = await db
-      .select({ computedAt: featuresTable.computedAt })
-      .from(featuresTable)
-      .where(
-        and(
-          eq(featuresTable.matchId, match.id),
-          eq(featuresTable.featureName, "home_form_last5"),
-        ),
-      )
-      .limit(1);
+    if (!force) {
+      const existingFeature = await db
+        .select({ computedAt: featuresTable.computedAt })
+        .from(featuresTable)
+        .where(
+          and(
+            eq(featuresTable.matchId, match.id),
+            eq(featuresTable.featureName, "home_form_last5"),
+          ),
+        )
+        .limit(1);
 
-    if (existingFeature.length > 0 && existingFeature[0]!.computedAt > sixHoursAgo) {
-      skipped++;
-      continue;
+      if (existingFeature.length > 0 && existingFeature[0]!.computedAt > sixHoursAgo) {
+        skipped++;
+        continue;
+      }
     }
 
     if (match.betfairEventId?.startsWith("af_")) {

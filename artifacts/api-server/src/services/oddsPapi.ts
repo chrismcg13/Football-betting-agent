@@ -35,6 +35,35 @@ const ODDSPAPI_SERVICE = "oddspapi";
 const MONTHLY_CAP = 100_000;
 const DEFAULT_DAILY_CAP = 3_300;
 
+const GOALS_OU_ALIASES: Record<string, string> = {
+  "Over 0.5": "Over 0.5 Goals",
+  "Under 0.5": "Under 0.5 Goals",
+  "Over 1.5": "Over 1.5 Goals",
+  "Under 1.5": "Under 1.5 Goals",
+  "Over 2.5": "Over 2.5 Goals",
+  "Under 2.5": "Under 2.5 Goals",
+  "Over 3.5": "Over 3.5 Goals",
+  "Under 3.5": "Under 3.5 Goals",
+  "Over 4.5": "Over 4.5 Goals",
+  "Under 4.5": "Under 4.5 Goals",
+  "Over 5.5": "Over 5.5 Goals",
+  "Under 5.5": "Under 5.5 Goals",
+};
+const REVERSE_GOALS_ALIASES: Record<string, string> = Object.fromEntries(
+  Object.entries(GOALS_OU_ALIASES).map(([k, v]) => [v, k]),
+);
+
+export function selectionNameVariants(name: string): string[] {
+  const variants = [name];
+  if (GOALS_OU_ALIASES[name]) variants.push(GOALS_OU_ALIASES[name]);
+  if (REVERSE_GOALS_ALIASES[name]) variants.push(REVERSE_GOALS_ALIASES[name]);
+  return variants;
+}
+
+export function canonicalSelectionName(name: string): string {
+  return GOALS_OU_ALIASES[name] ?? name;
+}
+
 const PRIORITY_MONTHLY_BUDGETS: Record<string, number> = {
   P1: 40_000,
   P2: 30_000,
@@ -1728,9 +1757,10 @@ export async function prefetchAndStoreOddsPapiOdds(
         hasPinnacleData: so.pinnacle !== null,
       };
 
-      matchCache[selName] = validation;
+      for (const variant of selectionNameVariants(selName)) {
+        matchCache[variant] = validation;
+      }
 
-      // Determine the correct market type for this selection name
       const targetMeta = PREFETCH_TARGETS.find((t) => t.selectionName === selName);
       const marketTypeForSnapshot = targetMeta?.marketType ?? "MATCH_ODDS";
 
@@ -1825,7 +1855,7 @@ export async function loadOddsPapiCacheFromSnapshots(
   for (const [matchId, selMap] of matchMap.entries()) {
     const matchCache: Record<string, OddspapiValidation> = {};
     for (const [selName, data] of Object.entries(selMap)) {
-      matchCache[selName] = {
+      const entry: OddspapiValidation = {
         pinnacleOdds: null,
         pinnacleImplied: null,
         bestOdds: data.backOdds,
@@ -1837,6 +1867,9 @@ export async function loadOddsPapiCacheFromSnapshots(
         pinnacleAligned: false,
         hasPinnacleData: false,
       };
+      for (const variant of selectionNameVariants(selName)) {
+        matchCache[variant] = entry;
+      }
     }
     if (Object.keys(matchCache).length > 0) cache.set(matchId, matchCache);
   }
@@ -2134,7 +2167,7 @@ export async function buildPinnacleValidationFromApiFootball(
       if (sd.best <= 1.01) continue;
       const pinnacleImplied = sd.pinnacle ? 1 / sd.pinnacle : null;
 
-      matchCache[selName] = {
+      const entry: OddspapiValidation = {
         pinnacleOdds: sd.pinnacle,
         pinnacleImplied,
         bestOdds: sd.best,
@@ -2146,6 +2179,10 @@ export async function buildPinnacleValidationFromApiFootball(
         pinnacleAligned: false,
         hasPinnacleData: sd.pinnacle !== null,
       };
+
+      for (const variant of selectionNameVariants(selName)) {
+        matchCache[variant] = entry;
+      }
     }
 
     if (Object.keys(matchCache).length > 0) {
@@ -2160,6 +2197,82 @@ export async function buildPinnacleValidationFromApiFootball(
   );
 
   return cache;
+}
+
+export async function backfillPinnacleOnPendingBets(): Promise<{ updated: number; checked: number }> {
+  const pending = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      selectionName: paperBetsTable.selectionName,
+    })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        sql`${paperBetsTable.deletedAt} IS NULL`,
+        sql`${paperBetsTable.pinnacleOdds} IS NULL`,
+        gte(matchesTable.kickoffTime, new Date()),
+      ),
+    );
+
+  if (pending.length === 0) return { updated: 0, checked: 0 };
+
+  const matchIds = [...new Set(pending.map((b) => b.matchId))];
+
+  const pinnSnaps = await db
+    .select({
+      matchId: oddsSnapshotsTable.matchId,
+      selectionName: oddsSnapshotsTable.selectionName,
+      backOdds: oddsSnapshotsTable.backOdds,
+    })
+    .from(oddsSnapshotsTable)
+    .where(
+      and(
+        eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
+        inArray(oddsSnapshotsTable.matchId, matchIds),
+      ),
+    );
+
+  const pinnMap = new Map<string, number>();
+  for (const s of pinnSnaps) {
+    const odds = parseFloat(s.backOdds ?? "0");
+    if (odds <= 1.01) continue;
+    const key = `${s.matchId}:${s.selectionName}`;
+    const existing = pinnMap.get(key);
+    if (!existing || odds > existing) pinnMap.set(key, odds);
+  }
+
+  let updated = 0;
+  const updates: Array<{ id: number; odds: number }> = [];
+
+  for (const bet of pending) {
+    const variants = selectionNameVariants(bet.selectionName);
+    let bestOdds = 0;
+    for (const v of variants) {
+      const key = `${bet.matchId}:${v}`;
+      const o = pinnMap.get(key);
+      if (o && o > bestOdds) bestOdds = o;
+    }
+    if (bestOdds > 1.01) {
+      updates.push({ id: bet.id, odds: bestOdds });
+    }
+  }
+
+  for (const u of updates) {
+    await db
+      .update(paperBetsTable)
+      .set({
+        pinnacleOdds: String(u.odds),
+        pinnacleImplied: String(1 / u.odds),
+      })
+      .where(eq(paperBetsTable.id, u.id));
+    updated++;
+  }
+
+  logger.info({ checked: pending.length, updated }, "Backfilled Pinnacle odds on pending bets");
+  return { updated, checked: pending.length };
 }
 
 // ─── Three-snapshot CLV system ─────────────────────────────────────────────────

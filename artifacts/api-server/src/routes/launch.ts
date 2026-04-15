@@ -1,6 +1,9 @@
 import { Router } from "express";
 import { runLaunchActivation } from "../services/launchActivation";
 import { runThresholdAssessment } from "../services/thresholdAssessment";
+import { backfillPinnacleOnPendingBets } from "../services/oddsPapi";
+import { backfillAfTeamIds, fetchTeamStatsForUpcomingMatches } from "../services/apiFootball";
+import { runFeatureEngineForUpcomingMatches } from "../services/featureEngine";
 import { logger } from "../lib/logger";
 
 const router = Router();
@@ -50,6 +53,51 @@ router.get("/launch-activation/threshold-assessment", async (req, res) => {
     res.json(result);
   } catch (err) {
     logger.error({ err }, "Threshold assessment failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/launch-activation/backfill-pinnacle", async (_req, res) => {
+  logger.info("Pinnacle backfill triggered via API");
+  try {
+    const result = await backfillPinnacleOnPendingBets();
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "Pinnacle backfill failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/launch-activation/backfill-team-ids", async (_req, res) => {
+  logger.info("AF team ID backfill triggered via API");
+  try {
+    const result = await backfillAfTeamIds();
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "AF team ID backfill failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/launch-activation/enrich-team-stats", async (_req, res) => {
+  logger.info("Team stats enrichment triggered via API");
+  try {
+    const result = await fetchTeamStatsForUpcomingMatches();
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "Team stats enrichment failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/launch-activation/recompute-features", async (req, res) => {
+  const force = req.query.force === "true";
+  logger.info({ force }, "Feature recomputation triggered via API");
+  try {
+    const result = await runFeatureEngineForUpcomingMatches(force);
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "Feature recomputation failed");
     res.status(500).json({ error: String(err) });
   }
 });

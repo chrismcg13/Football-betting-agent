@@ -844,6 +844,11 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
       });
     }
 
+    if (matched.teams?.home?.id && matched.teams?.away?.id) {
+      await upsertFeature(match.id, "_af_home_team_id", matched.teams.home.id);
+      await upsertFeature(match.id, "_af_away_team_id", matched.teams.away.id);
+    }
+
     mappings.push({
       matchId: match.id,
       fixtureId: matched.fixture.id,
@@ -1244,7 +1249,7 @@ async function getStoredFeature(matchId: number, featureName: string): Promise<n
     .where(and(eq(featuresTable.matchId, matchId), eq(featuresTable.featureName, featureName)))
     .limit(1);
   if (!rows[0]?.featureValue) return null;
-  const v = parseInt(rows[0].featureValue, 10);
+  const v = parseFloat(rows[0].featureValue);
   return isNaN(v) ? null : v;
 }
 
@@ -1289,6 +1294,7 @@ export async function fetchAndStoreTeamStats(
 export async function fetchTeamStatsForUpcomingMatches(): Promise<{
   matchesProcessed: number;
   teamsUpdated: number;
+  skippedNoLeague: number;
 }> {
   logger.info("Starting API-Football team stats ingestion");
 
@@ -1304,14 +1310,32 @@ export async function fetchTeamStatsForUpcomingMatches(): Promise<{
       ),
     );
 
+  const discoveredRows = await db
+    .select({ leagueId: discoveredLeaguesTable.leagueId, name: discoveredLeaguesTable.name })
+    .from(discoveredLeaguesTable);
+  const discoveredMap = new Map<string, number>();
+  for (const r of discoveredRows) {
+    discoveredMap.set(r.name, r.leagueId);
+  }
+
   let matchesProcessed = 0;
   let teamsUpdated = 0;
+  let skippedNoLeague = 0;
 
   for (const match of upcoming) {
     if (!(await canMakeRequest(2))) break;
 
-    const leagueId = LEAGUE_IDS[match.league];
-    if (!leagueId) continue;
+    const existingAfStats = await getStoredFeature(match.id, "home_af_goals_scored_avg");
+    if (existingAfStats !== null) continue;
+
+    let leagueId = LEAGUE_IDS[match.league];
+    if (!leagueId) {
+      leagueId = discoveredMap.get(match.league) ?? 0;
+    }
+    if (!leagueId) {
+      skippedNoLeague++;
+      continue;
+    }
 
     const homeAfId = await getStoredFeature(match.id, "_af_home_team_id");
     const awayAfId = await getStoredFeature(match.id, "_af_away_team_id");
@@ -1325,7 +1349,7 @@ export async function fetchTeamStatsForUpcomingMatches(): Promise<{
     }
   }
 
-  return { matchesProcessed, teamsUpdated };
+  return { matchesProcessed, teamsUpdated, skippedNoLeague };
 }
 
 // ─── Fixture statistics (post-match for training data) ───────────────────────
@@ -1576,8 +1600,11 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
           ? f.league.name
           : league.name;
 
+        const homeTeamId = f.teams?.home?.id;
+        const awayTeamId = f.teams?.away?.id;
+
         if (existing.length === 0) {
-          await db.insert(matchesTable).values({
+          const inserted = await db.insert(matchesTable).values({
             homeTeam: homeTeamName,
             awayTeam: awayTeamName,
             league: resolvedLeagueName,
@@ -1586,14 +1613,25 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
             status: "scheduled",
             betfairEventId: afKey,
             apiFixtureId: fixtureId,
-          });
+          }).returning({ id: matchesTable.id });
           fixturesInserted++;
+
+          if (inserted[0] && homeTeamId && awayTeamId) {
+            const mid = inserted[0].id;
+            await upsertFeature(mid, "_af_home_team_id", homeTeamId);
+            await upsertFeature(mid, "_af_away_team_id", awayTeamId);
+          }
         } else {
-          // Update status if needed
           await db.update(matchesTable)
             .set({ status: "scheduled" })
             .where(eq(matchesTable.betfairEventId, afKey));
           fixturesUpdated++;
+
+          if (existing[0] && homeTeamId && awayTeamId) {
+            const mid = existing[0].id;
+            await upsertFeature(mid, "_af_home_team_id", homeTeamId);
+            await upsertFeature(mid, "_af_away_team_id", awayTeamId);
+          }
         }
       }
 
@@ -1606,6 +1644,56 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
 
   logger.info({ leaguesScanned, fixturesInserted, fixturesUpdated }, "Discovered league fixture ingestion complete");
   return { leaguesScanned, fixturesInserted, fixturesUpdated };
+}
+
+// ─── Backfill AF team IDs from fixture data ───────────────────────────────────
+
+export async function backfillAfTeamIds(): Promise<{ updated: number; checked: number; apiCalls: number }> {
+  const matchesMissingTeamIds = await db.execute(sql`
+    SELECT m.id, m.api_fixture_id, m.betfair_event_id
+    FROM matches m
+    WHERE m.status = 'scheduled'
+    AND m.api_fixture_id IS NOT NULL
+    AND (
+      NOT EXISTS (SELECT 1 FROM features f WHERE f.match_id = m.id AND f.feature_name = '_af_home_team_id')
+      OR NOT EXISTS (SELECT 1 FROM features f WHERE f.match_id = m.id AND f.feature_name = '_af_away_team_id')
+    )
+    LIMIT 500
+  `);
+
+  const rows = matchesMissingTeamIds.rows as Array<{ id: number; api_fixture_id: number; betfair_event_id: string }>;
+  let updated = 0;
+  let apiCalls = 0;
+
+  const batchSize = 20;
+  const fixtureIds = rows.map(r => r.api_fixture_id).filter(Boolean);
+
+  for (let i = 0; i < fixtureIds.length; i += batchSize) {
+    if (!(await canMakeRequest(1))) break;
+
+    const batch = fixtureIds.slice(i, i + batchSize);
+    const idsParam = batch.join("-");
+
+    const fixtures = await fetchApiFootball<ApiFixture[]>("/fixtures", { ids: idsParam });
+    apiCalls++;
+    if (!fixtures) continue;
+
+    for (const f of fixtures) {
+      const fid = f.fixture?.id;
+      const homeId = f.teams?.home?.id;
+      const awayId = f.teams?.away?.id;
+      if (!fid || !homeId || !awayId) continue;
+
+      const matchRow = rows.find(r => r.api_fixture_id === fid);
+      if (!matchRow) continue;
+
+      await upsertFeature(matchRow.id, "_af_home_team_id", homeId);
+      await upsertFeature(matchRow.id, "_af_away_team_id", awayId);
+      updated++;
+    }
+  }
+
+  return { updated, checked: rows.length, apiCalls };
 }
 
 // ─── League Performance Scoring ───────────────────────────────────────────────
