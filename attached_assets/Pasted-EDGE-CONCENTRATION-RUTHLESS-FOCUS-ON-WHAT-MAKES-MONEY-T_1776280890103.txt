@@ -1,0 +1,72 @@
+EDGE CONCENTRATION — RUTHLESS FOCUS ON WHAT MAKES MONEY
+
+The model must maintain ruthless concentration on the highest-edge segments while keeping broad coverage to discover new edges. This is about how the model thinks about market selection and resource allocation.
+
+CORE PRINCIPLE: Profit = Volume × Strike Rate × Average Edge × Stake Size
+Every decision the model makes should be evaluated against this equation. Improvements to any factor compound.
+
+1. EDGE SEGMENTATION — KNOW WHERE YOUR EDGE LIVES:
+   - Segment all historical bets by:
+     a) League
+     b) Market type (match result, BTTS, over/under goals, corners, cards)
+     c) Odds range (1.5-2.0, 2.0-3.0, 3.0-5.0, 5.0+)
+     d) Time before kick-off when bet was placed
+     e) Data completeness level
+     f) Pinnacle edge size at time of placement
+   - For each segment, calculate: CLV, ROI, volume, statistical significance
+   - Identify the TOP SEGMENTS where edge is statistically significant and large
+   - Identify the BOTTOM SEGMENTS where edge is negative or statistically insignificant
+   - The model should bet MORE in top segments and LESS (or not at all) in bottom segments
+   - This is not a one-time exercise — run this segmentation weekly and adapt
+
+2. DYNAMIC RESOURCE ALLOCATION:
+   - Based on edge segmentation, the model should dynamically allocate:
+     a) API-Football budget: more requests for high-edge leagues, fewer for low-edge
+     b) OddsPapi budget: prioritise Pinnacle validation for high-edge segments
+     c) Computing time: spend more cycles analysing fixtures in profitable segments
+     d) Kelly fraction: higher confidence (within limits) in proven segments
+   - This creates a virtuous cycle: more data in profitable segments → better predictions → more profit → more confidence → more allocation
+
+3. EXPLORATION vs EXPLOITATION BALANCE:
+   - The model MUST NOT become tunnel-visioned on current profitable segments
+   - Allocate a fixed 15% of resources to EXPLORATION:
+     a) New leagues being assessed for profitability
+     b) New market types within known leagues
+     c) New feature combinations being tested
+     d) New odds ranges or timing strategies
+   - The remaining 85% goes to EXPLOITATION of known profitable segments
+   - Track exploration bets separately. When an exploration segment shows consistent positive CLV over 20+ bets, graduate it to exploitation.
+   - When an exploitation segment shows declining CLV over 30+ bets, demote it to exploration or remove it entirely.
+   - This ratio (85/15) should itself be adaptive — if the model is finding lots of new edge through exploration, temporarily increase the exploration allocation. If exploration is consistently unproductive, reduce it to 10%.
+
+4. MARKET TYPE SPECIALISATION:
+   - Not all market types have equal edge potential:
+     a) Match result: most efficient market, hardest to find edge, but highest liquidity
+     b) BTTS: less efficient, good edge potential, decent liquidity
+     c) Over/Under goals: moderately efficient, edge possible especially in totals markets
+     d) Corners: least efficient, potentially large edge, but lowest liquidity
+     e) Cards: least efficient, potentially large edge, but lowest liquidity and hardest to model
+   - The model should develop specialisms. If it's particularly good at BTTS in Scandinavian leagues, lean into that.
+   - Track "edge by market type by league" — this triple-segmented view is where the real insights live.
+
+5. TIMING OPTIMISATION:
+   - Edge varies by when you bet relative to kick-off:
+     a) Early markets (48+ hours before): lines may be soft but can move against you
+     b) Mid-range (12-48 hours before): lines are forming, moderate efficiency
+     c) Late markets (1-12 hours before): most information is priced in, but team news can create edge
+     d) Just before kick-off (0-1 hour): lineup announcements can create sharp edge that hasn't been absorbed
+   - Track which timing windows produce the best CLV. Optimise bet placement timing accordingly.
+   - This interacts with Prompt 8's execution speed — the model needs to place bets quickly when it identifies edge.
+
+6. DEEP LEARNING INTEGRATION:
+   - The edge concentration strategy should be continuously refined by the model's learning system:
+     a) After each weekly review (Prompt 7), update the segment scorecards
+     b) Automatically adjust resource allocation based on rolling performance
+     c) Identify EMERGING edge (new patterns in previously neutral segments)
+     d) Identify DECAYING edge (profitable segments becoming more efficient)
+   - The model should explicitly track: "I am profitable in [these segments] because [these features] are predictive, and I believe this edge will persist because [reasoning]"
+   - If the model cannot articulate WHY it has edge in a segment, the edge is suspect and sizing should be conservative.
+
+The goal is an agent that acts like a professional quantitative hedge fund: concentrating capital where it has proven, understood edge, while maintaining a disciplined research pipeline to discover new opportunities.
+
+Show me the segmentation framework and resource allocation logic before implementing.
