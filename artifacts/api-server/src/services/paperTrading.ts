@@ -366,12 +366,18 @@ export async function placePaperBet(
   // ──────────────────────────────────────────────────────────────────────────
 
   // ── Production quarantine ──────────────────────────────────────────────
-  // In production, only promoted-tier bets are allowed. Experiment-tier and
-  // boosted bets must stay in the dev environment.
+  // In production, only promoted-tier bets are allowed. Experiment-tier,
+  // candidate-tier, and boosted bets must stay in the dev environment.
   const currentEnv = process.env["ENVIRONMENT"] ?? "development";
   if (currentEnv === "production") {
     if (dataTier === "experiment") {
       return logReject("Production quarantine: experiment-tier bets blocked in prod");
+    }
+    if (dataTier === "candidate") {
+      return logReject("Production quarantine: candidate-tier bets blocked in prod (candidates run at 25% Kelly in dev only)");
+    }
+    if (dataTier === "abandoned" || dataTier === "demoted") {
+      return logReject(`Production quarantine: ${dataTier}-tier bets blocked in prod`);
     }
     if (opportunityBoosted) {
       return logReject("Production quarantine: opportunity-boosted bets blocked in prod");

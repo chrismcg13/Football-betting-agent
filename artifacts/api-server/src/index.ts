@@ -249,25 +249,19 @@ async function main() {
   }
 
   // 3. Production database hygiene
-  // On first production deploy, clear any stale data that leaked from dev.
-  // Production data should ONLY come via the syncDevToProd pipeline.
+  // Soft-delete non-promoted bets that leaked from dev (if any).
+  // NEVER hard-delete experiment_registry, promotion_audit_log, or experiment_learning_journal.
+  // Those tables contain historical progression data that must persist across restarts.
   if (ENVIRONMENT === "production") {
     const staleCheck = await db.execute(sql`
       SELECT COUNT(*) as cnt FROM paper_bets
-      WHERE data_tier != 'promoted' OR data_tier IS NULL
+      WHERE (data_tier != 'promoted' OR data_tier IS NULL) AND deleted_at IS NULL
     `);
     const staleCount = Number(staleCheck.rows[0]?.cnt ?? 0);
     if (staleCount > 0) {
-      logger.warn({ staleCount }, "Production DB contains non-promoted bets — cleaning stale data");
+      logger.warn({ staleCount }, "Production DB contains non-promoted bets — soft-deleting stale data");
       await db.execute(sql`UPDATE paper_bets SET deleted_at = NOW() WHERE (data_tier != 'promoted' OR data_tier IS NULL) AND deleted_at IS NULL`);
-      await db.execute(sql`DELETE FROM experiment_registry`);
-      await db.execute(sql`DELETE FROM promotion_audit_log`);
-      await db.execute(sql`DELETE FROM experiment_learning_journal`);
-      const configExists = await db.execute(sql`SELECT 1 FROM agent_config WHERE key = 'bankroll'`);
-      if (configExists.rows.length > 0) {
-        await db.execute(sql`UPDATE agent_config SET value = '500' WHERE key = 'bankroll'`);
-      }
-      logger.info("Production DB cleaned — only promoted bets (if any) remain. Bankroll reset to £500.");
+      logger.info("Production DB cleaned — non-promoted bets soft-deleted. Experiment history preserved.");
     }
   }
 

@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "TDlkpwK7ObiI4NDHvVLUE"
+uri = "file://.local/pre-launch-audit.md"
+type = "text"
+title = "Pre-Launch Audit Report"
