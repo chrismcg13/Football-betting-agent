@@ -1,0 +1,91 @@
+TRADING SPEED & EXECUTION — EDGE CAPTURED IS EDGE EARNED
+
+Even the best signal is worthless if you can't get your money on. This prompt covers two critical areas: faster trading cycles and rock-solid execution.
+
+PART A: TRADING CRON TIGHTENING (15 minutes → 5 minutes or less)
+
+1. REDUCE TRADING CYCLE TO 5 MINUTES:
+   - The current 15-minute trading cron means we can lose up to 14 minutes of edge decay between signal generation and bet placement
+   - In fast-moving markets, this is the difference between getting +5% CLV and getting 0% CLV
+   - Tighten the main trading cron to run every 5 minutes
+   - HOWEVER, before implementing, analyse the impact on resource consumption:
+     a) Calculate: current requests per trading cycle × 3 (tripling frequency) = new request rate
+     b) Project monthly API-Football consumption at 5-minute cycles. If this exceeds 80% of the 75k budget, optimise:
+        - Only run full analysis for fixtures within 48 hours of kick-off on every cycle
+        - Run broader scans (48h+ fixtures) every 30 minutes
+        - Cache data aggressively — don't re-fetch data that hasn't changed
+     c) Project OddsPapi consumption at 5-minute cycles. With 100k budget there should be headroom, but verify.
+     d) Monitor Betfair API rate limits — ensure 5-minute cycles don't trigger throttling
+   - If 5-minute cycles are sustainable on current budgets: implement immediately
+   - If 5-minute cycles would blow the budget: implement a TIERED approach:
+     a) 5-minute cycles for fixtures kicking off within 6 hours (this is where speed matters most)
+     b) 15-minute cycles for fixtures 6-48 hours away
+     c) 60-minute cycles for fixtures 48+ hours away
+   - Log the actual request consumption weekly and report in Agent Recommendations if budget is being strained
+
+2. SUB-MINUTE EXECUTION FOR BET PLACEMENT:
+   - Once a signal is generated, the bet must be placed on Betfair within 30 seconds
+   - Separate the SIGNAL GENERATION (runs on cron) from BET EXECUTION (runs immediately when signal fires)
+   - Signal generation can take time (API calls, feature engineering, model inference)
+   - But once the signal says "place this bet", the execution path must be optimised:
+     a) Pre-authenticate with Betfair (maintain a warm session, don't re-auth for every bet)
+     b) Pre-fetch market IDs for upcoming fixtures so placement doesn't require a market lookup
+     c) Build the bet order object during signal generation, not during execution
+     d) Submit to Betfair immediately — target <5 seconds from signal to API call
+   - Track and log: time from signal generation to bet submission, time from submission to match confirmation
+   - Alert if average execution time exceeds 30 seconds
+
+PART B: EXECUTION RELIABILITY — GETTING BETS ON
+
+3. IP AND CONNECTIVITY FOR BETFAIR — DIGITALOCEAN VPS:
+   - Betfair is blocked from Replit US servers due to IP/geolocation issues
+   - We have a DigitalOcean VPS (UK/EU region) already set up that solves this
+   - The execution architecture should be:
+     a) Replit handles: signal generation, feature engineering, model inference, dashboard, all non-Betfair API calls
+     b) DigitalOcean VPS handles: all Betfair API communication (bet placement, balance fetch, settlement fetch, market data)
+     c) Communication between Replit and VPS via a secure API (authenticated endpoint on the VPS that accepts bet placement requests from Replit)
+   - The VPS acts as a thin execution relay — it receives structured bet orders from Replit and submits them to Betfair, returning the result
+   - The VPS should also handle:
+     a) Betfair session token management (auto-renewal before expiry)
+     b) Balance polling (cache locally, expose via API to Replit)
+     c) Settlement fetching (poll Betfair, push results back to Replit)
+     d) Market ID lookups and pre-caching for upcoming fixtures
+   - Connectivity monitoring:
+     a) Replit should health-check the VPS every 5 minutes
+     b) VPS should health-check Betfair connectivity every 5 minutes
+     c) If either link is down, alert immediately — this is a critical path
+     d) Log latency between Replit→VPS→Betfair on every bet placement
+   - The VPS must be lightweight and reliable. It is NOT running the model or any heavy computation — just acting as the Betfair gateway.
+   - Ensure the VPS auto-restarts if it crashes (systemd service or PM2 process manager)
+
+4. LIQUIDITY AWARENESS & TRACKING:
+   - Betfair exchange liquidity varies enormously by market:
+     a) Premier League match result: deep liquidity, any stake fills instantly
+     b) Finnish league BTTS: thin liquidity, may only have £50-200 available at your price
+   - For EVERY bet the model evaluates, fetch and record the available liquidity at our target odds:
+     a) Available to back/lay at our price
+     b) Available within 1 tick, 2 ticks, 3 ticks of our price
+     c) Total market volume
+   - If available liquidity at our price is less than our desired stake:
+     a) Place what we can at our price
+     b) Do NOT chase worse odds to fill the remainder — either wait or skip
+     c) Log the "liquidity shortfall" — the difference between desired and actual stake
+   - Track liquidity shortfalls over time by league and market type:
+     a) This directly informs which leagues to prioritise (high edge + low liquidity = limited scalability)
+     b) This feeds into Prompt 5's edge concentration strategy — no point focusing resources on a league where you can't get meaningful money on
+   - IMPORTANT: Start tracking liquidity data NOW in paper trading too, so by the time we scale, we already know which markets can absorb larger stakes
+
+5. PARTIAL FILL MANAGEMENT:
+   - Implement intelligent handling of partially matched bets:
+     a) If >70% filled: accept the partial fill, cancel the rest
+     b) If 30-70% filled: hold for 5 more minutes, then accept what's matched
+     c) If <30% filled after 10 minutes: cancel entirely — insufficient liquidity at this price
+   - Log all partial fills with context. If a specific market type consistently partially fills, factor this into the expected value calculation (you're not actually getting your full desired stake on)
+
+6. ORDER TYPE STRATEGY:
+   - Use LIMIT orders at our calculated price — never market orders
+   - If our limit order is unmatched after 15 minutes and the match is >2 hours away: leave it (the market may come to us)
+   - If our limit order is unmatched and the match is <2 hours away: reassess. If current odds still offer positive commission-adjusted EV, resubmit at the current best available price. If not, cancel.
+   - NEVER chase odds down more than 2 ticks from our target price
+
+Show me the execution architecture and cron schedule before implementing.
