@@ -168,7 +168,7 @@ async function qualifiesForTier1(opts: {
   pinnacleImplied: number | null;
   modelProbability: number;
 }): Promise<Tier1CheckResult> {
-  if (opts.dataTier === "candidate" || opts.dataTier === "experiment" || opts.dataTier === "abandoned" || opts.dataTier === "demoted") {
+  if (opts.dataTier === "abandoned" || opts.dataTier === "demoted") {
     return { qualifies: false, reason: `${opts.dataTier}-tier bets never qualify for Tier 1` };
   }
 
@@ -190,6 +190,7 @@ async function qualifiesForTier1(opts: {
     return { qualifies: false, reason: `Pinnacle edge ${edgeVsPinnacle.toFixed(2)}% < minimum ${MIN_PINNACLE_EDGE_PCT}%` };
   }
 
+  // PATH 1: Promoted experiment — qualifies directly with Pinnacle validation
   if (opts.dataTier === "promoted") {
     return {
       qualifies: true,
@@ -198,6 +199,8 @@ async function qualifiesForTier1(opts: {
     };
   }
 
+  // PATH 2: Data richness — any tier (experiment/candidate) can qualify for Tier 1
+  // if the league/market has sufficient data coverage (≥70%)
   const isRichData = await isLeagueMarketTier1Eligible(opts.league, opts.country, opts.marketType);
   if (!isRichData) {
     return { qualifies: false, reason: `League-market ${opts.league} (${opts.country}) / ${opts.marketType} data richness < 70%` };
@@ -205,7 +208,7 @@ async function qualifiesForTier1(opts: {
 
   return {
     qualifies: true,
-    reason: `Data-rich market: score=${opts.opportunityScore} >= ${threshold}, Pinnacle edge=${edgeVsPinnacle.toFixed(2)}%, data richness >= 70%`,
+    reason: `Data-rich market: score=${opts.opportunityScore} >= ${threshold}, Pinnacle edge=${edgeVsPinnacle.toFixed(2)}%, data richness >= 70% [${opts.dataTier}]`,
     path: "data_richness",
   };
 }
@@ -366,16 +369,12 @@ export async function placePaperBet(
   // ──────────────────────────────────────────────────────────────────────────
 
   // ── Production quarantine ──────────────────────────────────────────────
-  // In production, only promoted-tier bets are allowed. Experiment-tier,
-  // candidate-tier, and boosted bets must stay in the dev environment.
+  // In production, block abandoned/demoted tiers and opportunity-boosted bets.
+  // Experiment and candidate tiers are allowed through — they can still qualify
+  // for Tier 1 via the Data Richness Path (opp score ≥ threshold + Pinnacle
+  // 2%+ edge + data richness ≥ 70%). The Tier 1 gate handles the final decision.
   const currentEnv = process.env["ENVIRONMENT"] ?? "development";
   if (currentEnv === "production") {
-    if (dataTier === "experiment") {
-      return logReject("Production quarantine: experiment-tier bets blocked in prod");
-    }
-    if (dataTier === "candidate") {
-      return logReject("Production quarantine: candidate-tier bets blocked in prod (candidates run at 25% Kelly in dev only)");
-    }
     if (dataTier === "abandoned" || dataTier === "demoted") {
       return logReject(`Production quarantine: ${dataTier}-tier bets blocked in prod`);
     }
