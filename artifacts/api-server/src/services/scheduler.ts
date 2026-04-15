@@ -972,7 +972,7 @@ export async function syncMatchResults(daysBack = 2): Promise<number> {
 
   let recentFixtures: Awaited<ReturnType<typeof fetchRecentFixtureResults>>;
   try {
-    recentFixtures = await fetchRecentFixtureResults(daysBack);
+    recentFixtures = await fetchRecentFixtureResults(daysBack, { priority: true });
   } catch (err) {
     logger.warn({ err }, "syncMatchResults: failed to fetch recent fixtures");
     return 0;

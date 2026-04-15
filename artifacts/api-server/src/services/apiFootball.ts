@@ -611,6 +611,7 @@ export function isApiFootballCircuitOpen(): boolean {
 async function fetchApiFootball<T = unknown>(
   path: string,
   params: Record<string, string | number> = {},
+  options?: { priority?: boolean },
 ): Promise<T | null> {
   const key = process.env.API_FOOTBALL_KEY;
   if (!key) {
@@ -618,7 +619,7 @@ async function fetchApiFootball<T = unknown>(
     return null;
   }
 
-  if (!(await canMakeRequest())) {
+  if (!options?.priority && !(await canMakeRequest())) {
     logger.warn({ path, used: await getApiUsageToday() }, "API-Football daily budget exhausted");
     return null;
   }
@@ -702,14 +703,14 @@ function teamNameMatch(dbName: string, apiName: string): boolean {
   return false;
 }
 
-export async function getFixturesForDate(date: string): Promise<ApiFixture[]> {
-  const result = await fetchApiFootball<ApiFixture[]>("/fixtures", { date });
+export async function getFixturesForDate(date: string, opts?: { priority?: boolean }): Promise<ApiFixture[]> {
+  const result = await fetchApiFootball<ApiFixture[]>("/fixtures", { date }, opts);
   return result ?? [];
 }
 
 // ─── Fetch recent finished fixtures for result syncing ─────────────────────
 
-export async function fetchRecentFixtureResults(daysBack = 7): Promise<ApiFixture[]> {
+export async function fetchRecentFixtureResults(daysBack = 7, opts?: { priority?: boolean }): Promise<ApiFixture[]> {
   const dates: string[] = [];
   for (let i = daysBack; i >= 0; i--) {
     const d = new Date();
@@ -720,7 +721,7 @@ export async function fetchRecentFixtureResults(daysBack = 7): Promise<ApiFixtur
   const all: ApiFixture[] = [];
   for (const date of dates) {
     try {
-      const fixtures = await getFixturesForDate(date);
+      const fixtures = await getFixturesForDate(date, opts);
       const finished = fixtures.filter(
         (f) => f.fixture.status.short === "FT" || f.fixture.status.short === "AET" || f.fixture.status.short === "PEN",
       );
@@ -729,7 +730,7 @@ export async function fetchRecentFixtureResults(daysBack = 7): Promise<ApiFixtur
       logger.warn({ err, date }, "fetchRecentFixtureResults: error fetching date");
     }
   }
-  logger.info({ count: all.length }, "fetchRecentFixtureResults: finished fixtures fetched via API-Football");
+  logger.info({ count: all.length, priority: !!opts?.priority }, "fetchRecentFixtureResults: finished fixtures fetched via API-Football");
   return all;
 }
 
@@ -1341,11 +1342,9 @@ function getStat(stats: ApiFixtureStats["statistics"], type: string): number {
 export async function fetchMatchStatsForSettlement(
   fixtureId: number,
 ): Promise<{ totalCorners: number; totalCards: number } | null> {
-  if (!(await canMakeRequest())) return null;
-
   const result = await fetchApiFootball<ApiFixtureStats[]>("/fixtures/statistics", {
     fixture: fixtureId,
-  });
+  }, { priority: true });
 
   if (!result || result.length < 2) return null;
   const [homeStats, awayStats] = result;

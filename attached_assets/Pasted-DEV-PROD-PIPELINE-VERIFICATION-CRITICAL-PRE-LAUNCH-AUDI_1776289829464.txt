@@ -1,0 +1,99 @@
+DEV→PROD PIPELINE VERIFICATION — CRITICAL PRE-LAUNCH AUDIT
+
+Before going live, we need to verify the entire pipeline from dev (experiment/paper trading/settlement) to prod (live trading/bet place/ settlement) is fully operational, non-destructive, and ready. This is a one-time audit but the fixes are permanent.
+
+1. SYNC PIPELINE DESTRUCTIVE OPERATION AUDIT:
+   - Review ALL code in the dev→prod sync pipeline
+   - Search for and flag ANY of the following operations:
+     a) TRUNCATE TABLE
+     b) DELETE FROM (without a narrow WHERE clause)
+     c) DROP TABLE
+     d) Any migration that wipes or recreates tables
+     e) Any "reset" or "clean" functions that could destroy data
+   - If ANY destructive operations exist in the sync pipeline: REMOVE THEM IMMEDIATELY
+   - The sync must be purely ADDITIVE — upsert only (INSERT ... ON CONFLICT UPDATE)
+   - The sync must NEVER delete data from prod that exists in prod
+   - If the sync needs to handle removed records, use soft deletes (set a flag, don't delete the row)
+   - Show me every destructive operation found and confirm each one has been replaced with a safe alternative
+
+2. EXPERIMENT PROGRESSION PERSISTENCE:
+   - Verify that when the sync runs:
+     a) Experiment tags and their accumulated statistics survive the sync
+     b) Promotion history (experiment → candidate → promoted) is preserved
+     c) The promotion_audit_log is never wiped or truncated
+     d) The experiment_learning_journal is never wiped or truncated
+     e) experiment_registry records persist across syncs
+   - Run a test: create a test experiment tag in dev, sync to prod, verify it exists, sync again, verify it still exists with data intact
+   - If any experiment data is being lost during sync: fix it before launch
+
+3. BET DATA INTEGRITY ACROSS SYNC:
+   - Verify the sync correctly handles:
+     a) New bets from dev flow into prod (with correct sync_eligible and data_tier flags)
+     b) Existing prod bets are NEVER overwritten or modified by the sync
+     c) Settlement data from Betfair (in prod) is never affected by dev sync
+     d) Live bets (Tier 1, placed with real money) are clearly separated from synced paper trade data
+   - The double-gate must work: sync_eligible=true AND data_tier='promoted' — verify this is enforced
+   - Run a test: place a paper bet in dev, verify it does NOT appear in prod unless both gates pass
+
+4. PRODUCTION QUARANTINE VERIFICATION:
+   - Verify that production quarantine is active and correctly blocking:
+     a) Experiment-tier bets from being placed with real money
+     b) Candidate-tier bets from being placed with real money (candidates run at 25% Kelly in dev only)
+     c) Opportunity-boosted bets that don't meet the Tier 1 criteria
+   - Only PROMOTED experiments that also pass the opportunity score threshold AND data richness check should ever result in real money bets
+   - Test this explicitly: attempt to force an experiment-tier bet through to live placement — it MUST be blocked
+
+5. SCHEDULER VERIFICATION:
+   - Confirm prod scheduler is running the correct cron jobs at correct frequencies:
+     a) Trading cycle: 5 minutes (as per Prompt 8)
+     b) Ingestion: 30 minutes
+     c) Features: 6 hours
+     d) Learning: Sunday 3am
+     e) OddsPapi/Pinnacle: continuous per Prompt 3 budget allocation
+     f) Odds refresh: 8 hours
+     g) Lineups/stats: weekly
+     h) Promotion engine: daily 4am
+     i) Experiment analysis: Sunday 4am
+     j) Dev→prod sync: 6 hours
+     k) Opportunity score threshold review: Sunday 5am
+     l) Settlement reconciliation: 30 minutes
+     m) Balance refresh: 15 minutes
+   - Log every cron job's last successful run time. Flag any that haven't run within 2x their interval.
+
+6. DATA MODEL READINESS CHECK:
+   - Verify all tables required for live trading exist in prod:
+     a) exchanges table (with Betfair record)
+     b) alerts table
+     c) liquidity_tracking table
+     d) line_movement_history table
+     e) All commission-related columns on bet/settlement records
+     f) execution_metrics logging
+   - Run a schema diff between dev and prod — they should match for all trading-related tables
+
+7. ENVIRONMENT VARIABLE AUDIT:
+   - Verify all required secrets/environment variables are set in prod:
+     a) LIVE_BETFAIR_KEY
+     b) BETFAIR_USERNAME
+     c) BETFAIR_PASSWORD
+     d) TRADING_MODE = "LIVE"
+     e) DATABASE_URL (pointing to Neon, NOT dev)
+     f) ALERT_WEBHOOK_URL (if configured)
+     g) API-Football key
+     h) OddsPapi key
+   - Verify none of these contain dev/test values
+
+8. END-TO-END DRY RUN:
+   - Run a complete trading cycle in prod with a DRY_RUN flag that does everything EXCEPT actually submit the bet to Betfair:
+     a) Fetch fixtures
+     b) Run feature engineering
+     c) Generate predictions
+     d) Apply Pinnacle validation (Prompt 3)
+     e) Apply Tier 1 criteria (Prompt 2)
+     f) Calculate stakes with Kelly (Prompt 6)
+     g) Check exposure limits
+     h) Build the Betfair order object
+     i) Log what WOULD have been placed
+   - Review the dry run output. Verify the bets look sensible — correct stakes, correct odds, correct markets.
+   - This is your final sanity check before real money moves.
+
+Generate a full pre-launch audit report. Every check must show PASS or FAIL. Do not proceed to Prompt 15 if any check fails.
