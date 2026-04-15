@@ -177,6 +177,13 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   }}
                 />
               </div>
+              {budget?.projectedPct != null && (
+                <p className="text-[9px] mt-0.5">
+                  <span className={budget.throttled ? "text-red-400 font-semibold" : budget.projectedPct >= 80 ? "text-amber-400" : "text-slate-500"}>
+                    proj {budget.projectedPct}% of month{budget.throttled ? " ⚠ THROTTLED" : ""}
+                  </span>
+                </p>
+              )}
             </div>
           </div>
         </div>
@@ -210,6 +217,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
               </div>
               <p className="text-[9px] text-slate-600 mt-0.5">
                 {oddsBudget ? `${oddsBudget.monthCount ?? 0}/${oddsBudget.monthlyCap ?? 240} this month` : "—/240 this month"}
+                {oddsBudget?.projectedPct != null && (
+                  <span className={oddsBudget.throttled ? "text-red-400 font-semibold" : oddsBudget.projectedPct >= 80 ? "text-amber-400" : "text-slate-500"}>
+                    {" "}· proj {oddsBudget.projectedPct}%{oddsBudget.throttled ? " ⚠ THROTTLED" : ""}
+                  </span>
+                )}
               </p>
             </div>
           </div>

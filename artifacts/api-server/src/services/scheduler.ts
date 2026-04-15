@@ -86,6 +86,40 @@ function markStart(job: string) {
   if (s) s.isRunning = true;
 }
 
+async function trackCronExecution(
+  jobName: string,
+  fn: () => Promise<number | void>,
+): Promise<void> {
+  const startedAt = new Date();
+  try {
+    const { cronExecutionsTable } = await import("@workspace/db");
+    const recordsProcessed = (await fn()) ?? 0;
+    const durationMs = Date.now() - startedAt.getTime();
+    await db.insert(cronExecutionsTable).values({
+      jobName,
+      startedAt,
+      completedAt: new Date(),
+      success: true,
+      recordsProcessed: typeof recordsProcessed === "number" ? recordsProcessed : 0,
+      durationMs,
+    });
+  } catch (err) {
+    const durationMs = Date.now() - startedAt.getTime();
+    try {
+      const { cronExecutionsTable } = await import("@workspace/db");
+      await db.insert(cronExecutionsTable).values({
+        jobName,
+        startedAt,
+        completedAt: new Date(),
+        success: false,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        durationMs,
+      });
+    } catch (_) {}
+    throw err;
+  }
+}
+
 // ===================== Guard flags =====================
 let ingestionRunning = false;
 let featureRunning = false;
@@ -102,7 +136,9 @@ async function safeRunIngestion(): Promise<void> {
   ingestionRunning = true;
   markStart("ingestion");
   try {
-    await runDataIngestion();
+    await trackCronExecution("ingestion", async () => {
+      await runDataIngestion();
+    });
     markRun("ingestion", "success");
     void safeRunFeatures();
   } catch (err) {
@@ -122,7 +158,9 @@ async function safeRunFeatures(): Promise<void> {
   featureRunning = true;
   markStart("features");
   try {
-    await runFeatureEngineForUpcomingMatches();
+    await trackCronExecution("features", async () => {
+      await runFeatureEngineForUpcomingMatches();
+    });
     markRun("features", "success");
   } catch (err) {
     logger.error({ err }, "Scheduled feature computation run failed");
@@ -861,6 +899,17 @@ export async function runTradingCycle(options?: {
       "Trading cycle complete",
     );
     markRun("trading", "success");
+    try {
+      const { cronExecutionsTable } = await import("@workspace/db");
+      await db.insert(cronExecutionsTable).values({
+        jobName: `trading_${tier}`,
+        startedAt: new Date(cycleStartedAt),
+        completedAt: new Date(),
+        success: true,
+        recordsProcessed: betsPlaced,
+        durationMs: cycleDurationMs,
+      });
+    } catch (_) {}
     return {
       betsPlaced,
       betsSettled: settlement.settled,
@@ -872,6 +921,17 @@ export async function runTradingCycle(options?: {
   } catch (err) {
     logger.error({ err, tier }, "Trading cycle failed");
     markRun("trading", "error");
+    try {
+      const { cronExecutionsTable } = await import("@workspace/db");
+      await db.insert(cronExecutionsTable).values({
+        jobName: `trading_${tier}`,
+        startedAt: new Date(cycleStartedAt),
+        completedAt: new Date(),
+        success: false,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - cycleStartedAt,
+      });
+    } catch (_) {}
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   } finally {
     tradingCycleRunning = false;
@@ -1374,6 +1434,22 @@ export function startScheduler(): void {
     }, { timezone: "UTC" });
     logger.info("Order management cron active — every 2 minutes (partial fills, cancellations, reassessment)");
   }
+
+  // Stale placement reconciliation: every hour — check for PENDING_PLACEMENT > 10 min
+  cron.schedule("0 * * * *", () => {
+    void (async () => {
+      try {
+        const { reconcileStalePlacements } = await import("./paperTrading");
+        const result = await reconcileStalePlacements();
+        if (result.reconciled > 0 || result.flagged > 0) {
+          logger.info(result, "Stale placement reconciliation complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Stale placement reconciliation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Stale placement reconciliation active — hourly");
 
   // Alert detection: every 5 minutes — check for critical/warning conditions
   cron.schedule("*/5 * * * *", () => {

@@ -72,6 +72,7 @@ export const paperBetsTable = pgTable("paper_bets", {
   lineDirection: text("line_direction"),
   pinnacleSnapshotCount: integer("pinnacle_snapshot_count").default(0),
   clvDataQuality: text("clv_data_quality").default("incomplete"),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
 });
 
 export const insertPaperBetSchema = createInsertSchema(paperBetsTable).omit({

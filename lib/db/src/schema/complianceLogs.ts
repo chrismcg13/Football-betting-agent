@@ -9,6 +9,7 @@ export const complianceLogsTable = pgTable("compliance_logs", {
   timestamp: timestamp("timestamp", { withTimezone: true })
     .notNull()
     .defaultNow(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
 });
 
 export const insertComplianceLogSchema = createInsertSchema(

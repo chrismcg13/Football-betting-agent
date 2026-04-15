@@ -5,7 +5,7 @@ import { createAlert, type AlertSeverity, type AlertCategory } from "./alerting"
 import { getBankroll, getConfigValue } from "./paperTrading";
 import { isLiveMode, getAccountFunds } from "./betfairLive";
 import { getStartingDeposit, getCurrentLiveRiskLevel } from "./liveRiskManager";
-import { getApiBudgetStatus } from "./apiFootball";
+import { getApiBudgetStatus, checkAndUpdateThrottle } from "./apiFootball";
 
 function alert(
   severity: AlertSeverity,
@@ -21,6 +21,7 @@ function alert(
 export async function runAlertDetection(): Promise<void> {
   logger.info("Running alert detection scan");
   try {
+    await checkAndUpdateThrottle().catch(() => {});
     await Promise.allSettled([
       checkConnectivity(),
       checkRiskLimits(),
@@ -29,6 +30,7 @@ export async function runAlertDetection(): Promise<void> {
       checkApiBudget(),
       checkExecutionQuality(),
       checkNoBets(),
+      checkCronHealth(),
     ]);
     logger.info("Alert detection scan complete");
   } catch (err) {
@@ -497,4 +499,53 @@ export async function fireTestAlert(severity: AlertSeverity): Promise<number | n
     message: m.message,
     metadata: { test: true, firedAt: new Date().toISOString() },
   });
+}
+
+const CRON_EXPECTED_INTERVALS: Record<string, number> = {
+  trading_near: 5 * 60 * 1000,
+  trading_far: 30 * 60 * 1000,
+  ingestion: 30 * 60 * 1000,
+  features: 6 * 60 * 60 * 1000,
+};
+
+async function checkCronHealth(): Promise<void> {
+  try {
+    const { cronExecutionsTable } = await import("@workspace/db");
+    const { desc, eq } = await import("drizzle-orm");
+
+    for (const [jobName, expectedIntervalMs] of Object.entries(CRON_EXPECTED_INTERVALS)) {
+      const lastExec = await db
+        .select({
+          completedAt: cronExecutionsTable.completedAt,
+          success: cronExecutionsTable.success,
+        })
+        .from(cronExecutionsTable)
+        .where(eq(cronExecutionsTable.jobName, jobName))
+        .orderBy(desc(cronExecutionsTable.startedAt))
+        .limit(1);
+
+      if (lastExec.length === 0) continue;
+
+      const last = lastExec[0]!;
+      const lastTime = last.completedAt?.getTime() ?? 0;
+      const elapsed = Date.now() - lastTime;
+      const missedThreshold = expectedIntervalMs * 2;
+
+      if (elapsed > missedThreshold) {
+        const missedRuns = Math.floor(elapsed / expectedIntervalMs);
+        const isTradingCritical = jobName.startsWith("trading_") && missedRuns >= 2;
+
+        await alert(
+          isTradingCritical ? "critical" : "warning",
+          "system",
+          `CRON_MISSED_${jobName.toUpperCase()}`,
+          `Cron job "${jobName}" missed ${missedRuns} runs`,
+          `Job "${jobName}" last completed ${Math.round(elapsed / 60000)} minutes ago (expected every ${Math.round(expectedIntervalMs / 60000)} min). ${isTradingCritical ? "CRITICAL: Trading cron missed 2+ consecutive runs." : ""}`,
+          { jobName, missedRuns, elapsedMinutes: Math.round(elapsed / 60000), lastRunAt: last.completedAt?.toISOString() },
+        );
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, "Cron health check failed");
+  }
 }

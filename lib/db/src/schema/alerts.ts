@@ -16,6 +16,7 @@ export const alertsTable = pgTable("alerts", {
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
 });
 
 export const insertAlertSchema = createInsertSchema(alertsTable).omit({ id: true });

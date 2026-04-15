@@ -19,8 +19,10 @@ import {
 } from "@workspace/db";
 import { eq, and, gte, lte, desc, sql, ne, like, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
+import { resilientFetch, isCircuitOpen } from "./resilientFetch";
 
 const BASE_URL = "https://v3.football.api-sports.io";
+const API_FOOTBALL_SERVICE = "api-football";
 const MONTHLY_CAP = 75_000;
 const DEFAULT_DAILY_CAP = 2_500;
 const MIN_DAILY_CAP = 1_500;
@@ -541,9 +543,10 @@ async function canMakeRequest(needed = 1): Promise<boolean> {
     getApiUsageToday(),
     getApiUsageThisMonth(),
   ]);
-  const dailyCap = getFlexibleDailyCap();
+  const rawCap = getFlexibleDailyCap();
+  const effectiveCap = apiFootballThrottled ? Math.round(rawCap * 0.5) : rawCap;
   if (monthlyUsed + needed > MONTHLY_CAP) return false;
-  return dailyUsed + needed <= dailyCap;
+  return dailyUsed + needed <= effectiveCap;
 }
 
 export async function getApiBudgetStatus(): Promise<{
@@ -555,25 +558,55 @@ export async function getApiBudgetStatus(): Promise<{
   monthlyCap: number;
   monthlyRemaining: number;
   dailyCap: number;
+  projectedMonthlyUsage: number;
+  projectedPct: number;
+  throttled: boolean;
 }> {
   const [used, monthlyUsed] = await Promise.all([
     getApiUsageToday(),
     getApiUsageThisMonth(),
   ]);
   const dailyCap = getFlexibleDailyCap();
+
+  const now = new Date();
+  const dayOfMonth = now.getUTCDate();
+  const daysInMonth = new Date(now.getUTCFullYear(), now.getUTCMonth() + 1, 0).getUTCDate();
+  const avgDailyUsage = dayOfMonth > 0 ? monthlyUsed / dayOfMonth : 0;
+  const projectedMonthlyUsage = Math.round(avgDailyUsage * daysInMonth);
+  const projectedPct = MONTHLY_CAP > 0 ? Math.round((projectedMonthlyUsage / MONTHLY_CAP) * 100) : 0;
+  const throttled = projectedPct >= 90;
+
   return {
     used,
-    cap: dailyCap,
-    remaining: Math.max(0, dailyCap - used),
+    cap: throttled ? Math.round(dailyCap * 0.5) : dailyCap,
+    remaining: Math.max(0, (throttled ? Math.round(dailyCap * 0.5) : dailyCap) - used),
     date: todayStr(),
     monthlyUsed,
     monthlyCap: MONTHLY_CAP,
     monthlyRemaining: Math.max(0, MONTHLY_CAP - monthlyUsed),
-    dailyCap,
+    dailyCap: throttled ? Math.round(dailyCap * 0.5) : dailyCap,
+    projectedMonthlyUsage,
+    projectedPct,
+    throttled,
   };
 }
 
+export function isApiFootballThrottled(): boolean {
+  return apiFootballThrottled;
+}
+
+let apiFootballThrottled = false;
+
+export async function checkAndUpdateThrottle(): Promise<void> {
+  const status = await getApiBudgetStatus();
+  apiFootballThrottled = status.throttled;
+}
+
 // ─── Core fetch ───────────────────────────────────────────────────────────────
+
+export function isApiFootballCircuitOpen(): boolean {
+  return isCircuitOpen(API_FOOTBALL_SERVICE);
+}
 
 async function fetchApiFootball<T = unknown>(
   path: string,
@@ -595,24 +628,20 @@ async function fetchApiFootball<T = unknown>(
     url.searchParams.set(k, String(v));
   }
 
-  try {
-    const res = await fetch(url.toString(), {
-      headers: { "x-apisports-key": key },
-    });
+  const json = await resilientFetch<{ response: T; errors?: unknown }>(url.toString(), {
+    service: API_FOOTBALL_SERVICE,
+    timeoutMs: 30_000,
+    maxRetries: 3,
+    backoffBaseMs: 1000,
+    headers: { "x-apisports-key": key },
+  });
 
+  if (json) {
     await trackApiCall(path);
-
-    if (!res.ok) {
-      logger.warn({ status: res.status, path }, "API-Football HTTP error");
-      return null;
-    }
-
-    const json = (await res.json()) as { response: T; errors?: unknown };
     return json.response ?? null;
-  } catch (err) {
-    logger.error({ err, path }, "API-Football fetch failed");
-    return null;
   }
+
+  return null;
 }
 
 // ─── Fixture discovery ────────────────────────────────────────────────────────

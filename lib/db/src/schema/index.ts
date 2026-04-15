@@ -24,3 +24,4 @@ export * from "./lineMovements";
 export * from "./filteredBets";
 export * from "./liquiditySnapshots";
 export * from "./alerts";
+export * from "./cronExecutions";

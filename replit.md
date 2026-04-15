@@ -76,6 +76,20 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 
 **Services:**
 *   `alerting.ts`: Core CRUD (createAlert with dedup, acknowledge, getAlerts with pagination/filtering, getUnreadCount with per-severity breakdown, cleanupOldAlerts with 90-day retention, webhook delivery).
-*   `alertDetection.ts`: 20+ detection checks across categories: connectivity (Betfair/API-Football/VPS), risk (drawdown, exposure, consecutive losses), performance (CLV decay, ROI decline, win rate), execution (fill rate, latency), anomaly (statistical outliers), milestone (bet count, profit targets), system (API budget, no-bet detection).
+*   `alertDetection.ts`: 20+ detection checks across categories: connectivity (Betfair/API-Football/VPS), risk (drawdown, exposure, consecutive losses), performance (CLV decay, ROI decline, win rate), execution (fill rate, latency), anomaly (statistical outliers), milestone (bet count, profit targets), system (API budget, no-bet detection, cron health/missed-run detection).
+
+# Operational Resilience (6-Phase Hardening)
+
+**Phase 1 — API Resilience:** `resilientFetch.ts` provides 30s timeout, 3× exponential backoff retry, per-service circuit breaker (5 failures/10min → 15min cooldown). Wired into `apiFootball.ts` and `oddsPapi.ts`. Graceful degradation: API-Football circuit open → +5 opportunity score threshold.
+
+**Phase 2 — Bet Lifecycle Safety:** DB transaction wrapping (bet insert + compliance log in BEGIN/COMMIT/ROLLBACK). PENDING_PLACEMENT status set before Betfair API call; PLACEMENT_FAILED on failure/exception. `reconcileStalePlacements()` checks Betfair cleared orders hourly.
+
+**Phase 3 — Cron Monitoring:** `cron_executions` table tracks every job run (start/end/success/error/duration). `trackCronExecution()` wrapper in `safeRunIngestion` and `safeRunFeatures`. Trading cycle logs success/error to cron_executions. `checkCronHealth()` alert detection fires warning/critical for missed cron runs (trading 2+ misses = critical).
+
+**Phase 4 — Shutdown & Recovery:** SIGTERM/SIGINT handlers with idempotent shutdown flag. 2s grace period for in-flight operations, then reconcile stale placements and log shutdown to compliance. Startup reconciliation runs `reconcileStalePlacements()` before serving traffic.
+
+**Phase 5 — Database Safety:** `deleted_at` column on `paper_bets`, `compliance_logs`, `alerts`. DELETE operations converted to soft deletes (UPDATE SET deleted_at). Alert queries filter `deleted_at IS NULL`.
+
+**Phase 6 — Budget Projections:** Monthly usage projection (avg daily × days in month) on both API-Football and OddsPapi. Auto-throttle at 90% projected usage halves daily cap. Dashboard sidebar shows projection percentage with throttle warning (red "THROTTLED" indicator).
 
 **Scheduler crons:** Alert detection every 5 min, anomaly detection daily 04:30 UTC, cleanup weekly Sunday 06:00 UTC.

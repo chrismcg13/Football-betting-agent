@@ -259,7 +259,7 @@ async function main() {
     const staleCount = Number(staleCheck.rows[0]?.cnt ?? 0);
     if (staleCount > 0) {
       logger.warn({ staleCount }, "Production DB contains non-promoted bets — cleaning stale data");
-      await db.execute(sql`DELETE FROM paper_bets WHERE data_tier != 'promoted' OR data_tier IS NULL`);
+      await db.execute(sql`UPDATE paper_bets SET deleted_at = NOW() WHERE (data_tier != 'promoted' OR data_tier IS NULL) AND deleted_at IS NULL`);
       await db.execute(sql`DELETE FROM experiment_registry`);
       await db.execute(sql`DELETE FROM promotion_audit_log`);
       await db.execute(sql`DELETE FROM experiment_learning_journal`);
@@ -311,6 +311,21 @@ async function main() {
     logger.info("Production serves dashboard API only. Data arrives via syncDevToProd pipeline.");
   }
 
+  // 5b. Startup reconciliation — check for bets stuck in PENDING_PLACEMENT from a crash
+  if (ENVIRONMENT !== "production") {
+    try {
+      const { reconcileStalePlacements } = await import("./services/paperTrading");
+      const reconResult = await reconcileStalePlacements();
+      if (reconResult.reconciled > 0 || reconResult.flagged > 0) {
+        logger.warn(reconResult, "Startup reconciliation found stale placements from prior run");
+      } else {
+        logger.info("Startup reconciliation: no stale placements found");
+      }
+    } catch (err) {
+      logger.error({ err }, "Startup reconciliation failed — will retry on hourly cron");
+    }
+  }
+
   // 6. Log agent started to compliance audit trail
   await logAgentStarted({
     nodeVersion: process.version,
@@ -353,6 +368,50 @@ async function main() {
     logger.info({ intervalMs: KEEPALIVE_INTERVAL_MS }, "Keepalive ping active — GET /api/health every 5 min");
   });
 }
+
+// ─── Graceful shutdown ──────────────────────────────────────────────────────
+
+let isShuttingDown = false;
+
+export function isShutdownRequested(): boolean {
+  return isShuttingDown;
+}
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  logger.info({ signal }, "Graceful shutdown initiated — completing in-flight operations");
+
+  await db.insert(complianceLogsTable).values({
+    actionType: "system_shutdown",
+    details: {
+      signal,
+      reason: "graceful_shutdown",
+      timestamp: new Date().toISOString(),
+      environment: ENVIRONMENT,
+    },
+    timestamp: new Date(),
+  }).catch(() => {});
+
+  await new Promise((r) => setTimeout(r, 2000));
+
+  try {
+    const { reconcileStalePlacements } = await import("./services/paperTrading");
+    const result = await reconcileStalePlacements();
+    if (result.reconciled > 0 || result.flagged > 0) {
+      logger.info(result, "Shutdown reconciliation of stale placements complete");
+    }
+  } catch (err) {
+    logger.error({ err }, "Shutdown reconciliation failed");
+  }
+
+  logger.info({ signal }, "Graceful shutdown complete — exiting");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => void gracefulShutdown("SIGINT"));
 
 main().catch((err) => {
   logger.error({ err }, "Fatal startup error");

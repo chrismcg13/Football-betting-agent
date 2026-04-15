@@ -7,10 +7,10 @@ import {
   oddsSnapshotsTable,
   competitionConfigTable,
 } from "@workspace/db";
-import { eq, and, gte, lt, inArray, desc, sql, isNull, or } from "drizzle-orm";
+import { eq, and, gte, lt, lte, inArray, desc, sql, isNull, or } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { retrainIfNeeded } from "./predictionEngine";
-import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch } from "./apiFootball";
+import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch, isApiFootballCircuitOpen } from "./apiFootball";
 import { getThresholdCategory } from "./correlationDetector";
 import { isLiveMode, placeLiveBetOnBetfair, isBalanceStale, getLiveBankroll } from "./betfairLive";
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
@@ -352,6 +352,19 @@ export async function placePaperBet(
   }
   // ──────────────────────────────────────────────────────────────────────────
 
+  // ── Graceful degradation: tighten threshold when API-Football is down ──
+  const API_FOOTBALL_DEGRADATION_BOOST = 5;
+  if (isApiFootballCircuitOpen()) {
+    const tightenedMin = score - API_FOOTBALL_DEGRADATION_BOOST;
+    if (score < 70 + API_FOOTBALL_DEGRADATION_BOOST) {
+      return logReject(
+        `API-Football circuit open — opportunity score ${score} < tightened threshold ${70 + API_FOOTBALL_DEGRADATION_BOOST} (normal 70 + ${API_FOOTBALL_DEGRADATION_BOOST} degradation penalty)`,
+      );
+    }
+    logger.info({ matchId, score, tightenedMin }, "API-Football degraded — applying +5 score penalty (bet passes)");
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   // ── Production quarantine ──────────────────────────────────────────────
   // In production, only promoted-tier bets are allowed. Experiment-tier and
   // boosted bets must stay in the dev environment.
@@ -578,42 +591,88 @@ export async function placePaperBet(
     Math.round(stake * (backOdds - 1) * 0.98 * 100) / 100;
   const impliedProbability = 1 / backOdds;
 
-  const [bet] = await db
-    .insert(paperBetsTable)
-    .values({
-      matchId,
-      marketType,
-      selectionName,
-      betType: "back",
-      oddsAtPlacement: String(backOdds),
-      stake: String(stake),
-      potentialProfit: String(potentialProfit),
-      modelProbability: String(modelProbability),
-      betfairImpliedProbability: String(impliedProbability),
-      calculatedEdge: String(edge),
-      opportunityScore: String(score),
-      modelVersion: modelVersion ?? null,
-      oddsSource: oddsSource ?? "synthetic",
-      enhancedOpportunityScore: enhancedOpportunityScore != null ? String(enhancedOpportunityScore) : null,
-      pinnacleOdds: pinnacleOdds != null ? String(pinnacleOdds) : null,
-      pinnacleImplied: pinnacleImplied != null ? String(pinnacleImplied) : null,
-      bestOdds: bestOdds != null ? String(bestOdds) : null,
-      bestBookmaker: bestBookmaker ?? null,
-      betThesis: betThesis ?? null,
-      isContrarian: String(isContrarian),
-      status: "pending",
-      dataTier,
-      experimentTag: experimentTag ?? null,
-      opportunityBoosted,
-      originalOpportunityScore: originalOpportunityScore ?? null,
-      boostedOpportunityScore: boostedOpportunityScore ?? null,
-      syncEligible,
-      pinnacleEdgeCategory: pinnacleEdgeCategory ?? null,
-      lineDirection: lineDirection ?? null,
-      pinnacleSnapshotCount: pinnacleOdds ? 1 : 0,
-      clvDataQuality: pinnacleOdds ? "incomplete" : "incomplete",
-    })
-    .returning();
+  const kellyFraction = kellyFractionForScore(score);
+
+  const { pool } = await import("@workspace/db");
+  const pgClient = await pool.connect();
+  let bet: any;
+  try {
+    await pgClient.query("BEGIN");
+
+    const betResult = await db
+      .insert(paperBetsTable)
+      .values({
+        matchId,
+        marketType,
+        selectionName,
+        betType: "back",
+        oddsAtPlacement: String(backOdds),
+        stake: String(stake),
+        potentialProfit: String(potentialProfit),
+        modelProbability: String(modelProbability),
+        betfairImpliedProbability: String(impliedProbability),
+        calculatedEdge: String(edge),
+        opportunityScore: String(score),
+        modelVersion: modelVersion ?? null,
+        oddsSource: oddsSource ?? "synthetic",
+        enhancedOpportunityScore: enhancedOpportunityScore != null ? String(enhancedOpportunityScore) : null,
+        pinnacleOdds: pinnacleOdds != null ? String(pinnacleOdds) : null,
+        pinnacleImplied: pinnacleImplied != null ? String(pinnacleImplied) : null,
+        bestOdds: bestOdds != null ? String(bestOdds) : null,
+        bestBookmaker: bestBookmaker ?? null,
+        betThesis: betThesis ?? null,
+        isContrarian: String(isContrarian),
+        status: "pending",
+        dataTier,
+        experimentTag: experimentTag ?? null,
+        opportunityBoosted,
+        originalOpportunityScore: originalOpportunityScore ?? null,
+        boostedOpportunityScore: boostedOpportunityScore ?? null,
+        syncEligible,
+        pinnacleEdgeCategory: pinnacleEdgeCategory ?? null,
+        lineDirection: lineDirection ?? null,
+        pinnacleSnapshotCount: pinnacleOdds ? 1 : 0,
+        clvDataQuality: pinnacleOdds ? "incomplete" : "incomplete",
+      })
+      .returning();
+
+    bet = betResult[0];
+
+    await db.insert(complianceLogsTable).values({
+      actionType: "bet_placed",
+      details: {
+        betId: bet?.id,
+        matchId,
+        marketType,
+        selectionName,
+        backOdds,
+        stake,
+        potentialProfit,
+        modelProbability,
+        impliedProbability,
+        edge,
+        opportunityScore: score,
+        bankrollBefore: bankroll,
+        kellyFraction,
+        dynamicKellyFraction: kellyFraction,
+        modelVersion,
+        exposureAtPlacement: {
+          currentExposure: Math.round(exposureAtPlacement.current * 100) / 100,
+          maxExposure: Math.round(exposureAtPlacement.max * 100) / 100,
+          exposurePct: exposureAtPlacement.pct,
+        },
+      },
+      timestamp: new Date(),
+    });
+
+    await pgClient.query("COMMIT");
+  } catch (txErr) {
+    await pgClient.query("ROLLBACK");
+    logger.error({ err: txErr, matchId, marketType }, "Transaction failed for bet placement");
+    throw txErr;
+  } finally {
+    pgClient.release();
+  }
 
   if (bet?.id && pinnacleOdds) {
     storePinnacleSnapshot({
@@ -625,35 +684,6 @@ export async function placePaperBet(
       pinnacleOdds,
     }).catch((err) => logger.warn({ err, betId: bet.id }, "Failed to store snapshot A"));
   }
-
-  const kellyFraction = kellyFractionForScore(score);
-
-  await db.insert(complianceLogsTable).values({
-    actionType: "bet_placed",
-    details: {
-      betId: bet?.id,
-      matchId,
-      marketType,
-      selectionName,
-      backOdds,
-      stake,
-      potentialProfit,
-      modelProbability,
-      impliedProbability,
-      edge,
-      opportunityScore: score,
-      bankrollBefore: bankroll,
-      kellyFraction,
-      dynamicKellyFraction: kellyFraction,
-      modelVersion,
-      exposureAtPlacement: {
-        currentExposure: Math.round(exposureAtPlacement.current * 100) / 100,
-        maxExposure: Math.round(exposureAtPlacement.max * 100) / 100,
-        exposurePct: exposureAtPlacement.pct,
-      },
-    },
-    timestamp: new Date(),
-  });
 
   logger.info(
     {
@@ -705,12 +735,19 @@ export async function placePaperBet(
         "TIER 1: Bet qualifies for live placement",
       );
 
+      await db.update(paperBetsTable)
+        .set({ status: "pending_placement" })
+        .where(eq(paperBetsTable.id, bet.id));
+
       try {
         if (isBalanceStale()) {
           logger.warn(
             { betId: bet.id },
             "LIVE: Skipping Betfair placement — balance is stale (>1hr)",
           );
+          await db.update(paperBetsTable)
+            .set({ status: "pending" })
+            .where(eq(paperBetsTable.id, bet.id));
         } else if (match?.betfairEventId) {
           const liveResult = await placeLiveBetOnBetfair({
             internalBetId: bet.id,
@@ -728,18 +765,27 @@ export async function placePaperBet(
               { betId: bet.id, error: liveResult.error },
               "LIVE: Betfair placement failed — paper bet recorded but no live bet",
             );
+            await db.update(paperBetsTable)
+              .set({ status: "placement_failed", betfairStatus: `FAILED: ${liveResult.error ?? "unknown"}` })
+              .where(eq(paperBetsTable.id, bet.id));
           }
         } else {
           logger.warn(
             { betId: bet.id, matchId },
             "LIVE: No betfairEventId for match — paper bet only",
           );
+          await db.update(paperBetsTable)
+            .set({ status: "pending" })
+            .where(eq(paperBetsTable.id, bet.id));
         }
       } catch (err) {
         logger.error(
           { err, betId: bet.id },
           "LIVE: Unexpected error during Betfair placement — paper bet preserved",
         );
+        await db.update(paperBetsTable)
+          .set({ status: "placement_failed", betfairStatus: `EXCEPTION: ${err instanceof Error ? err.message : String(err)}` })
+          .where(eq(paperBetsTable.id, bet.id));
       }
     } else {
       logger.info(
@@ -750,6 +796,114 @@ export async function placePaperBet(
   }
 
   return { placed: true, betId: bet?.id, stake };
+}
+
+// ===================== Reconcile stale PENDING_PLACEMENT bets =====================
+
+const STALE_PLACEMENT_THRESHOLD_MS = 10 * 60 * 1000;
+
+export async function reconcileStalePlacements(): Promise<{ reconciled: number; flagged: number }> {
+  const cutoff = new Date(Date.now() - STALE_PLACEMENT_THRESHOLD_MS);
+
+  const staleBets = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      stake: paperBetsTable.stake,
+      placedAt: paperBetsTable.placedAt,
+      betfairBetId: paperBetsTable.betfairBetId,
+    })
+    .from(paperBetsTable)
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending_placement"),
+        lte(paperBetsTable.placedAt, cutoff),
+      ),
+    );
+
+  if (staleBets.length === 0) return { reconciled: 0, flagged: 0 };
+
+  logger.warn({ count: staleBets.length }, "Found stale PENDING_PLACEMENT bets — reconciling");
+
+  let reconciled = 0;
+  let flagged = 0;
+
+  for (const bet of staleBets) {
+    try {
+      if (bet.betfairBetId) {
+        await db.update(paperBetsTable)
+          .set({ status: "pending" })
+          .where(eq(paperBetsTable.id, bet.id));
+        reconciled++;
+        logger.info({ betId: bet.id, betfairBetId: bet.betfairBetId }, "Stale bet had Betfair ID — restored to pending");
+      } else {
+        if (isLiveMode()) {
+          try {
+            const { listClearedOrders } = await import("./betfairLive");
+            const cleared = await listClearedOrders("LATEST", 50);
+            const matchingOrder = cleared?.clearedOrders?.find((o: any) =>
+              Math.abs(Number(o.sizeSettled ?? o.sizeMatched ?? 0) - Number(bet.stake)) < 0.5,
+            );
+
+            if (matchingOrder) {
+              await db.update(paperBetsTable)
+                .set({
+                  status: "pending",
+                  betfairBetId: matchingOrder.betId,
+                  betfairStatus: "RECONCILED",
+                })
+                .where(eq(paperBetsTable.id, bet.id));
+              reconciled++;
+              logger.info(
+                { betId: bet.id, betfairBetId: matchingOrder.betId },
+                "Stale bet matched to Betfair order — reconciled",
+              );
+              continue;
+            }
+          } catch (bfErr) {
+            logger.warn({ betId: bet.id, err: bfErr }, "Could not query Betfair for stale bet reconciliation");
+          }
+        }
+
+        await db.update(paperBetsTable)
+          .set({ status: "placement_failed", betfairStatus: "STALE_PENDING: not found on Betfair" })
+          .where(eq(paperBetsTable.id, bet.id));
+        flagged++;
+
+        await db.insert(complianceLogsTable).values({
+          actionType: "stale_placement_flagged",
+          details: {
+            betId: bet.id,
+            matchId: bet.matchId,
+            marketType: bet.marketType,
+            selectionName: bet.selectionName,
+            placedAt: bet.placedAt?.toISOString(),
+            ageMinutes: Math.round((Date.now() - (bet.placedAt?.getTime() ?? 0)) / 60000),
+          },
+          timestamp: new Date(),
+        });
+
+        const { createAlert } = await import("./alerting");
+        await createAlert({
+          severity: "warning",
+          category: "execution",
+          code: "STALE_PENDING_PLACEMENT",
+          title: "Stale pending placement detected",
+          message: `Bet #${bet.id} (${bet.marketType} on match ${bet.matchId}) was in PENDING_PLACEMENT for ${Math.round((Date.now() - (bet.placedAt?.getTime() ?? 0)) / 60000)} minutes without resolution. Marked as placement_failed.`,
+          metadata: { betId: bet.id, matchId: bet.matchId, marketType: bet.marketType },
+        });
+
+        logger.warn({ betId: bet.id }, "Stale bet flagged as placement_failed — no Betfair match found");
+      }
+    } catch (err) {
+      logger.error({ err, betId: bet.id }, "Error reconciling stale placement");
+    }
+  }
+
+  logger.info({ reconciled, flagged, total: staleBets.length }, "Stale placement reconciliation complete");
+  return { reconciled, flagged };
 }
 
 // ===================== Determine bet outcome from match result =====================

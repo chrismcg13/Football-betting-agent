@@ -575,6 +575,36 @@ export async function runMigrations() {
         ON alerts(code)
     `);
 
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS cron_executions (
+        id SERIAL PRIMARY KEY,
+        job_name TEXT NOT NULL,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        success BOOLEAN,
+        records_processed INTEGER DEFAULT 0,
+        error_message TEXT,
+        duration_ms INTEGER
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_cron_executions_job_name
+        ON cron_executions(job_name, started_at DESC)
+    `);
+
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
+    `);
+    await db.execute(sql`
+      ALTER TABLE compliance_logs
+        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
+    `);
+    await db.execute(sql`
+      ALTER TABLE alerts
+        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

@@ -1,5 +1,5 @@
 import { db, alertsTable } from "@workspace/db";
-import { eq, and, gte, desc, sql, count } from "drizzle-orm";
+import { eq, and, gte, desc, sql, count, isNull } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 export type AlertSeverity = "critical" | "warning" | "info";
@@ -40,6 +40,7 @@ export async function createAlert(input: CreateAlertInput): Promise<number | nul
         and(
           eq(alertsTable.code, input.code),
           gte(alertsTable.createdAt, cutoff),
+          isNull(alertsTable.deletedAt),
         ),
       )
       .limit(1);
@@ -156,12 +157,12 @@ export async function getAlerts(opts: {
   const limit = opts.limit ?? 50;
   const offset = (page - 1) * limit;
 
-  const conditions: any[] = [];
+  const conditions: any[] = [isNull(alertsTable.deletedAt)];
   if (opts.severity) conditions.push(eq(alertsTable.severity, opts.severity));
   if (opts.acknowledged !== undefined)
     conditions.push(eq(alertsTable.acknowledged, opts.acknowledged));
 
-  const where = conditions.length > 0 ? and(...conditions) : undefined;
+  const where = and(...conditions);
 
   const [alerts, [countResult]] = await Promise.all([
     db
@@ -198,7 +199,7 @@ export async function getUnreadCount(): Promise<{
       count: count(),
     })
     .from(alertsTable)
-    .where(eq(alertsTable.acknowledged, false))
+    .where(and(eq(alertsTable.acknowledged, false), isNull(alertsTable.deletedAt)))
     .groupBy(alertsTable.severity);
 
   const result = { total: 0, critical: 0, warning: 0, info: 0 };
@@ -215,7 +216,8 @@ export async function getUnreadCount(): Promise<{
 export async function cleanupOldAlerts(retentionDays = 90): Promise<number> {
   const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
   const result = await db
-    .delete(alertsTable)
-    .where(sql`${alertsTable.createdAt} < ${cutoff}`);
+    .update(alertsTable)
+    .set({ deletedAt: new Date() })
+    .where(sql`${alertsTable.createdAt} < ${cutoff} AND ${alertsTable.deletedAt} IS NULL`);
   return result.rowCount ?? 0;
 }

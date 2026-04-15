@@ -28,8 +28,10 @@ import {
 } from "@workspace/db";
 import { eq, and, gte, lte, sql, like, inArray, ne, desc } from "drizzle-orm";
 import { logger } from "../lib/logger";
+import { resilientFetch, isCircuitOpen } from "./resilientFetch";
 
 const BASE_URL = "https://api.oddspapi.io/v4";
+const ODDSPAPI_SERVICE = "oddspapi";
 const MONTHLY_CAP = 100_000;
 const DEFAULT_DAILY_CAP = 3_300;
 
@@ -188,6 +190,9 @@ export async function getOddspapiStatus(): Promise<{
   monthlyCap: number;
   enabled: boolean;
   byPriority?: Record<string, number>;
+  projectedMonthlyUsage: number;
+  projectedPct: number;
+  throttled: boolean;
 }> {
   const key = process.env.ODDSPAPI_KEY;
   const [todayCount, monthCount, effectiveDailyCap, p1, p2, p3, p4] = await Promise.all([
@@ -199,13 +204,31 @@ export async function getOddspapiStatus(): Promise<{
     getOddspapiUsageByPriority("P3"),
     getOddspapiUsageByPriority("P4"),
   ]);
+
+  const now = new Date();
+  const dayOfMonth = now.getUTCDate();
+  const daysInMonth = new Date(now.getUTCFullYear(), now.getUTCMonth() + 1, 0).getUTCDate();
+  const avgDailyUsage = dayOfMonth > 0 ? monthCount / dayOfMonth : 0;
+  const projectedMonthlyUsage = Math.round(avgDailyUsage * daysInMonth);
+  const projectedPct = MONTHLY_CAP > 0 ? Math.round((projectedMonthlyUsage / MONTHLY_CAP) * 100) : 0;
+  const throttled = projectedPct >= 90;
+
   return {
-    todayCount, monthCount, dailyCap: effectiveDailyCap, monthlyCap: MONTHLY_CAP, enabled: !!key,
+    todayCount, monthCount,
+    dailyCap: throttled ? Math.round(effectiveDailyCap * 0.5) : effectiveDailyCap,
+    monthlyCap: MONTHLY_CAP, enabled: !!key,
     byPriority: { P1: p1, P2: p2, P3: p3, P4: p4 },
+    projectedMonthlyUsage,
+    projectedPct,
+    throttled,
   };
 }
 
 // ─── Core fetch ───────────────────────────────────────────────────────────────
+
+export function isOddsPapiCircuitOpen(): boolean {
+  return isCircuitOpen(ODDSPAPI_SERVICE);
+}
 
 async function fetchOddsPapi<T = unknown>(
   path: string,
@@ -227,24 +250,21 @@ async function fetchOddsPapi<T = unknown>(
     url.searchParams.set(k, String(v));
   }
 
-  try {
-    const res = await fetch(url.toString());
+  const json = await resilientFetch<Record<string, unknown>>(url.toString(), {
+    service: ODDSPAPI_SERVICE,
+    timeoutMs: 30_000,
+    maxRetries: 3,
+    backoffBaseMs: 1000,
+  });
+
+  if (json) {
     await trackOddspapiCall(trackAs, 1, priority);
-
-    if (!res.ok) {
-      logger.warn({ status: res.status, path }, "OddsPapi HTTP error");
-      return null;
-    }
-
-    const json = await res.json() as Record<string, unknown>;
-    // Handle both { data: ... } and direct array responses
-    if (json.data !== undefined) return json.data as T;
+    if ((json as any).data !== undefined) return (json as any).data as T;
     if (Array.isArray(json)) return json as unknown as T;
     return json as unknown as T;
-  } catch (err) {
-    logger.error({ err, path }, "OddsPapi fetch failed");
-    return null;
   }
+
+  return null;
 }
 
 // ─── Team name normalisation (comprehensive, shared with apiFootball.ts) ─────

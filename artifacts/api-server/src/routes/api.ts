@@ -1762,8 +1762,16 @@ router.get("/admin/promotion-log", async (_req, res) => {
 
 router.get("/admin/circuit-breaker-status", async (_req, res) => {
   try {
+    const { getCircuitStatus } = await import("../services/resilientFetch");
     const status = await getCircuitBreakerStatus();
-    res.json({ success: true, ...status });
+    res.json({
+      success: true,
+      ...status,
+      apiCircuitBreakers: {
+        apiFootball: getCircuitStatus("api-football"),
+        oddsPapi: getCircuitStatus("oddspapi"),
+      },
+    });
   } catch (err) {
     logger.error({ err }, "Failed to get circuit breaker status");
     res.status(500).json({ success: false, message: String(err) });
