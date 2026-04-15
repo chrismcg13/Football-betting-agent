@@ -1,8 +1,8 @@
 /**
  * API-Football v3 Integration
  * Base: https://v3.football.api-sports.io/
- * Upgraded plan: 75,000 requests/day — no rationing needed.
- * Priority: odds (all bookmakers) → fixture stats → team stats
+ * Budget: 75,000 requests/month with flexible daily cap.
+ * Priority: odds (betting leagues) → fixture stats → team stats → discovery
  */
 
 import {
@@ -14,12 +14,17 @@ import {
   apiUsageTable,
   oddsHistoryTable,
   discoveredLeaguesTable,
+  competitionConfigTable,
+  paperBetsTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, desc, sql, ne, like } from "drizzle-orm";
+import { eq, and, gte, lte, desc, sql, ne, like, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const BASE_URL = "https://v3.football.api-sports.io";
-const DAILY_CAP = 75_000;
+const MONTHLY_CAP = 75_000;
+const DEFAULT_DAILY_CAP = 2_500;
+const MIN_DAILY_CAP = 1_500;
+const MAX_DAILY_CAP = 4_000;
 
 // ─── Comprehensive league ID mapping ─────────────────────────────────────────
 export const LEAGUE_IDS: Record<string, number> = {
@@ -493,6 +498,36 @@ export async function getApiUsageToday(): Promise<number> {
   return Number(rows[0]?.total ?? 0);
 }
 
+function monthStr(): string {
+  const now = new Date();
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+export async function getApiUsageThisMonth(): Promise<number> {
+  const prefix = monthStr();
+  const rows = await db
+    .select({ total: sql<number>`COALESCE(sum(${apiUsageTable.requestCount})::int, 0)` })
+    .from(apiUsageTable)
+    .where(
+      and(
+        sql`${apiUsageTable.date} LIKE ${prefix + '%'}`,
+        sql`${apiUsageTable.endpoint} NOT LIKE 'oddspapi_%'`,
+      ),
+    );
+  return Number(rows[0]?.total ?? 0);
+}
+
+function getFlexibleDailyCap(): number {
+  const now = new Date();
+  const dayOfMonth = now.getUTCDate();
+  const daysInMonth = new Date(now.getUTCFullYear(), now.getUTCMonth() + 1, 0).getUTCDate();
+  const daysRemaining = daysInMonth - dayOfMonth + 1;
+  const idealDaily = Math.round(MONTHLY_CAP / daysInMonth);
+  const earlyMonthBuffer = dayOfMonth <= 10 ? 1.3 : dayOfMonth <= 20 ? 1.0 : 0.8;
+  const flexCap = Math.round(idealDaily * earlyMonthBuffer);
+  return Math.max(MIN_DAILY_CAP, Math.min(MAX_DAILY_CAP, flexCap));
+}
+
 async function trackApiCall(endpoint: string, count = 1): Promise<void> {
   await db.insert(apiUsageTable).values({
     date: todayStr(),
@@ -502,8 +537,13 @@ async function trackApiCall(endpoint: string, count = 1): Promise<void> {
 }
 
 async function canMakeRequest(needed = 1): Promise<boolean> {
-  const used = await getApiUsageToday();
-  return used + needed <= DAILY_CAP;
+  const [dailyUsed, monthlyUsed] = await Promise.all([
+    getApiUsageToday(),
+    getApiUsageThisMonth(),
+  ]);
+  const dailyCap = getFlexibleDailyCap();
+  if (monthlyUsed + needed > MONTHLY_CAP) return false;
+  return dailyUsed + needed <= dailyCap;
 }
 
 export async function getApiBudgetStatus(): Promise<{
@@ -511,9 +551,26 @@ export async function getApiBudgetStatus(): Promise<{
   cap: number;
   remaining: number;
   date: string;
+  monthlyUsed: number;
+  monthlyCap: number;
+  monthlyRemaining: number;
+  dailyCap: number;
 }> {
-  const used = await getApiUsageToday();
-  return { used, cap: DAILY_CAP, remaining: Math.max(0, DAILY_CAP - used), date: todayStr() };
+  const [used, monthlyUsed] = await Promise.all([
+    getApiUsageToday(),
+    getApiUsageThisMonth(),
+  ]);
+  const dailyCap = getFlexibleDailyCap();
+  return {
+    used,
+    cap: dailyCap,
+    remaining: Math.max(0, dailyCap - used),
+    date: todayStr(),
+    monthlyUsed,
+    monthlyCap: MONTHLY_CAP,
+    monthlyRemaining: Math.max(0, MONTHLY_CAP - monthlyUsed),
+    dailyCap,
+  };
 }
 
 // ─── Core fetch ───────────────────────────────────────────────────────────────
@@ -1018,6 +1075,43 @@ export async function fetchAndStoreOddsForFixture(
   return storedCount;
 }
 
+export async function getLeagueOddsFetchTier(leagueName: string): Promise<"high" | "medium" | "low" | "dormant"> {
+  const config = await db
+    .select({ tier: competitionConfigTable.tier, pollingFrequency: competitionConfigTable.pollingFrequency, hasPinnacleOdds: competitionConfigTable.hasPinnacleOdds })
+    .from(competitionConfigTable)
+    .where(eq(competitionConfigTable.name, leagueName))
+    .limit(1);
+
+  if (!config[0]) return "low";
+
+  const hasPendingBets = await db
+    .select({ id: paperBetsTable.id })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        eq(matchesTable.league, leagueName),
+      ),
+    )
+    .limit(1);
+
+  if (hasPendingBets.length > 0) return "high";
+
+  if (config[0].tier === 1) return "high";
+  if (config[0].tier === 2 && config[0].hasPinnacleOdds) return "medium";
+  if (config[0].tier === 2) return "low";
+  return "dormant";
+}
+
+function shouldFetchOddsThisCycle(fetchTier: "high" | "medium" | "low" | "dormant"): boolean {
+  const hour = new Date().getUTCHours();
+  if (fetchTier === "high") return true;
+  if (fetchTier === "medium") return hour % 6 === 0;
+  if (fetchTier === "low") return hour % 12 === 0;
+  return false;
+}
+
 export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   fixturesProcessed: number;
   oddsStored: number;
@@ -1029,7 +1123,10 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   const mappings = await discoverFixtureMappings();
   logger.info({ count: mappings.length }, "Fixture mappings discovered");
 
+  const leagueTierCache = new Map<string, "high" | "medium" | "low" | "dormant">();
+
   let oddsStored = 0;
+  let skippedByTier = 0;
   const leaguesScanned = new Set<string>();
 
   for (const m of mappings) {
@@ -1037,6 +1134,18 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
       logger.warn("Budget exhausted — stopping odds ingestion");
       break;
     }
+
+    let fetchTier = leagueTierCache.get(m.league);
+    if (!fetchTier) {
+      fetchTier = await getLeagueOddsFetchTier(m.league);
+      leagueTierCache.set(m.league, fetchTier);
+    }
+
+    if (!shouldFetchOddsThisCycle(fetchTier)) {
+      skippedByTier++;
+      continue;
+    }
+
     const count = await fetchAndStoreOddsForFixture(m.matchId, m.fixtureId, m.kickoffTime);
     oddsStored += count;
     leaguesScanned.add(m.league);
@@ -1045,6 +1154,7 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   logger.info({
     fixturesProcessed: mappings.length,
     oddsStored,
+    skippedByTier,
     leaguesScanned: leaguesScanned.size,
     leagues: [...leaguesScanned],
     budgetUsed: await getApiUsageToday(),
@@ -1056,6 +1166,7 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
       action: "odds_ingestion",
       fixturesProcessed: mappings.length,
       oddsStored,
+      skippedByTier,
       leaguesScanned: [...leaguesScanned],
       budgetUsed: await getApiUsageToday(),
     },
@@ -1466,4 +1577,269 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
 
   logger.info({ leaguesScanned, fixturesInserted, fixturesUpdated }, "Discovered league fixture ingestion complete");
   return { leaguesScanned, fixturesInserted, fixturesUpdated };
+}
+
+// ─── League Performance Scoring ───────────────────────────────────────────────
+
+export interface LeagueScore {
+  league: string;
+  totalBets: number;
+  winRate: number;
+  avgClv: number;
+  roi: number;
+  dataCompleteness: number;
+  hasPinnacle: boolean;
+  fixtureFrequency: number;
+  compositeScore: number;
+  sampleSizeWeight: number;
+  tier: number;
+}
+
+export async function calculateLeaguePerformanceScores(): Promise<LeagueScore[]> {
+  const leagueStats = await db.execute(sql`
+    SELECT 
+      m.league,
+      COUNT(pb.id) as total_bets,
+      ROUND(AVG(CASE WHEN pb.status='won' THEN 1 WHEN pb.status='lost' THEN 0 END)::numeric * 100, 2) as win_rate,
+      ROUND(AVG(CASE WHEN pb.clv_pct IS NOT NULL THEN pb.clv_pct::numeric END), 2) as avg_clv,
+      ROUND(SUM(CASE WHEN pb.settlement_pnl IS NOT NULL THEN pb.settlement_pnl::numeric ELSE 0 END) / NULLIF(SUM(pb.stake::numeric), 0) * 100, 2) as roi
+    FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    WHERE pb.status IN ('won','lost')
+    GROUP BY m.league
+    HAVING COUNT(pb.id) >= 1
+  `);
+
+  const configRows = await db
+    .select({
+      name: competitionConfigTable.name,
+      tier: competitionConfigTable.tier,
+      hasStatistics: competitionConfigTable.hasStatistics,
+      hasLineups: competitionConfigTable.hasLineups,
+      hasPinnacleOdds: competitionConfigTable.hasPinnacleOdds,
+      hasEvents: competitionConfigTable.hasEvents,
+      fixtureCount: competitionConfigTable.fixtureCount,
+    })
+    .from(competitionConfigTable)
+    .where(eq(competitionConfigTable.isActive, true));
+
+  const configByName = new Map(configRows.map((c) => [c.name, c]));
+
+  const scores: LeagueScore[] = [];
+
+  for (const row of leagueStats.rows as Record<string, unknown>[]) {
+    const league = String(row.league ?? "");
+    const totalBets = Number(row.total_bets ?? 0);
+    const winRate = Number(row.win_rate ?? 0);
+    const avgClv = Number(row.avg_clv ?? 0);
+    const roi = Number(row.roi ?? 0);
+    const config = configByName.get(league);
+
+    const dataCompleteness = config
+      ? ((config.hasStatistics ? 30 : 0) +
+         (config.hasLineups ? 20 : 0) +
+         (config.hasPinnacleOdds ? 30 : 0) +
+         (config.hasEvents ? 20 : 0))
+      : 0;
+
+    const sampleSizeWeight = Math.min(1, Math.sqrt(totalBets / 30));
+
+    const clvScore = Math.max(0, Math.min(40, avgClv * 0.8)) * sampleSizeWeight;
+    const roiScore = Math.max(0, Math.min(25, (roi + 10) * 0.5)) * sampleSizeWeight;
+    const dataScore = dataCompleteness * 0.2;
+    const fixtureFreq = config?.fixtureCount ?? 0;
+    const fixtureScore = Math.min(15, fixtureFreq * 0.05);
+
+    const compositeScore = Math.round((clvScore + roiScore + dataScore + fixtureScore) * 10) / 10;
+
+    scores.push({
+      league,
+      totalBets,
+      winRate,
+      avgClv,
+      roi,
+      dataCompleteness,
+      hasPinnacle: config?.hasPinnacleOdds ?? false,
+      fixtureFrequency: fixtureFreq,
+      compositeScore,
+      sampleSizeWeight,
+      tier: config?.tier ?? 3,
+    });
+  }
+
+  scores.sort((a, b) => b.compositeScore - a.compositeScore);
+
+  logger.info(
+    { leaguesScored: scores.length, topLeagues: scores.slice(0, 5).map((s) => `${s.league}: ${s.compositeScore}`) },
+    "League performance scoring complete",
+  );
+
+  return scores;
+}
+
+export async function deactivateLowValueLeagues(): Promise<{
+  deactivated: number;
+  kept: number;
+  reasons: Record<string, string>;
+}> {
+  const allActive = await db
+    .select({
+      id: competitionConfigTable.id,
+      apiFootballId: competitionConfigTable.apiFootballId,
+      name: competitionConfigTable.name,
+      tier: competitionConfigTable.tier,
+      hasStatistics: competitionConfigTable.hasStatistics,
+      hasPinnacleOdds: competitionConfigTable.hasPinnacleOdds,
+      hasOdds: competitionConfigTable.hasOdds,
+    })
+    .from(competitionConfigTable)
+    .where(eq(competitionConfigTable.isActive, true));
+
+  const leaguesWithBets = await db.execute(sql`
+    SELECT DISTINCT m.league FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    WHERE pb.status IN ('won','lost','pending')
+  `);
+  const bettingLeagues = new Set(
+    (leaguesWithBets.rows as Record<string, unknown>[]).map((r) => String(r.league ?? "")),
+  );
+
+  const leaguesWithUpcoming = await db.execute(sql`
+    SELECT DISTINCT league FROM matches WHERE status = 'scheduled' AND kickoff_time > NOW()
+  `);
+  const upcomingLeagues = new Set(
+    (leaguesWithUpcoming.rows as Record<string, unknown>[]).map((r) => String(r.league ?? "")),
+  );
+
+  let deactivated = 0;
+  let kept = 0;
+  const reasons: Record<string, string> = {};
+
+  for (const league of allActive) {
+    let keep = false;
+    let reason = "";
+
+    if (league.tier === 1) {
+      keep = true;
+      reason = "tier_1";
+    } else if (bettingLeagues.has(league.name)) {
+      keep = true;
+      reason = "has_bets";
+    } else if (league.hasPinnacleOdds && league.hasStatistics) {
+      keep = true;
+      reason = "pinnacle_with_stats";
+    } else if (league.tier === 2 && league.hasStatistics && upcomingLeagues.has(league.name)) {
+      keep = true;
+      reason = "tier2_with_stats_and_fixtures";
+    }
+
+    if (!keep) {
+      await db
+        .update(competitionConfigTable)
+        .set({ isActive: false, pollingFrequency: "dormant" })
+        .where(eq(competitionConfigTable.id, league.id));
+      deactivated++;
+      reasons[league.name] = "deactivated: no bets, no pinnacle, no stats";
+    } else {
+      kept++;
+      reasons[league.name] = reason;
+    }
+  }
+
+  logger.info({ deactivated, kept }, "League deactivation complete");
+  return { deactivated, kept, reasons };
+}
+
+// ─── Settlement Scope Reduction ───────────────────────────────────────────────
+
+export async function getLeaguesWithPendingBets(): Promise<Set<string>> {
+  const rows = await db.execute(sql`
+    SELECT DISTINCT m.league FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    WHERE pb.status = 'pending'
+  `);
+  return new Set(
+    (rows.rows as Record<string, unknown>[]).map((r) => String(r.league ?? "")),
+  );
+}
+
+// ─── Pre-kickoff Lineup Capture ───────────────────────────────────────────────
+
+export async function capturePreKickoffLineups(): Promise<{
+  checked: number;
+  captured: number;
+  keyPlayerMissing: number;
+}> {
+  const now = new Date();
+  const in90min = new Date(now.getTime() + 90 * 60 * 1000);
+  const in30min = new Date(now.getTime() + 30 * 60 * 1000);
+
+  const matchesWithBets = await db.execute(sql`
+    SELECT DISTINCT m.id, m.home_team, m.away_team, m.league, m.api_fixture_id, m.kickoff_time
+    FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    WHERE pb.status = 'pending'
+      AND m.status = 'scheduled'
+      AND m.kickoff_time BETWEEN ${in30min} AND ${in90min}
+      AND m.api_fixture_id IS NOT NULL
+  `);
+
+  if (matchesWithBets.rows.length === 0) {
+    return { checked: 0, captured: 0, keyPlayerMissing: 0 };
+  }
+
+  let captured = 0;
+  let keyPlayerMissing = 0;
+
+  for (const row of matchesWithBets.rows as Record<string, unknown>[]) {
+    const fixtureId = Number(row.api_fixture_id);
+    if (!fixtureId || !(await canMakeRequest())) continue;
+
+    try {
+      const data = await fetchApiFootball<{
+        fixture: { id: number };
+        lineups?: Array<{
+          team: { id: number; name: string };
+          startXI?: Array<{ player: { id: number; name: string; number: number; pos: string } }>;
+          substitutes?: Array<{ player: { id: number; name: string; number: number; pos: string } }>;
+          coach?: { id: number; name: string };
+        }>;
+      }[]>("/fixtures", { id: fixtureId });
+
+      if (!data || data.length === 0) continue;
+
+      const fixture = data[0];
+      if (!fixture?.lineups || fixture.lineups.length === 0) continue;
+
+      const matchId = Number(row.id);
+      const lineupData = {
+        lineups: fixture.lineups.map((l) => ({
+          team: l.team.name,
+          startXI: l.startXI?.map((p) => p.player.name) ?? [],
+          subs: l.substitutes?.slice(0, 7).map((p) => p.player.name) ?? [],
+          coach: l.coach?.name ?? null,
+        })),
+        capturedAt: new Date().toISOString(),
+      };
+
+      await db.insert(featuresTable).values({
+        matchId,
+        featureName: "_lineup_data",
+        featureValue: JSON.stringify(lineupData),
+        computedAt: new Date(),
+      }).onConflictDoNothing();
+
+      captured++;
+
+      logger.info(
+        { matchId, fixtureId, home: row.home_team, away: row.away_team },
+        "Pre-kickoff lineup captured",
+      );
+    } catch (err) {
+      logger.warn({ err, fixtureId }, "Lineup capture failed — skipping");
+    }
+  }
+
+  logger.info({ checked: matchesWithBets.rows.length, captured, keyPlayerMissing }, "Pre-kickoff lineup capture complete");
+  return { checked: matchesWithBets.rows.length, captured, keyPlayerMissing };
 }

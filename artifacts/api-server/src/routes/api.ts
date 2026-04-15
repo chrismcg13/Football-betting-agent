@@ -64,6 +64,9 @@ import {
   getApiBudgetStatus,
   fetchAndStoreOddsForAllUpcoming,
   getScanStats,
+  calculateLeaguePerformanceScores,
+  deactivateLowValueLeagues,
+  capturePreKickoffLineups,
 } from "../services/apiFootball";
 import { getTodayLineMovements } from "../services/lineMovement";
 import { getThresholdCategory } from "../services/correlationDetector";
@@ -2091,6 +2094,36 @@ router.get("/dashboard/line-movements", async (_req, res) => {
     });
   } catch (err) {
     logger.warn({ err }, "Line movements endpoint failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get("/dashboard/league-scores", async (_req, res) => {
+  try {
+    const scores = await calculateLeaguePerformanceScores();
+    res.json({ scores, count: scores.length });
+  } catch (err) {
+    logger.warn({ err }, "League scores endpoint failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/admin/deactivate-low-value-leagues", async (_req, res) => {
+  try {
+    const result = await deactivateLowValueLeagues();
+    res.json(result);
+  } catch (err) {
+    logger.warn({ err }, "League deactivation failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/admin/capture-lineups", async (_req, res) => {
+  try {
+    const result = await capturePreKickoffLineups();
+    res.json(result);
+  } catch (err) {
+    logger.warn({ err }, "Lineup capture failed");
     res.status(500).json({ error: String(err) });
   }
 });

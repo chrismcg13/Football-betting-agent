@@ -11,6 +11,11 @@ import {
   fetchAndStoreOddsForAllUpcoming,
   fetchTeamStatsForUpcomingMatches,
   ingestFixturesForDiscoveredLeagues,
+  calculateLeaguePerformanceScores,
+  deactivateLowValueLeagues,
+  getLeaguesWithPendingBets,
+  capturePreKickoffLineups,
+  getApiBudgetStatus,
 } from "./apiFootball";
 import { runXGIngestion } from "./xgIngestionService";
 import {
@@ -31,7 +36,7 @@ import {
   analyseSharpMovements,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement } from "./apiFootball";
+import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql } from "drizzle-orm";
@@ -554,6 +559,8 @@ export async function runTradingCycle(): Promise<{
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
       let filterPassed = true;
+      let filterEdgeCategory: string | null = null;
+      let filterLineDirection: string | null = null;
       try {
         const filterResult = await pinnaclePreBetFilter({
           matchId: candidate.matchId,
@@ -566,6 +573,9 @@ export async function runTradingCycle(): Promise<{
           pinnacleOdds: validation?.pinnacleOdds ?? null,
           pinnacleImplied: validation?.pinnacleImplied ?? null,
         });
+
+        filterEdgeCategory = filterResult.edgeCategory !== "filtered" ? filterResult.edgeCategory : null;
+        filterLineDirection = filterResult.lineDirection !== "unknown" ? filterResult.lineDirection : null;
 
         if (!filterResult.passed) {
           logger.info(
@@ -612,8 +622,8 @@ export async function runTradingCycle(): Promise<{
           originalOpportunityScore: candidate.originalOpportunityScore,
           boostedOpportunityScore: candidate.boostedOpportunityScore,
           syncEligible: candidate.syncEligible,
-          pinnacleEdgeCategory: filterResult.edgeCategory !== "filtered" ? filterResult.edgeCategory : null,
-          lineDirection: filterResult.lineDirection !== "unknown" ? filterResult.lineDirection : null,
+          pinnacleEdgeCategory: filterEdgeCategory,
+          lineDirection: filterLineDirection,
         },
       );
 
@@ -657,6 +667,34 @@ export async function runTradingCycle(): Promise<{
 // ===================== Sync match results from football-data.org =====================
 
 export async function syncMatchResults(daysBack = 2): Promise<number> {
+  const pendingLeagues = await getLeaguesWithPendingBets();
+
+  const scheduledMatches = await db
+    .select()
+    .from(matchesTable)
+    .where(
+      and(
+        eq(matchesTable.status, "scheduled"),
+        sql`${matchesTable.kickoffTime} < NOW()`,
+        pendingLeagues.size > 0
+          ? sql`${matchesTable.league} IN (${sql.join(
+              [...pendingLeagues].map((l) => sql`${l}`),
+              sql`, `,
+            )})`
+          : sql`1=0`,
+      ),
+    );
+
+  if (scheduledMatches.length === 0) {
+    logger.info({ pendingLeagues: pendingLeagues.size }, "syncMatchResults: no scheduled past matches in pending-bet leagues");
+    return 0;
+  }
+
+  logger.info(
+    { pendingLeagues: pendingLeagues.size, scheduledPastMatches: scheduledMatches.length },
+    "syncMatchResults: scoped to leagues with pending bets",
+  );
+
   let recentFixtures: Awaited<ReturnType<typeof fetchRecentFixtureResults>>;
   try {
     recentFixtures = await fetchRecentFixtureResults(daysBack);
@@ -667,21 +705,6 @@ export async function syncMatchResults(daysBack = 2): Promise<number> {
 
   if (recentFixtures.length === 0) {
     logger.info("syncMatchResults: API-Football returned 0 finished fixtures");
-    return 0;
-  }
-
-  const scheduledMatches = await db
-    .select()
-    .from(matchesTable)
-    .where(
-      and(
-        eq(matchesTable.status, "scheduled"),
-        sql`${matchesTable.kickoffTime} < NOW()`,
-      ),
-    );
-
-  if (scheduledMatches.length === 0) {
-    logger.info("syncMatchResults: no scheduled past matches to update");
     return 0;
   }
 
@@ -1057,6 +1080,28 @@ export function startScheduler(): void {
     });
   }, { timezone: "UTC" });
   logger.info("Dev→Prod sync scheduler active — every 6 hours");
+
+  cron.schedule("*/15 * * * *", () => {
+    void capturePreKickoffLineups().catch((err) => {
+      logger.error({ err }, "Pre-kickoff lineup capture failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Pre-kickoff lineup capture active — every 15 min");
+
+  cron.schedule("0 3 1 * *", () => {
+    logger.info("Monthly league performance scoring + deactivation triggered");
+    void (async () => {
+      try {
+        const scores = await calculateLeaguePerformanceScores();
+        logger.info({ topScores: scores.slice(0, 10).map((s) => `${s.league}: ${s.compositeScore} (n=${s.totalBets}, w=${s.sampleSizeWeight.toFixed(2)})`).join(", ") }, "League scores calculated");
+        const result = await deactivateLowValueLeagues();
+        logger.info(result, "League deactivation complete");
+      } catch (err) {
+        logger.error({ err }, "Monthly league scoring/deactivation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Monthly league scoring active — 1st of month 03:00 UTC");
 
   // Startup trading cycle: fire 3 minutes after server start so any restart
   // doesn't leave the cycle dormant for up to 15 minutes.

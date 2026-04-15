@@ -42,17 +42,19 @@ const KNOWN_PINNACLE_LEAGUE_IDS = new Set([
   197,  // Super League Greece
   128,  // Argentine Liga Profesional
   262,  // Colombian Liga BetPlay
-  98,   // J1 League (Japan)
-  292,  // K League 1 (South Korea)
-  188,  // A-League (Australia)
-  235,  // Russian Premier League
-  333,  // Ukrainian Premier League
-  135,  // Serie A
-  207,  // Swiss Super League
-  218,  // Austrian Bundesliga
   106,  // Polish Ekstraklasa
   345,  // Czech First League
   283,  // Romanian Liga I
+  286,  // Serbian SuperLiga
+  188,  // A-League (Australia)
+  98,   // J1 League (Japan)
+  292,  // K-League 1 (South Korea)
+  244,  // Finnish Veikkausliiga
+  72,   // Brazilian Serie B
+  235,  // Russian Premier League
+  333,  // Ukrainian Premier League
+  207,  // Swiss Super League
+  218,  // Austrian Bundesliga
   210,  // Croatian HNL
   253,  // Major League Soccer
   4,    // UEFA Conference League
@@ -61,7 +63,6 @@ const KNOWN_PINNACLE_LEAGUE_IDS = new Set([
   141,  // Segunda División
   41,   // EFL League One
   42,   // EFL League Two
-  333,  // Ukrainian Premier League
   307,  // Saudi Pro League
   288,  // South Africa PSL
 ]);
