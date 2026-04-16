@@ -1,0 +1,127 @@
+LAUNCH DAY ACTIVATION — GO LIVE NOW
+
+This is it. Real money. Execute with extreme precision.
+
+PRE-LAUNCH CONFIGURATION:
+- Set opportunity score threshold to 67 (update agent_config)
+- TRADING_MODE must be LIVE
+- ENVIRONMENT must be production
+- Expected Betfair balance: approximately £1,044 — verify this matches the API response within £5 tolerance
+
+STEP 1: PRE-LAUNCH VALIDATION
+Run every check. If ANY single check fails, STOP IMMEDIATELY. Do not place a single bet.
+
+- [ ] TRADING_MODE = LIVE
+- [ ] ENVIRONMENT = production
+- [ ] DATABASE_URL points to Neon production database (NOT dev)
+- [ ] DEV_DATABASE_URL points back to dev database (for sync pipeline)
+- [ ] LIVE_BETFAIR_KEY is set and valid
+- [ ] BETFAIR_USERNAME and BETFAIR_PASSWORD are set
+- [ ] VPS relay is reachable (health check passes)
+- [ ] VPS → Betfair connectivity confirmed (session authentication succeeds)
+- [ ] Live Betfair balance fetched successfully — log the exact amount
+- [ ] Balance is approximately £1,044 (within £5 — if wildly different, STOP and alert me)
+- [ ] Commission tracking active (Betfair exchange record exists, 5% rate)
+- [ ] Opportunity score threshold = 67 (confirm after setting)
+- [ ] Risk level = Level 1 (25% max exposure, 2% max single bet)
+- [ ] All alerting functional (fire test info alert: "Go-live validation complete")
+- [ ] Pinnacle/OddsPapi integration active (verify recent data exists)
+- [ ] Dev→prod sync pipeline is non-destructive (confirm destructive ops were removed in audit)
+- [ ] Production quarantine blocks abandoned and demoted tiers only
+- [ ] Tier 1 gate has both paths active: Promoted path AND Data Richness path
+- [ ] All cron jobs registered and scheduled
+
+Log every check result with PASS/FAIL. Show me the full validation output before proceeding.
+
+STEP 2: CALCULATE LIVE EXPOSURE LIMITS
+Based on the actual Betfair balance (approximately £1,044), calculate and display:
+- Max single bet stake: 2% = ~£20.88
+- Max total open exposure: 25% = ~£261.00
+- Max daily loss: 5% = ~£52.20
+- Max weekly loss: 10% = ~£104.40
+- Max per-league exposure: 8% = ~£83.52
+- Max per-market-type exposure: 10% = ~£104.40
+- Max per-fixture correlated: 3% = ~£31.32
+- Bankroll floor (60% of deposit): £626.40
+
+These must be calculated from the ACTUAL live balance, not these approximations.
+
+STEP 3: SCAN OPEN PAPER BETS FOR LIVE PROMOTION
+Query the dev database for all current paper trade bets that meet ALL of the following:
+- Status: OPEN (match has not kicked off)
+- Opportunity score >= 67
+- Pinnacle odds available (from unified layer: OddsPapi, API-Football, or derived)
+- Pinnacle edge >= 2% over implied probability
+- Data richness >= 70% for the league-market combination
+- Match kick-off MORE than 30 minutes from now
+- Match kick-off LESS than 72 hours from now
+- Available Betfair odds within 5% of paper trade identification odds
+
+Report: total scanned, filtered at each stage, number qualifying.
+
+STEP 4: ODDS VERIFICATION & EDGE CONFIRMATION
+For each qualifying bet:
+a) Fetch CURRENT live odds from Betfair Exchange via VPS relay
+b) Fetch CURRENT Pinnacle odds — confirm minimum 2% edge still holds
+c) Recalculate expected value using CURRENT Betfair odds (not paper trade odds)
+d) Apply commission-adjusted EV: adjusted_EV = (probability × (odds - 1) × (1 - 0.05)) - (1 - probability)
+e) Reject if commission-adjusted EV is negative
+f) Check available liquidity at target odds via VPS relay
+g) Recalculate Kelly stake against LIVE balance (not paper bankroll)
+h) Verify stake fits within ALL exposure limits (single bet, total, league, market type, fixture correlation)
+i) If current odds are BETTER than paper odds — place the bet
+j) If current odds are worse but still positive commission-adjusted EV with 2%+ Pinnacle edge — place the bet
+k) If edge has evaporated — SKIP and log why
+
+For every bet evaluated, log the full decision with all numbers.
+
+STEP 5: PLACE LIVE BETS
+For each bet that passes Step 4:
+a) Write to prod database with status PENDING_PLACEMENT
+b) Submit LIMIT order to Betfair via VPS relay at our calculated odds
+c) Target: under 5 seconds from signal to Betfair API submission
+d) If MATCHED: update status to PLACED, store Betfair betId, log success with execution time
+e) If UNMATCHED after 5 minutes: check if odds moved. If moved beyond edge threshold, cancel and log. If close, hold 10 more minutes then cancel if still unmatched.
+f) If PARTIALLY MATCHED: apply partial fill rules (>70% accept, 30-70% wait 5min, <30% cancel after 10min)
+g) Log EVERY action — this is the first real money the system has ever placed
+
+Place bets in order of HIGHEST opportunity score first. If exposure limits are reached before all qualifying bets are placed, queue the remainder for the next normal 5-minute trading cycle.
+
+STEP 6: LAUNCH REPORT
+Generate and display a complete launch report:
+
+- Validation: all checks passed (list each)
+- Live Betfair balance: £X
+- Bets scanned: X
+- Qualified for Tier 1: X
+- Passed odds verification: X
+- Passed Pinnacle edge: X
+- Passed liquidity check: X
+- Successfully placed: X
+- Skipped (edge gone): X
+- Skipped (no liquidity): X
+- Failed to place: X
+- Total stake deployed: £X (X% of balance)
+- Current open exposure: X% of balance
+- Per bet: fixture, league, market, selection, stake, odds, opp score, Pinnacle edge %, commission-adjusted EV, execution time, Betfair betId, status
+- Display on dashboard and in audit trail
+
+STEP 7: ACTIVATE NORMAL OPERATIONS
+After the launch batch:
+- The 5-minute trading cycle takes over — all future bets go through standard Tier 1/Tier 2 pipeline
+- Settlement reconciliation active (30-min cycle)
+- Balance refresh active (15-min cycle)  
+- Order management active (2-min cycle)
+- All alerting and anomaly detection active
+- The launch batch bets are tracked identically to any future bet
+- Fire informational alert: "LIVE TRADING ACTIVE. [X] bets placed at launch. Total exposure: X%. System operating normally."
+
+CRITICAL SAFETY RULES:
+- If Betfair balance does not match expectation (within £5), STOP EVERYTHING
+- If VPS relay is unreachable, STOP EVERYTHING
+- If more than 2 bets fail to place, STOP the batch and alert me
+- If any exposure limit would be breached, skip that bet (do not override limits)
+- This launch batch runs ONCE. After this, the normal 5-minute cycle handles everything.
+- Every penny is real. Every bet is permanent. Triple-check before submitting to Betfair.
+
+GO LIVE NOW. Show me the validation results first, then the launch report.
