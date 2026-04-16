@@ -1,0 +1,161 @@
+You're right, and I'll be direct: the mapping angle is the correct next move and we should push it aggressively before accepting "Pinnacle coverage is structurally thin."
+
+Let me explain what I think is actually happening, because it reframes the scope of what's possible.
+
+The hypothesis — and it's a strong one:
+
+Pinnacle almost certainly prices way more than 3.5% of your fixtures. Pinnacle prices the Premier League, Championship, every major European league, Champions League, most South American leagues, MLS, the big Asian leagues — the same competitions you're pulling into the 514 experiment tags. If only 7 of 200 matches are landing Pinnacle data, the most likely explanation isn't "Pinnacle doesn't price them." It's that the match identifier on your side isn't joining successfully to Pinnacle's identifier on OddsPapi's/API-Football's side.
+
+This is a classic mapping problem. Every data source names things slightly differently:
+
+    "Manchester United" vs "Man United" vs "Man Utd" vs "Manchester Utd" vs "MUFC"
+    "Inter" vs "Internazionale" vs "Inter Milan" vs "FC Internazionale Milano"
+    "Paris Saint-Germain" vs "PSG" vs "Paris SG" vs "Paris S-G"
+    Date/time drift across timezones
+    Competition names: "Premier League" vs "English Premier League" vs "EPL" vs "Barclays Premier League"
+    Women's/men's/reserves/U21s colliding when the naming gets sloppy
+
+If your mapping is doing strict string equality between your fixture table and OddsPapi's team names, you're going to miss 90%+ of matches. If it's doing simple substring matching, you'll catch some more but still miss a lot and introduce false positives. The actual fix is fuzzy matching with a disambiguation layer, and this is a solved problem — there are standard techniques (Levenshtein distance, Jaro-Winkler, token-sort ratio, normalised-name lookup tables) that get mapping success rates into the 95%+ range.
+
+Why I'm confident this is the bottleneck, not Pinnacle coverage itself:
+
+Dev apparently has better Pinnacle coverage in its historical data (implied by the fact that dev found 150 settled bets in the 48-57 score band — many of which must have had Pinnacle data to even be scored). If dev's mapping is also broken, both sides would be thin. Worth confirming, but the asymmetry between dev's historical bet quality and prod's current 3.5% coverage suggests mapping may have degraded in the Neon migration, or dev's mapping was always slightly better because it's had more time to accumulate manual corrections.
+
+Also telling: the fact that 7 of 200 matches do land Pinnacle data. It's not zero. It's not 100%. It's in that classic "strict-match finding the exact-equal names, missing everything else" range that fuzzy matching fixes.
+
+What aggressive mapping looks like:
+
+    Fuzzy string matching on team names — Levenshtein, Jaro-Winkler, or token-sort ratio with a tuned threshold (typically 85%+ similarity).
+    Normalised name lookup table — a mapping table you build and maintain: canonical team name → list of known aliases across sources. Seeded from known cases, auto-populated from high-confidence fuzzy matches, manually corrected where needed.
+    Multi-field matching — don't just match on team names. Match on (home team + away team + date within 24h + competition). This disambiguates "Liverpool" (England) from "Liverpool" (Uruguay), and catches timezone drift on kickoff times.
+    Source-provided IDs where they exist — API-Football has stable team IDs; OddsPapi may have its own. Build a cross-reference table between them so future lookups skip string matching entirely.
+    Logging every failed match — when mapping fails, log it with enough detail to investigate. Over time you'll see patterns: "Every Bundesliga 2 match fails because OddsPapi uses '2. Bundesliga' but we use 'Bundesliga 2.'" That's a 10-minute fix unlocking hundreds of matches.
+    Match confidence scoring — not every mapping is certain. High-confidence matches auto-accept, medium-confidence flag for review, low-confidence reject. Better to miss a match than mis-map to the wrong fixture.
+
+On your fallback question — running Tier 1 without Pinnacle validation:
+
+I'd strongly resist this, at least until mapping is exhausted. Pinnacle validation isn't just one more filter — it's the sharp-money anchor for your edge calculation. Dev's high CLV (+14.38%) is measured against Pinnacle's closing line. If you drop Pinnacle validation for live bets, you lose the CLV measurement that's your best leading indicator of whether the model is genuinely profitable in live conditions. You'd be flying blind on the one metric that tells you fastest whether to scale up or pull back.
+
+Dev runs without Pinnacle validation on some bets because dev is paper — the cost of a bad bet is zero. Live has real money on the line. Keeping Pinnacle as a live gate is correct until we prove mapping can't get coverage high enough, and we're not close to that proof yet.
+
+You said "cross that bridge when we come to it" and I agree. Push mapping hard first. If mapping gets coverage from 3.5% to 60%+ and Tier 1 volume is still insufficient, then it's worth discussing whether to allow live bets without Pinnacle validation — but probably with alternative validation (e.g. another sharp book's closing line, or a market-efficiency signal) rather than no validation at all.
+
+Also — the filter inventory problem is getting serious.
+
+We've found three hidden filters in three rounds (Tier 1 threshold at 67, contrarian threshold at 75, Level 1 exposure at 25%). I'm going to fold a demand for a complete filter and gate inventory into this prompt. You can't optimise a system whose filters you don't fully know. Every round we find another one and the work resets. Better to surface them all now.
+
+Here's the prompt:
+MISSION: Aggressive Pinnacle Mapping + Complete Filter Inventory
+
+The firehose is flowing at the discovery layer (457 value bets/cycle) but only 3.5% of matches have Pinnacle data (7 of 200). Pinnacle validation is the Tier 1 gate keeping bets paper. Before concluding "Pinnacle coverage is structurally thin," exhaust the mapping angle. Pinnacle prices far more matches than 3.5% of your fixture list — the coverage gap is almost certainly a match identification / mapping failure, not a data availability failure.
+
+Operating principle this round: try everything within API budget to improve mapping success. Be aggressive. Don't hold back on techniques. If a technique costs API calls, use them — that's what the budget is for. Chris would rather spend 80% of monthly budget on aggressive backfill and mapping than sit at 3.5% coverage conservatively.
+
+Alongside this, produce a complete inventory of every filter, threshold, gate, cap, level, and quarantine rule in the system. We've found three hidden ones in three rounds. No more surprises.
+
+Phase 1 — Mapping diagnostic (30 min, no changes yet).
+
+    Current mapping logic. Walk through exactly how matches are joined between your fixtures table and (a) OddsPapi Pinnacle odds, (b) API-Football Pinnacle odds.
+        Is it strict string equality on team names?
+        Substring matching?
+        Any fuzzy matching already in place? If so, algorithm and threshold.
+        What fields are matched: team names only, or (home, away, date, competition) tuple?
+        Are source-provided team IDs used anywhere, or is it all string-based?
+    Failure sampling. Take 30 matches from this cycle that failed to join Pinnacle data. For each:
+        Our team names (home, away)
+        Our competition name
+        Our kickoff time
+        What OddsPapi and API-Football returned for the same fixture (by searching their data for matches on the same date between plausibly similar team names)
+        Diagnose why the join failed: exact string mismatch, timezone drift, competition naming, transliteration, diacritics, abbreviations, women's/youth naming, something else
+    Report the failure patterns. Frequency of each failure type.
+    Dev vs prod comparison. What's dev's current Pinnacle coverage rate? Has dev ever been at 60%+ coverage, or has dev always been in the same 3.5-10% range? If dev has higher coverage, what's different about dev's mapping logic or data?
+    Upper bound estimate. Of the 193 missing matches in this cycle, how many are in leagues Pinnacle definitely prices (Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Championship, Champions League, Europa League, major continental competitions, etc.)? That number is the realistic upper bound of what mapping can unlock.
+
+Phase 2 — Complete filter and gate inventory.
+
+We have discovered three hidden filters across recent rounds: Tier 1 opp_score_threshold (was 67), contrarian threshold (75, hardcoded), Level 1 exposure limit (25% of balance). Produce a complete inventory of every rule in the system that can reject, downgrade, or gate a bet between discovery and live placement.
+
+For each rule, report:
+
+    Name
+    Where it's set (code file/line, config table, env var)
+    Current value in dev vs prod
+    What it does (rejects, downgrades to paper, caps, delays, etc.)
+    What triggers it (always, market-type specific, score-range specific, exposure-specific)
+    Whether it's referenced in the funnel report or hidden
+    Whether there's a graduation/unlock condition (e.g. Level 1 → Level 2)
+
+Include at minimum:
+
+    Score thresholds (all of them)
+    Contrarian / Pinnacle-alignment penalties and thresholds
+    Tier gates (Tier 1, Tier 2, any Tier 3?)
+    Quarantine rules (experiment-tier, opportunity-boosted, any others)
+    Exposure caps (per-bet, concurrent, daily, Level-based, market-type, league-based, experiment-tag-based, correlation-based)
+    Loss limits (daily, weekly, per-market, per-league)
+    Correlation filters
+    Data richness requirements
+    Stats coverage gates
+    Promoted/candidate/experiment tier gates
+    Circuit breakers
+    Rate limits (internal throttling, not just Betfair API)
+    Cooldowns after losses or wins
+    Any rule that references a "Level," "Tier," "Grade," "Stage," or similar ladder concept
+
+Present as a single structured table. This becomes the canonical reference.
+
+Phase 3 — Aggressive mapping fix (execute after Phase 1 reported and reviewed).
+
+Based on Phase 1 diagnosis, implement the following — use all of them, don't pick one:
+
+    Fuzzy string matching on team names using a strong algorithm. Jaro-Winkler or token-sort ratio recommended. Tune threshold via the 30-match failure sample — find the threshold that maximises true matches while minimising false positives.
+    Name normalisation pipeline before fuzzy matching:
+        Lowercase, strip diacritics (é → e), strip punctuation
+        Remove common noise words ("FC," "AFC," "CF," "Club," "de," "the")
+        Expand common abbreviations ("Man Utd" → "Manchester United," "PSG" → "Paris Saint-Germain")
+        Handle team name translations for non-English sources
+    Multi-field disambiguation. Always match on (home team, away team, kickoff within ±24h, competition) — not team names alone. Prevents cross-league collisions.
+    Persistent alias table. Build a team_aliases table: canonical_name, source, source_name, confidence. Seed from known cases. Auto-populate from high-confidence fuzzy matches. Allow manual corrections. Use the alias table as the primary lookup; fall back to fuzzy matching only when alias misses.
+    Source team ID cross-reference. API-Football provides stable team IDs. OddsPapi may too. Build a cross-reference table so future lookups skip string matching entirely. Populate aggressively.
+    Failure logging. Every mapping failure logged with full context: our match details, candidate source matches within the date window, why they were rejected. Review daily. Patterns become 10-minute fixes unlocking hundreds of matches.
+    Confidence scoring. High-confidence matches (alias hit, source ID match, or fuzzy score >95%) auto-accept. Medium-confidence (fuzzy 85-95%) accept but flag. Low-confidence (<85%) reject. Log all tiers.
+    Aggressive backfill. Once mapping is improved, re-run mapping across all historical fixtures and re-attach Pinnacle data wherever possible. Budget: use up to 50% of this month's remaining API budget on backfill. Prioritise:
+        Leagues where dev has the most settled bets at positive ROI
+        Recent fixtures (last 30 days)
+        Upcoming fixtures (next 14 days) — these are the ones that matter for live execution
+    Both sources, always. Both OddsPapi and API-Football queried for every match. No fallback-on-miss. Results merged; discrepancies logged.
+    Coverage metric on every cycle. Report Pinnacle coverage as a first-class metric in the funnel: matches_with_pinnacle / total_matches_evaluated, trended. Target: 60%+ coverage on matches in Pinnacle-priced leagues.
+
+Phase 4 — Report results.
+
+After Phase 3:
+
+    New Pinnacle coverage rate (matches with Pinnacle / total)
+    Coverage rate restricted to leagues Pinnacle actually prices
+    Tier 1 eligible bets per cycle before vs after
+    Live Tier 1 bets actually placed per cycle before vs after
+    API budget consumed by the backfill and ongoing dual-source queries
+    Any mapping edge cases flagged for manual review
+
+Fallback decision — don't execute, just analyse:
+
+If after full aggressive mapping, coverage tops out below 30% on matches in Pinnacle-priced leagues (i.e. mapping is genuinely blocked for reasons we can't fix with more effort), report:
+
+    Why mapping can't go higher
+    What alternative sharp-money validators exist (other sharp bookmakers, market efficiency metrics)
+    Whether running Tier 1 with relaxed Pinnacle requirements is defensible given dev's data
+
+Do not implement the fallback. Just report the analysis so Chris can decide.
+
+Operating rules:
+
+    Exhaust mapping before discussing dropping Pinnacle validation for Tier 1. Pinnacle CLV is the most important leading indicator of live model health.
+    Every Pinnacle coverage number backed by a query. No estimates.
+    API budget spent aggressively but tracked — report budget consumed vs monthly cap after the backfill.
+    The filter inventory (Phase 2) is non-negotiable. No more hidden filters discovered in subsequent rounds. Produce the complete list.
+    Dev and prod both receive the mapping improvements. Don't fix prod and leave dev behind.
+    Confirm DATABASE_URL isolation before and after.
+
+Report Phases 1 and 2 together for review before executing Phase 3. Phase 3 and 4 in a single push after approval.
+
+Go.

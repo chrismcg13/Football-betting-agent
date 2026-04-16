@@ -1549,11 +1549,22 @@ export function startScheduler(): void {
 
   setTimeout(async () => {
     try {
-      logger.info("Startup: running OddsPapi fixture mapping + API-Football odds refresh before trading cycle");
+      logger.info("Startup: running OddsPapi fixture mapping + bulk prefetch + API-Football odds refresh before trading cycle");
       await safeRunOddspapiMapping();
-      await fetchAndStoreOddsForAllUpcoming().then((r) => {
-        logger.info(r, "Startup API-Football odds refresh complete");
-      });
+      const [afResult, opResult] = await Promise.all([
+        fetchAndStoreOddsForAllUpcoming().then((r) => {
+          logger.info(r, "Startup API-Football odds refresh complete");
+          return r;
+        }),
+        runDedicatedBulkPrefetch(7, 1000).then(async (r) => {
+          logger.info(r, "Startup OddsPapi bulk prefetch complete");
+          const dc = await derivePinnacleDCFromMatchOdds();
+          logger.info(dc, "Startup post-prefetch DC derivation complete");
+          const unified = await backfillPinnacleUnified();
+          logger.info({ unified }, "Startup post-prefetch unified Pinnacle backfill complete");
+          return r;
+        }),
+      ]);
     } catch (err) {
       logger.warn({ err }, "Startup odds refresh failed — non-fatal, proceeding to trading cycle");
     }
@@ -1566,7 +1577,7 @@ export function startScheduler(): void {
         logger.warn({ err }, "Startup warmup failed — non-fatal, cron will retry");
       });
   }, 30 * 1000);
-  logger.info("Startup warmup scheduled — OddsPapi mapping + odds refresh + trading cycle in 30s");
+  logger.info("Startup warmup scheduled — OddsPapi mapping + bulk prefetch + odds refresh + trading cycle in 30s");
 
   // Seed baseline leagues + competition config at startup (idempotent — uses onConflictDoNothing)
   void seedBaselineLeagues().catch((err) => logger.warn({ err }, "Baseline league seed failed — non-fatal"));
