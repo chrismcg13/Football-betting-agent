@@ -21,7 +21,7 @@ const RISK_LEVELS: LiveRiskLevel[] = [
   {
     level: 1,
     maxSingleBetPct: 0.02,
-    maxOpenExposurePct: 0.25,
+    maxOpenExposurePct: 0.95,
     maxDailyLossPct: 0.05,
     maxWeeklyLossPct: 0.10,
     maxLeagueExposurePct: 0.08,
