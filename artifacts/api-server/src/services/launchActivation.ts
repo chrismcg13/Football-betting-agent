@@ -599,6 +599,7 @@ export async function runCrossDbLaunchActivation(opts?: {
   dryRun?: boolean;
   maxBets?: number;
   maxStakePerBet?: number;
+  excludeBetIds?: number[];
 }): Promise<{
   mode: string;
   dryRun: boolean;
@@ -611,6 +612,7 @@ export async function runCrossDbLaunchActivation(opts?: {
   const dryRun = opts?.dryRun ?? true;
   const maxBets = opts?.maxBets ?? 20;
   const maxStakePerBet = opts?.maxStakePerBet ?? 10;
+  const excludeBetIds = new Set(opts?.excludeBetIds ?? []);
 
   const devDbUrl = process.env.DEV_DATABASE_URL;
   if (!devDbUrl) {
@@ -656,6 +658,11 @@ export async function runCrossDbLaunchActivation(opts?: {
     const seenMatchMarket = new Set<string>();
 
     for (const row of rows) {
+      if (excludeBetIds.has(Number(row.bet_id))) {
+        incSkip("excluded_already_placed");
+        continue;
+      }
+
       const dedupKey = `${row.home_team}|${row.away_team}|${row.market_type}|${row.selection_name}`;
       if (seenMatchMarket.has(dedupKey)) {
         incSkip("duplicate_match_market");
@@ -717,6 +724,33 @@ export async function runCrossDbLaunchActivation(opts?: {
         betfairEventId: row.betfair_event_id,
         kickoffTime: new Date(row.kickoff_time),
       });
+    }
+
+    let alreadyPlacedKeys = new Set<string>();
+    try {
+      const countResult = await db.execute(sql`SELECT COUNT(*) AS cnt FROM paper_bets`);
+      const totalBets = Number((countResult.rows[0] as any)?.cnt ?? 0);
+      if (totalBets > 0) {
+        const alreadyPlacedRows = await db.execute(sql`
+          SELECT DISTINCT home_team || '|' || away_team || '|' || market_type || '|' || selection_name AS dedup_key
+          FROM paper_bets
+          WHERE deleted_at IS NULL
+        `);
+        alreadyPlacedKeys = new Set(
+          (alreadyPlacedRows.rows as any[]).map(r => r.dedup_key)
+        );
+      }
+    } catch (err) {
+      logger.warn({ err }, "Cross-DB: could not check already-placed bets on Neon — proceeding without dedup");
+    }
+    logger.info({ alreadyPlacedCount: alreadyPlacedKeys.size }, "Cross-DB: bets already on Neon");
+
+    for (const bet of [...qualified]) {
+      const dedupKey = `${bet.homeTeam}|${bet.awayTeam}|${bet.marketType}|${bet.selectionName}`;
+      if (alreadyPlacedKeys.has(dedupKey)) {
+        incSkip("already_placed_on_betfair");
+        qualified.splice(qualified.indexOf(bet), 1);
+      }
     }
 
     const skippedList = Object.entries(skippedReasons).map(([reason, count]) => ({ reason, count }));

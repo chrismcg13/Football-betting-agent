@@ -1829,6 +1829,20 @@ router.get("/admin/circuit-breaker-status", async (_req, res) => {
   }
 });
 
+router.post("/admin/set-config", async (req, res) => {
+  try {
+    const { key, value } = req.body;
+    if (!key || value === undefined) {
+      return res.status(400).json({ error: "key and value required" });
+    }
+    await setConfigValue(key, String(value));
+    const verify = await getConfigValue(key);
+    res.json({ success: true, key, value: verify });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/resume-agent", async (_req, res) => {
   try {
     await resumeAgent();
