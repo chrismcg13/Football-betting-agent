@@ -1,0 +1,80 @@
+FULL CAP RECONCILIATION: End the Whack-a-Mole
+We have fixed six binding constraints in six consecutive rounds. Each time we loosen one cap, the next tightest cap becomes the bottleneck. This approach is too slow. Fix all caps in one pass.
+The operating principle: prod's financial and concentration caps should match the risk tolerance Chris has already authorised (95% concurrent exposure, 3% per bet, 200/day budget) and should not independently throttle below those levels. The daily loss limit (5%) and weekly loss limit (10%) are the primary risk controls. Concentration caps are secondary and should be set loose enough that they only fire in genuinely extreme scenarios, not on normal trading volume.
+
+Phase 1: Pull current values for every Level 1 cap. Report as a table.
+For every rule in the financial/exposure section of the filter inventory (Rules 15-22), plus any concentration cap that can reject a bet:
+| Rule | Name | Current Level 1 Value | Current Dev Value | Recommended New Value |
+Include at minimum:
+
+Max single bet (Rule 15)
+Total open exposure (Rule 16)
+Daily loss limit (Rule 17)
+Weekly loss limit (Rule 18)
+League exposure cap (Rule 19)
+Market type exposure cap (Rule 20)
+Fixture exposure cap (Rule 21)
+Slippage guard (Rule 22)
+Any other concentration or exposure check that can reject a bet
+
+For each, state what dev uses. If dev is uncapped, say so.
+
+Phase 2: Apply these specific changes (all pre-authorised):
+
+Market type exposure cap (Rule 20): raise to 40% of balance. OVER_UNDER is 54% of value candidates. At 9.5%, the cap binds after ~3 bets. At 40%, the cap allows meaningful OVER_UNDER volume while still preventing a single market type from consuming the entire bankroll. This is the immediate blocker — fix it first.
+League exposure cap (Rule 19): raise to 30% of balance. Same logic. Some leagues (Premier League, Championship) generate disproportionate value. 8% throttles them after 2-3 bets.
+Fixture exposure cap (Rule 21): raise to 10% of balance. Currently 3% = one bet per fixture at max stake. 10% allows the per-match cap of 2 bets to actually function (2 bets × 3% stake = 6%, within 10%).
+Total open exposure (Rule 16): confirm at 95%. We authorised this earlier. If the Level 1 system is still overriding to 25%, fix it. This was supposed to be done already.
+Daily loss limit (Rule 17): keep at 5%. This is the real risk control. Don't touch it.
+Weekly loss limit (Rule 18): keep at 10%. Same.
+Max single bet (Rule 15): keep at 3%. Already set.
+Slippage guard (Rule 22): keep at 5%. Sensible protection against stale odds.
+
+
+Phase 3: Check for any OTHER cap or gate that could become the next binding constraint once the above are loosened.
+Go through the entire filter inventory (all 36 rules). For each rule, confirm: at the new cap levels above, with 200/day budget, 95% exposure, improved Pinnacle coverage, and Tier 1A + 1B paths both active — will this rule bind and throttle volume below expectations?
+Specifically check:
+
+Per-cycle cap of 30 — at 200/day across ~288 cycles (5-min cadence), average is <1 per cycle. But busy fixture windows could cluster. Is 30 enough?
+Per-match cap of 2 — fine, leave it.
+Category concentration (Rule 7, max 1 bet per market category per match) — fine, leave it.
+Consecutive loss circuit breakers (Rules 24-26) — these could pause trading for hours after a bad streak. At higher volume, streaks happen faster. Confirm the thresholds are appropriate for 50+ bets/day volume.
+Bankroll floor at 60% of deposits (Rule 27) — at £500 bankroll, this triggers at £300. With 95% concurrent exposure, a bad day could approach this. Confirm the halt mechanism works cleanly.
+
+Report any rule that will bind at projected volume levels. Propose adjustment if needed. Do not adjust without Chris's approval unless it's clearly a config bug.
+
+Phase 4: Run post-change cycle and report.
+After applying all Phase 2 changes:
+
+Run one trading cycle.
+Report:
+
+Total Tier 1 bets placed (1A + 1B + 1B_boosted)
+Breakdown by market type (especially OVER_UNDER volume now that the cap is loosened)
+Betfair balance before and after
+Betfair bet IDs for every live bet
+Which gates, if any, still rejected candidates — with counts
+Projected 24h live bet volume at this cycle's rate
+
+
+If fewer than 10 live bets place in the first post-change cycle, report the new binding constraint immediately.
+
+
+Phase 5: 24-hour volume target.
+After all changes, the realistic 24h target given current state (29% Pinnacle coverage climbing, Tier 1A + 1B active, all caps loosened):
+
+Minimum acceptable: 30 live bets/day. Below this means another hidden constraint exists.
+Expected: 50-100 live bets/day. Based on funnel showing ~457 value bets/cycle, ~30% Pinnacle coverage, and loosened concentration caps.
+Stretch: 100-200 live bets/day. Achievable as Pinnacle coverage climbs toward 60%.
+
+If 24h volume lands below 30, we do one more round. If it lands above 50, we shift focus from "more bets" to "monitoring live ROI and CLV on the bets we're placing."
+
+Operating rules:
+
+All Phase 2 changes ship in one deployment. No more one-at-a-time.
+After this round, if volume is still throttled, the next step is a systematic stress test: simulate placing 200 bets through the full pipeline and log every rejection at every gate. That will surface any remaining hidden constraints in one pass rather than discovering them one per round.
+Betfair balance movement remains the only proof of live execution.
+Daily and weekly loss limits are untouched. Those are the risk floor.
+Confirm DATABASE_URL isolation.
+
+Go.

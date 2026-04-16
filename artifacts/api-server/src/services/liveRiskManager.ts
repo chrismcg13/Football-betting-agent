@@ -20,13 +20,13 @@ export interface LiveRiskLevel {
 const RISK_LEVELS: LiveRiskLevel[] = [
   {
     level: 1,
-    maxSingleBetPct: 0.02,
+    maxSingleBetPct: 0.03,
     maxOpenExposurePct: 0.95,
     maxDailyLossPct: 0.05,
     maxWeeklyLossPct: 0.10,
-    maxLeagueExposurePct: 0.08,
-    maxMarketTypeExposurePct: 0.10,
-    maxFixtureExposurePct: 0.03,
+    maxLeagueExposurePct: 0.30,
+    maxMarketTypeExposurePct: 0.40,
+    maxFixtureExposurePct: 0.10,
     kellyFraction: 0.25,
   },
   {
