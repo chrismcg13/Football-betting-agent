@@ -774,7 +774,10 @@ export async function findEventIdByTeamNames(
   homeTeam: string,
   awayTeam: string,
 ): Promise<string | null> {
-  const shortHome = homeTeam.replace(/\b(FC|SC|CF|AC|AS|US|SS|SSC|1907|Calcio)\b/gi, "").trim().split(/\s+/).slice(0, 2).join(" ");
+  const shortHome = homeTeam
+    .replace(/\b(FC|SC|CF|AC|AS|US|SS|SSC|TSG|SV|VfL|VfB|1\. FC|1907|1899|1860|Calcio|W)\b/gi, "")
+    .replace(/\b(II|III|IV|B|C|U\d+)\b$/i, "")
+    .trim().split(/\s+/).slice(0, 2).join(" ");
   try {
     const markets = await apiRequest<MarketCatalogueItem[]>(
       "betting",
@@ -790,20 +793,24 @@ export async function findEventIdByTeamNames(
           },
         },
         marketProjection: ["MARKET_DESCRIPTION", "EVENT"],
-        maxResults: 10,
+        maxResults: 20,
       },
       3,
     );
-    const awayFirst = awayTeam.toLowerCase().split(/\s+/)[0];
+    const awayTokens = awayTeam.toLowerCase()
+      .replace(/\b(FC|SC|CF|AC|AS|US|SS|SSC|Borussia|TSG)\b/gi, "")
+      .trim().split(/\s+/);
+    const awayFirst = awayTokens[0];
     const match = markets.find(m => (m.event?.name ?? "").toLowerCase().includes(awayFirst));
     if (match) {
-      logger.info({ eventId: match.event.id, eventName: match.event.name }, "Resolved Betfair event ID via MATCH_ODDS search");
+      logger.info({ eventId: match.event.id, eventName: match.event.name, shortHome }, "Resolved Betfair event ID via MATCH_ODDS search");
       return match.event.id;
     }
     if (markets.length === 1) {
       logger.info({ eventId: markets[0].event.id, eventName: markets[0].event.name }, "Resolved Betfair event ID (single result)");
       return markets[0].event.id;
     }
+    logger.warn({ shortHome, awayFirst, resultCount: markets.length, eventNames: markets.map(m => m.event?.name) }, "Could not match Betfair event from results");
     return null;
   } catch (err) {
     logger.error({ err, homeTeam, awayTeam }, "Failed to resolve Betfair event ID");
