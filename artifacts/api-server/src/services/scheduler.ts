@@ -958,10 +958,12 @@ export async function runTradingCycle(options?: {
     funnel["per_league_cap"] = maxPerLeague;
     funnel["per_market_cap"] = maxPerMarket;
     funnel["score_threshold"] = minScore;
-    funnel["pinnacle_matches"] = oddsPapiCache.size;
-    funnel["pinnacle_matches_total"] = valueSummary.matchesEvaluated;
-    funnel["pinnacle_coverage_pct"] = valueSummary.matchesEvaluated > 0
-      ? Math.round((oddsPapiCache.size / valueSummary.matchesEvaluated) * 100)
+    funnel["pinnacle_matches_with_data"] = oddsPapiCache.size;
+    funnel["pinnacle_from_oddspapi"] = oddsPapiCacheRaw.size;
+    funnel["pinnacle_from_af"] = afPinnacleCache.size;
+    funnel["pinnacle_matches_total"] = allUpcoming.length;
+    funnel["pinnacle_coverage_pct"] = allUpcoming.length > 0
+      ? Math.round((oddsPapiCache.size / allUpcoming.length) * 100)
       : 0;
 
     logger.info({ funnel }, "=== TRADING CYCLE FUNNEL REPORT ===");

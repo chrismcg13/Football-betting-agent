@@ -109,6 +109,7 @@ const CORRELATED_PAIRS: CorrelatedPair[] = [
 // Bets in the same category on the same match are correlated and should be deduped.
 export function getThresholdCategory(marketType: string): string | null {
   if (/^OVER_UNDER_\d+$/.test(marketType)) return "goals_ou";
+  if (marketType === "BTTS") return "goals_ou";
   if (/^TOTAL_CORNERS_\d+$/.test(marketType)) return "corners";
   if (/^TOTAL_CARDS_\d+$/.test(marketType)) return "cards";
   return null;

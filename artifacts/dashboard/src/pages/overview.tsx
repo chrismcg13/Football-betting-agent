@@ -151,6 +151,8 @@ export default function Overview() {
   const winPercentage = summary?.winPercentage ?? 0;
   const isLive = (summary as any)?.isLive === true;
   const betsToday = (summary as any)?.betsToday ?? 0;
+  const tierSplit = (summary as any)?.tierSplit ?? { tier1a: 0, tier1b: 0, tier1Other: 0, betfairLive: 0, tier2: 0, betfairStake: 0 };
+  const totalLive = tierSplit.tier1a + tierSplit.tier1b + tierSplit.tier1Other;
   const avgClv: number | null = (clvStats as any)?.count > 0 ? Number((clvStats as any).avgClv) : null;
 
   const daysRemaining = useMemo(() => {
@@ -194,7 +196,11 @@ export default function Overview() {
         <div className="flex items-center gap-2 flex-wrap">
           {!loadingSummary && (
             <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-semibold">
-              {betsToday} placed today · {pending} open
+              {totalLive > 0 ? (
+                <>{totalLive} live on Betfair{tierSplit.tier1a > 0 ? ` (1A: ${tierSplit.tier1a}` : " ("}{tierSplit.tier1b > 0 ? `${tierSplit.tier1a > 0 ? ", " : ""}1B: ${tierSplit.tier1b}` : ""}{tierSplit.tier1Other > 0 ? `${(tierSplit.tier1a + tierSplit.tier1b) > 0 ? ", " : ""}P: ${tierSplit.tier1Other}` : ""}) · {tierSplit.tier2} paper · {formatCurrency(tierSplit.betfairStake)} staked</>
+              ) : (
+                <>{betsToday} placed today · {pending} open</>
+              )}
             </span>
           )}
         </div>

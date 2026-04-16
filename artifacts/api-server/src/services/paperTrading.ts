@@ -155,8 +155,10 @@ const MIN_PINNACLE_EDGE_PCT = 2;
 interface Tier1CheckResult {
   qualifies: boolean;
   reason: string;
-  path?: "data_richness" | "promoted";
+  path?: "1A" | "1B" | "promoted";
 }
+
+const MIN_TIER1_ODDS = 1.80;
 
 async function qualifiesForTier1(opts: {
   opportunityScore: number;
@@ -167,6 +169,7 @@ async function qualifiesForTier1(opts: {
   pinnacleOdds: number | null;
   pinnacleImplied: number | null;
   modelProbability: number;
+  backOdds: number;
 }): Promise<Tier1CheckResult> {
   if (opts.dataTier === "abandoned" || opts.dataTier === "demoted") {
     return { qualifies: false, reason: `${opts.dataTier}-tier bets never qualify for Tier 1` };
@@ -182,6 +185,10 @@ async function qualifiesForTier1(opts: {
     return { qualifies: false, reason: "No Pinnacle odds available — cannot validate edge" };
   }
 
+  if (opts.backOdds < MIN_TIER1_ODDS) {
+    return { qualifies: false, reason: `Odds ${opts.backOdds} < minimum ${MIN_TIER1_ODDS} for Tier 1` };
+  }
+
   const pinnacleImpliedProb = opts.pinnacleImplied;
   const ourImpliedProb = opts.modelProbability;
   const edgeVsPinnacle = (ourImpliedProb - pinnacleImpliedProb) * 100;
@@ -190,7 +197,6 @@ async function qualifiesForTier1(opts: {
     return { qualifies: false, reason: `Pinnacle edge ${edgeVsPinnacle.toFixed(2)}% < minimum ${MIN_PINNACLE_EDGE_PCT}%` };
   }
 
-  // PATH 1: Promoted experiment — qualifies directly with Pinnacle validation
   if (opts.dataTier === "promoted") {
     return {
       qualifies: true,
@@ -199,17 +205,19 @@ async function qualifiesForTier1(opts: {
     };
   }
 
-  // PATH 2: Data richness — any tier (experiment/candidate) can qualify for Tier 1
-  // if the league/market has sufficient data coverage (≥70%)
   const isRichData = await isLeagueMarketTier1Eligible(opts.league, opts.country, opts.marketType);
-  if (!isRichData) {
-    return { qualifies: false, reason: `League-market ${opts.league} (${opts.country}) / ${opts.marketType} data richness < 70%` };
+  if (isRichData) {
+    return {
+      qualifies: true,
+      reason: `Tier 1A: score=${opts.opportunityScore} >= ${threshold}, Pinnacle edge=${edgeVsPinnacle.toFixed(2)}%, data richness >= 70% [${opts.dataTier}]`,
+      path: "1A",
+    };
   }
 
   return {
     qualifies: true,
-    reason: `Data-rich market: score=${opts.opportunityScore} >= ${threshold}, Pinnacle edge=${edgeVsPinnacle.toFixed(2)}%, data richness >= 70% [${opts.dataTier}]`,
-    path: "data_richness",
+    reason: `Tier 1B: score=${opts.opportunityScore} >= ${threshold}, Pinnacle edge=${edgeVsPinnacle.toFixed(2)}%, odds=${opts.backOdds} [${opts.dataTier}]`,
+    path: "1B",
   };
 }
 
@@ -443,45 +451,50 @@ export async function placePaperBet(
   // ── Duplicate / per-match cap guard ─────────────────────────────────────────
   // Enforced at placement time so duplicates never reach the DB.
   {
-    const existingPending = await db
+    const recentVoidCutoff = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const existingBets = await db
       .select({
         id: paperBetsTable.id,
         marketType: paperBetsTable.marketType,
         selectionName: paperBetsTable.selectionName,
+        status: paperBetsTable.status,
       })
       .from(paperBetsTable)
       .where(
         and(
           eq(paperBetsTable.matchId, matchId),
-          eq(paperBetsTable.status, "pending"),
           sql`deleted_at IS NULL`,
+          sql`(${paperBetsTable.status} = 'pending' OR (${paperBetsTable.status} = 'void' AND ${paperBetsTable.settledAt} >= ${recentVoidCutoff}))`,
         ),
       );
 
-    // 1. Exact duplicate — same market + selection already pending
-    const exactDup = existingPending.find(
+    const existingPending = existingBets.filter((b) => b.status === "pending");
+    const allRelevant = existingBets;
+
+    // 1. Exact duplicate — same market + selection already pending or recently voided
+    const exactDup = allRelevant.find(
       (b) => b.marketType === marketType && b.selectionName === selectionName,
     );
     if (exactDup) {
       return logReject(
-        `Duplicate: pending bet already exists for ${marketType}:${selectionName} on match ${matchId}`,
+        `Duplicate: ${exactDup.status} bet already exists for ${marketType}:${selectionName} on match ${matchId}`,
       );
     }
 
-    // 2. Threshold-category duplicate — e.g. already have a Goals OU bet → skip another Goals OU
+    // 2. Threshold-category duplicate — e.g. already have a Goals OU or BTTS bet → skip another
     const thisCat = getThresholdCategory(marketType);
     if (thisCat) {
-      const catDup = existingPending.find(
+      const catDup = allRelevant.find(
         (b) => getThresholdCategory(b.marketType) === thisCat,
       );
       if (catDup) {
         return logReject(
-          `Threshold category "${thisCat}" already covered by pending ${catDup.marketType}:${catDup.selectionName} on match ${matchId}`,
+          `Threshold category "${thisCat}" already covered by ${catDup.status} ${catDup.marketType}:${catDup.selectionName} on match ${matchId}`,
         );
       }
     }
 
-    // 3. Hard cap — max 2 bets per match
+    // 3. Hard cap — max 2 bets per match (pending only)
     if (existingPending.length >= 2) {
       return logReject(
         `Match ${matchId} already has ${existingPending.length} pending bets (max 2) — skipping ${marketType}:${selectionName}`,
@@ -732,10 +745,12 @@ export async function placePaperBet(
       pinnacleOdds: pinnacleOdds ?? null,
       pinnacleImplied: pinnacleImplied ?? null,
       modelProbability,
+      backOdds,
     });
 
     const liveTier = tier1Check.qualifies ? "tier1" : "tier2";
-    await db.update(paperBetsTable).set({ liveTier }).where(eq(paperBetsTable.id, bet.id));
+    const qualificationPath = tier1Check.qualifies ? (tier1Check.path ?? "1B") : "paper";
+    await db.update(paperBetsTable).set({ liveTier, qualificationPath }).where(eq(paperBetsTable.id, bet.id));
 
     if (tier1Check.qualifies) {
       logger.info(

@@ -877,6 +877,11 @@ export async function runMigrations() {
       )
     `);
 
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS qualification_path TEXT
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

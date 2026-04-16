@@ -1162,6 +1162,8 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   oddsStored: number;
   mappings: number;
   leaguesScanned: Set<string>;
+  pinnacleLeaguesFetched: number;
+  pinnacleLeaguesTotal: number;
 }> {
   logger.info("Starting API-Football odds ingestion for upcoming fixtures");
 
@@ -1170,11 +1172,26 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
 
   const leagueTierCache = new Map<string, "high" | "medium" | "low" | "dormant">();
 
+  const pinnacleLeagues = new Set<string>();
+  const pinnacleConfigs = await db
+    .select({ name: competitionConfigTable.name })
+    .from(competitionConfigTable)
+    .where(eq(competitionConfigTable.hasPinnacleOdds, true));
+  for (const c of pinnacleConfigs) pinnacleLeagues.add(c.name);
+
+  const pinnacleFirst = [...mappings].sort((a, b) => {
+    const aP = pinnacleLeagues.has(a.league) ? 0 : 1;
+    const bP = pinnacleLeagues.has(b.league) ? 0 : 1;
+    return aP - bP;
+  });
+
   let oddsStored = 0;
   let skippedByTier = 0;
+  let pinnacleLeaguesFetched = 0;
+  const pinnacleLeagueMatchCount = pinnacleFirst.filter(m => pinnacleLeagues.has(m.league)).length;
   const leaguesScanned = new Set<string>();
 
-  for (const m of mappings) {
+  for (const m of pinnacleFirst) {
     if (!(await canMakeRequest())) {
       logger.warn("Budget exhausted — stopping odds ingestion");
       break;
@@ -1194,6 +1211,7 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
     const count = await fetchAndStoreOddsForFixture(m.matchId, m.fixtureId, m.kickoffTime);
     oddsStored += count;
     leaguesScanned.add(m.league);
+    if (pinnacleLeagues.has(m.league)) pinnacleLeaguesFetched++;
   }
 
   logger.info({
@@ -1202,6 +1220,11 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
     skippedByTier,
     leaguesScanned: leaguesScanned.size,
     leagues: [...leaguesScanned],
+    pinnacleLeaguesFetched,
+    pinnacleLeaguesTotal: pinnacleLeagueMatchCount,
+    pinnacleCoveragePct: pinnacleLeagueMatchCount > 0
+      ? Math.round((pinnacleLeaguesFetched / pinnacleLeagueMatchCount) * 100)
+      : 0,
     budgetUsed: await getApiUsageToday(),
   }, "API-Football odds ingestion complete");
 
@@ -1218,7 +1241,7 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
     timestamp: new Date(),
   });
 
-  return { fixturesProcessed: mappings.length, oddsStored, mappings: mappings.length, leaguesScanned };
+  return { fixturesProcessed: mappings.length, oddsStored, mappings: mappings.length, leaguesScanned, pinnacleLeaguesFetched, pinnacleLeaguesTotal: pinnacleLeagueMatchCount };
 }
 
 // ─── Team Statistics ──────────────────────────────────────────────────────────

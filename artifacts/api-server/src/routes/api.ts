@@ -110,7 +110,7 @@ router.get("/dashboard/summary", async (req, res) => {
   const todayStartUtc = new Date();
   todayStartUtc.setUTCHours(0, 0, 0, 0);
 
-  const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, paperModeRow, maxExposurePctRow, exposureRuleSinceRow] = await Promise.all([
+  const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, tierSplitRows, paperModeRow, maxExposurePctRow, exposureRuleSinceRow] = await Promise.all([
     getBankroll(),
     getAgentStatus(),
     getSettledBetsStats(),
@@ -127,6 +127,17 @@ router.get("/dashboard/summary", async (req, res) => {
       .select({ count: sql<number>`count(*)::int` })
       .from(paperBetsTable)
       .where(gte(paperBetsTable.placedAt, todayStartUtc)),
+    db.execute(sql`
+      SELECT
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1A') AS tier1a,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1B') AS tier1b,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND (qualification_path = 'promoted' OR qualification_path IS NULL)) AS tier1_other,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND betfair_bet_id IS NOT NULL) AS betfair_live,
+        COUNT(*) FILTER (WHERE live_tier = 'tier2' OR live_tier IS NULL) AS tier2,
+        COALESCE(SUM(stake::numeric) FILTER (WHERE live_tier = 'tier1' AND betfair_bet_id IS NOT NULL AND status != 'void'), 0) AS betfair_stake
+      FROM paper_bets
+      WHERE placed_at >= ${todayStartUtc} AND deleted_at IS NULL
+    `),
     db
       .select({ value: agentConfigTable.value })
       .from(agentConfigTable)
@@ -145,6 +156,15 @@ router.get("/dashboard/summary", async (req, res) => {
   ]);
 
   const betsToday = betsTodayRows[0]?.count ?? 0;
+  const tsRow = (tierSplitRows as any).rows?.[0] ?? (tierSplitRows as any)[0] ?? {};
+  const tierSplit = {
+    tier1a: Number(tsRow.tier1a ?? 0),
+    tier1b: Number(tsRow.tier1b ?? 0),
+    tier1Other: Number(tsRow.tier1_other ?? 0),
+    betfairLive: Number(tsRow.betfair_live ?? 0),
+    tier2: Number(tsRow.tier2 ?? 0),
+    betfairStake: Math.round(Number(tsRow.betfair_stake ?? 0) * 100) / 100,
+  };
   const paperMode = paperModeRow[0]?.value === "true";
   const maxExposurePct = Number(maxExposurePctRow[0]?.value ?? "0.40");
   const exposureRuleSince = exposureRuleSinceRow[0]?.value ? new Date(exposureRuleSinceRow[0].value) : null;
@@ -237,6 +257,7 @@ router.get("/dashboard/summary", async (req, res) => {
     voids,
     pending: allPending.length,
     betsToday,
+    tierSplit,
     paperMode,
     tradingMode,
     isLive: tradingMode === "LIVE",

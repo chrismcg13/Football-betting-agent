@@ -1,0 +1,69 @@
+PRAGMATIC FIX: Unblock Live Execution Today
+Execute both fixes today. No extended diagnostic first — we've diagnosed enough. Ship the fix, measure what happens, iterate.
+
+Fix 1: Duplicate bet bug (execute immediately).
+Add BTTS to getThresholdCategory() as correlated with OVER_UNDER_25. Review other cross-market correlations and add any missing ones. Alternative/additional: placement-time dedup should check against recently-voided bets, not just pending — propose a time window (suggest 2-4 hours).
+Verify fix by monitoring for duplicate placements in subsequent cycles.
+
+Fix 2: Create Tier 1B path — Pinnacle-validated, richness-independent.
+New Tier 1 qualification logic:
+A bet qualifies for Tier 1 live execution if it passes either:
+
+Tier 1A (existing path): score ≥ threshold, has Pinnacle odds, Pinnacle edge ≥2%, data richness ≥70% OR promoted tier, not quarantined, odds ≥1.80
+Tier 1B (new path): score ≥ threshold, has Pinnacle odds, Pinnacle edge ≥2%, no data richness requirement, not quarantined, odds ≥1.80
+
+Tier 1A continues unchanged. Tier 1B is additive — it unblocks bets that were being incorrectly gated by the impossible-to-reach data richness threshold.
+Why this is safe:
+
+Pinnacle edge ≥2% is itself a strong quality signal — beating a sharp closing line by 2% is a high-conviction bet.
+All existing safety gates remain: quarantine, odds floor, exposure caps, per-cycle cap, daily cap, Level 1 exposure limit.
+Tier 1A still operates — if data richness is ever populated correctly, 1A bets continue qualifying as intended.
+
+Implementation requirements:
+
+Tag every bet in the database with which path qualified it: qualification_path: '1A' | '1B' | 'paper'. This lets us measure live ROI and CLV separately by path over the next 30 days.
+Do not remove or modify Tier 1A logic. 1B is a parallel path, not a replacement.
+Do not change the data richness threshold or scoring formula. Leave the existing system intact for later proper fix.
+Dashboard should display Tier 1A and Tier 1B counts separately so Chris can see which path is doing the work.
+
+
+Fix 3: Dashboard transparency (execute alongside).
+Current dashboard counts all pending bets together, making "30 bets placed today" ambiguous. Fix:
+
+Bet counts split by tier: "X live on Betfair (Tier 1A: n, Tier 1B: m), Y paper (Tier 2)"
+Betfair balance movement expected vs actual: if Y live bets were placed today at total stake £Z, available balance should have decreased by approximately £Z. Flag if it hasn't.
+Clear visual distinction between "placed" (recorded in DB) and "executed on Betfair" (actually sent to exchange).
+
+
+Phase 4 — Monitor and report.
+After deploying Fix 1 + Fix 2 + Fix 3:
+
+Run one trading cycle immediately. Report:
+
+Bets qualifying for Tier 1A (expected: 0 or near-0, since richness gate still impossible)
+Bets qualifying for Tier 1B (the new unblocked volume)
+Bets still in Tier 2 paper, with reason (no Pinnacle, edge <2%, odds <1.80, quarantined, capped)
+Betfair API calls made, confirmed bet IDs returned
+Betfair available balance before and after the cycle
+
+
+24-hour monitor. Report:
+
+Total Tier 1B live bets placed
+Total stake wagered on Betfair (must match Betfair balance decrease)
+Any failed Betfair placements with reasons
+Distribution of Tier 1B bets by league, market type, odds range
+First settled live bets (if any kick off and finish in the window): P&L and CLV
+
+
+
+
+Operating rules:
+
+This is shipping today. Do not gold-plate. Do not add additional safety layers beyond what's specified. Existing safety gates are sufficient.
+Every Tier 1B bet placed must be traceable: database row with qualification_path='1B', Betfair bet ID confirmed, Betfair balance movement matched.
+If Betfair balance doesn't decrease when Tier 1B bets place, stop immediately — it means bets are recorded as live but not actually sent to Betfair. This is the same failure mode we just diagnosed and must not recur.
+Dev and prod both receive Fix 1 and Fix 3. Fix 2 (Tier 1B path) applies to both environments so dev's Tier 1B counts serve as a forward reference.
+Confirm DATABASE_URL isolation before and after.
+
+Go.
