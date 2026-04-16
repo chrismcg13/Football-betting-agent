@@ -678,7 +678,7 @@ export async function runStartupHealthCheck(): Promise<{
   return { passed: allPassed, checks };
 }
 
-const MARKET_TYPE_MAP: Record<string, string> = {
+export const MARKET_TYPE_MAP: Record<string, string> = {
   MATCH_ODDS: "MATCH_ODDS",
   BTTS: "BOTH_TEAMS_TO_SCORE",
   OVER_UNDER_15: "OVER_UNDER_15",

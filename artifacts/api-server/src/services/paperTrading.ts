@@ -119,6 +119,22 @@ export async function getAgentStatus(): Promise<string> {
 
 const NEW_MARKET_TYPES = new Set(["TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_CORNERS_95", "TOTAL_CORNERS_105"]);
 
+// ── Banned-market hardstop (single source of truth) ───────────────────────────
+// These markets are permanently banned due to unreliable edge signals or
+// poor settlement data. Block placement and exclude from value detection.
+export const BANNED_MARKETS: ReadonlySet<string> = new Set([
+  "OVER_UNDER_05",     // ~92% win rate — no edge signal
+  "OVER_UNDER_15",     // ~75% win rate — no edge signal
+  "TOTAL_CARDS_55",    // ~85% win rate — no edge signal
+  "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
+  "TOTAL_CORNERS_75",  // Edge concentration: ALL corners suspended — 90 bets, -42.5% ROI
+  "TOTAL_CORNERS_85",  // Edge concentration: ALL corners suspended
+  "TOTAL_CORNERS_95",  // Edge concentration: ALL corners suspended
+  "TOTAL_CORNERS_105", // Edge concentration: ALL corners suspended
+  "TOTAL_CORNERS_115", // Edge concentration: ALL corners suspended
+  "FIRST_HALF_OU_05",  // Too easy; FIRST_HALF_OU_15 retained instead
+]);
+
 function kellyFractionForScore(opportunityScore: number, marketType?: string): number {
   let fraction: number;
   if (opportunityScore >= 80) fraction = 0.50;       // high confidence
@@ -312,21 +328,7 @@ export async function placePaperBet(
     return { placed: false, reason };
   };
 
-  // ── Banned-market hardstop ─────────────────────────────────────────────────
-  // These markets are permanently banned due to unreliable edge signals or
-  // poor settlement data. Block placement regardless of agent status.
-  const BANNED_MARKETS = new Set([
-    "OVER_UNDER_05",     // ~92% win rate — no edge signal
-    "OVER_UNDER_15",     // ~75% win rate — no edge signal
-    "TOTAL_CARDS_55",    // ~85% win rate — no edge signal
-    "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
-    "TOTAL_CORNERS_75",  // Edge concentration: ALL corners suspended — 90 bets, -42.5% ROI
-    "TOTAL_CORNERS_85",  // Edge concentration: ALL corners suspended
-    "TOTAL_CORNERS_95",  // Edge concentration: ALL corners suspended
-    "TOTAL_CORNERS_105", // Edge concentration: ALL corners suspended
-    "TOTAL_CORNERS_115", // Edge concentration: ALL corners suspended
-    "FIRST_HALF_OU_05",  // Too easy; FIRST_HALF_OU_15 retained instead
-  ]);
+  // ── Banned-market hardstop (uses module-level BANNED_MARKETS) ─────────────
   if (BANNED_MARKETS.has(marketType)) {
     logger.warn({ matchId, marketType, selectionName }, "HARDSTOP: Banned market — bet blocked at placement");
     return logReject(`Banned market: ${marketType}`);
@@ -1702,18 +1704,7 @@ export async function voidBetsOnBannedMarkets(): Promise<{
   totalStakeRefunded: number;
   byMarket: Record<string, number>;
 }> {
-  const BANNED_MARKETS = [
-    "OVER_UNDER_05",
-    "OVER_UNDER_15",
-    "TOTAL_CARDS_55",
-    "TOTAL_CARDS_45",
-    "TOTAL_CORNERS_75",
-    "TOTAL_CORNERS_85",
-    "TOTAL_CORNERS_95",
-    "TOTAL_CORNERS_105",
-    "TOTAL_CORNERS_115",
-    "FIRST_HALF_OU_05",
-  ];
+  const bannedList = [...BANNED_MARKETS];
 
   const pendingBanned = await db
     .select({
@@ -1726,7 +1717,7 @@ export async function voidBetsOnBannedMarkets(): Promise<{
       and(
         eq(paperBetsTable.status, "pending"),
         sql`deleted_at IS NULL`,
-        inArray(paperBetsTable.marketType, BANNED_MARKETS),
+        inArray(paperBetsTable.marketType, bannedList),
       ),
     );
 

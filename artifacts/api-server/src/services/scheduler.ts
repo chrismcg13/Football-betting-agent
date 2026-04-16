@@ -4,6 +4,7 @@ import { runDataIngestion } from "./dataIngestion";
 import { runFeatureEngineForUpcomingMatches } from "./featureEngine";
 import { detectValueBets } from "./valueDetection";
 import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets, backfillCornersCardsStats } from "./paperTrading";
+import { isLiveMode, listMarketsByEventId, MARKET_TYPE_MAP as BETFAIR_MARKET_TYPE_MAP } from "./betfairLive";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
 import { runLearningLoop } from "./learningLoop";
@@ -555,13 +556,102 @@ export async function runTradingCycle(options?: {
 
     // All candidates are now enhanced (Pinnacle-validated or cache-hit).
     // Sort by effective score so the best opportunities are placed first.
-    const allEntries: BetEntry[] = enhancedCandidates
+    const allEntriesUnfiltered: BetEntry[] = enhancedCandidates
       .map(({ bet, validation, effectiveScore }) => ({
         bet,
         effectiveScore,
         validation: validation ?? null,
       }))
       .sort((a, b) => b.effectiveScore - a.effectiveScore);
+
+    // ── Fix 2: Pre-check Betfair Exchange market availability (live mode only)
+    // Avoid wasting cycle slots on candidates whose market isn't listed on
+    // Betfair for the event. Batch one listMarketCatalogue call per unique
+    // event, cache results for the cycle, then filter synchronously.
+    let allEntries: BetEntry[] = allEntriesUnfiltered;
+    let funnelBfMarketUnavailable = 0;
+    let funnelBfNoEventId = 0;
+    let funnelBfTypeUnsupported = 0;
+    if (isLiveMode() && allEntriesUnfiltered.length > 0) {
+      const liveCandidates = allEntriesUnfiltered;
+      const matchIds = [...new Set(liveCandidates.map(e => e.bet.matchId))];
+      const matchRows = await db
+        .select({ id: matchesTable.id, betfairEventId: matchesTable.betfairEventId })
+        .from(matchesTable)
+        .where(inArray(matchesTable.id, matchIds));
+      const eventIdByMatch = new Map<number, string | null>();
+      for (const m of matchRows) {
+        const ev = m.betfairEventId;
+        eventIdByMatch.set(m.id, ev && !ev.startsWith("af_") ? ev : null);
+      }
+
+      // Limit catalogue lookups to top-N candidates by score to bound API calls.
+      const TOP_N_FOR_CATALOGUE = 200;
+      const topCandidates = liveCandidates.slice(0, TOP_N_FOR_CATALOGUE);
+      const eventsNeeded = new Set<string>();
+      for (const e of topCandidates) {
+        const ev = eventIdByMatch.get(e.bet.matchId);
+        if (ev) eventsNeeded.add(ev);
+      }
+
+      // Per-cycle catalogue cache: eventId → Set of available bf market types
+      const availableTypesByEvent = new Map<string, Set<string>>();
+      const catalogueStartedAt = Date.now();
+      for (const eventId of eventsNeeded) {
+        try {
+          const markets = await listMarketsByEventId(eventId);
+          const types = new Set<string>();
+          for (const m of markets) {
+            const t = m.description?.marketType;
+            if (t) types.add(t);
+          }
+          availableTypesByEvent.set(eventId, types);
+        } catch (err) {
+          logger.warn({ err, eventId }, "Betfair catalogue lookup failed — treating event as unavailable");
+          availableTypesByEvent.set(eventId, new Set());
+        }
+      }
+      const catalogueDurationMs = Date.now() - catalogueStartedAt;
+
+      const filtered: BetEntry[] = [];
+      for (const entry of liveCandidates) {
+        const ev = eventIdByMatch.get(entry.bet.matchId);
+        if (!ev) {
+          funnelBfNoEventId++;
+          continue;
+        }
+        const bfType = BETFAIR_MARKET_TYPE_MAP[entry.bet.marketType];
+        if (!bfType) {
+          funnelBfTypeUnsupported++;
+          continue;
+        }
+        const availableTypes = availableTypesByEvent.get(ev);
+        if (!availableTypes) {
+          // Outside top-N catalogue lookup window; let it through and let
+          // placement-time findMarketForBet decide.
+          filtered.push(entry);
+          continue;
+        }
+        if (!availableTypes.has(bfType)) {
+          funnelBfMarketUnavailable++;
+          continue;
+        }
+        filtered.push(entry);
+      }
+      logger.info(
+        {
+          before: allEntriesUnfiltered.length,
+          after: filtered.length,
+          eventsLookedUp: eventsNeeded.size,
+          catalogueDurationMs,
+          rejectedNoEventId: funnelBfNoEventId,
+          rejectedTypeUnsupported: funnelBfTypeUnsupported,
+          rejectedMarketUnavailable: funnelBfMarketUnavailable,
+        },
+        "Betfair availability pre-check complete",
+      );
+      allEntries = filtered;
+    }
 
     // 7b. Load config early so funnel counters can reference thresholds
     const configRows = await db.select().from(agentConfigTable);
