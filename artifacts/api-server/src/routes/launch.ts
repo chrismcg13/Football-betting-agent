@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { runLaunchActivation } from "../services/launchActivation";
+import { runLaunchActivation, runCrossDbLaunchActivation } from "../services/launchActivation";
 import { runThresholdAssessment } from "../services/thresholdAssessment";
 import {
   backfillPinnacleOnPendingBets,
@@ -150,6 +150,20 @@ router.post("/launch-activation/bulk-prefetch-oddspapi", async (req, res) => {
     res.json(result);
   } catch (err) {
     logger.error({ err }, "Bulk OddsPapi prefetch failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post("/launch-activation/cross-db", async (req, res) => {
+  const dryRun = req.query.dryRun !== "false";
+  const maxBets = Number(req.query.maxBets ?? 20);
+  const maxStakePerBet = Number(req.query.maxStakePerBet ?? 10);
+  logger.info({ dryRun, maxBets, maxStakePerBet }, "Cross-DB launch activation triggered via API");
+  try {
+    const report = await runCrossDbLaunchActivation({ dryRun, maxBets, maxStakePerBet });
+    res.json(report);
+  } catch (err) {
+    logger.error({ err }, "Cross-DB launch activation failed");
     res.status(500).json({ error: String(err) });
   }
 });

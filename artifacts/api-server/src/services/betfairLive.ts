@@ -705,31 +705,84 @@ interface MarketCatalogueItem {
 async function findMarketForBet(
   betfairEventId: string,
   internalMarketType: string,
+  homeTeam?: string,
+  awayTeam?: string,
 ): Promise<MarketCatalogueItem | null> {
   const bfMarketType = MARKET_TYPE_MAP[internalMarketType];
   if (!bfMarketType) return null;
 
-  try {
-    const markets = await apiRequest<MarketCatalogueItem[]>(
-      "betting",
-      "/listMarketCatalogue/",
-      {
-        filter: {
-          eventIds: [betfairEventId],
-          marketTypeCodes: [bfMarketType],
-        },
-        marketProjection: [
-          "RUNNER_DESCRIPTION",
-          "MARKET_DESCRIPTION",
-          "MARKET_START_TIME",
-        ],
-        maxResults: 10,
-      },
-      3,
-    );
+  const isAfId = betfairEventId.startsWith("af_");
 
-    if (markets.length === 0) return null;
-    return markets[0];
+  try {
+    if (!isAfId) {
+      const markets = await apiRequest<MarketCatalogueItem[]>(
+        "betting",
+        "/listMarketCatalogue/",
+        {
+          filter: {
+            eventIds: [betfairEventId],
+            marketTypeCodes: [bfMarketType],
+          },
+          marketProjection: [
+            "RUNNER_DESCRIPTION",
+            "MARKET_DESCRIPTION",
+            "MARKET_START_TIME",
+          ],
+          maxResults: 10,
+        },
+        3,
+      );
+      if (markets.length > 0) return markets[0];
+    }
+
+    if (homeTeam && awayTeam) {
+      const searchTerms = [homeTeam, awayTeam];
+      for (const term of searchTerms) {
+        const shortName = term.replace(/\b(FC|SC|CF|AC|AS|US|SS|SSC|1907|Calcio)\b/gi, "").trim().split(/\s+/).slice(0, 2).join(" ");
+        logger.info({ searchTerm: shortName, marketType: bfMarketType }, "Searching Betfair by team name");
+        const markets = await apiRequest<MarketCatalogueItem[]>(
+          "betting",
+          "/listMarketCatalogue/",
+          {
+            filter: {
+              eventTypeIds: ["1"],
+              textQuery: shortName,
+              marketTypeCodes: [bfMarketType],
+              marketStartTime: {
+                from: new Date().toISOString(),
+                to: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+              },
+            },
+            marketProjection: [
+              "RUNNER_DESCRIPTION",
+              "MARKET_DESCRIPTION",
+              "MARKET_START_TIME",
+            ],
+            maxResults: 10,
+          },
+          3,
+        );
+
+        if (markets.length > 0) {
+          const otherTeam = term === homeTeam ? awayTeam : homeTeam;
+          const otherLower = otherTeam.toLowerCase();
+          const match = markets.find(m => {
+            const eventName = (m.event?.name ?? "").toLowerCase();
+            return eventName.includes(otherLower.split(/\s+/)[0]);
+          });
+          if (match) {
+            logger.info({ marketId: match.marketId, event: match.event?.name }, "Found Betfair market via text search");
+            return match;
+          }
+          if (markets.length === 1) {
+            logger.info({ marketId: markets[0].marketId, event: markets[0].event?.name }, "Single Betfair market found via text search — using it");
+            return markets[0];
+          }
+        }
+      }
+    }
+
+    return null;
   } catch (err) {
     logger.error(
       { err, betfairEventId, internalMarketType },
@@ -879,7 +932,7 @@ export async function placeLiveBetOnBetfair(params: {
     return { success: false, error: msg };
   }
 
-  const market = await findMarketForBet(betfairEventId, marketType);
+  const market = await findMarketForBet(betfairEventId, marketType, homeTeam, awayTeam);
   if (!market) {
     const msg = `No Betfair market found for event=${betfairEventId} type=${marketType}`;
     logger.warn({ internalBetId, betfairEventId, marketType }, msg);

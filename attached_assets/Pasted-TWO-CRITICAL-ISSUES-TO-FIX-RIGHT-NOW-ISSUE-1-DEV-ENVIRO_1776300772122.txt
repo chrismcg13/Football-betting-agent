@@ -1,0 +1,56 @@
+TWO CRITICAL ISSUES TO FIX RIGHT NOW
+
+ISSUE 1: DEV ENVIRONMENT HEALTH CHECK
+
+The dev dashboard has disappeared. Check immediately:
+- Is the dev Replit deployment still running?
+- Did changing ENVIRONMENT=production or TRADING_MODE=LIVE break the dev environment?
+- Dev must continue running independently — it's where Tier 2 experiments build confidence and where the paper trading pipeline feeds the promotion engine
+- The dev database (Helium) should be untouched — verify it still has all 1,019+ bets, 961 experiment tags, and all historical data
+- If dev is broken, fix it WITHOUT touching any prod configuration
+- Dev should have: ENVIRONMENT=development, TRADING_MODE=PAPER, DATABASE_URL pointing to Helium
+- Report: is dev alive, is dev data intact, is the dev dashboard accessible?
+
+ISSUE 2: LAUNCH BETS NOT PLACING
+
+The dry-run assessment at threshold 67 identified 11 qualifying Tier 1 bets. The system is now live but says 0 paper bets in Neon and is waiting for the model to train. This is wrong — we already identified qualifying bets from the dev database.
+
+The launch activation (Prompt 15) was designed to scan EXISTING paper bets from dev that meet Tier 1 criteria and place them live. The system should not be starting from scratch on prod — it should be promoting qualifying dev bets to live.
+
+Do this now:
+
+1. Query the DEV database (via DEV_DATABASE_URL) for all open paper bets that meet Tier 1 launch criteria:
+   - Opportunity score >= 67
+   - Pinnacle odds available (any source: OddsPapi, API-Football, derived)
+   - Pinnacle edge >= 2%
+   - Data richness >= 70%
+   - Match kick-off between 30 minutes and 72 hours from now
+   - Match not already kicked off or settled
+
+2. For each qualifying bet, fetch CURRENT live Betfair odds via the VPS relay:
+   - Verify the edge still holds at current odds
+   - Apply commission-adjusted EV check
+   - Check available liquidity
+   - Calculate Kelly stake against the LIVE £1,044 balance
+
+3. For every bet that passes all checks:
+   - Write to prod Neon database with status PENDING_PLACEMENT
+   - Place the LIMIT order on Betfair via VPS relay
+   - Target under 5 seconds signal to submission
+   - Handle matched/unmatched/partial as per order management rules
+   - Log everything — fixture, market, selection, stake, odds, Pinnacle edge, execution time, Betfair betId
+
+4. Show me the results:
+   - How many dev bets were scanned
+   - How many qualified at each gate
+   - How many were successfully placed on Betfair
+   - For each placed bet: full details including Betfair betId and matched status
+   - Total stake deployed and exposure as % of balance
+
+5. After the launch batch, confirm:
+   - The 5-minute trading cycle is running and will pick up new bets automatically
+   - Settlement reconciliation is active
+   - Balance refresh is active
+   - Alerting is active
+
+Fix dev first so we don't lose the experiment pipeline, then place the launch bets. Both are urgent.

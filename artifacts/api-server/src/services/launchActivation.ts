@@ -1,4 +1,5 @@
 import { db, paperBetsTable, matchesTable, complianceLogsTable, pinnacleOddsSnapshotsTable } from "@workspace/db";
+import { createPool } from "@workspace/db";
 import { eq, and, gte, lte, sql, desc, isNull } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { isLiveMode, getAccountFunds, getCachedBalance, getLiveBankroll, placeLiveBetOnBetfair } from "./betfairLive";
@@ -592,4 +593,224 @@ async function processCandidate(
     status: "placed",
     executionTimeMs: 0,
   };
+}
+
+export async function runCrossDbLaunchActivation(opts?: {
+  dryRun?: boolean;
+  maxBets?: number;
+  maxStakePerBet?: number;
+}): Promise<{
+  mode: string;
+  dryRun: boolean;
+  totalScanned: number;
+  qualified: number;
+  skipped: { reason: string; count: number }[];
+  placements: any[];
+  summary: { placed: number; failed: number; skipped: number; totalStake: number };
+}> {
+  const dryRun = opts?.dryRun ?? true;
+  const maxBets = opts?.maxBets ?? 20;
+  const maxStakePerBet = opts?.maxStakePerBet ?? 10;
+
+  const devDbUrl = process.env.DEV_DATABASE_URL;
+  if (!devDbUrl) {
+    throw new Error("DEV_DATABASE_URL not set — cannot read dev bets");
+  }
+
+  const isLive = isLiveMode();
+  logger.info({ dryRun, isLive, maxBets, maxStakePerBet }, "Cross-DB launch activation starting");
+
+  const devPool = createPool(devDbUrl);
+
+  try {
+    const now = new Date();
+    const minKickoff = new Date(now.getTime() + 30 * 60 * 1000);
+    const maxKickoff = new Date(now.getTime() + 72 * 60 * 60 * 1000);
+
+    const { rows } = await devPool.query(`
+      SELECT pb.id AS bet_id, pb.match_id, pb.market_type, pb.selection_name,
+        pb.odds_at_placement::float, pb.stake::float, pb.opportunity_score::float,
+        pb.model_probability::float, pb.data_tier, pb.pinnacle_odds::float,
+        pb.pinnacle_implied::float, pb.pinnacle_edge_category, pb.calculated_edge::float,
+        m.home_team, m.away_team, m.league, m.country, m.kickoff_time,
+        m.betfair_event_id, m.api_fixture_id
+      FROM paper_bets pb
+      JOIN matches m ON pb.match_id = m.id
+      WHERE pb.status = 'pending'
+        AND pb.deleted_at IS NULL
+        AND m.kickoff_time > $1
+        AND m.kickoff_time < $2
+        AND pb.opportunity_score >= 67
+        AND pb.pinnacle_odds IS NOT NULL
+        AND pb.calculated_edge >= 0.02
+        AND pb.pinnacle_edge_category IS NOT NULL
+        AND pb.pinnacle_edge_category != ''
+      ORDER BY pb.opportunity_score DESC
+    `, [minKickoff.toISOString(), maxKickoff.toISOString()]);
+
+    logger.info({ totalRows: rows.length }, "Cross-DB: raw candidates from dev DB");
+
+    const skippedReasons: Record<string, number> = {};
+    const incSkip = (r: string) => { skippedReasons[r] = (skippedReasons[r] ?? 0) + 1; };
+    const qualified: ScanCandidate[] = [];
+    const seenMatchMarket = new Set<string>();
+
+    for (const row of rows) {
+      const dedupKey = `${row.home_team}|${row.away_team}|${row.market_type}|${row.selection_name}`;
+      if (seenMatchMarket.has(dedupKey)) {
+        incSkip("duplicate_match_market");
+        continue;
+      }
+      seenMatchMarket.add(dedupKey);
+
+      const dataTier = row.data_tier ?? "experiment";
+      if (dataTier === "abandoned" || dataTier === "demoted") {
+        incSkip(`blocked_tier_${dataTier}`);
+        continue;
+      }
+
+      const modelProb = Number(row.model_probability ?? 0);
+      const pinnImpl = Number(row.pinnacle_implied ?? 0);
+      const edgePct = (modelProb - pinnImpl) * 100;
+      if (edgePct < 2) {
+        incSkip("pinnacle_edge_insufficient");
+        continue;
+      }
+
+      const isPromoted = dataTier === "promoted";
+      if (!isPromoted) {
+        const drResult = await devPool.query(
+          `SELECT tier1_eligible FROM data_richness_cache
+           WHERE LOWER(league) = LOWER($1) AND LOWER(country) = LOWER($2)
+             AND market_type = $3 LIMIT 1`,
+          [row.league ?? "", row.country ?? "", row.market_type],
+        );
+        const isRichData = drResult.rows[0]?.tier1_eligible === true;
+        if (!isRichData) {
+          incSkip("data_richness_insufficient");
+          continue;
+        }
+      }
+
+      if (!row.betfair_event_id) {
+        incSkip("no_betfair_event_id");
+        continue;
+      }
+
+      qualified.push({
+        betId: row.bet_id,
+        matchId: row.match_id,
+        fixture: `${row.home_team} vs ${row.away_team}`,
+        homeTeam: row.home_team ?? "",
+        awayTeam: row.away_team ?? "",
+        league: row.league ?? "",
+        country: row.country ?? "",
+        marketType: row.market_type,
+        selectionName: row.selection_name,
+        oddsAtPlacement: Number(row.odds_at_placement),
+        stake: Math.min(Number(row.stake), maxStakePerBet),
+        opportunityScore: Number(row.opportunity_score),
+        modelProbability: modelProb,
+        dataTier,
+        pinnacleOdds: Number(row.pinnacle_odds),
+        pinnacleImplied: pinnImpl,
+        betfairEventId: row.betfair_event_id,
+        kickoffTime: new Date(row.kickoff_time),
+      });
+    }
+
+    const skippedList = Object.entries(skippedReasons).map(([reason, count]) => ({ reason, count }));
+    logger.info({ qualified: qualified.length, skipped: skippedList }, "Cross-DB: filtered candidates");
+
+    const toPlace = qualified.slice(0, maxBets);
+    const placements: any[] = [];
+    let placed = 0, failed = 0, skipped = 0, totalStake = 0;
+
+    for (const bet of toPlace) {
+      const pinnEdgePct = ((bet.modelProbability - (bet.pinnacleImplied ?? 0)) * 100);
+      const path = bet.dataTier === "promoted" ? "promoted" : "data_richness";
+
+      if (bet.stake < 2) {
+        placements.push({
+          betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+          selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+          opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+          path, status: "skipped", reason: "Stake below £2 minimum",
+        });
+        skipped++;
+        continue;
+      }
+
+      if (dryRun) {
+        placements.push({
+          betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+          selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+          opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+          path, status: "dry_run",
+          betfairEventId: bet.betfairEventId,
+        });
+        placed++;
+        totalStake += bet.stake;
+        continue;
+      }
+
+      try {
+        const result = await placeLiveBetOnBetfair({
+          internalBetId: bet.betId,
+          betfairEventId: bet.betfairEventId!,
+          marketType: bet.marketType,
+          selectionName: bet.selectionName,
+          odds: bet.oddsAtPlacement,
+          stake: bet.stake,
+          homeTeam: bet.homeTeam,
+          awayTeam: bet.awayTeam,
+        });
+
+        if (result.success) {
+          placed++;
+          totalStake += bet.stake;
+          placements.push({
+            betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+            selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+            opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+            path, status: "placed",
+            betfairBetId: result.betfairBetId,
+            sizeMatched: result.sizeMatched,
+            avgPrice: result.avgPriceMatched,
+          });
+        } else {
+          failed++;
+          placements.push({
+            betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+            selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+            opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+            path, status: "failed", error: result.error,
+          });
+        }
+      } catch (err) {
+        failed++;
+        placements.push({
+          betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+          selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+          opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+          path, status: "error", error: String(err),
+        });
+      }
+    }
+
+    const report = {
+      mode: isLive ? "LIVE" : "PAPER",
+      dryRun,
+      totalScanned: rows.length,
+      qualified: qualified.length,
+      skipped: skippedList,
+      placements,
+      summary: { placed, failed, skipped, totalStake: Math.round(totalStake * 100) / 100 },
+    };
+
+    logger.info({ summary: report.summary }, "Cross-DB launch activation complete");
+    return report;
+  } finally {
+    await devPool.end();
+  }
 }
