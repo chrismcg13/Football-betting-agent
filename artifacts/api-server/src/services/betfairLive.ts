@@ -770,7 +770,7 @@ export async function listAllMarketsForEvent(
   }
 }
 
-async function findEventIdByTeamNames(
+export async function findEventIdByTeamNames(
   homeTeam: string,
   awayTeam: string,
 ): Promise<string | null> {

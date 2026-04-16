@@ -190,9 +190,11 @@ router.post("/launch-activation/cross-db", async (req, res) => {
   const maxStakePerBet = Number(req.query.maxStakePerBet ?? 10);
   const excludeParam = String(req.query.excludeBetIds ?? "");
   const excludeBetIds = excludeParam ? excludeParam.split(",").map(Number).filter(n => !isNaN(n)) : [];
-  logger.info({ dryRun, maxBets, maxStakePerBet, excludeBetIds }, "Cross-DB launch activation triggered via API");
+  const rawMinOpp = Number(req.query.minOpp ?? 60);
+  const minOpportunityScore = Number.isFinite(rawMinOpp) ? Math.max(0, Math.min(100, rawMinOpp)) : 60;
+  logger.info({ dryRun, maxBets, maxStakePerBet, excludeBetIds, minOpportunityScore }, "Cross-DB launch activation triggered via API");
   try {
-    const report = await runCrossDbLaunchActivation({ dryRun, maxBets, maxStakePerBet, excludeBetIds });
+    const report = await runCrossDbLaunchActivation({ dryRun, maxBets, maxStakePerBet, excludeBetIds, minOpportunityScore });
     res.json(report);
   } catch (err) {
     logger.error({ err }, "Cross-DB launch activation failed");

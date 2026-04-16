@@ -124,4 +124,4 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 
 **Admin Endpoint Protection:** All `/api/launch-activation/*` endpoints gated by `requireDevEnvironment` middleware — returns 403 in production (`ENVIRONMENT=production`).
 
-**Tier 1 Gate:** PATH 1 (promoted + opp≥68 + Pinnacle 2%+ edge) or PATH 2 (any active tier + opp≥68 + Pinnacle 2%+ edge + data richness ≥70%). At threshold 68: 9 qualifying bets, $1,521 total stake.
+**Tier 1 Gate:** PATH 1 (promoted + opp≥60 + Pinnacle 2%+ edge) or PATH 2 (any active tier + opp≥60 + Pinnacle 2%+ edge + data richness ≥70%). Configurable via `minOpp` query param (default 60). Exchange market pre-check: before placing any non-MATCH_ODDS bet (DC, O/U, BTTS), verifies the market exists on Betfair via `findEventIdByTeamNames` + `listMarketsByEventId` — skips immediately if unavailable, avoiding wasted API calls and failed placements.

@@ -2,7 +2,7 @@ import { db, paperBetsTable, matchesTable, complianceLogsTable, pinnacleOddsSnap
 import { createPool } from "@workspace/db";
 import { eq, and, gte, lte, sql, desc, isNull } from "drizzle-orm";
 import { logger } from "../lib/logger";
-import { isLiveMode, getAccountFunds, getCachedBalance, getLiveBankroll, placeLiveBetOnBetfair } from "./betfairLive";
+import { isLiveMode, getAccountFunds, getCachedBalance, getLiveBankroll, placeLiveBetOnBetfair, findEventIdByTeamNames, listMarketsByEventId } from "./betfairLive";
 import { getEffectiveLimits, getCurrentLiveRiskLevel, runLiveConcentrationChecks, checkLiveCircuitBreakers, getLiveKellyFraction } from "./liveRiskManager";
 import { getApiBudgetStatus } from "./apiFootball";
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
@@ -600,6 +600,7 @@ export async function runCrossDbLaunchActivation(opts?: {
   maxBets?: number;
   maxStakePerBet?: number;
   excludeBetIds?: number[];
+  minOpportunityScore?: number;
 }): Promise<{
   mode: string;
   dryRun: boolean;
@@ -613,6 +614,7 @@ export async function runCrossDbLaunchActivation(opts?: {
   const maxBets = opts?.maxBets ?? 20;
   const maxStakePerBet = opts?.maxStakePerBet ?? 10;
   const excludeBetIds = new Set(opts?.excludeBetIds ?? []);
+  const minOppScore = opts?.minOpportunityScore ?? 60;
 
   const devDbUrl = process.env.DEV_DATABASE_URL;
   if (!devDbUrl) {
@@ -642,13 +644,13 @@ export async function runCrossDbLaunchActivation(opts?: {
         AND pb.deleted_at IS NULL
         AND m.kickoff_time > $1
         AND m.kickoff_time < $2
-        AND pb.opportunity_score >= 67
+        AND pb.opportunity_score >= $3
         AND pb.pinnacle_odds IS NOT NULL
         AND pb.calculated_edge >= 0.02
         AND pb.pinnacle_edge_category IS NOT NULL
         AND pb.pinnacle_edge_category != ''
       ORDER BY pb.opportunity_score DESC
-    `, [minKickoff.toISOString(), maxKickoff.toISOString()]);
+    `, [minKickoff.toISOString(), maxKickoff.toISOString(), minOppScore]);
 
     logger.info({ totalRows: rows.length }, "Cross-DB: raw candidates from dev DB");
 
@@ -773,6 +775,62 @@ export async function runCrossDbLaunchActivation(opts?: {
         });
         skipped++;
         continue;
+      }
+
+      const internalToBetfairType: Record<string, string> = {
+        "DOUBLE_CHANCE": "DOUBLE_CHANCE",
+        "OVER_UNDER_05": "OVER_UNDER_05",
+        "OVER_UNDER_15": "OVER_UNDER_15",
+        "OVER_UNDER_25": "OVER_UNDER_25",
+        "OVER_UNDER_35": "OVER_UNDER_35",
+        "OVER_UNDER_45": "OVER_UNDER_45",
+        "BTTS": "BOTH_TEAMS_TO_SCORE",
+        "BOTH_TEAMS_TO_SCORE": "BOTH_TEAMS_TO_SCORE",
+      };
+      const needsPreCheck = bet.marketType !== "MATCH_ODDS" && bet.homeTeam && bet.awayTeam;
+      if (needsPreCheck) {
+        const expectedBfType = internalToBetfairType[bet.marketType] ?? bet.marketType;
+        try {
+          const rawEventId = bet.betfairEventId && !bet.betfairEventId.startsWith("af_") ? bet.betfairEventId : null;
+          const eventId = rawEventId ?? await findEventIdByTeamNames(bet.homeTeam, bet.awayTeam);
+          if (eventId) {
+            const eventMarkets = await listMarketsByEventId(eventId);
+            const hasMarket = eventMarkets.some(m => m.description?.marketType === expectedBfType);
+            if (!hasMarket) {
+              const availableTypes = [...new Set(eventMarkets.map(m => m.description?.marketType).filter(Boolean))];
+              logger.info({ fixture: bet.fixture, eventId, marketType: bet.marketType, expectedBfType, availableTypes }, "Market not available on exchange — skipping pre-flight");
+              placements.push({
+                betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+                selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+                opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+                path, status: "skipped", reason: `${bet.marketType} unavailable on exchange (pre-check)`,
+              });
+              skipped++;
+              continue;
+            }
+            logger.info({ fixture: bet.fixture, eventId, marketType: bet.marketType }, "Market confirmed available — proceeding");
+          } else {
+            logger.warn({ fixture: bet.fixture }, "Could not resolve Betfair event — skipping");
+            placements.push({
+              betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+              selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+              opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+              path, status: "skipped", reason: "Event not found on Betfair",
+            });
+            skipped++;
+            continue;
+          }
+        } catch (err) {
+          logger.warn({ err, fixture: bet.fixture }, "Market pre-check failed — skipping");
+          placements.push({
+            betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
+            selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
+            opp: bet.opportunityScore, pinnEdge: Math.round(pinnEdgePct * 100) / 100,
+            path, status: "skipped", reason: "Market pre-check error",
+          });
+          skipped++;
+          continue;
+        }
       }
 
       if (dryRun) {
