@@ -1,0 +1,49 @@
+
+APPROVED: Lower Tier 1 Threshold to 48 — Publish After
+Dev data is unambiguous. Sub-67 bets: 279 settled, +27.3% ROI, 4x the volume of 67+ bets. The 48-57 band is the highest-performing band in the system at +36.8% ROI and +14.38% CLV. The current Tier 1 gate at 67 is routing the highest-ROI bets into paper.
+Approved changes:
+
+Lower live_opp_score_threshold from 67 to 48 in prod Neon. Match the score threshold. Apply floor adjustment if the current floor of 60 blocks this — drop the floor to 48 or remove it, whichever is cleaner.
+Also lower in dev to 48 for consistency (currently 68). Prod and dev configs should match unless there's a reason to differ, and there isn't one here.
+Update the code default in liveThresholdReview.ts from 68 to 48 so future deploys don't reintroduce the higher value.
+
+Safety net preserved: Tier 1 still requires Pinnacle odds + 2% Pinnacle edge + (promoted OR data richness ≥70%). Threshold is one gate of four. Lowering it doesn't remove the Pinnacle validation or edge requirement. This is the backstop that makes aggressive threshold-lowering defensible.
+
+Blocker 1 (VPS): Resolved. BETFAIR_PROXY_URL is live and routing. The "VPS Relay: Not configured" dashboard label is misleading — fix the label to reflect reality. Update it to show two statuses: "Betfair Proxy: configured (209.38.164.154)" and "Order Manager Relay: not configured (optional feature)." No other action required on VPS.
+Blocker 3 (SQL bug): Resolved. Path-dependent bug explanation makes sense. No bypass paths remain.
+
+Execution order:
+
+Apply the Tier 1 threshold change (67 → 48) in prod Neon and dev.
+Update code default in liveThresholdReview.ts (68 → 48) and floor if applicable.
+Fix the dashboard VPS status label.
+Run one trading cycle post-change. Report:
+
+How many bets now qualify for Tier 1 vs Tier 2.
+How many Tier 1 bets actually executed live (passed Pinnacle + edge + data richness gates).
+Full funnel at every stage.
+
+
+Publish. Push the deployment so the updated code runs persistently in Replit's cloud.
+Monitor for 24 hours. Report daily:
+
+Tier 1 bets placed live.
+Tier 1 CLV vs dev CLV on comparable score bands.
+Any bets rejected at Pinnacle/edge/data-richness gates (important — these are the remaining safety filters).
+Paper-to-live ROI delta if any bets settle in the window.
+
+
+
+
+Critical metric to track:
+Live CLV on the 48-57 score band vs dev CLV on the same band (+14.38% in dev). This is the single most important number over the next 2-3 weeks. If live CLV on this band tracks dev within a few points, the aggressive threshold lowering is validated. If live CLV drops meaningfully (below +5%), the 48-57 band may be suffering disproportionate slippage in live and we should raise the threshold incrementally.
+Do not preemptively raise the threshold based on noise. Wait for 30+ settled live bets in the band before judging.
+
+Operating rules:
+
+Show query output confirming threshold change is live in both DBs.
+Confirm Pinnacle/edge/data-richness gates still function after the change.
+Confirm prod and dev DATABASE_URL isolation intact.
+Publish happens after the post-change cycle report, not before.
+
+Go.

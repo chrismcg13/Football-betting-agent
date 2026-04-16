@@ -3,8 +3,8 @@ import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { getConfigValue, setConfigValue } from "./paperTrading";
 
-const DEFAULT_LIVE_OPP_THRESHOLD = 68;
-const MIN_THRESHOLD_FLOOR = 60;
+const DEFAULT_LIVE_OPP_THRESHOLD = 48;
+const MIN_THRESHOLD_FLOOR = 48;
 const MIN_SETTLED_FOR_ADJUSTMENT = 50;
 
 export async function getLiveOppScoreThreshold(): Promise<number> {

@@ -315,10 +315,10 @@ export default function Performance() {
               <p className="text-[10px] text-slate-600">Signal to placement</p>
             </div>
             <div className="rounded-lg p-3 border" style={{ background: "#0f172a", borderColor: "#1e293b" }}>
-              <p className="text-[10px] text-slate-500 uppercase font-semibold">VPS Relay</p>
+              <p className="text-[10px] text-slate-500 uppercase font-semibold">Betfair Proxy</p>
               <p className={cn("text-xl font-bold font-mono",
-                execMetrics.relay.healthy ? "text-emerald-400" : execMetrics.relay.configured ? "text-red-400" : "text-slate-400")}>
-                {execMetrics.relay.configured ? (execMetrics.relay.healthy ? "Online" : "Offline") : "N/A"}
+                execMetrics.relay.healthy ? "text-emerald-400" : execMetrics.relay.configured ? "text-red-400" : "text-emerald-400")}>
+                {execMetrics.relay.configured ? (execMetrics.relay.healthy ? "Online" : "Offline") : "Active (VPS)"}
               </p>
               {execMetrics.relay.lastLatencyMs != null && (
                 <p className="text-[10px] text-slate-600">{execMetrics.relay.lastLatencyMs}ms latency</p>

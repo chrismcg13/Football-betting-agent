@@ -168,17 +168,15 @@ export async function runMigrations() {
       WHERE key = 'bankroll' AND value::numeric < 500
     `);
 
-    // ── Set min_opportunity_score floor — raised to 58 after 73 settled bets collected.
-    //    Only applies as default seed; manual config updates take precedence.
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)
-      VALUES ('min_opportunity_score', '58', NOW())
-      ON CONFLICT (key) DO UPDATE SET value = '58', updated_at = NOW()
+      VALUES ('min_opportunity_score', '48', NOW())
+      ON CONFLICT (key) DO NOTHING
     `);
 
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)
-      VALUES ('live_opp_score_threshold', '68', NOW())
+      VALUES ('live_opp_score_threshold', '48', NOW())
       ON CONFLICT (key) DO NOTHING
     `);
 

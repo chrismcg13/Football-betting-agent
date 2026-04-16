@@ -311,10 +311,10 @@ export default function Overview() {
             sub={`${execMetrics.weekActivity.bets} this week`}
           />
           <SecondaryCard
-            label="VPS Relay"
-            value={execMetrics.relay.configured ? (execMetrics.relay.healthy ? "Healthy" : "Offline") : "Not configured"}
-            sub={execMetrics.relay.lastLatencyMs != null ? `${execMetrics.relay.lastLatencyMs}ms latency` : undefined}
-            color={execMetrics.relay.configured ? (execMetrics.relay.healthy ? "green" : "red") : "default"}
+            label="Betfair Proxy"
+            value={execMetrics.relay.configured ? (execMetrics.relay.healthy ? "Healthy" : "Offline") : "Active (VPS)"}
+            sub={execMetrics.relay.lastLatencyMs != null ? `${execMetrics.relay.lastLatencyMs}ms latency` : "Order relay: not configured"}
+            color={execMetrics.relay.configured ? (execMetrics.relay.healthy ? "green" : "red") : "green"}
           />
         </div>
       )}
