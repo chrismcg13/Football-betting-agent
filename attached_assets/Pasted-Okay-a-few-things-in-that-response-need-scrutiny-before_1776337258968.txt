@@ -1,0 +1,84 @@
+Okay, a few things in that response need scrutiny before you hit Publish. Let me flag them.
+
+Thing 1 — the VPS is missing, and that's a significant regression.
+
+Your memory and prior context clearly establish: "DigitalOcean VPS (UK/EU) resolving IP-blocking issues from Replit's US servers." You spent real money and real time setting that VPS up specifically because Betfair blocks Replit's US-based IPs. That was the whole point.
+
+Replit is now saying VPS_RELAY_URL isn't set and all Betfair calls go direct from the Replit instance. Two possibilities:
+
+    The VPS is still running but the env var got lost in the migration/config changes — bets are still landing because Replit happens to be routing via some path that works, or because Betfair isn't currently blocking.
+    The VPS was never actually integrated, or was decommissioned, and bets have been going direct all along.
+
+Either way, this is not the architecture you built. If Betfair blocks the Replit IP at any point — which is the exact scenario the VPS existed to prevent — your live betting stops instantly. This needs investigating before Publish, not after.
+
+Thing 2 — the "Tier 1 vs Tier 2" threshold is new information.
+
+Replit just said the Inter vs Cagliari bet landed as "paper-only (Tier 2)" because its score (60.8) was below the "Tier 1 live-placement threshold (67)."
+
+This is the first time a 67 threshold has been mentioned in this entire session. We've been debating the score threshold (58 → 48) under the belief that bets passing the threshold would be live-executed in prod. Now there's a second threshold at 67 that gates live vs paper in prod. The funnel analysis didn't surface this. The lever recommendations didn't address it.
+
+Think about what this means: the sub-58 score band that showed 36.8% ROI in dev? Those bets are now going to flow through prod's score threshold of 48, but get stopped at the Tier 1 threshold of 67 and land as paper bets, not live bets. The entire "turn the firehose on" work gets nullified by a filter nobody mentioned until now.
+
+This might be the actual bottleneck. All session. Everything we just did at the score-threshold layer might have been the wrong layer.
+
+Thing 3 — "the 13 existing Betfair bets were placed by this same instance before today's session, when the old code was running."
+
+Wait. The SQL array bug was crashing every trading cycle that tried to check market-type exposure. How did 13 live bets land if the cycle was crashing? Either the bug wasn't crashing every cycle (it was intermittent or path-dependent), or those 13 bets were placed via a path that bypassed the market-type exposure check. Worth understanding which, because if they went via a bypass path, that bypass path might still be operating and producing behaviour you can't see.
+
+Thing 4 — the Tier 1 bet that landed live today.
+
+Replit earlier said: "Betfair: £914 available, £130 exposure, £1,044 total ... 13 pending bets." Then later: "190 matches evaluated → ... 1 bet placed (Inter vs Cagliari BTTS Yes @ 5.50, edge 25.4%)." And now: "that bet landed as paper-only (Tier 2)."
+
+So the "bet placed" from the post-change cycle is paper, not live. The 13 Betfair bets are pre-fix. Net live bets placed after today's work: zero. The funnel is flowing, but the firehose we thought we turned on is pouring into the paper bucket, not the live one.
+
+Do not hit Publish yet.
+
+Publishing deploys current code. Current code has three open questions that need answering first. Here's what to send:
+HOLD ON PUBLISH — Three Blockers to Resolve First
+
+Good update on the deployment pipeline. Before I hit Publish, three issues surfaced in your response that need resolving. Do not publish until these are all answered and, where needed, fixed.
+
+Blocker 1: The DigitalOcean VPS appears to be missing.
+
+You reported VPS_RELAY_URL is not set and all Betfair calls go direct from Replit. This contradicts the established architecture. The VPS was set up specifically because Betfair blocks Replit's US-based IPs. That's why I paid for it. That's why we migrated the Betfair integration through it.
+
+Questions:
+
+    Does the DigitalOcean VPS still exist and run? Confirm with direct check, not inference.
+    If it exists, why is VPS_RELAY_URL not set? When was it unset? What removed it?
+    If it doesn't exist, when and how was it decommissioned, and why haven't we been IP-blocked by Betfair since?
+    How are Betfair API calls currently succeeding from a Replit US IP? Has Betfair's blocking policy changed, or is there a routing path I don't know about?
+    What's the exposure if Betfair IP-blocks the current route mid-session — does the system fail gracefully or does it hang?
+
+Fix: if the VPS exists, restore VPS_RELAY_URL and route Betfair traffic through it. If it doesn't, we need to decide whether to rebuild it or accept the direct-route risk. Do not publish while this is unresolved.
+
+Blocker 2: The Tier 1 / Tier 2 threshold at 67.
+
+You just mentioned: "that bet landed as paper-only (Tier 2) because its opportunity score (60.8) was below the Tier 1 live-placement threshold (67)."
+
+This is the first time a 67 threshold has been mentioned in this entire session. The funnel analysis didn't surface it. The lever recommendations didn't address it. All the work we just did at the score-threshold layer (58 → 48) appears to be nullified by a second, higher threshold gating live execution.
+
+Questions:
+
+    Where is the Tier 1 threshold of 67 set? File, line, config table.
+    What's the full tier structure? Tier 1 = live, Tier 2 = paper, are there more tiers? What thresholds gate each?
+    How does the Tier system interact with the score threshold, quarantine, and candidate/promoted gates? Which applies first?
+    Did the Tier thresholds also diverge between dev and prod during the migration, like min_opportunity_score did?
+    What does dev's distribution of bets look like across Tier 1 / Tier 2 / other? What's dev's ROI and CLV on each tier?
+    Given dev's sub-58 score band showed +36.8% ROI and +14.38% CLV, and bets at score 48–67 are the ones we just unblocked — these are now landing as paper in prod, not live. Is that the actual bottleneck we should have been solving?
+
+This might be the real firehose constraint. Pull the dev data on Tier 1 / Tier 2 ROI and CLV. If dev's Tier 2 bets (score below 67) are profitable, the Tier 1 threshold should come down or the Tier gate for live execution should be revisited. Recommend with reasoning.
+
+Blocker 3: Pre-fix bet placement consistency.
+
+You said the 13 existing Betfair bets "were placed by this same instance before today's session, when the old code was running." But the SQL array bug in checkMarketTypeExposure was described as "crashing every trading cycle that tried to place a bet."
+
+If every cycle crashed, how did 13 live bets land?
+
+Possibilities:
+
+    The crash was intermittent (only certain market types triggered the array format issue).
+    Some code paths bypassed the market-type exposure check entirely.
+    The crash was non-fatal — cycle continued past the check somehow.
+
+Clarify which. If there's a bypass path, confirm it's now closed. If the crash was intermittent, confirm which market types were affected and whether any of today's placed bets went via the broken path.
