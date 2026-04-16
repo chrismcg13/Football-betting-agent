@@ -234,6 +234,20 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS closing_pinnacle_odds NUMERIC(10,4)
     `);
 
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS odds_source TEXT DEFAULT 'synthetic',
+        ADD COLUMN IF NOT EXISTS enhanced_opportunity_score NUMERIC(6,2),
+        ADD COLUMN IF NOT EXISTS pinnacle_odds NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS pinnacle_implied NUMERIC(8,6),
+        ADD COLUMN IF NOT EXISTS best_odds NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS best_bookmaker TEXT,
+        ADD COLUMN IF NOT EXISTS bet_thesis TEXT,
+        ADD COLUMN IF NOT EXISTS is_contrarian TEXT DEFAULT 'false',
+        ADD COLUMN IF NOT EXISTS closing_odds_proxy NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS clv_pct NUMERIC(8,4)
+    `);
+
     // ── Pinnacle upgrade compliance log (idempotent — only logs once) ────────
     const upgradeLogged = await db.execute(sql`
       SELECT 1 FROM compliance_logs
@@ -774,6 +788,95 @@ export async function runMigrations() {
       ALTER TABLE competition_config
         ADD COLUMN IF NOT EXISTS competition_type TEXT NOT NULL DEFAULT 'league',
         ADD COLUMN IF NOT EXISTS seasonal_phase TEXT NOT NULL DEFAULT 'unknown'
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS discovered_leagues (
+        id SERIAL PRIMARY KEY,
+        league_id INTEGER NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        country TEXT NOT NULL DEFAULT '',
+        tier TEXT NOT NULL DEFAULT 'unknown',
+        fixture_count INTEGER NOT NULL DEFAULT 0,
+        has_api_football_odds BOOLEAN NOT NULL DEFAULT false,
+        has_pinnacle_odds BOOLEAN NOT NULL DEFAULT false,
+        seed_edge_score INTEGER NOT NULL DEFAULT 75,
+        bets_placed INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'monitoring',
+        first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        activated_at TIMESTAMPTZ,
+        discovery_notes TEXT
+      )
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS api_usage (
+        id SERIAL PRIMARY KEY,
+        date TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        request_count INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS league_edge_scores (
+        id SERIAL PRIMARY KEY,
+        league TEXT NOT NULL,
+        market_type TEXT NOT NULL DEFAULT 'ALL',
+        total_bets INTEGER NOT NULL DEFAULT 0,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+        roi_pct REAL NOT NULL DEFAULT 0,
+        avg_clv REAL NOT NULL DEFAULT 0,
+        avg_edge REAL NOT NULL DEFAULT 0,
+        confidence_score REAL NOT NULL DEFAULT 50,
+        is_seed_data INTEGER NOT NULL DEFAULT 1,
+        last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(league, market_type)
+      )
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS odds_history (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        bookmaker TEXT NOT NULL DEFAULT 'market',
+        odds NUMERIC(10,4) NOT NULL,
+        snapshot_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        previous_odds NUMERIC(10,4),
+        odds_change_pct NUMERIC(10,4),
+        direction TEXT,
+        hours_to_kickoff NUMERIC(10,2)
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS odds_history_match_idx ON odds_history(match_id)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS odds_history_time_idx ON odds_history(snapshot_time)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS oddspapi_fixture_map (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        oddspapi_fixture_id TEXT NOT NULL,
+        cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(match_id)
+      )
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS oddspapi_league_coverage (
+        id SERIAL PRIMARY KEY,
+        league TEXT NOT NULL UNIQUE,
+        has_odds INTEGER NOT NULL DEFAULT 0,
+        last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
     `);
 
     logger.info("Migrations complete");
