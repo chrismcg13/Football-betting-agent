@@ -1,0 +1,78 @@
+STOP — Verify Live Execution Before Pulling More Levers
+Before any more config changes, confirm what actually happened with live execution in prod. Something doesn't add up and Chris has flagged it correctly.
+Discrepancy to explain:
+
+Report claims 30 bets placed today, 13 Tier 1 Betfair, 17 Tier 2 paper, £259 staked.
+Betfair available balance: £914. Pending exposure: £214.
+Earlier today (before Pinnacle fix, before all this session's work): Betfair available balance was £914, pending exposure £130, 13 live bets.
+
+Balance hasn't moved. Are the "13 Tier 1 Betfair" bets in your report the same 13 pre-existing live bets from before this session, or 13 new bets placed today in addition to the pre-existing ones?
+
+Phase 1 — Reconcile live execution (no config changes).
+
+Explicit bet-by-bet breakdown. For every bet in the "30 placed today" count:
+
+Bet ID
+Placed timestamp
+Tier (1 or 2)
+Market, selection, odds, stake
+If Tier 1: Betfair bet ID, confirmed placement status
+Which database contains it: prod Neon or dev Replit Postgres
+Whether it was placed before or after today's Pinnacle mapping fix
+
+
+Count of genuinely new Tier 1 live bets since the Pinnacle fix. Not cumulative. Not pre-existing. Just: after the Pinnacle coverage went from 3.5% to 29%, how many new bets actually placed on real money on Betfair? If the answer is zero, say zero.
+Environment isolation check. Confirm that:
+
+All "placed today" bets live in prod Neon, not dev Replit Postgres
+Dashboard "upcoming bets" (previously reported as wrong at 25) is pulling from prod only, not mixing environments
+The scheduler currently running and reporting is pointing at prod DATABASE_URL, not dev
+No aggregation query anywhere is summing across both databases
+
+
+Explain the balance non-movement. If any new Tier 1 live bets were placed since the Pinnacle fix, Betfair's available balance should have decreased by the total staked. If it hasn't, either the bets were paper-only (not actually sent to Betfair) or the stake values in the report don't match what was actually wagered on Betfair.
+
+
+Phase 2 — If genuinely zero new Tier 1 live bets since Pinnacle fix: diagnose why.
+If Phase 1 confirms zero new live bets, the Pinnacle mapping improvement isn't translating to live execution. Trace every Tier 1 eligibility check for a sample of bets that should have qualified:
+Pick 5 bets from the last 10 cycles where:
+
+Score ≥ 48
+Pinnacle odds were present in the merged cache
+
+For each, report which of these gates rejected it to paper:
+
+Pinnacle edge < 2% (Rule 12)
+Data richness < 70% (Rule 13)
+Not on promoted tier AND data richness <70% (Rule 13 second clause)
+Production quarantine (Rule 14)
+Tier 1 odds floor <1.80 (Rule 4)
+Universal odds floor <1.50 (Rule 3)
+Stats coverage fail (Rule 5, corners/cards only)
+Duplicate guard
+Any exposure cap at Level 1 (Rules 15-22)
+
+This tells us which gate is actually blocking live execution now that Pinnacle coverage is better.
+
+Phase 3 — Then and only then, recommend lever pulls with dev data.
+Once Phase 2 identifies which gate is now the binding constraint, propose a lever change only on that gate, backed by dev ROI data on bets that would be unblocked.
+Specific gates I want you to have dev data ready for when you recommend:
+
+Data richness threshold (Rule 13, currently ≥70%). What's dev's ROI on bets with data richness 50-70%? 60-70%? If dev is profitable at lower richness, this threshold is likely too tight.
+Pinnacle edge threshold (Rule 12, currently ≥2%). What's dev's ROI on bets with Pinnacle edge 1-2%? At 0-1%? The 2% threshold was chosen at some point — let's see if dev justifies it.
+Tier 1 odds floor (Rule 4, currently ≥1.80). What's dev's ROI on live-qualifying bets with odds 1.50-1.80? This band includes lots of strong-favourite markets.
+Stats coverage gate (Rule 5). How many candidates per cycle are being rejected for corners/cards stats gaps? Is dev profitable on corners/cards without full stats coverage?
+
+Do not pull any lever until Phase 1 and 2 are reported and Chris approves.
+
+Operating rules:
+
+Do not change any config this round until Chris confirms what actually happened with live execution since the Pinnacle fix. Data first, pulls second.
+Every number in the Phase 1 reconciliation backed by a query against the specific database (prod Neon or dev Replit Postgres). Name the database for every number.
+If the environment isolation check reveals any cross-contamination between dev and prod, stop everything and report immediately. That would be a critical issue overriding all other work.
+If Phase 1 confirms zero new live bets since the Pinnacle fix, do not try to spin the finding. State it plainly. The mapping work was valuable even if live execution hasn't followed yet — understanding where the remaining gate is matters more than making the numbers look good.
+
+Go.
+
+Paste that in.
+My honest read on where this lands: I expect Phase 1 confirms the 13 Tier 1 bets are the pre-existing ones and zer
