@@ -273,7 +273,6 @@ export async function placePaperBet(
     bestBookmaker,
     betThesis,
     isContrarian = false,
-    stakeMultiplier = 1.0,
     experimentTag,
     dataTier = "experiment",
     opportunityBoosted = false,
@@ -283,6 +282,11 @@ export async function placePaperBet(
     pinnacleEdgeCategory = null,
     lineDirection = null,
   } = options;
+  // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
+  let stakeMultiplier = options.stakeMultiplier ?? 1.0;
+  // Mutable: boosted bets that pre-qualify for Tier 1B get tagged "1B_boosted"
+  // and bypass the production quarantine.
+  let boostedTier1BApproved = false;
   // Make these mutable so we can fall back to DB-stored Pinnacle snapshots
   // when the trading-cycle cache misses (allows Tier 1B qualification).
   let pinnacleOdds: number | null = options.pinnacleOdds ?? null;
@@ -381,17 +385,83 @@ export async function placePaperBet(
   // ──────────────────────────────────────────────────────────────────────────
 
   // ── Production quarantine ──────────────────────────────────────────────
-  // In production, block abandoned/demoted tiers and opportunity-boosted bets.
-  // Experiment and candidate tiers are allowed through — they can still qualify
-  // for Tier 1 via the Data Richness Path (opp score ≥ threshold + Pinnacle
-  // 2%+ edge + data richness ≥ 70%). The Tier 1 gate handles the final decision.
+  // In production, block abandoned/demoted tiers. Opportunity-boosted bets
+  // are allowed through ONLY if they pre-qualify for Tier 1B (Pinnacle odds
+  // present, Pinnacle edge ≥ 1%, score ≥ threshold, odds ≥ 1.80). Approved
+  // boosted bets get a 0.5x stake multiplier and qualification_path = '1B_boosted'.
   const currentEnv = process.env["ENVIRONMENT"] ?? "development";
   if (currentEnv === "production") {
     if (dataTier === "abandoned" || dataTier === "demoted") {
       return logReject(`Production quarantine: ${dataTier}-tier bets blocked in prod`);
     }
     if (opportunityBoosted) {
-      return logReject("Production quarantine: opportunity-boosted bets blocked in prod");
+      // Lookup match league/country for Tier 1B pre-check.
+      const [matchRow] = await db
+        .select({ league: matchesTable.league, country: matchesTable.country })
+        .from(matchesTable)
+        .where(eq(matchesTable.id, matchId))
+        .limit(1);
+
+      // Run a Pinnacle DB fallback inline so the pre-check sees DB-stored Pinnacle odds.
+      let preCheckPinOdds = pinnacleOdds;
+      let preCheckPinImplied = pinnacleImplied;
+      if (preCheckPinOdds == null) {
+        try {
+          const variants = Array.from(new Set([
+            selectionName,
+            selectionName.endsWith(" Goals") ? selectionName.replace(/ Goals$/, "") : `${selectionName} Goals`,
+          ]));
+          const latestPin = await db
+            .select({ backOdds: oddsSnapshotsTable.backOdds })
+            .from(oddsSnapshotsTable)
+            .where(and(
+              eq(oddsSnapshotsTable.matchId, matchId),
+              eq(oddsSnapshotsTable.marketType, marketType),
+              inArray(oddsSnapshotsTable.selectionName, variants),
+              or(
+                eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
+                eq(oddsSnapshotsTable.source, "oddspapi"),
+                eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
+              ),
+            ))
+            .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+            .limit(1);
+          const fb = latestPin[0]?.backOdds ? parseFloat(latestPin[0].backOdds) : null;
+          if (fb && fb > 1.01) {
+            preCheckPinOdds = fb;
+            preCheckPinImplied = 1 / fb;
+            // Promote to outer scope so the main flow uses these too.
+            pinnacleOdds = fb;
+            pinnacleImplied = preCheckPinImplied;
+          }
+        } catch (err) {
+          logger.warn({ err, matchId }, "Boosted-bet Pinnacle pre-check fallback failed");
+        }
+      }
+
+      const preCheck = await qualifiesForTier1({
+        opportunityScore: score,
+        dataTier,
+        marketType,
+        league: matchRow?.league ?? "",
+        country: matchRow?.country ?? "",
+        pinnacleOdds: preCheckPinOdds,
+        pinnacleImplied: preCheckPinImplied,
+        modelProbability,
+        backOdds,
+      });
+      if (!preCheck.qualifies || preCheck.path !== "1B") {
+        return logReject(
+          `Production quarantine: opportunity-boosted bet not Tier 1B-qualified (${preCheck.reason})`,
+        );
+      }
+      // Approved: apply 0.5x stake and tag for later.
+      stakeMultiplier *= 0.5;
+      boostedTier1BApproved = true;
+      logger.info(
+        { matchId, marketType, score, edge, stakeMultiplier },
+        "Boosted bet exempted from quarantine — pre-qualifies Tier 1B at 0.5x stake",
+      );
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -793,7 +863,12 @@ export async function placePaperBet(
     });
 
     const liveTier = tier1Check.qualifies ? "tier1" : "tier2";
-    const qualificationPath = tier1Check.qualifies ? (tier1Check.path ?? "1B") : "paper";
+    let qualificationPath: string = tier1Check.qualifies ? (tier1Check.path ?? "1B") : "paper";
+    // If this is an opportunity-boosted bet that passed the Tier 1B pre-check
+    // in the production quarantine, tag it as 1B_boosted (overrides "1B").
+    if (boostedTier1BApproved && tier1Check.qualifies) {
+      qualificationPath = "1B_boosted";
+    }
     await db.update(paperBetsTable).set({ liveTier, qualificationPath }).where(eq(paperBetsTable.id, bet.id));
 
     if (tier1Check.qualifies) {

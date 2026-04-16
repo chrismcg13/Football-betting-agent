@@ -1,0 +1,69 @@
+1. Fix cards stats flags and has_lineups/has_events for major leagues (immediate).
+This was approved earlier but not yet executed. Do it now:
+sqlUPDATE competition_config 
+SET has_statistics = true, has_lineups = true, has_events = true
+WHERE (name, country) IN (
+  ('Premier League', 'England'), ('Championship', 'England'),
+  ('League One', 'England'), ('League Two', 'England'),
+  ('Serie A', 'Italy'), ('Serie B', 'Italy'),
+  ('Ligue 1', 'France'), ('Ligue 2', 'France'),
+  ('Bundesliga', 'Germany'), ('2. Bundesliga', 'Germany'),
+  ('La Liga', 'Spain'), ('Segunda División', 'Spain'),
+  ('Primeira Liga', 'Portugal'), ('Eredivisie', 'Netherlands'),
+  ('Süper Lig', 'Turkey'), ('Allsvenskan', 'Sweden'),
+  ('Ekstraklasa', 'Poland'), ('HNL', 'Croatia'),
+  ('Super League', 'Greece'), ('K League 1', 'South Korea'),
+  ('J1 League', 'Japan'), ('MLS', 'USA')
+);
+Verify after: query the data_richness_cache for these leagues. Scores should jump from ~52 to ~92. Bets in these leagues now qualify for Tier 1A as well as Tier 1B.
+Rebuild the data_richness_cache after the update so the new scores take effect immediately.
+
+
+what does the 40-48 band look like in dev? If dev has settled bets below 48 with positive ROI and Pinnacle validation, lowering the threshold for Pinnacle-validated bets is fully defensible.
+The implementation would be a conditional threshold: score ≥48 for all bets, but score ≥40 (or even 35) if the bet also passes Pinnacle validation with edge ≥1%. Two-tier threshold. Pinnacle presence earns a lower bar.
+
+Allow opportunity-boosted bets through Tier 1B at 0.5x stake.
+Modify production quarantine: if a bet is opportunity_boosted = true AND qualifies for Tier 1B (Pinnacle odds present, Pinnacle edge ≥1%, score ≥ threshold, odds ≥1.80), exempt it from quarantine but apply 0.5x stake multiplier. Tag as qualification_path = '1B_boosted'.
+
+3. Lower score threshold for Pinnacle-validated bets only.
+First, pull dev data: what's dev's ROI and CLV on bets with scores in these bands that also had Pinnacle validation:
+
+Score 35-40: N settled, ROI, CLV
+Score 40-45: N settled, ROI, CLV
+Score 45-48: N settled, ROI, CLV
+Score 48+ (current threshold): N settled, ROI, CLV (already known)
+
+If dev shows positive ROI and CLV at lower score bands when Pinnacle-validated, implement a conditional threshold:
+
+Bets WITHOUT Pinnacle validation: score ≥48 (unchanged)
+Bets WITH Pinnacle validation AND Pinnacle edge ≥1%: score ≥ [lowest band with positive dev ROI and CLV]
+
+This is a two-tier threshold. Pinnacle presence earns a lower bar because it provides independent edge confirmation that compensates for lower model confidence. The model's score and Pinnacle's edge are two separate signals — requiring both to be high is over-filtering.
+If dev data doesn't support lowering below 48 (insufficient sample or negative ROI at lower bands), leave the threshold at 48 and report the data. Don't force the change without evidence.
+
+Cards has_statistics flag for top leagues — this was worth ~84 bets/day in the earlier analysis. Many of those will have Pinnacle data and qualify for Tier 1B. This is free volume you've already approved in principle.
+Lifting opportunity_boosted quarantine for Tier 1B bets — worth ~66 bets/day. With Pinnacle edge ≥1% as the quality gate, the quarantine on boosted bets is redundant for Tier 1B-qualifying bets. Apply at 0.5x stake as discussed.
+Combined, those two unlock ~150 more candidates per day. Not all will have Pinnacle data, but at 29% coverage (climbing), that's 40+ additional Pinnacle-validated candidates.
+
+Approach 3: Push Pinnacle coverage harder — it's still climbing.
+Coverage went 3.5% → 20% → 29% in one session. The mapping fixes are still propagating. 
+
+After all three changes, run one cycle and report:
+
+Tier 1A bets placed (should now be non-zero for major leagues with updated richness scores)
+Tier 1B bets placed
+Tier 1B_boosted bets placed
+Tier 2 paper bets with blocking reason for each
+Betfair balance before and after
+Betfair bet IDs for every live bet
+Total live bet volume estimate for next 24h based on this cycle's rate
+
+
+Operating rules:
+
+Ship changes 1 and 2 immediately — no dev data needed.
+Change 3 requires dev data first. Pull the data, report it, then apply if supported.
+Betfair balance movement remains the source of truth.
+If the post-change cycle places fewer than 5 live bets, report which gate is now the binding constraint.
+
+Go.
