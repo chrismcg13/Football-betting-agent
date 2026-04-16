@@ -273,14 +273,15 @@ async function main() {
     logger.warn({ err }, "Baseline league seed failed — non-fatal"),
   );
 
-  // 4. Start schedulers — DEV ONLY
-  // In production, the server only serves the dashboard API. All data ingestion,
-  // betting, settlement, and ML training happen exclusively in the dev environment.
-  // Data flows to production ONLY via the syncDevToProd pipeline after promotion.
+  // 4. Start schedulers
+  // When TRADING_MODE=LIVE, the full trading engine runs regardless of ENVIRONMENT.
+  // In production with PAPER mode, the server only serves the dashboard API.
+  const TRADING_MODE = process.env["TRADING_MODE"] ?? "PAPER";
+  const shouldRunEngine = TRADING_MODE === "LIVE" || ENVIRONMENT !== "production";
   let modelLoaded = false;
-  if (ENVIRONMENT !== "production" && !liveHealthPassed) {
+  if (shouldRunEngine && !liveHealthPassed) {
     logger.error("LIVE health checks failed — schedulers and trading engine DISABLED. Server will only serve API.");
-  } else if (ENVIRONMENT !== "production") {
+  } else if (shouldRunEngine) {
     startSettlementCron();
     logger.info("Settlement cron started (every 5 min)");
 
@@ -301,12 +302,12 @@ async function main() {
       logger.warn({ err }, "Startup data richness calculation failed — will run on next Sunday cron"),
     );
   } else {
-    logger.info("PRODUCTION MODE — schedulers, settlement, ML training, and data ingestion DISABLED");
+    logger.info("PRODUCTION MODE (PAPER) — schedulers, settlement, ML training, and data ingestion DISABLED");
     logger.info("Production serves dashboard API only. Data arrives via syncDevToProd pipeline.");
   }
 
   // 5b. Startup reconciliation — check for bets stuck in PENDING_PLACEMENT from a crash
-  if (ENVIRONMENT !== "production") {
+  if (shouldRunEngine) {
     try {
       const { reconcileStalePlacements } = await import("./services/paperTrading");
       const reconResult = await reconcileStalePlacements();

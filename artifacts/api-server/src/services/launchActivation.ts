@@ -231,11 +231,11 @@ async function runPreFlightChecks(isLive: boolean): Promise<PreFlightResult> {
       checks.push({ name: "Betfair API / Balance", passed: false, detail: `Failed: ${String(err)}` });
     }
 
-    const vpsUrl = process.env["VPS_RELAY_URL"];
+    const proxyUrl = process.env["BETFAIR_PROXY_URL"];
     checks.push({
-      name: "VPS Relay",
-      passed: !!vpsUrl,
-      detail: vpsUrl ? `Configured: ${vpsUrl}` : "VPS_RELAY_URL not set — live placement will fail",
+      name: "Betfair Proxy",
+      passed: !!proxyUrl,
+      detail: proxyUrl ? `Configured: ${proxyUrl}` : "BETFAIR_PROXY_URL not set — live placement will fail",
     });
   } else {
     const bankroll = await getBankroll();

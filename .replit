@@ -95,5 +95,5 @@ ENVIRONMENT = "production"
 TRADING_MODE = "LIVE"
 
 [userenv.development]
-ENVIRONMENT = "development"
-TRADING_MODE = "PAPER"
+ENVIRONMENT = "production"
+TRADING_MODE = "LIVE"
