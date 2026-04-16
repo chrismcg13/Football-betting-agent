@@ -320,13 +320,6 @@ export async function runTradingCycle(options?: {
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   }
 
-  const lockAcquired = await tryAdvisoryLock(TRADING_LOCK_ID);
-  if (!lockAcquired) {
-    logger.warn({ tier }, "Trading cycle locked by another instance — skipping");
-    markRun("trading", "skipped");
-    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
-  }
-
   tradingCycleRunning = true;
   markStart("trading");
 
@@ -401,10 +394,8 @@ export async function runTradingCycle(options?: {
       "Pinnacle validation cache ready (OddsPapi + API-Football Pinnacle merged, selection-level)",
     );
 
-    const valueSummary = await detectValueBets();
-    const timely = valueSummary.valueBets.filter(
-      (b) => new Date(b.kickoffTime) >= earliest && new Date(b.kickoffTime) <= latest,
-    );
+    const valueSummary = await detectValueBets({ earliestKickoff: earliest, latestKickoff: latest });
+    const timely = valueSummary.valueBets;
 
     logger.info(
       {
@@ -413,7 +404,7 @@ export async function runTradingCycle(options?: {
         realOdds: valueSummary.realOddsCount,
         syntheticOdds: valueSummary.syntheticOddsCount,
         byMarketType: valueSummary.byMarketType,
-        window: "1h-168h before kickoff",
+        window: `${minHours}h-${maxHours}h before kickoff`,
       },
       "Value detection complete for trading cycle",
     );
@@ -572,7 +563,7 @@ export async function runTradingCycle(options?: {
     const todayBetRows = await db
       .select({ count: sql<number>`count(*)` })
       .from(paperBetsTable)
-      .where(sql`date_trunc('day', ${paperBetsTable.placedAt} AT TIME ZONE 'UTC') = current_date AND status != 'void'`);
+      .where(sql`date_trunc('day', ${paperBetsTable.placedAt} AT TIME ZONE 'UTC') = current_date AND status != 'void' AND deleted_at IS NULL`);
     const todayCount = Number(todayBetRows[0]?.count ?? 0);
     const dailySlotsLeft = Math.max(0, maxDailyBets - todayCount);
 
@@ -938,7 +929,6 @@ export async function runTradingCycle(options?: {
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   } finally {
     tradingCycleRunning = false;
-    await releaseAdvisoryLock(TRADING_LOCK_ID);
   }
 }
 
@@ -1500,24 +1490,17 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Alert cleanup active — Sunday 06:00 UTC (90-day retention)");
 
-  // Startup trading cycle: fire 2 minutes after server start so any restart
-  // doesn't leave the cycle dormant for up to 5 minutes.
-  // Also refresh odds first so the cycle has fresh market data.
   setTimeout(() => {
-    logger.info("Startup odds refresh triggered (post-restart warmup)");
-    void fetchAndStoreOddsForAllUpcoming()
-      .then(() => {
-        logger.info("Startup odds refresh complete — running near-term trading cycle");
-        return runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 });
-      })
+    logger.info("Startup near trading cycle triggered (post-restart warmup, skipping full odds refresh)");
+    void runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 })
       .then((result) => {
         logger.info(result, "Startup near trading cycle complete");
       })
       .catch((err) => {
-        logger.warn({ err }, "Startup warmup sequence failed — non-fatal, cron will retry");
+        logger.warn({ err }, "Startup warmup failed — non-fatal, cron will retry");
       });
-  }, 2 * 60 * 1000); // 2 minutes after start
-  logger.info("Startup warmup scheduled — odds refresh + near trading cycle in 2 min");
+  }, 30 * 1000);
+  logger.info("Startup warmup scheduled — near trading cycle in 30s (odds already in DB)");
 
   // Seed baseline leagues + competition config at startup (idempotent — uses onConflictDoNothing)
   void seedBaselineLeagues().catch((err) => logger.warn({ err }, "Baseline league seed failed — non-fatal"));

@@ -9,7 +9,7 @@ import {
   learningNarrativesTable,
   leagueEdgeScoresTable,
 } from "@workspace/db";
-import { eq, desc, and, gte, sql } from "drizzle-orm";
+import { eq, desc, and, gte, lte, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { ensureExperimentRegistered, getExperimentTier } from "./promotionEngine";
 import {
@@ -668,7 +668,10 @@ const BANNED_MARKETS = new Set([
 
 // ─── Main detection function ──────────────────────────────────────────────────
 
-export async function detectValueBets(): Promise<EvaluationSummary> {
+export async function detectValueBets(options?: {
+  earliestKickoff?: Date;
+  latestKickoff?: Date;
+}): Promise<EvaluationSummary> {
   const modelVersion = getModelVersion();
   logger.info({ modelVersion }, "Running value detection");
 
@@ -687,10 +690,20 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
 
   discoveryCountsLoaded = false;
 
+  const conditions = [eq(matchesTable.status, "scheduled")];
+  if (options?.earliestKickoff) {
+    conditions.push(gte(matchesTable.kickoffTime, options.earliestKickoff));
+  }
+  if (options?.latestKickoff) {
+    conditions.push(lte(matchesTable.kickoffTime, options.latestKickoff));
+  }
+
   const matches = await db
     .select()
     .from(matchesTable)
-    .where(eq(matchesTable.status, "scheduled"));
+    .where(and(...conditions));
+
+  logger.info({ matchCount: matches.length, earliest: options?.earliestKickoff, latest: options?.latestKickoff }, "Value detection: matches to evaluate");
 
   const valueBets: ValueBet[] = [];
   let selectionsEvaluated = 0;

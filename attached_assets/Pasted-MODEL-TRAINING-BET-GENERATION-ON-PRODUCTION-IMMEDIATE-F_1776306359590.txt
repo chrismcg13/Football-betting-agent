@@ -1,0 +1,35 @@
+MODEL TRAINING & BET GENERATION ON PRODUCTION — IMMEDIATE FIX
+
+The system is live but the model can't generate new bets because it has no training data on Neon. Meanwhile the DC over-generation fix means fewer low-quality DC bets will pass the threshold, which is correct — but we need volume in exchange-friendly markets to replace them.
+
+PRIORITY 1: GET THE MODEL RUNNING ON PROD
+
+The dev-trained model (v1.16.0-retrain-320bets trained on 320 settled bets from Helium) should work identically on prod — model weights and coefficients don't depend on the database they were trained from. They predict based on input features, not database queries at inference time.
+
+Options in order of speed:
+a) Export the trained model parameters from dev and load them directly on prod. The model just needs its weights/coefficients — it doesn't need to retrain from scratch.
+b) If the model can't be exported: copy the minimum required historical match data from Helium to Neon (just the settled matches the model needs for training, not all 1,019 bets) and retrain on prod.
+c) If neither works: explain what's blocking and propose a solution.
+
+Whatever you do, the 5-minute trading cycle must have a working model within the hour. Every cycle without a model is missed opportunity.
+
+PRIORITY 2: VERIFY EXCHANGE-FRIENDLY MARKET GENERATION
+
+Once the model is running:
+a) Run one full trading cycle manually
+b) Show me every bet the model evaluates — what market types is it looking at?
+c) Specifically: how many Over/Under 2.5 bets is it evaluating? This is the most liquid market on Betfair after Match Odds and should be generating significant volume
+d) How many Match Odds (1X2) bets?
+e) How many BTTS bets?
+f) With the DC deflation active, what percentage of qualifying bets are now DC vs other market types?
+g) How many pass the full Tier 1 gate (threshold 58, Pinnacle edge >= 2%, data richness >= 70%)?
+h) Of those, how many have a market available on Betfair Exchange?
+
+PRIORITY 3: ASSESS THE O/U 2.5 GAP
+
+The data showed only 3 O/U 2.5 bets qualifying previously vs 103 DC. This feels wrong — O/U 2.5 is one of the most popular betting markets and should have plenty of fixtures where the model finds edge. Investigate:
+a) Is the model actually evaluating O/U 2.5 for every fixture, or is it skipping them?
+b) What edge is the model typically finding on O/U 2.5? If edges are small (1-2%), they're being filtered by the Pinnacle gate — which is correct but might indicate the model needs better features for this market
+c) Are there fixtures where O/U 2.5 shows strong edge but the opportunity score is below 58?
+
+Show me the full picture. The goal is a system generating 10-20+ placeable bets per day across exchange-friendly markets, not 4 bets from a one-time launch batch.
