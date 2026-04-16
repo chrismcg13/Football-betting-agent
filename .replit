@@ -88,12 +88,10 @@ channel = "stable-25_05"
 BETFAIR_PROXY_URL = "http://209.38.164.154:3001"
 BETFAIR_IDENTITY_PROXY_URL = "http://209.38.164.154:3001/identity"
 DEV_DATABASE_URL = "postgresql://postgres:password@helium/heliumdb?sslmode=disable"
-
-[userenv.production]
-SHARED_DATABASE_URL = ""
 ENVIRONMENT = "production"
 TRADING_MODE = "LIVE"
 
+[userenv.production]
+SHARED_DATABASE_URL = ""
+
 [userenv.development]
-ENVIRONMENT = "development"
-TRADING_MODE = "PAPER"
