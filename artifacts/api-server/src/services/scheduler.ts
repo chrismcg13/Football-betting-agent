@@ -597,7 +597,7 @@ export async function runTradingCycle(options?: {
     const existingPending = await db
       .select({ matchId: paperBetsTable.matchId, marketType: paperBetsTable.marketType, selectionName: paperBetsTable.selectionName })
       .from(paperBetsTable)
-      .where(eq(paperBetsTable.status, "pending"));
+      .where(and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`));
     const pendingKeys = new Set(existingPending.map((b) => `${b.matchId}|${b.marketType}|${b.selectionName}`));
 
     for (const entry of allEntries) {

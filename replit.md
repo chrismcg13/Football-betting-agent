@@ -126,4 +126,30 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 
 **Tier 1 Gate:** PATH 1 (promoted + opp≥58 + Pinnacle 2%+ edge) or PATH 2 (any active tier + opp≥58 + Pinnacle 2%+ edge + data richness ≥70%). Configurable via `minOpp` query param (default 58). Exchange market pre-check: before placing any non-MATCH_ODDS bet (DC, O/U, BTTS), verifies the market exists on Betfair via `findEventIdByTeamNames` + `listMarketsByEventId` — skips immediately if unavailable, avoiding wasted API calls and failed placements.
 
-**Trading Cycle Performance:** Value detection scoped to match time window (48h for NEAR tier, 168h for FAR tier) — evaluates ~47 matches per cycle instead of all 479 scheduled. Startup warmup runs trading cycle directly (30s delay) without full odds re-ingestion. Advisory locks removed (incompatible with Neon pgbouncer pooling); in-memory `tradingCycleRunning` flag provides single-instance concurrency control. Daily bet count excludes soft-deleted bets (`deleted_at IS NULL`). Typical cycle duration: ~75 seconds.
+**Trading Cycle Performance:** Value detection scoped to match time window (48h for NEAR tier, 168h for FAR tier) — evaluates ~183 matches per cycle across 1,851 scheduled. Startup warmup runs trading cycle directly (30s delay) without full odds re-ingestion. Advisory locks removed (incompatible with Neon pgbouncer pooling); in-memory `tradingCycleRunning` flag provides single-instance concurrency control. Daily bet count excludes soft-deleted bets (`deleted_at IS NULL`). Typical cycle duration: ~210 seconds.
+
+# Production/Dev Parity Fixes (April 16, 2026)
+
+**P0 — Critical crash fixes:**
+- Removed startup cleanup routine in `index.ts` that was soft-deleting ALL non-promoted bets on every restart (was destroying 13 live Betfair bets with £130 exposure)
+- Fixed SQL `ANY()` array literal bug in `liveRiskManager.ts:191` — was using malformed string instead of proper `sql.raw(ARRAY[...])`, crashing every trading cycle that reached bet placement
+- Restored 13 soft-deleted live Betfair bets (IDs 1-13, bet IDs 425675187014–425678470910)
+- Fixed `scheduler.ts` pending bet dedup query to exclude soft-deleted rows (`deleted_at IS NULL`)
+
+**P1 — Production reference data backfills:**
+- `discovered_leagues`: 211 → 942 rows
+- `competition_config`: 210 → 1,021 rows
+- `experiment_registry`: 0 → 973 rows
+- `league_edge_scores`: 32 → 60 rows
+- `agent_config`: 19 → 34 keys
+
+**P2 — Pre-authorized config changes:**
+- `max_stake_pct`: 0.02 → 0.03
+- `max_exposure_pct`: → 0.90
+- `max_unsettled_exposure_pct`: → 0.90
+
+**Current live state (April 16):**
+- 13 Betfair bets pending on matches Apr 16-18 (£130 exposure)
+- Betfair balance: £914 available, £1,044 total (HWM)
+- Trading cycles completing cleanly (~210s, 183 matches evaluated)
+- Daily budget: 13/15 slots used today

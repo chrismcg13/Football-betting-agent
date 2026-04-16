@@ -155,6 +155,7 @@ export async function checkLeagueExposure(
     FROM paper_bets pb
     JOIN matches m ON pb.match_id = m.id
     WHERE pb.status = 'pending'
+    AND pb.deleted_at IS NULL
     AND m.league = ${match.league}
   `);
 
@@ -188,7 +189,8 @@ export async function checkMarketTypeExposure(
     SELECT COALESCE(SUM(stake::numeric), 0) AS total
     FROM paper_bets
     WHERE status = 'pending'
-    AND market_type = ANY(${marketTypes})
+    AND deleted_at IS NULL
+    AND market_type = ANY(${marketTypes}::text[])
   `);
 
   const currentExposure = Number((result.rows[0] as Record<string, unknown>)?.total ?? 0);
@@ -211,6 +213,7 @@ export async function checkFixtureExposure(
     SELECT COALESCE(SUM(stake::numeric), 0) AS total
     FROM paper_bets
     WHERE status = 'pending'
+    AND deleted_at IS NULL
     AND match_id = ${matchId}
   `);
 

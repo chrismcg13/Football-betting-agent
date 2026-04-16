@@ -76,8 +76,8 @@ async function getTotalPendingExposure(): Promise<number> {
     .from(paperBetsTable)
     .where(
       since
-        ? and(eq(paperBetsTable.status, "pending"), gte(paperBetsTable.placedAt, since))
-        : eq(paperBetsTable.status, "pending"),
+        ? and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`, gte(paperBetsTable.placedAt, since))
+        : and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`),
     );
   return Number(result[0]?.total ?? 0);
 }
@@ -454,6 +454,7 @@ export async function placePaperBet(
         and(
           eq(paperBetsTable.matchId, matchId),
           eq(paperBetsTable.status, "pending"),
+          sql`deleted_at IS NULL`,
         ),
       );
 
@@ -1058,7 +1059,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
   const pendingBets = await db
     .select()
     .from(paperBetsTable)
-    .where(eq(paperBetsTable.status, "pending"));
+    .where(and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`));
 
   if (pendingBets.length === 0) {
     return { settled: 0, won: 0, lost: 0, totalPnl: 0 };
@@ -1451,7 +1452,7 @@ export async function deduplicatePendingBets(): Promise<{
     })
     .from(paperBetsTable)
     .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
-    .where(eq(paperBetsTable.status, "pending"));
+    .where(and(eq(paperBetsTable.status, "pending"), sql`${paperBetsTable.deletedAt} IS NULL`));
 
   const totalBefore = rows.length;
   const toVoid = new Set<number>(); // bet IDs to void
@@ -1590,6 +1591,7 @@ export async function voidBetsOnBannedMarkets(): Promise<{
     .where(
       and(
         eq(paperBetsTable.status, "pending"),
+        sql`deleted_at IS NULL`,
         inArray(paperBetsTable.marketType, BANNED_MARKETS),
       ),
     );

@@ -249,21 +249,10 @@ async function main() {
   }
 
   // 3. Production database hygiene
-  // Soft-delete non-promoted bets that leaked from dev (if any).
-  // NEVER hard-delete experiment_registry, promotion_audit_log, or experiment_learning_journal.
-  // Those tables contain historical progression data that must persist across restarts.
-  if (ENVIRONMENT === "production") {
-    const staleCheck = await db.execute(sql`
-      SELECT COUNT(*) as cnt FROM paper_bets
-      WHERE (data_tier != 'promoted' OR data_tier IS NULL) AND deleted_at IS NULL
-    `);
-    const staleCount = Number(staleCheck.rows[0]?.cnt ?? 0);
-    if (staleCount > 0) {
-      logger.warn({ staleCount }, "Production DB contains non-promoted bets — soft-deleting stale data");
-      await db.execute(sql`UPDATE paper_bets SET deleted_at = NOW() WHERE (data_tier != 'promoted' OR data_tier IS NULL) AND deleted_at IS NULL`);
-      logger.info("Production DB cleaned — non-promoted bets soft-deleted. Experiment history preserved.");
-    }
-  }
+  // REMOVED: The old startup cleanup soft-deleted ALL non-promoted bets on every restart.
+  // This was destroying live Betfair bets (experiment-tier, real money) and preventing
+  // settlement. Bets placed via Betfair are legitimate prod data regardless of data_tier.
+  // The production quarantine in paperTrading.ts handles what SHOULD and SHOULDN'T be placed.
 
   // 3b. Seed league edge scores for expanded league coverage
   await seedLeagueEdgeScores();
