@@ -324,6 +324,9 @@ interface ScanCandidate {
   pinnacleImplied: number | null;
   betfairEventId: string | null;
   kickoffTime: Date;
+  apiFixtureId: number | null;
+  pinnacleEdgeCategory: string | null;
+  calculatedEdge: number | null;
 }
 
 async function scanPaperBets(oppThreshold: number): Promise<{
@@ -432,6 +435,9 @@ async function scanPaperBets(oppThreshold: number): Promise<{
       pinnacleImplied: pinnImpl,
       betfairEventId: row.betfairEventId,
       kickoffTime: row.kickoffTime!,
+      apiFixtureId: row.apiFixtureId ? Number(row.apiFixtureId) : null,
+      pinnacleEdgeCategory: row.pinnacleEdgeCategory ?? null,
+      calculatedEdge: row.calculatedEdge != null ? Number(row.calculatedEdge) : null,
     });
   }
 
@@ -595,6 +601,171 @@ async function processCandidate(
   };
 }
 
+async function recordBetOnNeon(
+  bet: ScanCandidate,
+  result: { betfairBetId?: string; sizeMatched?: number; avgPriceMatched?: number; betfairMarketId?: string },
+): Promise<number> {
+  let neonMatchId: number | null = null;
+
+  if (bet.apiFixtureId) {
+    const matchRows = await db.execute(sql`
+      SELECT id FROM matches WHERE api_fixture_id = ${bet.apiFixtureId} LIMIT 1
+    `);
+    if (matchRows.rows.length > 0) {
+      neonMatchId = Number((matchRows.rows[0] as any).id);
+    }
+  }
+
+  if (!neonMatchId) {
+    const matchRows = await db.execute(sql`
+      SELECT id FROM matches WHERE home_team = ${bet.homeTeam} AND away_team = ${bet.awayTeam}
+      AND kickoff_time > NOW() - INTERVAL '7 days'
+      ORDER BY kickoff_time DESC LIMIT 1
+    `);
+    if (matchRows.rows.length > 0) {
+      neonMatchId = Number((matchRows.rows[0] as any).id);
+    }
+  }
+
+  if (!neonMatchId) {
+    const insertResult = await db.execute(sql`
+      INSERT INTO matches (home_team, away_team, league, country, kickoff_time, api_fixture_id, betfair_event_id, status)
+      VALUES (${bet.homeTeam}, ${bet.awayTeam}, ${bet.league}, ${bet.country}, ${bet.kickoffTime.toISOString()}, ${bet.apiFixtureId}, ${bet.betfairEventId}, 'scheduled')
+      RETURNING id
+    `);
+    neonMatchId = Number((insertResult.rows[0] as any).id);
+    logger.info({ neonMatchId, fixture: bet.fixture }, "Created match on Neon for live bet");
+  }
+
+  const potentialProfit = Number((bet.stake * (bet.oddsAtPlacement - 1)).toFixed(2));
+  const betfairImplied = bet.oddsAtPlacement > 0 ? 1 / bet.oddsAtPlacement : null;
+
+  const insertBet = await db.execute(sql`
+    INSERT INTO paper_bets (
+      match_id, market_type, selection_name, bet_type,
+      odds_at_placement, stake, potential_profit,
+      model_probability, betfair_implied_probability, calculated_edge,
+      opportunity_score, data_tier, status,
+      pinnacle_odds, pinnacle_implied, pinnacle_edge_category,
+      live_tier, betfair_bet_id, betfair_market_id, betfair_status,
+      betfair_size_matched, betfair_avg_price_matched, betfair_placed_at,
+      odds_source
+    ) VALUES (
+      ${neonMatchId}, ${bet.marketType}, ${bet.selectionName}, 'back',
+      ${bet.oddsAtPlacement.toFixed(4)}, ${bet.stake.toFixed(2)}, ${potentialProfit.toFixed(2)},
+      ${bet.modelProbability.toFixed(6)}, ${betfairImplied?.toFixed(6) ?? null}, ${bet.calculatedEdge?.toFixed(6) ?? null},
+      ${bet.opportunityScore.toFixed(2)}, ${bet.dataTier}, 'pending',
+      ${bet.pinnacleOdds?.toFixed(4) ?? null}, ${bet.pinnacleImplied?.toFixed(6) ?? null}, ${bet.pinnacleEdgeCategory},
+      'tier1', ${result.betfairBetId ?? null}, ${result.betfairMarketId ?? null},
+      ${(result.sizeMatched ?? 0) > 0 ? 'matched' : 'unmatched'},
+      ${(result.sizeMatched ?? 0).toFixed(2)}, ${(result.avgPriceMatched ?? 0).toFixed(4)}, NOW(),
+      'betfair_exchange'
+    ) RETURNING id
+  `);
+
+  const neonBetId = Number((insertBet.rows[0] as any).id);
+  logger.info({ neonBetId, betfairBetId: result.betfairBetId, fixture: bet.fixture, market: bet.marketType }, "Bet recorded on Neon DB");
+  return neonBetId;
+}
+
+export async function backfillExistingBetsToNeon(): Promise<{
+  backfilled: number;
+  skipped: number;
+  errors: string[];
+  details: any[];
+}> {
+  const devDbUrl = process.env.DEV_DATABASE_URL;
+  if (!devDbUrl) throw new Error("DEV_DATABASE_URL not set");
+
+  const devPool = createPool(devDbUrl);
+  const errors: string[] = [];
+  const details: any[] = [];
+  let backfilled = 0, skipped = 0;
+
+  try {
+    const { rows: existingNeon } = await db.execute(sql`
+      SELECT betfair_bet_id FROM paper_bets WHERE betfair_bet_id IS NOT NULL AND deleted_at IS NULL
+    `) as any;
+    const existingBfIds = new Set((existingNeon as any[]).map((r: any) => r.betfair_bet_id));
+
+    const { rows } = await devPool.query(`
+      SELECT pb.id, pb.market_type, pb.selection_name,
+        pb.odds_at_placement::float, pb.stake::float, pb.opportunity_score::float,
+        pb.model_probability::float, pb.data_tier, pb.pinnacle_odds::float,
+        pb.pinnacle_implied::float, pb.pinnacle_edge_category, pb.calculated_edge::float,
+        m.home_team, m.away_team, m.league, m.country, m.kickoff_time,
+        m.betfair_event_id, m.api_fixture_id
+      FROM paper_bets pb
+      JOIN matches m ON pb.match_id = m.id
+      WHERE pb.betfair_bet_id IS NOT NULL
+        AND pb.deleted_at IS NULL
+    `);
+
+    logger.info({ total: rows.length }, "Backfill: found bets with betfair_bet_id on dev DB");
+
+    for (const row of rows) {
+      const devBetfairId = await devPool.query(
+        `SELECT betfair_bet_id FROM paper_bets WHERE id = $1`, [row.id]
+      );
+      const bfBetId = devBetfairId.rows[0]?.betfair_bet_id;
+      if (!bfBetId) { skipped++; continue; }
+      if (existingBfIds.has(bfBetId)) {
+        details.push({ fixture: `${row.home_team} vs ${row.away_team}`, status: "already_exists", betfairBetId: bfBetId });
+        skipped++;
+        continue;
+      }
+
+      try {
+        const bet: ScanCandidate = {
+          betId: row.id,
+          matchId: 0,
+          fixture: `${row.home_team} vs ${row.away_team}`,
+          homeTeam: row.home_team ?? "",
+          awayTeam: row.away_team ?? "",
+          league: row.league ?? "",
+          country: row.country ?? "",
+          marketType: row.market_type,
+          selectionName: row.selection_name,
+          oddsAtPlacement: Number(row.odds_at_placement),
+          stake: Number(row.stake),
+          opportunityScore: Number(row.opportunity_score),
+          modelProbability: Number(row.model_probability),
+          dataTier: row.data_tier ?? "experiment",
+          pinnacleOdds: row.pinnacle_odds ? Number(row.pinnacle_odds) : null,
+          pinnacleImplied: row.pinnacle_implied ? Number(row.pinnacle_implied) : null,
+          betfairEventId: row.betfair_event_id,
+          kickoffTime: new Date(row.kickoff_time),
+          apiFixtureId: row.api_fixture_id ? Number(row.api_fixture_id) : null,
+          pinnacleEdgeCategory: row.pinnacle_edge_category ?? null,
+          calculatedEdge: row.calculated_edge != null ? Number(row.calculated_edge) : null,
+        };
+
+        const devBetExtra = await devPool.query(
+          `SELECT betfair_bet_id, betfair_market_id, betfair_status, betfair_size_matched::float, betfair_avg_price_matched::float FROM paper_bets WHERE id = $1`, [row.id]
+        );
+        const extra = devBetExtra.rows[0] ?? {};
+
+        const neonBetId = await recordBetOnNeon(bet, {
+          betfairBetId: extra.betfair_bet_id,
+          betfairMarketId: extra.betfair_market_id,
+          sizeMatched: extra.betfair_size_matched ?? 0,
+          avgPriceMatched: extra.betfair_avg_price_matched ?? 0,
+        });
+
+        details.push({ fixture: bet.fixture, market: bet.marketType, selection: bet.selectionName, betfairBetId: bfBetId, neonBetId, status: "backfilled" });
+        backfilled++;
+      } catch (err) {
+        errors.push(`${row.home_team} vs ${row.away_team}: ${String(err)}`);
+      }
+    }
+
+    logger.info({ backfilled, skipped, errors: errors.length }, "Backfill to Neon complete");
+    return { backfilled, skipped, errors, details };
+  } finally {
+    await devPool.end();
+  }
+}
+
 export async function runCrossDbLaunchActivation(opts?: {
   dryRun?: boolean;
   maxBets?: number;
@@ -725,6 +896,9 @@ export async function runCrossDbLaunchActivation(opts?: {
         pinnacleImplied: pinnImpl,
         betfairEventId: row.betfair_event_id,
         kickoffTime: new Date(row.kickoff_time),
+        apiFixtureId: row.api_fixture_id ? Number(row.api_fixture_id) : null,
+        pinnacleEdgeCategory: row.pinnacle_edge_category ?? null,
+        calculatedEdge: row.calculated_edge != null ? Number(row.calculated_edge) : null,
       });
     }
 
@@ -861,6 +1035,14 @@ export async function runCrossDbLaunchActivation(opts?: {
         if (result.success) {
           placed++;
           totalStake += bet.stake;
+
+          let neonBetId: number | null = null;
+          try {
+            neonBetId = await recordBetOnNeon(bet, result);
+          } catch (recordErr) {
+            logger.error({ err: recordErr, betId: bet.betId, fixture: bet.fixture }, "Failed to record bet on Neon — bet is LIVE on Betfair but not in dashboard DB");
+          }
+
           placements.push({
             betId: bet.betId, fixture: bet.fixture, market: bet.marketType,
             selection: bet.selectionName, stake: bet.stake, odds: bet.oddsAtPlacement,
@@ -869,6 +1051,7 @@ export async function runCrossDbLaunchActivation(opts?: {
             betfairBetId: result.betfairBetId,
             sizeMatched: result.sizeMatched,
             avgPrice: result.avgPriceMatched,
+            neonBetId,
           });
         } else {
           failed++;

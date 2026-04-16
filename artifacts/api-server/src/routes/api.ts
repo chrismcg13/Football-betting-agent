@@ -51,7 +51,7 @@ import {
 import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import { getCircuitBreakerStatus, resumeAgent } from "../services/riskManager";
-import { getCachedBalance, isLiveMode } from "../services/betfairLive";
+import { getCachedBalance, isLiveMode, getAccountFunds } from "../services/betfairLive";
 import { getDataRichnessSummary } from "../services/dataRichness";
 import { getLiveOppScoreThreshold } from "../services/liveThresholdReview";
 import {
@@ -2660,7 +2660,15 @@ router.get("/dashboard/live-summary", async (_req, res) => {
   try {
     const tradingMode = process.env["TRADING_MODE"] ?? "PAPER";
 
-    const balance = getCachedBalance();
+    let balance = getCachedBalance();
+    if (!balance || (Date.now() - balance.fetchedAt > 120000)) {
+      try {
+        await getAccountFunds();
+        balance = getCachedBalance();
+      } catch (err) {
+        logger.warn({ err }, "Live summary: failed to refresh Betfair balance");
+      }
+    }
 
     let riskStatus = null;
     try {

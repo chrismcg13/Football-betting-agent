@@ -106,7 +106,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
               )}
             </div>
             <p className="text-xl font-bold font-mono text-white">
-              {summary ? formatCurrency(isLive && bfBalance ? bfBalance.total : bankroll) : <span className="text-slate-600">——</span>}
+              {summary ? formatCurrency(isLive && bfBalance ? bfBalance.available : bankroll) : <span className="text-slate-600">——</span>}
             </p>
             {summary && (
               <p className={cn("text-xs font-mono mt-0.5", pnl >= 0 ? "text-emerald-400" : "text-red-400")}>

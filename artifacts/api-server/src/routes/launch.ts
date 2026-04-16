@@ -202,4 +202,15 @@ router.post("/launch-activation/cross-db", async (req, res) => {
   }
 });
 
+router.post("/launch-activation/backfill-neon", async (req, res) => {
+  try {
+    const { backfillExistingBetsToNeon } = await import("../services/launchActivation");
+    const result = await backfillExistingBetsToNeon();
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "Backfill to Neon failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 export default router;
