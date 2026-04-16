@@ -1,0 +1,75 @@
+MISSION: Turn the Prod Firehose On — Funnel Diagnosis and Lever Pulls
+Your P0/P1/P2 work is solid. The remaining problem is not discovery — you're finding 12 value bets per cycle on 185 matches, which is dev-equivalent throughput. The problem is the funnel between "value bet identified" and "bet placed in prod." Paper-mode dev is doing hundreds of bets/day. Prod is doing a trickle. Today's job: find every filter collapsing the funnel, measure the collapse, pull the right levers.
+Pre-authorised change for today:
+
+Concurrent open-stake exposure cap: raise to 95% (up from 90%). Per-bet cap stays at 3%. Daily/weekly loss limits unchanged.
+
+Still requiring approval: any change to production quarantine rules, promotion thresholds, score thresholds, contrarian penalties, or daily budget — but I want your recommendation with reasoning on each, not a request to analyse. Propose the change, defend it, then I approve or push back.
+
+Phase 1 — Funnel instrumentation (do this first, 30 min max).
+Run one full trading cycle with comprehensive logging. For every match evaluated, record survival at each stage:
+
+Matches evaluated
+Value bets identified (model sees edge)
+Bets passing score threshold (58)
+Bets passing after contrarian penalty applied
+Bets passing after discovery bonus handling
+Bets passing production quarantine (experiment-tier, opportunity-boosted filters)
+Bets passing market-type exposure checks
+Bets passing concentration checks
+Bets passing daily budget slot check
+Bets passing candidate/promoted gate for live execution
+Bets actually placed
+
+Report the funnel as a table with absolute numbers AND percentage survival at each stage. Compare against dev running the same cycle with the same match inputs. The gap between dev and prod at each stage tells us exactly which levers matter.
+
+Phase 2 — Lever recommendations (do this after Phase 1, report all together).
+For each filter stage where prod loses meaningfully more bets than dev, propose a specific change with:
+
+Current setting in prod, current setting in dev, recommended new prod setting.
+Expected volume impact (how many additional bets/day).
+Risk analysis — what does this filter protect against, and is that protection still needed given current prod state?
+Whether dev's historical ROI including bets this filter would have rejected supports loosening it. This is the key question — if dev is profitable and dev doesn't apply this filter, the filter is costing volume without adding edge.
+
+Levers I specifically want you to evaluate:
+
+Production quarantine rule. You flagged the Peterborough bet getting stripped of its discovery bonus. Is the bonus predictive in dev data? If yes, propose either removing bonus-stripping from quarantine, exempting market types with proven dev ROI, or retiring the quarantine entirely in favour of the candidate/promoted ladder doing that job.
+Score threshold (58). What does dev use? If lower, recommend matching.
+Contrarian penalty (-10 for Pinnacle-misaligned). Check dev ROI on Pinnacle-misaligned bets. If ROI is positive, the penalty is miscalibrated — recommend right-sizing or removing.
+Daily budget (15 slots). What does dev use? If dev uses hundreds or has no cap, recommend matching. This alone may be the single biggest lever.
+Experiment-tier and opportunity-boosted quarantine. This is the largest structural block. Recommend either downgrading to "log but allow" or carving exemptions for markets with N+ dev settled bets at positive ROI.
+Candidate/promoted gate on live execution. Propose a signal-channel bypass (Path B/C from the previous mission) that lets dev's qualifying bets execute in prod directly, with a filter replacing promoted-status (minimum dev sample size, positive rolling dev ROI, minimum edge). Kill-switch required.
+Trading cycle cadence (15min). Verify dev cadence. If dev runs faster or in multiple tiers, match it.
+Market-type exposure and concentration checks. Now that soft-delete filtering is fixed, verify these aren't rejecting volume dev accepts.
+Increase daily cap on bets - 200/day overall, 30/day per experiment tag, 50/day per market type. Model can decide how the diversification is done but 200 is absolute daily limit. 
+
+
+Phase 3 — Execute approved changes and the signal channel.
+Once I approve the lever changes from Phase 2:
+
+Apply every approved config change.
+Apply the 95% concurrent exposure cap (pre-authorised).
+Build the dev-signals-prod-executes channel if I approve that path — this is likely the fastest unlock to volume. Include kill-switch, filter criteria, backlog monitoring.
+Fully automate everything. Nothing manual. The signal channel runs on dev's cadence and publishes to prod in real time.
+
+
+Phase 4 — Verify firehose is on.
+Success criteria, all measurable by end of day:
+
+Prod bet volume per day is within an order of magnitude of dev volume (if dev does 300/day, prod doing 50+ is acceptable for day-one; a trickle of 5–15 is not).
+Funnel survival at each stage is documented and matches approved design.
+Signal channel (if built) is publishing and executing with backlog < 5 min.
+All cap changes live and verified (3% per bet, 95% concurrent exposure).
+Kill-switches tested on signal channel and live betting.
+Monitoring alerts firing correctly on lag, errors, and backlog.
+
+
+Operating rules:
+
+Show me the funnel numbers before proposing lever changes. Data first, opinions second.
+For every lever you propose to loosen, tell me what dev's ROI looks like on the bets currently being filtered out. If dev doesn't have data on those bets either, say so — that changes the analysis.
+If you recommend removing or weakening the production quarantine, be explicit about what it was protecting against and why that protection is no longer needed.
+Report Phase 1 funnel, Phase 2 recommendations, and Phase 3 execution in a single continuous push with clear decision points marked for my approval.
+
+Go.
+

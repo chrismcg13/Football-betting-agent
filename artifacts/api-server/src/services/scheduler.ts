@@ -397,6 +397,12 @@ export async function runTradingCycle(options?: {
     const valueSummary = await detectValueBets({ earliestKickoff: earliest, latestKickoff: latest });
     const timely = valueSummary.valueBets;
 
+    const funnel: Record<string, number> = {
+      "01_matches_evaluated": valueSummary.matchesEvaluated,
+      "02_selections_evaluated": valueSummary.selectionsEvaluated,
+      "03_value_bets_found": valueSummary.valueBets.length,
+    };
+
     logger.info(
       {
         totalValueBets: valueSummary.valueBets.length,
@@ -535,6 +541,33 @@ export async function runTradingCycle(options?: {
       }))
       .sort((a, b) => b.effectiveScore - a.effectiveScore);
 
+    // 7b. Load config early so funnel counters can reference thresholds
+    const configRows = await db.select().from(agentConfigTable);
+    const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
+    const minScore = Number(cfg?.min_opportunity_score ?? "58");
+
+    // Funnel: count bets passing score threshold BEFORE any diversity caps
+    const funnelPassScore = allEntries.filter(e => e.effectiveScore >= minScore).length;
+    const funnelPassContrarian = allEntries.filter(e => {
+      const isC = e.validation?.isContrarian ?? false;
+      const thresh = isC ? 75 : minScore;
+      return e.effectiveScore >= thresh;
+    }).length;
+    const funnelBoosted = allEntries.filter(e => e.bet.opportunityBoosted).length;
+    const funnelNotBoosted = funnelPassContrarian - allEntries.filter(e => {
+      const isC = e.validation?.isContrarian ?? false;
+      const thresh = isC ? 75 : minScore;
+      return e.effectiveScore >= thresh && e.bet.opportunityBoosted;
+    }).length;
+    funnel["04_pass_base_score_threshold"] = funnelPassScore;
+    funnel["05_pass_after_contrarian_penalty"] = funnelPassContrarian;
+    funnel["05b_of_which_opportunity_boosted"] = allEntries.filter(e => {
+      const isC = e.validation?.isContrarian ?? false;
+      const thresh = isC ? 75 : minScore;
+      return e.effectiveScore >= thresh && e.bet.opportunityBoosted;
+    }).length;
+    funnel["05c_of_which_NOT_boosted"] = funnelNotBoosted;
+
     // Log Pinnacle validation coverage for this cycle
     const pinnacleValidated = enhancedCandidates.filter((e) => e.validation?.hasPinnacleData).length;
     const pinnacleAligned = enhancedCandidates.filter((e) => e.validation?.pinnacleAligned).length;
@@ -550,9 +583,7 @@ export async function runTradingCycle(options?: {
       "Pinnacle validation summary for trading cycle",
     );
 
-    // 8. Load config + diversity limits
-    const configRows = await db.select().from(agentConfigTable);
-    const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
+    // 8. Diversity limits (config already loaded above)
     const paperMode = cfg.paper_mode === "true";
 
     // Fix 3: Daily bet cap — top N by opportunity score, quality over quantity
@@ -580,8 +611,7 @@ export async function runTradingCycle(options?: {
     const maxPerCycle  = paperMode ? dailySlotsLeft : Math.min(Number(cfg.max_bets_per_cycle ?? "5"), dailySlotsLeft);
     const maxPerLeague = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_league ?? "2");
     const maxPerMarket = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_market ?? "2");
-    const minScore = Number(cfg.min_opportunity_score ?? "58");
-    const contrarinaThreshold = 75; // contrarian bets need higher bar
+    const contrarianThreshold = 75; // contrarian bets need higher bar
 
     if (paperMode) {
       logger.info({ dailySlotsLeft, maxDailyBets }, "Paper mode ACTIVE — daily cap enforced, diversity caps removed");
@@ -600,22 +630,26 @@ export async function runTradingCycle(options?: {
       .where(and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`));
     const pendingKeys = new Set(existingPending.map((b) => `${b.matchId}|${b.marketType}|${b.selectionName}`));
 
+    let funnelDupSkip = 0, funnelScoreSkip = 0, funnelLeagueSkip = 0, funnelMarketSkip = 0, funnelCycleCapHit = 0;
+
     for (const entry of allEntries) {
-      if (preCorrelation.length >= maxPerCycle) break;
+      if (preCorrelation.length >= maxPerCycle) { funnelCycleCapHit++; continue; }
 
       const { bet, effectiveScore, validation } = entry;
 
       // Skip if we already have a pending bet on this match+market+selection
       const dupKey = `${bet.matchId}|${bet.marketType}|${bet.selectionName}`;
       if (pendingKeys.has(dupKey)) {
+        funnelDupSkip++;
         logger.debug({ matchId: bet.matchId, market: bet.marketType, selection: bet.selectionName }, "Skipping duplicate — pending bet already exists");
         continue;
       }
 
       const isContrarian = validation?.isContrarian ?? false;
-      const scoreThreshold = isContrarian ? contrarinaThreshold : minScore;
+      const scoreThreshold = isContrarian ? contrarianThreshold : minScore;
 
       if (effectiveScore < scoreThreshold) {
+        funnelScoreSkip++;
         logger.debug(
           { matchId: bet.matchId, score: effectiveScore, threshold: scoreThreshold, isContrarian },
           "Skipping bet — below effective score threshold",
@@ -624,10 +658,10 @@ export async function runTradingCycle(options?: {
       }
 
       const leagueCount = leagueCounts[bet.league] ?? 0;
-      if (leagueCount >= maxPerLeague) continue;
+      if (leagueCount >= maxPerLeague) { funnelLeagueSkip++; continue; }
 
       const marketCount = marketCounts[bet.marketType] ?? 0;
-      if (marketCount >= maxPerMarket) continue;
+      if (marketCount >= maxPerMarket) { funnelMarketSkip++; continue; }
 
       // Generate thesis
       const backOdds = validation?.bestOdds ?? bet.backOdds;
@@ -669,8 +703,17 @@ export async function runTradingCycle(options?: {
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
 
+    funnel["06_pre_correlation_candidates"] = preCorrelation.length;
+    funnel["06b_skipped_duplicate_pending"] = funnelDupSkip;
+    funnel["06c_skipped_score_threshold"] = funnelScoreSkip;
+    funnel["06d_skipped_league_cap"] = funnelLeagueSkip;
+    funnel["06e_skipped_market_cap"] = funnelMarketSkip;
+    funnel["06f_skipped_cycle_cap"] = funnelCycleCapHit;
+
     // 10. Correlation detection
     const { selectedBets } = await applyCorrelationDetection(preCorrelation, bankroll);
+
+    funnel["07_post_correlation"] = selectedBets.length;
 
     // ═══════════════════════════════════════════════════════════════════
     // PHASE 2: SIGNAL → EXECUTION SPLIT
@@ -790,6 +833,9 @@ export async function runTradingCycle(options?: {
       });
     }
 
+    funnel["08_post_pinnacle_filter"] = betOrders.length;
+    funnel["08b_pinnacle_filtered_out"] = selectedBets.length - betOrders.length;
+
     if (betOrders.length > 0) {
       logger.info(
         { orders: betOrders.length, tier },
@@ -799,6 +845,7 @@ export async function runTradingCycle(options?: {
 
     // 11b. EXECUTE bet orders — fast path, no heavy computation
     let betsPlaced = 0;
+    let funnelQuarantineReject = 0, funnelExposureReject = 0, funnelOtherReject = 0;
     const executionTimings: Array<{ matchId: number; market: string; executionMs: number }> = [];
 
     for (const order of betOrders) {
@@ -861,6 +908,12 @@ export async function runTradingCycle(options?: {
           },
           "Automated bet placed",
         );
+      } else {
+        const reason = (result as { reason?: string }).reason ?? "unknown";
+        if (reason.includes("quarantine")) funnelQuarantineReject++;
+        else if (reason.includes("xposure") || reason.includes("oncentration")) funnelExposureReject++;
+        else funnelOtherReject++;
+        logger.info({ matchId: order.matchId, marketType: order.marketType, selectionName: order.selectionName, reason }, "Bet rejected");
 
         // Fire-and-forget: log liquidity snapshot for this bet (non-blocking)
         if (isRelayConfigured()) {
@@ -886,6 +939,20 @@ export async function runTradingCycle(options?: {
         );
       }
     }
+
+    funnel["09_bets_placed"] = betsPlaced;
+    funnel["09b_quarantine_rejected"] = funnelQuarantineReject;
+    funnel["09c_exposure_rejected"] = funnelExposureReject;
+    funnel["09d_other_rejected"] = funnelOtherReject;
+    funnel["daily_budget"] = maxDailyBets;
+    funnel["daily_used"] = todayCount;
+    funnel["daily_slots_left"] = dailySlotsLeft;
+    funnel["per_cycle_cap"] = maxPerCycle;
+    funnel["per_league_cap"] = maxPerLeague;
+    funnel["per_market_cap"] = maxPerMarket;
+    funnel["score_threshold"] = minScore;
+
+    logger.info({ funnel }, "=== TRADING CYCLE FUNNEL REPORT ===");
 
     const cycleDurationMs = Date.now() - cycleStartedAt;
     logger.info(
