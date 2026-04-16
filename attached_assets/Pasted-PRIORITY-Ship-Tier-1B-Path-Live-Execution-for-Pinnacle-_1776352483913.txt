@@ -1,0 +1,74 @@
+PRIORITY: Ship Tier 1B Path — Live Execution for Pinnacle-Validated Bets
+The data richness gate (Rule 13, threshold 70, mathematically unreachable) is still blocking every post-session bet from live Betfair execution. The 20 paper bets in prod today should mostly have been live. Fix this now.
+
+Implement the Tier 1B qualification path.
+A bet qualifies for Tier 1 live Betfair execution if it passes either:
+
+Tier 1A (existing, unchanged): score ≥ live_opp_score_threshold, Pinnacle odds present, Pinnacle edge ≥2%, (data richness ≥70 OR promoted tier), not quarantined, odds ≥1.80
+Tier 1B (new): score ≥ live_opp_score_threshold (currently 48), Pinnacle odds present in merged cache, Pinnacle edge ≥2%, odds ≥1.80, not in production quarantine. No data richness requirement.
+
+Implementation specifics:
+
+Modify qualifiesForTier1() in paperTrading.ts (around line 161) to add the 1B path. The existing 1A logic stays untouched. Add a second condition block: if the bet has Pinnacle validation, edge ≥2%, score ≥ threshold, odds ≥1.80, and isn't quarantined, it qualifies for Tier 1 regardless of data richness.
+Add a qualification_path field to every bet record: '1A', '1B', or 'paper'. This lets us compare live ROI by path over the next 30 days. If the bets table doesn't have this column, add it via migration.
+Any bet that qualifies via 1B must be sent to Betfair's API for real execution, same as 1A bets. Confirm the execution path downstream of qualifiesForTier1() doesn't have any additional gates that re-check data richness. Trace the full path from qualification → stake calculation → Betfair API call → bet ID confirmation.
+Bets that fail both 1A and 1B should still be recorded as Tier 2 paper in prod. These are bets without Pinnacle data, or with Pinnacle edge below 2%, or odds below 1.80, or quarantined. Recording them as paper preserves the data Chris needs to evaluate whether those gates should be loosened later. Do not remove paper bet recording from prod.
+
+
+Dashboard changes:
+Update the prod dashboard to clearly separate live from paper:
+
+Main bet count shows: "X live on Betfair (Tier 1A: n, Tier 1B: m) | Y paper (Tier 2)"
+Upcoming/pending bets split the same way
+Betfair balance section shows: expected balance movement from live bets placed today vs actual Betfair balance
+Any bet list or table has a visible "Live" or "Paper" badge per row
+
+The goal: Chris should never have to wonder whether a bet count includes paper bets. The distinction should be impossible to miss on every screen.
+
+Verify live execution end-to-end:
+After deploying Tier 1B:
+
+Run one trading cycle. Report:
+
+Bets qualifying via Tier 1A (expected: ~0, richness gate still broken)
+Bets qualifying via Tier 1B (expected: meaningfully non-zero)
+Bets remaining Tier 2 paper, with the specific gate that blocked each one
+For every Tier 1B bet: Betfair API call made, Betfair bet ID returned, confirmed on exchange
+
+
+Critical check: Betfair available balance must decrease by approximately the total stake of Tier 1B bets placed. Report balance before and after the cycle. If balance doesn't move, the bets are being recorded as Tier 1 but not actually sent to Betfair — find and fix the gap immediately.
+For every Tier 2 paper bet in this cycle, report which gate failed:
+
+No Pinnacle data in merged cache
+Pinnacle edge <2%
+Odds <1.80
+Production quarantine
+Score below threshold
+Exposure/cap limit
+
+This breakdown tells Chris exactly what's holding back the remaining volume and which lever to evaluate next.
+
+
+Also fix the duplicate bet bug (from prior round, still outstanding):
+Add BTTS to getThresholdCategory() as correlated with OVER_UNDER markets. Add a placement-time check against recently-voided bets (within last 4 hours) so the void-and-replace loop doesn't repeat.
+
+Execution order:
+
+Add qualification_path column to bets table via migration.
+Implement Tier 1B logic in qualifiesForTier1().
+Fix duplicate bet bug.
+Update dashboard to split live vs paper counts.
+Restart, run one cycle, report results.
+Report Betfair balance before and after.
+
+Do not batch this with other work. Ship Tier 1B first, verify it works, then move to other tasks.
+
+Operating rules:
+
+Every Tier 1B bet must have a confirmed Betfair bet ID. "Placed" means "Betfair returned a bet reference." If Betfair rejects the bet, log the rejection reason.
+Betfair balance movement is the source of truth, not the database. If the DB says 10 live bets and Betfair balance didn't move, the DB is wrong.
+Do not modify Tier 1A logic. Do not change the data richness threshold or formula. Tier 1B is additive only.
+Confirm DATABASE_URL isolation before deployment.
+This ships within the hour.
+
+Go.
