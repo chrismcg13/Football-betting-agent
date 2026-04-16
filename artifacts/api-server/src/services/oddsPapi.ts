@@ -23,6 +23,7 @@ import {
   leagueEdgeScoresTable,
   oddspapiLeagueCoverageTable,
   pinnacleOddsSnapshotsTable,
+  competitionConfigTable,
   lineMovementsTable,
   filteredBetsTable,
 } from "@workspace/db";
@@ -548,8 +549,14 @@ const TEAM_ALIASES: Record<string, string> = {
   "wsg tirol": "wsg tirol",
   "scr altach": "altach",
   "altach": "altach",
+  "rapid vienna": "rapid wien",
+  "rapid wien": "rapid wien",
+  "sk rapid": "rapid wien",
+  "sk rapid wien": "rapid wien",
   "panetolikos": "panetolikos",
   "panetolikos gfs": "panetolikos",
+  "panaitolikos": "panetolikos",
+  "panaitolikos agrinio": "panetolikos",
   "panserraikos": "panserraikos",
   "panserraikos fc": "panserraikos",
   "boston river": "boston river",
@@ -1869,25 +1876,41 @@ export async function prefetchAndStoreOddsPapiOdds(
       ),
     );
 
-  // Leagues with no Pinnacle coverage: retry once per week (7 days) in case coverage changed
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-  // Sort: highest league_edge_score first (dynamic); ties broken by earliest kickoff
+  const pinnacleLeagues = new Set(
+    (await db
+      .select({ name: competitionConfigTable.name })
+      .from(competitionConfigTable)
+      .where(eq(competitionConfigTable.hasPinnacleOdds, true))
+    ).map((r) => r.name),
+  );
+  const covGoodSet = new Set(
+    coverageRows.filter((r) => r.hasOdds === 1).map((r) => r.league),
+  );
+
   const mappedRows = allRows
     .filter((r) => {
       const cov = coverageMap.get(r.league ?? "");
-      if (!cov) return true; // unknown — try it
-      if (cov.hasOdds === 1) return true; // known good
-      // hasOdds=0: retry once per week to catch new league coverage
+      if (!cov) return true;
+      if (cov.hasOdds === 1) return true;
       return cov.lastChecked < sevenDaysAgo;
     })
     .sort((a, b) => {
+      const aKnown = covGoodSet.has(a.league ?? "") || pinnacleLeagues.has(a.league ?? "") ? 1 : 0;
+      const bKnown = covGoodSet.has(b.league ?? "") || pinnacleLeagues.has(b.league ?? "") ? 1 : 0;
+      if (aKnown !== bKnown) return bKnown - aKnown;
+      const aUnknown = coverageMap.has(a.league ?? "") ? 0 : 1;
+      const bUnknown = coverageMap.has(b.league ?? "") ? 0 : 1;
+      if (aUnknown !== bUnknown) return bUnknown - aUnknown;
+      const ta = a.kickoffTime?.getTime() ?? Infinity;
+      const tb = b.kickoffTime?.getTime() ?? Infinity;
+      if (ta !== tb) return ta - tb;
       const sa = edgeScoreMap.get(a.league ?? "") ?? 50;
       const sb = edgeScoreMap.get(b.league ?? "") ?? 50;
-      if (sa !== sb) return sb - sa; // higher edge score first
-      return (a.kickoffTime?.getTime() ?? 0) - (b.kickoffTime?.getTime() ?? 0);
+      return sb - sa;
     })
-    .slice(0, limit); // limit = remaining budget minus CLV reserve
+    .slice(0, limit);
 
   if (mappedRows.length === 0) return cache;
 

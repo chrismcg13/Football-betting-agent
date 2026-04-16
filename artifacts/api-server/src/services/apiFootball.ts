@@ -1118,8 +1118,6 @@ export async function getLeagueOddsFetchTier(leagueName: string): Promise<"high"
     .where(eq(competitionConfigTable.name, leagueName))
     .limit(1);
 
-  if (!config[0]) return "low";
-
   const hasPendingBets = await db
     .select({ id: paperBetsTable.id })
     .from(paperBetsTable)
@@ -1134,9 +1132,20 @@ export async function getLeagueOddsFetchTier(leagueName: string): Promise<"high"
 
   if (hasPendingBets.length > 0) return "high";
 
-  if (config[0].tier === 1) return "high";
-  if (config[0].hasPinnacleOdds) return "high";
-  if (config[0].tier === 2) return "low";
+  if (config[0]) {
+    if (config[0].tier === 1) return "high";
+    if (config[0].hasPinnacleOdds) return "high";
+    if (config[0].tier === 2) return "low";
+    return "dormant";
+  }
+
+  const disc = await db
+    .select({ hasPinnacleOdds: discoveredLeaguesTable.hasPinnacleOdds, tier: discoveredLeaguesTable.tier })
+    .from(discoveredLeaguesTable)
+    .where(eq(discoveredLeaguesTable.name, leagueName))
+    .limit(1);
+  if (disc[0]?.hasPinnacleOdds) return "high";
+  if (disc[0]?.tier === "tier1" || disc[0]?.tier === "tier2") return "low";
   return "dormant";
 }
 

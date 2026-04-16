@@ -42,7 +42,7 @@ import { applyCorrelationDetection, type BetCandidate } from "./correlationDetec
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets, fetchAndStoreOddsForAllUpcoming } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
-import { eq, and, inArray, sql } from "drizzle-orm";
+import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
 import { runPromotionEngine } from "./promotionEngine";
 import { runWeeklyExperimentAnalysis } from "./experimentAnalysis";
 import { syncDevToProd } from "./syncDevToProd";
@@ -384,12 +384,34 @@ export async function runTradingCycle(options?: {
       // OddsPapi wins per-selection; AF-Pinnacle fills gaps
       oddsPapiCache.set(matchId, { ...afEntry, ...opEntry });
     }
+    const pinnacleMatchIds = new Set(oddsPapiCache.keys());
+    const allUpcoming = await db
+      .select({ id: matchesTable.id, league: matchesTable.league })
+      .from(matchesTable)
+      .where(and(
+        eq(matchesTable.status, "scheduled"),
+        gte(matchesTable.kickoffTime, earliest),
+        lte(matchesTable.kickoffTime, latest),
+      ));
+    const leagueTotals = new Map<string, { total: number; covered: number }>();
+    for (const m of allUpcoming) {
+      const entry = leagueTotals.get(m.league) ?? { total: 0, covered: 0 };
+      entry.total++;
+      if (pinnacleMatchIds.has(m.id)) entry.covered++;
+      leagueTotals.set(m.league, entry);
+    }
+    const pinnacleLeagueBreakdown: Record<string, string> = {};
+    for (const [league, { total, covered }] of [...leagueTotals.entries()].sort((a, b) => b[1].total - a[1].total).slice(0, 25)) {
+      pinnacleLeagueBreakdown[league] = `${covered}/${total}`;
+    }
     logger.info(
       {
         oddsPapiMatches: oddsPapiCacheRaw.size,
         afPinnacleMatches: afPinnacleCache.size,
         mergedTotal: oddsPapiCache.size,
         totalSelections: [...oddsPapiCache.values()].reduce((n, m) => n + Object.keys(m).length, 0),
+        pinnacleLeagueBreakdown,
+        overallCoverage: `${oddsPapiCache.size}/${allUpcoming.length} (${allUpcoming.length > 0 ? Math.round(oddsPapiCache.size / allUpcoming.length * 100) : 0}%)`,
       },
       "Pinnacle validation cache ready (OddsPapi + API-Football Pinnacle merged, selection-level)",
     );

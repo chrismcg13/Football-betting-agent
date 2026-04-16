@@ -120,7 +120,7 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 
 **DC Derivation** (`derivePinnacleDCFromMatchOdds`): Derives DOUBLE_CHANCE Pinnacle odds from MATCH_ODDS via vig-removed implied probability. `1X = 1/(fairHome+fairDraw)`, `X2 = 1/(fairDraw+fairAway)`, `12 = 1/(fairHome+fairAway)`. Runs after each bulk prefetch in scheduler.
 
-**Coverage (as of April 15, 2026):** Overall 76.6% (180/235). DOUBLE_CHANCE 91.1%, OVER_UNDER_35 80.0%. BTTS remains structural gap (Pinnacle doesn't offer BTTS via any source).
+**Coverage (as of April 16, 2026):** OddsPapi 90/364 matches, AF-Pinnacle 16/364 matches, merged 106/364 (29%). Fix applied: sort order now prioritizes known-Pinnacle and `competition_config.has_pinnacle_odds` leagues + nearest kickoff over edge scores. `getLeagueOddsFetchTier` falls back to `discovered_leagues` when `competition_config` has no name match. Per-league breakdown logged each trading cycle. BTTS remains structural gap (Pinnacle doesn't offer BTTS via any source).
 
 **Admin Endpoint Protection:** All `/api/launch-activation/*` endpoints gated by `requireDevEnvironment` middleware — returns 403 in production (`ENVIRONMENT=production`).
 

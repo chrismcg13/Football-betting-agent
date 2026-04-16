@@ -1,0 +1,113 @@
+MISSION: Expand the Fixture Universe + Continue Pushing Mapping + Fix Dashboard
+Pinnacle coverage jumped from 3.3% to 20.2% in one session — a 6x improvement. Keep going. The ceiling isn't 20% — it's 60-80% of Pinnacle-priced-league matches, with further upside from expanding the fixture set itself.
+Three-pronged push this round:
+
+Expand the fixture universe. More leagues, more competitions, more fixtures feeds the top of the funnel.
+Continue pushing Pinnacle mapping on the expanded universe. Keep closing the gap from 20% to 60-80%.
+Fix dashboard data accuracy. Upcoming bets shows 25 — this is wrong. Until dashboard numbers are trustworthy, we can't read any metric with confidence.
+
+
+Phase 1 — Expand API-Football fixture coverage.
+Current behaviour: API-Football odds "only fetched for tier-1 leagues" (per your filter inventory). This is limiting the fixture universe unnecessarily. Push for maximum coverage within budget.
+
+Audit current league coverage. Which leagues does API-Football currently pull fixtures and odds for? Which does it skip? What's the rationale for each skip — API budget, league tier classification, or arbitrary config?
+Expand aggressively to include:
+
+All major European leagues already pulled (confirm)
+Second divisions and cup competitions in Pinnacle-priced markets
+Women's football — WSL, NWSL, UEFA Women's Champions League, Women's Euros, international women's fixtures. Pinnacle prices a surprising amount of women's football.
+International fixtures — UEFA Nations League, World Cup qualifiers, continental qualifiers, international friendlies where sharp markets exist
+Major Asian leagues (J1, K League, CSL, A-League)
+South American leagues (Brasileirão, Liga MX, Argentinian Primera, Copa Libertadores, Copa Sudamericana)
+MLS and USL
+Scandinavian top divisions (Allsvenskan, Eliteserien, Veikkausliiga, Superettan)
+African Cup of Nations and African continental club competitions when in season
+Any league in the 514 experiment tags that currently isn't being pulled
+
+
+Fuzzy matching on API-Football side. The filter inventory notes API-Football matching is "simpler — exact-after-normalize, substring, first-word, word-overlap. Binary accept/reject. No numeric scores. No alias table." This is worse than OddsPapi's 6-pass hierarchy. Upgrade API-Football matching to match OddsPapi's approach:
+
+6-pass hierarchy with date relaxation
+Fuzzy scoring with thresholds (not binary)
+Use the same alias table OddsPapi uses (shared resource)
+Transliteration, club prefix stripping, abbreviation handling
+Multi-field disambiguation (home + away + date window + competition)
+
+
+Shared alias table. The ~200 aliases added this session should be shared between OddsPapi and API-Football matchers — not duplicated. Same team name variations apply equally to both sources.
+Budget management. Report current API budget consumption vs monthly cap. If expanding to the leagues above puts the monthly cap at risk, propose prioritisation. Prioritise by dev ROI history — leagues dev is profitable in first.
+
+
+Phase 2 — Push OddsPapi coverage further.
+
+Run OddsPapi more frequently. Current cron is 10 */4 * * * (every 4 hours). Given the data freshness matters for live execution, propose a faster cadence:
+
+Pinnacle prefetch on every new fixture ingestion
+Periodic full refresh every 1-2 hours instead of 4
+Targeted refresh for matches within 24h of kickoff (odds move faster pre-match)
+
+Respect API rate limits and monthly budget. Report expected budget impact.
+OddsPapi re-runs on expanded fixture universe. Every time API-Football adds new fixtures (Phase 1), OddsPapi should automatically try to Pinnacle-enrich them. The two sources must work as a loop, not in isolation. Build this as an automated pipeline, not a manual step.
+Continue closing the 20% → 60-80% gap. Address remaining near-misses:
+
+League name ambiguity (the 8 "Ligue 1" matches that are actually Guinean/Algerian) — disambiguate by country/continent metadata
+Asian leagues haven't been reached yet in the prefetch queue — either prioritise them or increase prefetch throughput
+Any further alias gaps discovered in the new expanded fixture universe
+
+
+Mapping success monitoring. Add persistent logging: every failed Pinnacle mapping is recorded with full context. Weekly review identifies new alias patterns. Auto-suggest new aliases when the same mismatch pattern appears 3+ times.
+
+
+Phase 3 — Fix dashboard data accuracy.
+Dashboard shows "Upcoming bets: 25" but this is inaccurate. Before we rely on dashboard metrics for anything else:
+
+Audit every number on the dashboard against ground-truth queries. For each number displayed (upcoming bets, placed today, exposure, balance, HWM, etc.):
+
+What query produces it in the UI?
+Does the same query run against the prod database produce the same number?
+If not, why? Stale cache, wrong filter, wrong DB connection, stale computed field?
+
+
+Identify the "upcoming bets" source of truth. What does "upcoming" mean? Bets placed but not settled? Bets pending execution? Value bets identified but not yet acted on? Report the definition and the correct number.
+Fix all discrepancies. Every number on the dashboard must match a query Chris can run against prod Neon and get the same answer.
+Add a dashboard health check. On every page load, run a consistency check: reported metrics vs database ground truth. If any discrepancy >5%, flag on the dashboard itself.
+
+
+Phase 4 — Report results and target metrics.
+Goal state after this round:
+
+Fixture universe: ≥2x current 48h fixture count, with women's, internationals, and all major global leagues represented
+Pinnacle coverage: 40%+ overall, 60%+ on Pinnacle-priced leagues
+OddsPapi cadence: refreshing at least every 2 hours with automatic re-run on new fixtures
+API-Football mapping: upgraded to match OddsPapi's sophistication
+Dashboard: every displayed metric verified accurate
+Live bets placed today: meaningfully non-zero — target 20+ by end of day tomorrow as Pinnacle coverage compounds
+
+Report with:
+
+Before/after fixture counts by region/category
+Before/after Pinnacle coverage percentages overall and per-league
+Before/after mapping success rates for both sources
+API budget consumed vs monthly cap
+Dashboard discrepancies found and fixed
+
+
+Flag for next round (do not execute):
+Your filter inventory surfaced two odds floors I want to review later:
+
+Rule 3: Universal odds floor at 1.50 — rejects all bets below 1.50 odds
+Rule 4: Tier 1 odds floor at 1.80 — rejects live bets below 1.80 odds
+
+Pull dev ROI on bets that would be rejected by each floor. Does dev profit from bets at 1.40-1.50? At 1.50-1.80? Report the data so I can decide next round whether to lower them. Don't change anything.
+Also flag: Rule 29 (live_opp_score_threshold auto-raises +3 if 30d ROI<0 or CLV<1%) is a one-way ratchet — it tightens but never loosens. Over weeks of live operation, the threshold will only ever creep up. Propose a symmetric auto-loosen rule (threshold drops back by -3 if 30d ROI>5% AND CLV>3%) for a later round.
+
+Operating rules:
+
+Automate the loop. API-Football expansion → OddsPapi re-run → Pinnacle enrichment must be a continuous pipeline, not manual.
+Every coverage number and budget number backed by a query. No estimates.
+Dashboard accuracy is non-negotiable — we can't read the system's performance if its own metrics are wrong.
+Continue to confirm prod/dev DATABASE_URL isolation.
+Dev and prod both receive the mapping and fixture expansion improvements.
+
+Report Phases 1, 2, and 3 together with the Phase 4 metrics summary. Single continuous push.
+Go.
