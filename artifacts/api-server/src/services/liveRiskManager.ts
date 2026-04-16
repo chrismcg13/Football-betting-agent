@@ -185,12 +185,13 @@ export async function checkMarketTypeExposure(
         ? ["TOTAL_CORNERS_75", "TOTAL_CORNERS_85", "TOTAL_CORNERS_95", "TOTAL_CORNERS_105", "TOTAL_CORNERS_115"]
         : [marketType];
 
+  const pgArrayLiteral = `{${marketTypes.join(",")}}`;
   const result = await db.execute(sql`
     SELECT COALESCE(SUM(stake::numeric), 0) AS total
     FROM paper_bets
     WHERE status = 'pending'
     AND deleted_at IS NULL
-    AND market_type = ANY(${marketTypes}::text[])
+    AND market_type = ANY(${pgArrayLiteral}::text[])
   `);
 
   const currentExposure = Number((result.rows[0] as Record<string, unknown>)?.total ?? 0);

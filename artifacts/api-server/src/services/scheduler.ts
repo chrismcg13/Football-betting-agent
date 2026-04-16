@@ -548,25 +548,11 @@ export async function runTradingCycle(options?: {
 
     // Funnel: count bets passing score threshold BEFORE any diversity caps
     const funnelPassScore = allEntries.filter(e => e.effectiveScore >= minScore).length;
-    const funnelPassContrarian = allEntries.filter(e => {
-      const isC = e.validation?.isContrarian ?? false;
-      const thresh = isC ? 75 : minScore;
-      return e.effectiveScore >= thresh;
-    }).length;
-    const funnelBoosted = allEntries.filter(e => e.bet.opportunityBoosted).length;
-    const funnelNotBoosted = funnelPassContrarian - allEntries.filter(e => {
-      const isC = e.validation?.isContrarian ?? false;
-      const thresh = isC ? 75 : minScore;
-      return e.effectiveScore >= thresh && e.bet.opportunityBoosted;
-    }).length;
-    funnel["04_pass_base_score_threshold"] = funnelPassScore;
-    funnel["05_pass_after_contrarian_penalty"] = funnelPassContrarian;
-    funnel["05b_of_which_opportunity_boosted"] = allEntries.filter(e => {
-      const isC = e.validation?.isContrarian ?? false;
-      const thresh = isC ? 75 : minScore;
-      return e.effectiveScore >= thresh && e.bet.opportunityBoosted;
-    }).length;
-    funnel["05c_of_which_NOT_boosted"] = funnelNotBoosted;
+    const funnelBoosted = allEntries.filter(e => e.bet.opportunityBoosted && e.effectiveScore >= minScore).length;
+    const funnelContrarian = allEntries.filter(e => (e.validation?.isContrarian ?? false) && e.effectiveScore >= minScore).length;
+    funnel["04_pass_score_threshold"] = funnelPassScore;
+    funnel["04b_of_which_opportunity_boosted"] = funnelBoosted;
+    funnel["04c_of_which_contrarian"] = funnelContrarian;
 
     // Log Pinnacle validation coverage for this cycle
     const pinnacleValidated = enhancedCandidates.filter((e) => e.validation?.hasPinnacleData).length;
@@ -611,7 +597,7 @@ export async function runTradingCycle(options?: {
     const maxPerCycle  = paperMode ? dailySlotsLeft : Math.min(Number(cfg.max_bets_per_cycle ?? "5"), dailySlotsLeft);
     const maxPerLeague = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_league ?? "2");
     const maxPerMarket = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_market ?? "2");
-    const contrarianThreshold = 75; // contrarian bets need higher bar
+    // Contrarian penalty removed — all bets use minScore threshold (dev data shows +18.4% ROI on contrarian bets)
 
     if (paperMode) {
       logger.info({ dailySlotsLeft, maxDailyBets }, "Paper mode ACTIVE — daily cap enforced, diversity caps removed");
@@ -646,13 +632,12 @@ export async function runTradingCycle(options?: {
       }
 
       const isContrarian = validation?.isContrarian ?? false;
-      const scoreThreshold = isContrarian ? contrarianThreshold : minScore;
 
-      if (effectiveScore < scoreThreshold) {
+      if (effectiveScore < minScore) {
         funnelScoreSkip++;
         logger.debug(
-          { matchId: bet.matchId, score: effectiveScore, threshold: scoreThreshold, isContrarian },
-          "Skipping bet — below effective score threshold",
+          { matchId: bet.matchId, score: effectiveScore, threshold: minScore, isContrarian },
+          "Skipping bet — below score threshold",
         );
         continue;
       }
@@ -673,7 +658,7 @@ export async function runTradingCycle(options?: {
           `Model: ${(bet.modelProbability * 100).toFixed(1)}%, Pinnacle implies: ${((validation.pinnacleImplied ?? 0) * 100).toFixed(1)}%. ` +
           `Edge: ${(bet.edge * 100).toFixed(1)}% using best available price. ` +
           (validation.sharpSoftSpread ? `Sharp-soft spread: ${(validation.sharpSoftSpread * 100).toFixed(1)}%. ` : "") +
-          (isContrarian ? "CONTRARIAN — stake reduced 60%." : pinnacleAligned ? "Pinnacle-aligned." : "") +
+          (isContrarian ? "CONTRARIAN — Pinnacle-misaligned." : pinnacleAligned ? "Pinnacle-aligned." : "") +
           leagueBonusStr
         : `Backing ${bet.selectionName} at ${bet.backOdds.toFixed(2)}. Model: ${(bet.modelProbability * 100).toFixed(1)}%, Edge: ${(bet.edge * 100).toFixed(1)}%.${leagueBonusStr}`;
 

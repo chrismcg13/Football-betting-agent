@@ -534,7 +534,7 @@ export async function placePaperBet(
     );
   }
 
-  if (isContrarian) stake = Math.round(stake * 0.6 * 100) / 100;
+  // Contrarian stake reduction removed — dev data shows +18.4% ROI on contrarian bets
   if (stakeMultiplier !== 1.0) stake = Math.round(stake * stakeMultiplier * 100) / 100;
   if (dataTier === "candidate") {
     const CANDIDATE_STAKE_MULT = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");

@@ -143,13 +143,25 @@ React + Vite frontend using Wouter routing, TanStack Query, Recharts, and shadcn
 - `league_edge_scores`: 32 → 60 rows
 - `agent_config`: 19 → 34 keys
 
-**P2 — Pre-authorized config changes:**
-- `max_stake_pct`: 0.02 → 0.03
-- `max_exposure_pct`: → 0.90
-- `max_unsettled_exposure_pct`: → 0.90
+**P2 — "Match Dev's Filter Config" (April 16):**
+- `min_opportunity_score`: 58 → 48 (matches dev's proven 48-58 band = 36.8% ROI on 150 settled bets)
+- `max_daily_bets_live`: 15 → 200 (matches dev)
+- `max_bets_per_cycle`: 5 → 30 (retained as live-execution guard)
+- `max_bets_per_league`: 3 → 9999 (unlimited, matches dev)
+- `max_bets_per_market`: 3 → 9999 (unlimited, matches dev)
+- `max_exposure_pct`: → 0.95 (matches dev)
+- `max_unsettled_exposure_pct`: → 0.95 (matches dev)
+- `max_stake_pct`: 0.02 → 0.03 (dev uses 0.035)
+- Removed hardcoded contrarian threshold (75) from scheduler.ts — all bets use unified minScore
+- Removed contrarian 60% stake reduction from paperTrading.ts (dev data: contrarian +18.4% ROI)
+- Opportunity-boosted quarantine KEPT (N=0 settled in dev — indefensible to lift)
+
+**P0 — SQL array bug fix (April 16):**
+- Fixed `liveRiskManager.ts:checkMarketTypeExposure` — Drizzle `sql` template was passing JS array as single string to `ANY(... ::text[])`, causing `malformed array literal` crash. Fixed by pre-formatting as PG array literal `{val1,val2,...}`.
 
 **Current live state (April 16):**
-- 13 Betfair bets pending on matches Apr 16-18 (£130 exposure)
+- 14 Betfair/paper bets pending on matches Apr 16-18
 - Betfair balance: £914 available, £1,044 total (HWM)
-- Trading cycles completing cleanly (~210s, 183 matches evaluated)
-- Daily budget: 13/15 slots used today
+- Trading cycles completing cleanly (~298s, 190 matches evaluated)
+- Daily budget: 13/200 slots used today (opened up from 13/15)
+- Funnel: 190 matches → 14 value bets → 9 pass score → 8 candidates → 1 placed per cycle
