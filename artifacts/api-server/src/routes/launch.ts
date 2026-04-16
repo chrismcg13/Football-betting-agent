@@ -154,6 +154,36 @@ router.post("/launch-activation/bulk-prefetch-oddspapi", async (req, res) => {
   }
 });
 
+router.get("/launch-activation/betfair-markets", async (req, res) => {
+  const home = String(req.query.home ?? "");
+  const away = String(req.query.away ?? "");
+  const eventId = String(req.query.eventId ?? "");
+  if (!home && !eventId) {
+    return res.status(400).json({ error: "home or eventId query param required" });
+  }
+  try {
+    const { listAllMarketsForEvent, listMarketsByEventId } = await import("../services/betfairLive");
+    let markets;
+    if (eventId) {
+      markets = await listMarketsByEventId(eventId);
+    } else {
+      markets = await listAllMarketsForEvent(home, away || "__SKIP_FILTER__");
+    }
+    const summary = markets.map((m: any) => ({
+      marketId: m.marketId,
+      marketName: m.marketName,
+      marketType: m.description?.marketType,
+      event: m.event?.name,
+      eventId: m.event?.id,
+      startTime: m.marketStartTime,
+      runners: m.runners?.map((r: any) => ({ id: r.selectionId, name: r.runnerName, priority: r.sortPriority })),
+    }));
+    res.json({ count: summary.length, markets: summary });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 router.post("/launch-activation/cross-db", async (req, res) => {
   const dryRun = req.query.dryRun !== "false";
   const maxBets = Number(req.query.maxBets ?? 20);
