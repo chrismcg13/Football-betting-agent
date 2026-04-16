@@ -1,0 +1,60 @@
+Phase 1 — Diagnose Pinnacle coverage gap (30 min).
+
+Which sources currently provide Pinnacle data? Walk me through the current data flow:
+
+Is OddsPapi queried for every match? If not, which matches get skipped and why?
+Is API-Football's Pinnacle data being extracted and stored, or is only one bookmaker (e.g. Bet365) being pulled from API-Football responses?
+Are the two sources queried in parallel or sequentially? If sequentially, does the second source get skipped when the first returns data (even partial data)?
+What's the merge/reconciliation logic when both sources have Pinnacle odds for the same match?
+
+
+Where is Pinnacle coverage actually missing? For the 193 matches out of 200 without Pinnacle data, categorize:
+
+Matches in leagues Pinnacle genuinely doesn't price (obscure/small leagues) — unfixable by backfill.
+Matches in leagues Pinnacle does price, but where we never queried the source — fixable by improving query coverage going forward.
+Matches in leagues Pinnacle does price, queried successfully, but data not stored or lost in migration — fixable by backfill.
+
+Be specific. Report the breakdown with match counts per category.
+Prod vs dev comparison. What's dev's Pinnacle coverage rate on the same matches in the same cycle? If dev has 50% coverage and prod has 3.5%, the gap isn't upstream (Pinnacle just doesn't price these matches) — it's migration/collection failure on prod Neon. If dev also has 3.5%, the gap is upstream and backfill won't help.
+Historical backfill feasibility. For matches in the "Pinnacle prices it but we don't have it" category, can OddsPapi and API-Football retrieve historical Pinnacle odds for matches that already happened or are about to start? What's the API cost of a full backfill on the 514 experiment tags' leagues?
+
+
+Phase 2 — Fix the dual-source architecture.
+Once Phase 1 is reported, execute:
+
+Both sources query every match. Both OddsPapi and API-Football query every match for Pinnacle odds. Not one-or-the-other. Not fallback-on-miss. Both, always, in parallel (respecting API rate limits and budgets).
+Merge logic. If both sources return Pinnacle odds, store both and use the more recent one (or freshest price). If they disagree by more than a threshold (e.g. >2%), log the discrepancy — could indicate stale data on one side.
+Store Pinnacle odds independently of bookmaker preference. If API-Football returns multiple bookmakers, extract Pinnacle specifically rather than taking whichever bookmaker comes first.
+Aggressive backfill on categories 2 and 3 from Phase 1 diagnosis:
+
+Use available API budget (75k API-Football, 100k OddsPapi per month) proportionally.
+Prioritize leagues where dev shows highest ROI and most settled bets — this is where live execution unlocks the most value fastest.
+Run the backfill continuously in the background, not as a one-shot — new fixtures appear daily.
+
+
+Log coverage metrics on every cycle. Report Pinnacle coverage as a first-class metric: matches_with_pinnacle / total_matches_evaluated per cycle, trended over time. Target: 50%+ coverage on matches in leagues Pinnacle prices.
+
+
+Phase 3 — Surface two additional blockers we just discovered:
+Blocker A: Per-cycle cap at 30 will become the next bottleneck.
+This cycle: 441 bets passed score threshold, 416 were capped out at the per-cycle cap of 30. Right now that's fine because Pinnacle coverage will filter most of them anyway. Once Pinnacle coverage improves (Phase 2), the per-cycle cap becomes the binding constraint. Don't raise it yet — but model what the right value will be once Pinnacle coverage is at 30%, 50%, 70%. Propose a staircase: cap = X at Y% Pinnacle coverage.
+Blocker B: "Level 1 exposure limit" at 25% of balance.
+The funnel showed 9 bets blocked by "Level 1 exposure limit (£230/£229 = 25% of balance)." This hasn't been discussed before. Explain:
+
+What are the Levels? Is this a ladder (Level 1 → Level 2 → Level 3) that unlocks more exposure as the system proves itself?
+What are the thresholds for graduation between levels (settled bet count, ROI, CLV, time)?
+Where are the Level configurations set in code and config?
+What's Chris's configured Level currently? Prod vs dev.
+If it's a ladder, is it running as designed or was it forgotten in the migration like the Tier 1 threshold and score threshold were?
+
+Do not change Level configurations. Report only. Chris will decide.
+
+Operating rules:
+
+Pinnacle coverage is the mission. Phase 1 diagnostic first, then Phase 2 execution. Do not skip the diagnostic — I need to know how much of the gap is backfill-able vs structural before we burn API budget on aggressive backfill.
+Every Pinnacle coverage number reported must be backed by a query. No estimates.
+When backfill runs, log API usage against budget so we don't hit monthly caps unexpectedly.
+Confirm prod Neon and dev (Replit Postgres, helium) both receive the dual-source data going forward. Don't fix prod and leave dev on single-source.
+Report Phases 1, 2, and 3 in a single continuous push with clear decision points marked.
+
+Go.

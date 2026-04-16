@@ -1135,7 +1135,7 @@ export async function getLeagueOddsFetchTier(leagueName: string): Promise<"high"
   if (hasPendingBets.length > 0) return "high";
 
   if (config[0].tier === 1) return "high";
-  if (config[0].tier === 2 && config[0].hasPinnacleOdds) return "medium";
+  if (config[0].hasPinnacleOdds) return "high";
   if (config[0].tier === 2) return "low";
   return "dormant";
 }

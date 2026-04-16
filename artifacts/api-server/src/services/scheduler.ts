@@ -39,7 +39,7 @@ import {
   backfillPinnacleUnified,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets } from "./apiFootball";
+import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets, fetchAndStoreOddsForAllUpcoming } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql } from "drizzle-orm";
@@ -936,6 +936,11 @@ export async function runTradingCycle(options?: {
     funnel["per_league_cap"] = maxPerLeague;
     funnel["per_market_cap"] = maxPerMarket;
     funnel["score_threshold"] = minScore;
+    funnel["pinnacle_matches"] = oddsPapiCache.size;
+    funnel["pinnacle_matches_total"] = valueSummary.matchesEvaluated;
+    funnel["pinnacle_coverage_pct"] = valueSummary.matchesEvaluated > 0
+      ? Math.round((oddsPapiCache.size / valueSummary.matchesEvaluated) * 100)
+      : 0;
 
     logger.info({ funnel }, "=== TRADING CYCLE FUNNEL REPORT ===");
 
@@ -1542,8 +1547,17 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Alert cleanup active — Sunday 06:00 UTC (90-day retention)");
 
-  setTimeout(() => {
-    logger.info("Startup near trading cycle triggered (post-restart warmup, skipping full odds refresh)");
+  setTimeout(async () => {
+    try {
+      logger.info("Startup: running OddsPapi fixture mapping + API-Football odds refresh before trading cycle");
+      await safeRunOddspapiMapping();
+      await fetchAndStoreOddsForAllUpcoming().then((r) => {
+        logger.info(r, "Startup API-Football odds refresh complete");
+      });
+    } catch (err) {
+      logger.warn({ err }, "Startup odds refresh failed — non-fatal, proceeding to trading cycle");
+    }
+    logger.info("Startup near trading cycle triggered (post-restart warmup)");
     void runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 })
       .then((result) => {
         logger.info(result, "Startup near trading cycle complete");
@@ -1552,7 +1566,7 @@ export function startScheduler(): void {
         logger.warn({ err }, "Startup warmup failed — non-fatal, cron will retry");
       });
   }, 30 * 1000);
-  logger.info("Startup warmup scheduled — near trading cycle in 30s (odds already in DB)");
+  logger.info("Startup warmup scheduled — OddsPapi mapping + odds refresh + trading cycle in 30s");
 
   // Seed baseline leagues + competition config at startup (idempotent — uses onConflictDoNothing)
   void seedBaselineLeagues().catch((err) => logger.warn({ err }, "Baseline league seed failed — non-fatal"));
