@@ -1,0 +1,33 @@
+STOP — Dev Comparison Required Before Lever Changes
+Good funnel work on prod. Before I approve any lever changes, I need the same funnel run against the dev paper-trade database (Replit Postgres, helium host) so we can size the changes against what dev is actually doing. Proposing prod config changes without dev comparison is guessing.
+Do not change any configs yet. Data first.
+
+Phase 1 — Dev funnel (20 min).
+Run the identical funnel instrumentation against dev for one full trading cycle. Report the same 1–9 stages with the same fields. Side-by-side table with prod.
+Also resolve two inconsistencies in your prod report before anything else:
+
+Score threshold confusion. Prod config says score_threshold: 58, but your narrative says "5 contrarian bets fail the 75 threshold." Is there a secondary threshold specifically for contrarian-flagged bets? If yes, what is it, where is it set, and does dev apply the same?
+Per-cycle cap discrepancy. Funnel output shows per_cycle_cap: 2, your recommendation says raise from 5 to 8. Which is it? Does the cap dynamically shrink based on remaining daily slots (i.e. cap is min(5, daily_slots_left))? Confirm the actual behaviour.
+
+
+Phase 2 — Dev ROI on currently-filtered bets.
+For each filter you're proposing to loosen or lift, pull dev's historical ROI on bets that filter would have rejected. Specifically:
+
+Opportunity-boosted bets in dev. Settled sample size, win rate, ROI, CLV. Break down by market type (match result, BTTS, O/U, cards, corners). If dev shows positive ROI on opportunity-boosted bets with N ≥ 50 settled, lifting the quarantine on them is defensible. If sample is smaller or ROI is flat/negative, it's not.
+Contrarian bets (Pinnacle-misaligned) in dev. Same breakdown. If dev's contrarian bets are profitable, the -10 contrarian penalty is miscalibrated.
+Bets below the 58 score threshold in dev. Does dev use 58 too? If dev uses a lower threshold, what's dev's ROI on bets in the 48–58 score band?
+High-volume days in dev. On days dev placed the most bets, what was the ROI vs lower-volume days? This tells me whether volume scaling degrades edge quality — critical input for how aggressively I can raise the daily budget.
+
+
+Phase 3 — Revised lever recommendations with dev data.
+Once Phase 1 and 2 are complete, revise your recommendations. I'm specifically considering these as pre-authorised ceilings, but I want you to recommend within them based on dev data:
+
+Daily budget ceiling: up to 200/day. Your recommendation of 25 is likely far too conservative given dev's volume. Propose a specific number backed by dev ROI analysis. I'm willing to go to 200/day if dev's high-volume days show sustained ROI.
+Per-experiment-tag cap: 30/day. Diversification constraint to prevent a single tag eating the budget.
+Per-market-type cap: 50/day. Same reason.
+Per-cycle cap: raise as needed. Propose a number.
+Score threshold: match dev. Whatever dev uses, prod uses.
+Contrarian penalty: recalibrate or remove. Based on dev ROI on contrarian bets.
+Opportunity-boosted quarantine: lift if defensible. Based on dev ROI on opportunity-boosted bets. If you lift it, replace the quarantine with a minimum-dev-sample-size filter (e.g. "opportunity-boosted bets allowed only on experiment tags with N+ dev settled bets at positive ROI").
+
+For each lever, state: current prod, current dev, recommended new prod, expected additional bets/day, dev ROI on the class of bets this lever unlocks.
