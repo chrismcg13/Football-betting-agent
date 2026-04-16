@@ -1,0 +1,33 @@
+THE MODEL IS OVER-GENERATING DOUBLE CHANCE BETS — FIX THIS
+
+77% of qualifying bets are Double Chance but Betfair rarely offers DC markets. The model needs to shift its output toward markets that exist on the exchange: Over/Under (all lines), Match Odds, and BTTS.
+
+1. DIAGNOSE: Why is the model generating so many DC bets?
+   - Is DC genuinely where it finds the most edge, or is it an artefact of how probabilities are calculated?
+   - DC is derived from match result probabilities — is the model finding "edge" simply because combining two outcomes makes it easier to beat the Pinnacle threshold?
+   - Show me: for the same fixtures, what does the model's edge look like in Match Odds, Over/Under 2.5, and BTTS? Is there genuine edge in those markets too that isn't being surfaced?
+
+2. BETFAIR MARKET AVAILABILITY CHECK:
+   - Before the model evaluates whether a bet has edge, it should know whether the market is actually placeable
+   - Build a Betfair market availability cache: for each upcoming fixture, query what markets Betfair actually offers
+   - Cache this per event (markets don't change once listed)
+   - The model should prioritise evaluating markets that EXIST on the exchange
+   - DC bets in leagues where Betfair never offers DC should be deprioritised in the evaluation pipeline — they waste compute and API calls
+
+3. EXPAND MODEL OUTPUT TO EXCHANGE-FRIENDLY MARKETS:
+   - The model currently outputs: Match Result, BTTS, Over/Under Goals, Cards, Corners, Double Chance
+   - For exchange betting, the priority markets should be:
+     a) Over/Under 2.5 Goals — available on virtually every Betfair event
+     b) Match Odds (1X2) — available on every event
+     c) Over/Under 1.5, 3.5 Goals — widely available
+     d) BTTS — available on most events
+     e) Double Chance — only evaluate if confirmed available on Betfair for that event
+     f) Corners and Cards — rarely available on exchange, lowest priority
+   - Is the model evaluating all O/U lines for every fixture? Over 2.5 is the most liquid market on the exchange after Match Odds — if the model isn't generating O/U 2.5 bets, that's a huge gap
+
+4. IMMEDIATE ACTION:
+   - Run the model evaluation across all upcoming fixtures (30min-72hr) for Over/Under 2.5, Match Odds, and BTTS specifically
+   - Show me how many bets would qualify at threshold 56 with Pinnacle edge >= 2% in these exchange-friendly markets
+   - These are the markets where volume will come from
+
+The goal: shift from generating 77% DC bets to generating majority O/U and Match Odds bets where Betfair has deep liquidity and the bets can actually be placed.

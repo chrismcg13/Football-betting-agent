@@ -22,7 +22,7 @@ The project is a pnpm monorepo using TypeScript 5.9, Node.js 24, and Express 5 f
 *   **Agent Configuration:** Dynamic settings for bankroll, stake limits, edge thresholds, and diversity rules.
 *   **API Endpoints:** RESTful API for managing configurations, data, predictions, and analytics.
 *   **Market Types & Models:** Supports various football market types (Match Odds, BTTS, Over/Under, Asian Handicap, Cards, Corners) with specific ML models (e.g., Logistic Regression, Poisson).
-*   **Opportunity Scoring:** A 5-component system (Edge, Confidence, Odds Sweet Spot, Market Quality, Form Alignment) to identify high-value bets.
+*   **Opportunity Scoring:** A multi-component system (Edge, Confidence, Odds Sweet Spot, Market Quality, Form Alignment) with derived-market adjustments. DC and First Half Result are classified as `DERIVED_MARKETS` — their edge is deflated by 45% and confidence scores are capped using constituent outcome confidence (max individual H/D/A deviation from 0.5). DC also has a minimum 8% raw edge threshold to filter out false signals from probability aggregation.
 *   **Staking Strategy:** Kelly Criterion-based tiers, adjusted by opportunity score and market type.
 *   **Diversity Rules:** Per-cycle limits on total bets, bets per league, and bets per market type.
 *   **Prediction Engine:** Uses logistic regression, bootstrapped from historical data, auto-loaded, and retrained.

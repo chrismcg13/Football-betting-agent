@@ -231,6 +231,8 @@ async function getHotStreakBonus(
 
 // ─── Opportunity scoring (revised formula) ────────────────────────────────────
 
+const DERIVED_MARKETS = new Set(["DOUBLE_CHANCE", "FIRST_HALF_RESULT"]);
+
 function computeOpportunityScore(params: {
   edge: number;
   modelProbability: number;
@@ -241,47 +243,47 @@ function computeOpportunityScore(params: {
   leagueEdgeScore?: number;
   marketSpread?: number;
   bookmakerCount?: number;
+  marketType?: string;
+  constituentMaxConfidence?: number;
 }): number {
-  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus, isSynthetic, leagueEdgeScore, marketSpread, bookmakerCount } = params;
+  const { edge, modelProbability, backOdds, segmentStats, hotStreakBonus, isSynthetic, leagueEdgeScore, marketSpread, bookmakerCount, marketType, constituentMaxConfidence } = params;
+  const isDerived = marketType ? DERIVED_MARKETS.has(marketType) : false;
 
-  // 1. Edge size: (edge / 0.15) × 25, max 25
-  const edgeScore = Math.min((edge / 0.15) * 25, 25);
+  const effectiveEdge = isDerived ? edge * 0.55 : edge;
 
-  // 2. Model confidence: abs(prob - 0.5) × 50, max 25
-  const confidenceScore = Math.min(Math.abs(modelProbability - 0.5) * 50, 25);
+  const edgeScore = Math.min((effectiveEdge / 0.15) * 25, 25);
 
-  // 3. Historical segment ROI (max 20) — only when positive
+  let confidenceScore: number;
+  if (isDerived && constituentMaxConfidence !== undefined) {
+    confidenceScore = Math.min(constituentMaxConfidence * 50, 15);
+  } else {
+    confidenceScore = Math.min(Math.abs(modelProbability - 0.5) * 50, 25);
+  }
+
   let segmentScore = 0;
   if (segmentStats.betCount >= 3 && segmentStats.roi > 0) {
     segmentScore = Math.min(segmentStats.roi, 20);
   }
 
-  // 4. Sample reliability: min(count/20, 1) × 15, max 15
   const reliabilityScore = Math.min(segmentStats.betCount / 20, 1) * 15;
 
-  // 5. Odds sweet spot: 1.9–3.2 → 15pts, 1.5–1.9 or 3.2–4.5 → 8pts, outside → 0
   let oddsScore = 0;
   if (backOdds >= 1.9 && backOdds <= 3.2) oddsScore = 15;
   else if ((backOdds >= 1.5 && backOdds < 1.9) || (backOdds > 3.2 && backOdds <= 4.5)) oddsScore = 8;
 
-  // 6. League edge bonus: (leagueEdgeScore - 50) / 5, capped at ±10
   const leagueBonus = leagueEdgeScore !== undefined
     ? Math.max(-10, Math.min(10, (leagueEdgeScore - 50) / 5))
     : 0;
 
-  // 7. Market spread bonus — bookmaker disagreement = inefficient market = edge opportunity
-  //    Large spread (>5%) means bookmakers disagree significantly → bonus up to 8pts
-  //    Scaled by bookmaker count (more bookmakers = more reliable spread)
   let marketSpreadBonus = 0;
   if (marketSpread !== undefined && marketSpread > 0) {
-    const bmFactor = Math.min((bookmakerCount ?? 3) / 5, 1); // scale with bookmaker count
+    const bmFactor = Math.min((bookmakerCount ?? 3) / 5, 1);
     marketSpreadBonus = Math.min(marketSpread * 80 * bmFactor, 8);
   }
 
   const raw = edgeScore + confidenceScore + segmentScore + reliabilityScore + oddsScore + hotStreakBonus + leagueBonus + marketSpreadBonus;
   const score = Math.min(Math.round(raw * 100) / 100, 100);
 
-  // Synthetic-only odds are capped at 55 — below the default 50 min score
   if (isSynthetic) return Math.min(score, 55);
 
   return score;
@@ -795,7 +797,10 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       selectionsEvaluated++;
       const edge = modelProb - impliedProb;
 
-      if (edge <= minEdge) continue;
+      const effectiveMinEdge = DERIVED_MARKETS.has(oddsRow.marketType)
+        ? Math.max(minEdge, 0.08)
+        : minEdge;
+      if (edge < effectiveMinEdge) continue;
 
       const { commissionAdjustedEV, getCommissionRate } = await import("./commissionService");
       const commRate = await getCommissionRate("betfair");
@@ -821,6 +826,31 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
       const marketSpread = featureMap["avg_market_spread"] ?? featureMap["market_spread_home"] ?? undefined;
       const bookmakerCount = featureMap["bookmaker_count_home"] ? Math.round(featureMap["bookmaker_count_home"]) : undefined;
 
+      let constituentMaxConfidence: number | undefined;
+      if (DERIVED_MARKETS.has(oddsRow.marketType)) {
+        const outcomePreds = predictOutcome(enrichFeaturesWithXgProxy(featureMap));
+        if (outcomePreds) {
+          if (oddsRow.marketType === "FIRST_HALF_RESULT") {
+            const scale = 0.7;
+            const mean = 1 / 3;
+            const fhHome = mean + (outcomePreds.home - mean) * scale;
+            const fhDraw = mean + (outcomePreds.draw - mean) * scale;
+            const fhAway = mean + (outcomePreds.away - mean) * scale;
+            constituentMaxConfidence = Math.max(
+              Math.abs(fhHome - 0.5),
+              Math.abs(fhDraw - 0.5),
+              Math.abs(fhAway - 0.5),
+            );
+          } else {
+            constituentMaxConfidence = Math.max(
+              Math.abs(outcomePreds.home - 0.5),
+              Math.abs(outcomePreds.draw - 0.5),
+              Math.abs(outcomePreds.away - 0.5),
+            );
+          }
+        }
+      }
+
       const baseOpportunityScore = computeOpportunityScore({
         edge,
         modelProbability: modelProb,
@@ -831,6 +861,8 @@ export async function detectValueBets(): Promise<EvaluationSummary> {
         leagueEdgeScore,
         marketSpread,
         bookmakerCount,
+        marketType: oddsRow.marketType,
+        constituentMaxConfidence,
       });
       const softLine = await getSoftLineBonus(match.homeTeam, match.awayTeam, matchLeagueId, match.kickoffTime);
       const totalBonus = discoveryBonus + softLine.bonus;
