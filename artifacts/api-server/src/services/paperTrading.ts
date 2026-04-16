@@ -68,16 +68,18 @@ export async function getBankroll(): Promise<number> {
 // ===================== Bet placement pre-checks =====================
 
 async function getTotalPendingExposure(): Promise<number> {
-  // Only count bets placed on or after exposure_rule_since — pre-rule bets are grandfathered
+  // Only count bets placed on or after exposure_rule_since — pre-rule bets are grandfathered.
+  // Paper bets (qualification_path='paper') are excluded — they are NOT real money.
   const sinceStr = await getConfigValue("exposure_rule_since");
   const since = sinceStr ? new Date(sinceStr) : null;
+  const realMoneyFilter = sql`(${paperBetsTable.qualificationPath} IS NULL OR ${paperBetsTable.qualificationPath} != 'paper')`;
   const result = await db
     .select({ total: sql<number>`COALESCE(SUM(${paperBetsTable.stake}::numeric), 0)` })
     .from(paperBetsTable)
     .where(
       since
-        ? and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`, gte(paperBetsTable.placedAt, since))
-        : and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`),
+        ? and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`, gte(paperBetsTable.placedAt, since), realMoneyFilter)
+        : and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`, realMoneyFilter),
     );
   return Number(result[0]?.total ?? 0);
 }
@@ -150,7 +152,7 @@ function calculateDynamicKellyStake(
 
 // ===================== Tier 1 live qualification =====================
 
-const MIN_PINNACLE_EDGE_PCT = 2;
+const MIN_PINNACLE_EDGE_PCT = 1;
 
 interface Tier1CheckResult {
   qualifies: boolean;
@@ -267,8 +269,6 @@ export async function placePaperBet(
     opportunityScore,
     oddsSource,
     enhancedOpportunityScore,
-    pinnacleOdds,
-    pinnacleImplied,
     bestOdds,
     bestBookmaker,
     betThesis,
@@ -283,6 +283,10 @@ export async function placePaperBet(
     pinnacleEdgeCategory = null,
     lineDirection = null,
   } = options;
+  // Make these mutable so we can fall back to DB-stored Pinnacle snapshots
+  // when the trading-cycle cache misses (allows Tier 1B qualification).
+  let pinnacleOdds: number | null = options.pinnacleOdds ?? null;
+  let pinnacleImplied: number | null = options.pinnacleImplied ?? null;
   const score = opportunityScore ?? 65;
 
   const logReject = async (reason: string) => {
@@ -605,6 +609,46 @@ export async function placePaperBet(
       return logReject(`Live concentration limit: ${concentrationCheck.reason}`);
     }
   }
+
+  // ── Pinnacle DB fallback ─────────────────────────────────────────────────
+  // If the trading-cycle cache didn't supply Pinnacle odds, look them up from
+  // the most recent snapshot in odds_snapshots. This unblocks Tier 1B for
+  // matches whose Pinnacle data exists in DB but missed the in-memory cache.
+  if (pinnacleOdds == null) {
+    try {
+      const variants = Array.from(new Set([
+        selectionName,
+        selectionName.endsWith(" Goals") ? selectionName.replace(/ Goals$/, "") : `${selectionName} Goals`,
+      ]));
+      const latestPin = await db
+        .select({ backOdds: oddsSnapshotsTable.backOdds, source: oddsSnapshotsTable.source })
+        .from(oddsSnapshotsTable)
+        .where(and(
+          eq(oddsSnapshotsTable.matchId, matchId),
+          eq(oddsSnapshotsTable.marketType, marketType),
+          inArray(oddsSnapshotsTable.selectionName, variants),
+          or(
+            eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
+            eq(oddsSnapshotsTable.source, "oddspapi"),
+            eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
+          ),
+        ))
+        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+        .limit(1);
+      const fallbackOdds = latestPin[0]?.backOdds ? parseFloat(latestPin[0].backOdds) : null;
+      if (fallbackOdds && fallbackOdds > 1.01) {
+        pinnacleOdds = fallbackOdds;
+        pinnacleImplied = 1 / fallbackOdds;
+        logger.info(
+          { matchId, marketType, selectionName, pinnacleOdds, source: latestPin[0]?.source },
+          "Pinnacle odds loaded from DB snapshot fallback",
+        );
+      }
+    } catch (err) {
+      logger.warn({ err, matchId, marketType, selectionName }, "Pinnacle DB fallback lookup failed");
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
 
   const { getCommissionRate } = await import("./commissionService");
   const commRate = await getCommissionRate("betfair");

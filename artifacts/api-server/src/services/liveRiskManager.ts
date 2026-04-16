@@ -157,6 +157,7 @@ export async function checkLeagueExposure(
     WHERE pb.status = 'pending'
     AND pb.deleted_at IS NULL
     AND m.league = ${match.league}
+    AND (pb.qualification_path IS NULL OR pb.qualification_path != 'paper')
   `);
 
   const currentExposure = Number((result.rows[0] as Record<string, unknown>)?.total ?? 0);
@@ -192,6 +193,7 @@ export async function checkMarketTypeExposure(
     WHERE status = 'pending'
     AND deleted_at IS NULL
     AND market_type = ANY(${pgArrayLiteral}::text[])
+    AND (qualification_path IS NULL OR qualification_path != 'paper')
   `);
 
   const currentExposure = Number((result.rows[0] as Record<string, unknown>)?.total ?? 0);
@@ -216,6 +218,7 @@ export async function checkFixtureExposure(
     WHERE status = 'pending'
     AND deleted_at IS NULL
     AND match_id = ${matchId}
+    AND (qualification_path IS NULL OR qualification_path != 'paper')
   `);
 
   const currentExposure = Number((result.rows[0] as Record<string, unknown>)?.total ?? 0);
