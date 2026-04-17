@@ -8,8 +8,10 @@ import {
   paperBetsTable,
   learningNarrativesTable,
   leagueEdgeScoresTable,
+  competitionConfigTable,
+  experimentRegistryTable,
 } from "@workspace/db";
-import { eq, desc, and, gte, lte, sql } from "drizzle-orm";
+import { eq, desc, and, gte, lte, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { ensureExperimentRegistered, getExperimentTier } from "./promotionEngine";
 import {
@@ -20,6 +22,8 @@ import {
   predictCorners,
   getModelVersion,
 } from "./predictionEngine";
+import { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } from "./tournamentMode";
+import { commissionAdjustedEV, getCommissionRate } from "./commissionService";
 
 export interface ValueBet {
   matchId: number;
@@ -708,38 +712,215 @@ export async function detectValueBets(options?: {
   // (1466 inserts / cycle previously kept the cycle running 15+ minutes).
   const complianceBuffer: Array<typeof complianceLogsTable.$inferInsert> = [];
 
-  for (const match of matches) {
-    const { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } = await import("./tournamentMode");
+  // ─── Bulk pre-load all per-(league, marketType) and per-league data ─────
+  // Previously the inner loop did 7+ sequential DB round-trips per selection
+  // (~1500 iterations × 7 queries × 50ms = 8-10 minutes of pure DB latency).
+  // Pre-load everything once into Maps for O(1) lookups inside the loop.
+  const preloadStart = Date.now();
 
-    const matchLeagueId = await getLeagueIdForMatch(match.league);
-    let seasonalPhase: "active" | "off_season" | "pre_season" | "playoff" | "unknown" = "unknown";
-    try {
-      const { competitionConfigTable } = await import("@workspace/db");
-      const [ccRow] = await db
-        .select({ seasonalStart: competitionConfigTable.seasonalStart, seasonalEnd: competitionConfigTable.seasonalEnd })
-        .from(competitionConfigTable)
-        .where(eq(competitionConfigTable.name, match.league))
-        .limit(1);
-      if (ccRow) {
-        seasonalPhase = detectSeasonalPhase(ccRow.seasonalStart, ccRow.seasonalEnd, match.league);
+  // 1. Competitions config (per league: apiFootballId, seasonalStart, seasonalEnd)
+  const competitionRows = await db
+    .select({
+      name: competitionConfigTable.name,
+      apiFootballId: competitionConfigTable.apiFootballId,
+      seasonalStart: competitionConfigTable.seasonalStart,
+      seasonalEnd: competitionConfigTable.seasonalEnd,
+    })
+    .from(competitionConfigTable);
+  const competitionMap = new Map<string, { apiFootballId: number; seasonalStart: string | null; seasonalEnd: string | null }>();
+  for (const c of competitionRows) {
+    competitionMap.set(c.name, {
+      apiFootballId: c.apiFootballId ?? 0,
+      seasonalStart: c.seasonalStart,
+      seasonalEnd: c.seasonalEnd,
+    });
+  }
+
+  // 2. League edge scores
+  const edgeRows = await db
+    .select({ league: leagueEdgeScoresTable.league, score: leagueEdgeScoresTable.confidenceScore })
+    .from(leagueEdgeScoresTable);
+  const leagueEdgeMap = new Map<string, number>();
+  for (const r of edgeRows) leagueEdgeMap.set(r.league, r.score);
+
+  // 3. Segment stats per (league, marketType) — single GROUP BY query
+  const segStatsRows = await db.execute(sql`
+    SELECT m.league AS league,
+           pb.market_type AS market_type,
+           COUNT(*) FILTER (WHERE pb.status IN ('won','lost')) AS bet_count,
+           COUNT(*) FILTER (WHERE pb.status = 'won') AS wins,
+           COUNT(*) FILTER (WHERE pb.status = 'lost') AS losses,
+           COALESCE(SUM(CASE WHEN pb.status IN ('won','lost') THEN pb.settlement_pnl::numeric ELSE 0 END), 0) AS total_pnl,
+           COALESCE(SUM(CASE WHEN pb.status IN ('won','lost') THEN pb.stake::numeric ELSE 0 END), 0) AS total_stake
+    FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    GROUP BY m.league, pb.market_type
+  `);
+  const segmentStatsMap = new Map<string, SegmentStats>();
+  for (const row of (segStatsRows as any).rows ?? []) {
+    const betCount = Number(row.bet_count ?? 0);
+    if (betCount === 0) continue;
+    const totalPnl = Number(row.total_pnl ?? 0);
+    const totalStake = Number(row.total_stake ?? 0);
+    const roi = totalStake > 0 ? (totalPnl / totalStake) * 100 : 0;
+    segmentStatsMap.set(`${row.league}::${row.market_type}`, {
+      betCount,
+      wins: Number(row.wins ?? 0),
+      losses: Number(row.losses ?? 0),
+      totalPnl,
+      roi,
+    });
+  }
+
+  // 4. Hot-streak data per (league, marketType) — settled bets in window grouped by week
+  const weeksAgo = new Date();
+  weeksAgo.setDate(weeksAgo.getDate() - hotWeeks * 7);
+  const hotRows = await db.execute(sql`
+    SELECT m.league AS league,
+           pb.market_type AS market_type,
+           date_trunc('week', pb.settled_at) AS week_start,
+           COUNT(*) AS bets,
+           COALESCE(SUM(pb.settlement_pnl::numeric), 0) AS pnl
+    FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    WHERE pb.settled_at >= ${weeksAgo}
+      AND pb.status IN ('won','lost')
+    GROUP BY m.league, pb.market_type, date_trunc('week', pb.settled_at)
+  `);
+  const hotStreakBonusMap = new Map<string, number>();
+  const hotWeeksMap = new Map<string, Array<{ bets: number; pnl: number }>>();
+  for (const row of (hotRows as any).rows ?? []) {
+    const key = `${row.league}::${row.market_type}`;
+    const arr = hotWeeksMap.get(key) ?? [];
+    arr.push({ bets: Number(row.bets ?? 0), pnl: Number(row.pnl ?? 0) });
+    hotWeeksMap.set(key, arr);
+  }
+  for (const [key, weeks] of hotWeeksMap) {
+    const profitable = weeks.filter((w) => w.bets >= hotMinBets && w.pnl > 0).length;
+    if (profitable >= hotWeeks) {
+      hotStreakBonusMap.set(key, hotBonus);
+      if (!hotStreakNotified.has(key)) {
+        hotStreakNotified.add(key);
+        const [league, marketType] = key.split("::");
+        await db.insert(learningNarrativesTable).values({
+          narrativeType: "sustained_positive_edge",
+          narrativeText: `Hot streak: ${league} ${marketType} profitable for ${profitable} consecutive weeks. Boosting opportunity score by ${hotBonus} points.`,
+          relatedData: { league, marketType, weeks: profitable, bonus: hotBonus },
+          createdAt: new Date(),
+        });
       }
-    } catch {}
+    } else {
+      hotStreakNotified.delete(key);
+    }
+  }
+
+  // 5. Experiment registry tier per experimentTag
+  const expRows = await db
+    .select({ experimentTag: experimentRegistryTable.experimentTag, dataTier: experimentRegistryTable.dataTier })
+    .from(experimentRegistryTable);
+  const experimentTierMap = new Map<string, string>();
+  for (const r of expRows) experimentTierMap.set(r.experimentTag, r.dataTier);
+  const newExperiments: Array<{ tag: string; league: string; market: string }> = [];
+
+  // 6. Discovery counts (for boosting under-explored leagues) — uses existing module-level cache
+  discoveryCountsLoaded = false;
+
+  // 7. Commission rate — fetch once
+  const commRate = await getCommissionRate("betfair");
+
+  // 8. Cold-market exclusions evaluated up-front from segmentStatsMap
+  const coldMarkets = new Set<string>();
+  for (const [key, stats] of segmentStatsMap) {
+    if (stats.betCount >= coldMinBets && stats.roi < coldThreshold) {
+      const cached = coldMarketCache.get(key);
+      if (cached && new Date() < cached.excludedUntil) {
+        coldMarkets.add(key);
+        continue;
+      }
+      const excludedUntil = new Date();
+      excludedUntil.setDate(excludedUntil.getDate() + coldCooldownDays);
+      coldMarketCache.set(key, { excludedUntil });
+      coldMarkets.add(key);
+      const [league, marketType] = key.split("::");
+      await db.insert(learningNarrativesTable).values({
+        narrativeType: "strategy_shift",
+        narrativeText: `Pausing ${league} ${marketType} after ${stats.betCount} bets at ${stats.roi.toFixed(1)}% ROI. Reassessing in ${coldCooldownDays} days.`,
+        relatedData: { league, marketType, betCount: stats.betCount, roi: stats.roi, excludedUntil },
+        createdAt: new Date(),
+      });
+      complianceBuffer.push({
+        actionType: "decision",
+        details: { action: "cold_market_excluded", league, marketType, betCount: stats.betCount, roi: stats.roi, excludedUntil },
+        timestamp: new Date(),
+      });
+      logger.warn({ league, marketType, roi: stats.roi }, "Cold market excluded");
+    } else {
+      // Re-include if previously cold but cooldown expired
+      const cached = coldMarketCache.get(key);
+      if (cached && new Date() < cached.excludedUntil) coldMarkets.add(key);
+    }
+  }
+  // Also carry over any still-active cold-market entries that didn't appear in stats
+  for (const [key, entry] of coldMarketCache) {
+    if (new Date() < entry.excludedUntil) coldMarkets.add(key);
+  }
+
+  logger.info(
+    {
+      competitions: competitionMap.size,
+      leagueEdgeScores: leagueEdgeMap.size,
+      segmentStats: segmentStatsMap.size,
+      hotStreakBonuses: hotStreakBonusMap.size,
+      experiments: experimentTierMap.size,
+      coldMarkets: coldMarkets.size,
+      durationMs: Date.now() - preloadStart,
+    },
+    "Value detection bulk preload complete",
+  );
+
+  // 9. Bulk pre-fetch matches' odds + features in 2 queries instead of 2N
+  const matchIds = matches.map((m) => m.id);
+  const allOddsRows = matchIds.length > 0
+    ? await db
+        .select()
+        .from(oddsSnapshotsTable)
+        .where(inArray(oddsSnapshotsTable.matchId, matchIds))
+        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+    : [];
+  const oddsByMatch = new Map<number, typeof allOddsRows>();
+  for (const r of allOddsRows) {
+    const arr = oddsByMatch.get(r.matchId) ?? [];
+    arr.push(r);
+    oddsByMatch.set(r.matchId, arr);
+  }
+
+  const allFeatureRows = matchIds.length > 0
+    ? await db
+        .select()
+        .from(featuresTable)
+        .where(inArray(featuresTable.matchId, matchIds))
+    : [];
+  const featuresByMatch = new Map<number, typeof allFeatureRows>();
+  for (const r of allFeatureRows) {
+    const arr = featuresByMatch.get(r.matchId) ?? [];
+    arr.push(r);
+    featuresByMatch.set(r.matchId, arr);
+  }
+
+  for (const match of matches) {
+    const ccRow = competitionMap.get(match.league);
+    const matchLeagueId = ccRow?.apiFootballId ?? 0;
+    const seasonalPhase = ccRow
+      ? detectSeasonalPhase(ccRow.seasonalStart, ccRow.seasonalEnd, match.league)
+      : ("unknown" as const);
     const blockCheck = shouldBlockBet(matchLeagueId, match.league, seasonalPhase);
     if (blockCheck.blocked) {
       logger.debug({ matchId: match.id, league: match.league, seasonalPhase, reason: blockCheck.reason }, "Skipping match — seasonal/friendly block");
       continue;
     }
 
-    const oddsRows = await db
-      .select()
-      .from(oddsSnapshotsTable)
-      .where(eq(oddsSnapshotsTable.matchId, match.id))
-      .orderBy(desc(oddsSnapshotsTable.snapshotTime));
-
-    const featureRows = await db
-      .select()
-      .from(featuresTable)
-      .where(eq(featuresTable.matchId, match.id));
+    const oddsRows = oddsByMatch.get(match.id) ?? [];
+    const featureRows = featuresByMatch.get(match.id) ?? [];
 
     const publicFeatures = featureRows.filter((f) => !f.featureName.startsWith("_"));
     if (publicFeatures.length < 8) continue;
@@ -812,8 +993,6 @@ export async function detectValueBets(options?: {
         : minEdge;
       if (edge < effectiveMinEdge) continue;
 
-      const { commissionAdjustedEV, getCommissionRate } = await import("./commissionService");
-      const commRate = await getCommissionRate("betfair");
       const evCheck = commissionAdjustedEV(modelProb, backOdds, commRate);
       if (evCheck.netEV <= 0) {
         logger.debug(
@@ -823,13 +1002,13 @@ export async function detectValueBets(options?: {
         continue;
       }
 
-      const segmentStats = await getSegmentStats(match.league, oddsRow.marketType);
+      const segKey = `${match.league}::${oddsRow.marketType}`;
+      const segmentStats = segmentStatsMap.get(segKey) ?? { betCount: 0, wins: 0, losses: 0, totalPnl: 0, roi: 0 };
 
-      const cold = await isColdMarket(match.league, oddsRow.marketType, segmentStats, coldMinBets, coldThreshold, coldCooldownDays);
-      if (cold) continue;
+      if (coldMarkets.has(segKey)) continue;
 
-      const streakBonus = await getHotStreakBonus(match.league, oddsRow.marketType, hotWeeks, hotMinBets, hotBonus);
-      const leagueEdgeScore = await getLeagueEdgeScore(match.league ?? "");
+      const streakBonus = hotStreakBonusMap.get(segKey) ?? 0;
+      const leagueEdgeScore = leagueEdgeMap.get(match.league ?? "") ?? 50;
       const discoveryBonus = await getDiscoveryBonus(match.league ?? "");
 
       // Pull market spread features (computed from all-bookmaker odds)
@@ -891,9 +1070,12 @@ export async function detectValueBets(options?: {
       let dataTier: string;
       if (isExperimental) {
         dataTier = "experiment";
-        await ensureExperimentRegistered(expTag, match.league ?? "unknown", oddsRow.marketType);
+        if (!experimentTierMap.has(expTag)) {
+          experimentTierMap.set(expTag, "experiment");
+          newExperiments.push({ tag: expTag, league: match.league ?? "unknown", market: oddsRow.marketType });
+        }
       } else {
-        dataTier = await getExperimentTier(expTag);
+        dataTier = experimentTierMap.get(expTag) ?? "experiment";
         if (dataTier === "experiment" || dataTier === "abandoned" || dataTier === "demoted") dataTier = "experiment";
       }
       const syncEligible = dataTier === "promoted";
@@ -959,6 +1141,21 @@ export async function detectValueBets(options?: {
 
   // Sort by opportunity score descending
   valueBets.sort((a, b) => b.opportunityScore - a.opportunityScore);
+
+  // Bulk-register newly discovered experiments (one INSERT per new tag — typically <50/cycle)
+  if (newExperiments.length > 0) {
+    const regStart = Date.now();
+    let registered = 0;
+    for (const e of newExperiments) {
+      try {
+        await ensureExperimentRegistered(e.tag, e.league, e.market);
+        registered++;
+      } catch {
+        // Non-fatal: another concurrent process may have registered it
+      }
+    }
+    logger.info({ registered, attempted: newExperiments.length, durationMs: Date.now() - regStart }, "New experiments registered");
+  }
 
   // Bulk-flush buffered compliance logs in chunks. Failures here must not
   // block the trading cycle from returning value bets to the placement step.
