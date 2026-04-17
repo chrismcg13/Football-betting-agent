@@ -703,6 +703,11 @@ export async function detectValueBets(options?: {
   let realOddsCount = 0;
   const byMarketType: Record<string, number> = {};
 
+  // Buffer compliance log inserts and bulk-flush at the end. Per-row inserts
+  // through Neon serverless were ~100ms each and dominated cycle latency
+  // (1466 inserts / cycle previously kept the cycle running 15+ minutes).
+  const complianceBuffer: Array<typeof complianceLogsTable.$inferInsert> = [];
+
   for (const match of matches) {
     const { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } = await import("./tournamentMode");
 
@@ -764,7 +769,7 @@ export async function detectValueBets(options?: {
       ? "synthetic"
       : (realOddsRows[0]?.source ?? "api_football_real").replace("api_football_real:", "");
 
-    await db.insert(complianceLogsTable).values({
+    complianceBuffer.push({
       actionType: "value_detection_odds_source",
       details: {
         matchId: match.id,
@@ -897,7 +902,7 @@ export async function detectValueBets(options?: {
       const effectiveMinScore = minOppScore;
       const decision = opportunityScore >= effectiveMinScore ? "value_bet" : "skip_low_score";
 
-      await db.insert(complianceLogsTable).values({
+      complianceBuffer.push({
         actionType: "value_detection_evaluation",
         details: {
           matchId: match.id,
@@ -954,6 +959,30 @@ export async function detectValueBets(options?: {
 
   // Sort by opportunity score descending
   valueBets.sort((a, b) => b.opportunityScore - a.opportunityScore);
+
+  // Bulk-flush buffered compliance logs in chunks. Failures here must not
+  // block the trading cycle from returning value bets to the placement step.
+  if (complianceBuffer.length > 0) {
+    const flushStart = Date.now();
+    const CHUNK = 500;
+    let flushed = 0;
+    try {
+      for (let i = 0; i < complianceBuffer.length; i += CHUNK) {
+        const chunk = complianceBuffer.slice(i, i + CHUNK);
+        await db.insert(complianceLogsTable).values(chunk);
+        flushed += chunk.length;
+      }
+      logger.info(
+        { rows: flushed, durationMs: Date.now() - flushStart },
+        "Value detection compliance logs flushed",
+      );
+    } catch (err) {
+      logger.warn(
+        { err, attempted: complianceBuffer.length, flushed },
+        "Failed to flush value detection compliance logs (non-fatal)",
+      );
+    }
+  }
 
   logger.info(
     { matchesEvaluated: matches.length, selectionsEvaluated, valueBetsFound: valueBets.length, realOddsCount, syntheticOddsCount },

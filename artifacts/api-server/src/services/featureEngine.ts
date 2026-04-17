@@ -1,5 +1,5 @@
 import { db, matchesTable, featuresTable } from "@workspace/db";
-import { eq, and, desc, ne, or, sql } from "drizzle-orm";
+import { eq, and, gte, lte, asc, desc, ne, or, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
   getStandings,
@@ -640,129 +640,137 @@ async function computeFeaturesFromDb(
   );
 }
 
+// Tunables for feature computation throughput.
+// Goal: complete a feature run in <10 min so trading cycles can fire.
+const FEATURE_RUN_BUDGET_MS = 20 * 60 * 1000;          // Fix D: hard wall-clock cap
+const FEATURE_MAX_HOURS_AHEAD = 72;                    // Fix B: skip far-future matches
+const FEATURE_FRESHNESS_MS = 2 * 60 * 60 * 1000;       // Fix B: 2h staleness window
+const FEATURE_CONCURRENCY = 8;                         // Fix C-light: bounded parallelism
+
+async function processOneMatch(
+  match: typeof matchesTable.$inferSelect,
+  standingsCache: StandingsCache,
+): Promise<"processed" | "skipped" | "failed"> {
+  if (match.betfairEventId?.startsWith("af_")) {
+    try {
+      await computeFeaturesFromDb(match.id, match.homeTeam, match.awayTeam, match.league);
+      return "processed";
+    } catch (err) {
+      logger.error({ err, matchId: match.id, homeTeam: match.homeTeam, awayTeam: match.awayTeam },
+        "Feature computation (DB-backed) failed for match");
+      return "failed";
+    }
+  }
+  if (match.betfairEventId?.startsWith("fd_")) {
+    const fdMatchId = parseInt(match.betfairEventId.replace("fd_", ""), 10);
+    if (isNaN(fdMatchId)) return "skipped";
+
+    const homeTeamId = await getStoredTeamId(match.id, "_home_team_id");
+    const awayTeamId = await getStoredTeamId(match.id, "_away_team_id");
+
+    if (!homeTeamId || !awayTeamId) {
+      try {
+        await computeFeaturesFromDb(match.id, match.homeTeam, match.awayTeam, match.league);
+        return "processed";
+      } catch (err) {
+        logger.error({ err, matchId: match.id }, "Feature computation (DB fallback for fd_) failed");
+        return "failed";
+      }
+    }
+    try {
+      await computeFeaturesForMatch(match.id, homeTeamId, awayTeamId, match.league, fdMatchId, standingsCache);
+      return "processed";
+    } catch (err) {
+      logger.error({ err, matchId: match.id, homeTeam: match.homeTeam, awayTeam: match.awayTeam },
+        "Feature computation failed for match");
+      return "failed";
+    }
+  }
+  try {
+    await computeFeaturesFromDb(match.id, match.homeTeam, match.awayTeam, match.league);
+    return "processed";
+  } catch {
+    return "skipped";
+  }
+}
+
 export async function runFeatureEngineForUpcomingMatches(force = false): Promise<{
   processed: number;
   skipped: number;
   failed: number;
+  timedOut?: boolean;
+  remaining?: number;
+  durationMs: number;
 }> {
-  logger.info({ force }, "Starting feature computation run for upcoming matches");
+  const startedAt = Date.now();
+  logger.info({ force, budgetMs: FEATURE_RUN_BUDGET_MS, maxHoursAhead: FEATURE_MAX_HOURS_AHEAD,
+    freshnessMs: FEATURE_FRESHNESS_MS, concurrency: FEATURE_CONCURRENCY },
+    "Starting feature computation run for upcoming matches");
 
+  const now = new Date();
+  const horizon = new Date(now.getTime() + FEATURE_MAX_HOURS_AHEAD * 60 * 60 * 1000);
+
+  // Fix B: only matches kicking off in [now, now+72h], ordered by kickoff (most imminent first)
   const upcomingMatches = await db
     .select()
     .from(matchesTable)
-    .where(eq(matchesTable.status, "scheduled"));
+    .where(and(
+      eq(matchesTable.status, "scheduled"),
+      gte(matchesTable.kickoffTime, now),
+      lte(matchesTable.kickoffTime, horizon),
+    ))
+    .orderBy(asc(matchesTable.kickoffTime));
 
-  logger.info(
-    { count: upcomingMatches.length },
-    "Upcoming matches to process",
-  );
+  logger.info({ count: upcomingMatches.length, windowHours: FEATURE_MAX_HOURS_AHEAD },
+    "Upcoming matches to process (filtered by kickoff window)");
+
+  // Fix B: bulk freshness check — one query instead of N
+  let toProcess = upcomingMatches;
+  let preSkipped = 0;
+  if (!force && upcomingMatches.length > 0) {
+    const freshCutoff = new Date(Date.now() - FEATURE_FRESHNESS_MS);
+    const freshRows = await db
+      .select({ matchId: featuresTable.matchId })
+      .from(featuresTable)
+      .where(and(
+        eq(featuresTable.featureName, "home_form_last5"),
+        gte(featuresTable.computedAt, freshCutoff),
+      ));
+    const freshSet = new Set(freshRows.map((r) => r.matchId));
+    toProcess = upcomingMatches.filter((m) => !freshSet.has(m.id));
+    preSkipped = upcomingMatches.length - toProcess.length;
+    logger.info({ totalCandidates: upcomingMatches.length, alreadyFresh: preSkipped, toProcess: toProcess.length },
+      "Freshness filter applied");
+  }
 
   const standingsCache: StandingsCache = new Map();
   let processed = 0;
-  let skipped = 0;
+  let skipped = preSkipped;
   let failed = 0;
+  let cursor = 0;
+  let timedOut = false;
 
-  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
-
-  for (const match of upcomingMatches) {
-    if (!force) {
-      const existingFeature = await db
-        .select({ computedAt: featuresTable.computedAt })
-        .from(featuresTable)
-        .where(
-          and(
-            eq(featuresTable.matchId, match.id),
-            eq(featuresTable.featureName, "home_form_last5"),
-          ),
-        )
-        .limit(1);
-
-      if (existingFeature.length > 0 && existingFeature[0]!.computedAt > sixHoursAgo) {
-        skipped++;
-        continue;
-      }
-    }
-
-    if (match.betfairEventId?.startsWith("af_")) {
-      try {
-        await computeFeaturesFromDb(
-          match.id,
-          match.homeTeam,
-          match.awayTeam,
-          match.league,
-        );
-        processed++;
-      } catch (err) {
-        logger.error(
-          { err, matchId: match.id, homeTeam: match.homeTeam, awayTeam: match.awayTeam },
-          "Feature computation (DB-backed) failed for match",
-        );
-        failed++;
-      }
-    } else if (match.betfairEventId?.startsWith("fd_")) {
-      const fdMatchId = parseInt(
-        match.betfairEventId.replace("fd_", ""),
-        10,
-      );
-      if (isNaN(fdMatchId)) {
-        skipped++;
-        continue;
-      }
-
-      const homeTeamId = await getStoredTeamId(match.id, "_home_team_id");
-      const awayTeamId = await getStoredTeamId(match.id, "_away_team_id");
-
-      if (!homeTeamId || !awayTeamId) {
-        try {
-          await computeFeaturesFromDb(
-            match.id,
-            match.homeTeam,
-            match.awayTeam,
-            match.league,
-          );
-          processed++;
-        } catch (err) {
-          logger.error(
-            { err, matchId: match.id },
-            "Feature computation (DB fallback for fd_) failed",
-          );
-          failed++;
-        }
-        continue;
-      }
-
-      try {
-        await computeFeaturesForMatch(
-          match.id,
-          homeTeamId,
-          awayTeamId,
-          match.league,
-          fdMatchId,
-          standingsCache,
-        );
-        processed++;
-      } catch (err) {
-        logger.error(
-          { err, matchId: match.id, homeTeam: match.homeTeam, awayTeam: match.awayTeam },
-          "Feature computation failed for match",
-        );
-        failed++;
-      }
-    } else {
-      try {
-        await computeFeaturesFromDb(
-          match.id,
-          match.homeTeam,
-          match.awayTeam,
-          match.league,
-        );
-        processed++;
-      } catch (err) {
-        skipped++;
-      }
+  // Fix C-light + Fix D: bounded concurrency with wall-clock budget
+  async function worker() {
+    while (true) {
+      if (Date.now() - startedAt > FEATURE_RUN_BUDGET_MS) { timedOut = true; return; }
+      const idx = cursor++;
+      if (idx >= toProcess.length) return;
+      const match = toProcess[idx]!;
+      const outcome = await processOneMatch(match, standingsCache);
+      if (outcome === "processed") processed++;
+      else if (outcome === "skipped") skipped++;
+      else failed++;
     }
   }
+  await Promise.all(Array.from({ length: FEATURE_CONCURRENCY }, () => worker()));
 
-  logger.info({ processed, skipped, failed }, "Feature computation run complete");
-  return { processed, skipped, failed };
+  const durationMs = Date.now() - startedAt;
+  const remaining = Math.max(0, toProcess.length - cursor);
+  logger.info(
+    { processed, skipped, failed, timedOut, remaining, durationMs,
+      ratePerMin: durationMs > 0 ? Math.round((processed / durationMs) * 60_000) : 0 },
+    "Feature computation run complete",
+  );
+  return { processed, skipped, failed, timedOut, remaining, durationMs };
 }
