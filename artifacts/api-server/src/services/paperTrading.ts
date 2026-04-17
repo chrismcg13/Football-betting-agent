@@ -492,13 +492,17 @@ export async function placePaperBet(
 
   if (!isDev) {
     const effectiveBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
-    const bankrollFloor = liveLimits
-      ? liveLimits.bankrollFloor
-      : Number((await getConfigValue("bankroll_floor")) ?? "200");
-    if (effectiveBankroll <= bankrollFloor) {
-      return logReject(
-        `Bankroll £${effectiveBankroll.toFixed(2)} at or below floor £${bankrollFloor} ${liveLimits ? "(60% of total deposits)" : ""}`,
-      );
+    // Apr 17 2026: percentage-based bankroll floor decommissioned for live mode.
+    // The sole emergency stop is the absolute £50 floor on AVAILABLE cash, enforced
+    // by checkLiveCircuitBreakers() above (already evaluated this cycle). Paper mode
+    // retains the legacy configurable floor.
+    if (!liveLimits) {
+      const bankrollFloor = Number((await getConfigValue("bankroll_floor")) ?? "200");
+      if (effectiveBankroll <= bankrollFloor) {
+        return logReject(
+          `Bankroll £${effectiveBankroll.toFixed(2)} at or below paper floor £${bankrollFloor}`,
+        );
+      }
     }
 
     const dailyLossLimitPct = liveLimits

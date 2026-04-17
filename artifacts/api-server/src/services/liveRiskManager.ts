@@ -2,7 +2,12 @@ import { db, paperBetsTable, matchesTable, complianceLogsTable } from "@workspac
 import { eq, and, gte, sql, inArray, desc } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { getConfigValue, setConfigValue } from "./paperTrading";
-import { isLiveMode, getLiveBankroll } from "./betfairLive";
+import { isLiveMode, getLiveBankroll, getAccountFunds } from "./betfairLive";
+
+// Hardcoded absolute emergency stop. If Betfair available cash drops below
+// this, all betting halts. Replaces the percentage-based bankroll floor as
+// the primary kill-switch (Apr 17 2026 authorisation).
+export const ABSOLUTE_BANKROLL_FLOOR_GBP = 50;
 import { getMarketFamily } from "./edgeConcentration";
 
 export interface LiveRiskLevel {
@@ -90,12 +95,32 @@ export async function getBankrollFloorFromDeposit(): Promise<number> {
   return Math.round(deposit * 0.10 * 100) / 100;
 }
 
-export async function getLiveBalance(): Promise<number> {
+// AVAILABLE cash only (excludes open exposure). Use this for the absolute
+// emergency-stop floor check — never as a denominator for percentage caps.
+export async function getAvailableBalance(): Promise<number> {
   if (isLiveMode()) {
     try {
       return await getLiveBankroll();
     } catch {
-      logger.warn("Could not fetch live balance — falling back to paper bankroll");
+      logger.warn("Could not fetch live available balance — falling back to paper bankroll");
+    }
+  }
+  const val = await getConfigValue("bankroll");
+  return val ? Number(val) : 5000;
+}
+
+// TOTAL WEALTH (available + |exposure|). This is the correct denominator for
+// every percentage-based cap (single bet, open exposure, league, market type,
+// fixture). An open bet hasn't reduced the bankroll — it's just moved capital
+// from "available" to "in-flight". Apr 17 2026 fix: previously used available
+// only, causing routine exposure to misread as catastrophic drawdown.
+export async function getLiveBalance(): Promise<number> {
+  if (isLiveMode()) {
+    try {
+      const funds = await getAccountFunds();
+      return (funds.availableToBetBalance ?? 0) + Math.abs(funds.exposure ?? 0);
+    } catch {
+      logger.warn("Could not fetch live total wealth — falling back to paper bankroll");
     }
   }
   const val = await getConfigValue("bankroll");
@@ -523,15 +548,16 @@ export async function checkLiveCircuitBreakers(): Promise<LiveCircuitBreakerResu
     };
   }
 
-  const limits = await getEffectiveLimits();
-  const balance = limits.liveBalance;
-
-  const floor = limits.bankrollFloor;
-  if (balance < floor) {
+  // Absolute £50 floor (Apr 17 2026 authorisation). Compares Betfair AVAILABLE
+  // cash — not total wealth — against a hardcoded £50. This is the primary
+  // emergency stop. The percentage-based bankroll floor is retained only as
+  // a secondary alert in alertDetection.ts, not a kill-switch.
+  const available = await getAvailableBalance();
+  if (available < ABSOLUTE_BANKROLL_FLOOR_GBP) {
     return {
       triggered: true,
       action: "floor_halt",
-      reason: `CRITICAL: Balance £${balance.toFixed(2)} below floor £${floor.toFixed(2)} (60% of total deposits). ALL betting halted.`,
+      reason: `CRITICAL: Available cash £${available.toFixed(2)} below absolute floor £${ABSOLUTE_BANKROLL_FLOOR_GBP}. ALL betting halted.`,
       autoResumeAt: null,
     };
   }

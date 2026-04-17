@@ -84,16 +84,16 @@ async function checkConnectivity(): Promise<void> {
 
 async function checkRiskLimits(): Promise<void> {
   const bankroll = await getBankroll();
-  const deposit = await getStartingDeposit();
-  // Floor pct lowered 0.6 → 0.10 per Apr 17 2026 authorisation (alignment with
-  // riskManager.ts and liveRiskManager.ts). Floor is now an emergency stop only.
-  const floor = deposit > 0 ? deposit * 0.10 : 200;
+  // Apr 17 2026: replaced percentage-based floor with absolute £50 emergency
+  // stop (Chris-authorised). The kill-switch lives in liveRiskManager.ts;
+  // this is a critical-severity alert mirror so operators get notified.
+  const ABSOLUTE_FLOOR = 50;
 
-  if (bankroll < floor && deposit > 0) {
+  if (bankroll < ABSOLUTE_FLOOR) {
     await alert("critical", "risk", "BANKROLL_FLOOR",
-      "Bankroll Below Floor",
-      `Current bankroll £${bankroll.toFixed(2)} is below the 10% floor of £${floor.toFixed(2)} (deposit: £${deposit.toFixed(2)}).`,
-      { bankroll, floor, deposit });
+      "Available Cash Below Absolute Floor",
+      `Available Betfair balance £${bankroll.toFixed(2)} is below the absolute £${ABSOLUTE_FLOOR} emergency stop. Trading halted.`,
+      { bankroll, floor: ABSOLUTE_FLOOR });
   }
 
   const now = new Date();
