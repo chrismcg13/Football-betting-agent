@@ -872,6 +872,74 @@ const TEAM_ALIASES: Record<string, string> = {
   "fk rostov": "rostov",
   "krasnodar": "krasnodar",
   "fk krasnodar": "krasnodar",
+  // ── Aliases added from near-miss diagnostics (Apr 17 2026 morning batch) ──
+  // Ukrainian Premier League / Druha Liga
+  "fc polissya zhytomyr": "polissya",
+  "polissya zhytomyr": "polissya",
+  "polissya ii": "polissya",
+  "fc shakhtar donetsk": "shakhtar",
+  "shakhtar donetsk": "shakhtar",
+  "fc obolon kyiv": "obolon brovar",
+  "obolon brovar": "obolon brovar",
+  "obolon kyiv": "obolon brovar",
+  "obolon-brovar": "obolon brovar",
+  "sc poltava": "sk poltava",
+  "sk poltava": "sk poltava",
+  "fc epitsentr kamianets-podilskyi": "epitsentr dunayivtsi",
+  "epitsentr kamianets-podilskyi": "epitsentr dunayivtsi",
+  "epitsentr dunayivtsi": "epitsentr dunayivtsi",
+  "karpaty lviv": "karpaty",
+  "fc karpaty lviv": "karpaty",
+  // Egypt Premier League
+  "al mokawloon al arab": "el mokawloon",
+  "mokawloon al arab": "el mokawloon",
+  "al mokawloon": "el mokawloon",
+  "el mokawloon": "el mokawloon",
+  "talaea el gaish": "el geish",
+  "tala'ea el geish": "el geish",
+  "el geish": "el geish",
+  // Costa Rica Liga Pro / Ecuador Liga Pro
+  "puntarenas fc": "puntarenas",
+  "sporting fc": "sporting sj",
+  "sporting san jose": "sporting sj",
+  "leones futbol club": "leones del norte",
+  "leones del norte": "leones del norte",
+  "sd aucas": "aucas",
+  "manta fc": "manta",
+  "deportivo cuenca": "deportivo cuenca",
+  // China Super League
+  "shanghai shenhua fc": "shanghai shenhua",
+  "shanghai shenhua": "shanghai shenhua",
+  "liaoning tieren fc": "liaoning tieren",
+  "shenzhen peng city": "shenzhen peng city",
+  "shenzhen peng city srl": "shenzhen peng city",
+  "beijing guoan": "beijing guoan",
+  "beijing guoan fc": "beijing guoan",
+  "chongqing tonglianglong fc srl": "chongqing tongliang long",
+  "chongqing tongliang long": "chongqing tongliang long",
+  "sichuan jiuniu": "sichuan jiuniu",
+  "shenyang urban": "shenyang urban",
+  // Brazilian regional (Brasileirão CE / regional Atletico)
+  "cf atletas do tirol ce": "atletas do tirol",
+  "atletas do tirol": "atletas do tirol",
+  "fc atletico ce": "atletico ce",
+  "atletico ce": "atletico ce",
+  "guarany sc ce": "guarany ce",
+  "guarany ce": "guarany ce",
+  // Denmark 2nd Division
+  "b93 copenhagen": "b 93",
+  "b 93": "b 93",
+  "hb koege": "hb koge",
+  "hb koge": "hb koge",
+  "hb køge": "hb koge",
+  // Spain Segunda
+  "cultural leonesa": "cultural leonesa",
+  "cultural y deportiva leonesa": "cultural leonesa",
+  // Generic Real Madrid / PSG / national-team friendlies
+  "real madrid cf": "real madrid",
+  "paris saint-germain fc": "paris saint germain",
+  "paris saint-germain": "paris saint germain",
+  "psg": "paris saint germain",
 };
 
 function normalizeTeam(name: string): string {
@@ -2053,6 +2121,33 @@ export async function prefetchAndStoreOddsPapiOdds(
         snapshotTime: now,
         source: "oddspapi",
       });
+
+      // ALSO persist Pinnacle odds (when present) as a separate snapshot row.
+      // Without this, Pinnacle data fetched from OddsPapi lives only in
+      // in-memory cache and is lost on restart, leaving Pinnacle validation
+      // coverage stuck at ~17% (AF-Pinnacle leagues only). With this, all
+      // OddsPapi-mapped fixtures contribute Pinnacle data back to the cycle.
+      if (so.pinnacle) {
+        await db
+          .delete(oddsSnapshotsTable)
+          .where(
+            and(
+              eq(oddsSnapshotsTable.matchId, matchId),
+              eq(oddsSnapshotsTable.marketType, marketTypeForSnapshot),
+              eq(oddsSnapshotsTable.selectionName, selName),
+              eq(oddsSnapshotsTable.source, "oddspapi_pinnacle"),
+            ),
+          );
+        await db.insert(oddsSnapshotsTable).values({
+          matchId,
+          marketType: marketTypeForSnapshot,
+          selectionName: selName,
+          backOdds: String(so.pinnacle),
+          layOdds: null,
+          snapshotTime: now,
+          source: "oddspapi_pinnacle",
+        });
+      }
     }
 
     if (Object.keys(matchCache).length > 0) {
@@ -2091,12 +2186,13 @@ export async function loadOddsPapiCacheFromSnapshots(
       marketType: oddsSnapshotsTable.marketType,
       selectionName: oddsSnapshotsTable.selectionName,
       backOdds: oddsSnapshotsTable.backOdds,
+      source: oddsSnapshotsTable.source,
     })
     .from(oddsSnapshotsTable)
     .innerJoin(matchesTable, eq(oddsSnapshotsTable.matchId, matchesTable.id))
     .where(
       and(
-        eq(oddsSnapshotsTable.source, "oddspapi"),
+        inArray(oddsSnapshotsTable.source, ["oddspapi", "oddspapi_pinnacle"]),
         eq(matchesTable.status, "scheduled"),
         gte(matchesTable.kickoffTime, earliestKickoff),
         lte(matchesTable.kickoffTime, latestKickoff),
@@ -2105,27 +2201,43 @@ export async function loadOddsPapiCacheFromSnapshots(
 
   if (rows.length === 0) return cache;
 
-  // Group by matchId → build validation records
-  // We only have best-odds (no per-bookmaker breakdown) from the snapshot store.
-  // For alignment scoring, pinnacleOdds must come from buildPinnacleValidationFromApiFootball.
-  // This cache provides bestOdds + hasPinnacleData=false (overridden by merge in scheduler).
-  const matchMap = new Map<number, Record<string, { backOdds: number; marketType: string }>>();
+  // Group by matchId → build validation records.
+  // Best-odds come from source="oddspapi"; Pinnacle odds come from
+  // source="oddspapi_pinnacle" (persisted by prefetchAndStoreOddsPapiOdds).
+  const matchMap = new Map<number, Record<string, { backOdds: number; pinnacleOdds: number | null; marketType: string }>>();
+  let pinnacleRowCount = 0;
   for (const row of rows) {
     const odds = parseFloat(row.backOdds ?? "0");
     if (!odds || odds <= 1.01) continue;
     if (!matchMap.has(row.matchId)) matchMap.set(row.matchId, {});
     const m = matchMap.get(row.matchId)!;
-    if (!m[row.selectionName] || odds > m[row.selectionName]!.backOdds) {
-      m[row.selectionName] = { backOdds: odds, marketType: row.marketType };
+    const existing = m[row.selectionName];
+    if (row.source === "oddspapi_pinnacle") {
+      pinnacleRowCount++;
+      if (existing) {
+        existing.pinnacleOdds = odds;
+      } else {
+        m[row.selectionName] = { backOdds: odds, pinnacleOdds: odds, marketType: row.marketType };
+      }
+    } else {
+      if (!existing) {
+        m[row.selectionName] = { backOdds: odds, pinnacleOdds: null, marketType: row.marketType };
+      } else if (odds > existing.backOdds) {
+        existing.backOdds = odds;
+        existing.marketType = row.marketType;
+      }
     }
   }
 
+  let matchesWithPinnacle = 0;
   for (const [matchId, selMap] of matchMap.entries()) {
     const matchCache: Record<string, OddspapiValidation> = {};
+    let hasAnyPinn = false;
     for (const [selName, data] of Object.entries(selMap)) {
+      if (data.pinnacleOdds) hasAnyPinn = true;
       const entry: OddspapiValidation = {
-        pinnacleOdds: null,
-        pinnacleImplied: null,
+        pinnacleOdds: data.pinnacleOdds,
+        pinnacleImplied: data.pinnacleOdds ? 1 / data.pinnacleOdds : null,
         bestOdds: data.backOdds,
         bestBookmaker: "OddsPapi",
         oddsUpliftPct: null,
@@ -2133,16 +2245,26 @@ export async function loadOddsPapiCacheFromSnapshots(
         consensusPct: null,
         isContrarian: false,
         pinnacleAligned: false,
-        hasPinnacleData: false,
+        hasPinnacleData: data.pinnacleOdds !== null,
       };
       for (const variant of selectionNameVariants(selName)) {
         matchCache[variant] = entry;
       }
     }
     if (Object.keys(matchCache).length > 0) cache.set(matchId, matchCache);
+    if (hasAnyPinn) matchesWithPinnacle++;
   }
 
-  logger.info({ matchCount: cache.size, totalSelections: rows.length }, "OddsPapi snapshot cache loaded from DB");
+  logger.info(
+    {
+      matchCount: cache.size,
+      totalSelections: rows.length,
+      pinnacleRows: pinnacleRowCount,
+      matchesWithPinnacle,
+      pinnaclePct: cache.size ? Math.round((100 * matchesWithPinnacle) / cache.size) : 0,
+    },
+    "OddsPapi snapshot cache loaded from DB",
+  );
   return cache;
 }
 
