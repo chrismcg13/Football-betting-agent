@@ -337,12 +337,14 @@ router.get("/dashboard/performance", async (req, res) => {
     .where(settledWhere)
     .orderBy(asc(paperBetsTable.settledAt));
 
+  // Overview "Recent Results" shows wins/losses only — voids are tracked on the
+  // Bets History page so they don't clutter the at-a-glance settled view.
   const recentSettledWhere = liveOnly
     ? and(
-        inArray(paperBetsTable.status, ["won", "lost", "void"]),
+        inArray(paperBetsTable.status, ["won", "lost"]),
         isNotNull(paperBetsTable.betfairBetId),
       )
-    : inArray(paperBetsTable.status, ["won", "lost", "void"]);
+    : inArray(paperBetsTable.status, ["won", "lost"]);
   const recentBets = await db
     .select({
       id: paperBetsTable.id,

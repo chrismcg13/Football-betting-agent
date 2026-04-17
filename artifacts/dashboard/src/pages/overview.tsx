@@ -223,7 +223,7 @@ export default function Overview() {
         <PrimaryCard
           label="Win Rate"
           value={loadingSummary ? "—" : `${winPercentage.toFixed(1)}%`}
-          sub={!loadingSummary ? `${wins}W – ${losses}L – ${voids}V (${settledBets} settled)` : undefined}
+          sub={!loadingSummary ? `${wins}W – ${losses}L (${settledBets} settled)` : undefined}
           color={!loadingSummary ? (winPercentage >= 50 ? "green" : "amber") : "default"}
         />
         <PrimaryCard
