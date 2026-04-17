@@ -1,14 +1,14 @@
 import { useMemo, useState } from "react";
 import {
   useSummary, useBets, useNarratives, usePerformance, useClvStats,
-  useLeagueDiscoveryStats, useGoLiveReadiness, useExperiments, useCoverage,
+  useLeagueDiscoveryStats, useExperiments, useCoverage,
   useCircuitBreakerStatus, useInPlayBets, useUpcomingBets, useExecutionMetrics,
   useAgentRecommendations, useTournamentStatus,
 } from "@/hooks/use-dashboard";
 import { formatCurrency, formatRelativeTime, formatMarketType } from "@/lib/format";
 import { BetStatusBadge, LiveTierBadge, InfoTooltip } from "@/components/layout";
 import { cn } from "@/lib/utils";
-import { Info, Clock, Radio, Zap, AlertTriangle, TrendingUp, ArrowRight, CheckCircle2 } from "lucide-react";
+import { Info, Clock, Radio, Zap, AlertTriangle, TrendingUp, ArrowRight } from "lucide-react";
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip as RechartsTooltip,
   XAxis, YAxis, ReferenceLine,
@@ -122,21 +122,17 @@ const TOOLTIP_STYLE = {
   labelStyle: { color: "#64748b", fontWeight: 600 },
 };
 
-const DEMO_DAY = new Date("2026-04-23T23:59:59Z");
-const SETTLED_TARGET = 500;
-
 export default function Overview() {
-  const { data: summary, isLoading: loadingSummary } = useSummary();
+  const { data: summary, isLoading: loadingSummary } = useSummary({ liveOnly: true });
   const { data: clvStats } = useClvStats();
   const { data: narrativesData, isLoading: loadingNarratives } = useNarratives();
-  const { data: perfData, isLoading: loadingPerf } = usePerformance();
+  const { data: perfData, isLoading: loadingPerf } = usePerformance({ liveOnly: true });
   const { data: discoveryStats } = useLeagueDiscoveryStats();
-  const { data: readiness } = useGoLiveReadiness();
   const { data: experimentsData } = useExperiments();
   const { data: cbStatus } = useCircuitBreakerStatus();
   const { data: tournamentData } = useTournamentStatus();
-  const { data: inPlayData } = useInPlayBets();
-  const { data: upcomingData } = useUpcomingBets();
+  const { data: inPlayData } = useInPlayBets({ liveOnly: true });
+  const { data: upcomingData } = useUpcomingBets({ liveOnly: true });
   const { data: execMetrics } = useExecutionMetrics();
   const { data: recommendations } = useAgentRecommendations();
 
@@ -154,14 +150,6 @@ export default function Overview() {
   const tierSplit = (summary as any)?.tierSplit ?? { tier1a: 0, tier1b: 0, tier1Other: 0, betfairLive: 0, tier2: 0, betfairStake: 0 };
   const totalLive = tierSplit.tier1a + tierSplit.tier1b + tierSplit.tier1Other;
   const avgClv: number | null = (clvStats as any)?.count > 0 ? Number((clvStats as any).avgClv) : null;
-
-  const daysRemaining = useMemo(() => {
-    const diff = DEMO_DAY.getTime() - Date.now();
-    return Math.max(0, Math.ceil(diff / 86400000));
-  }, []);
-
-  const progressPct = Math.min((settledBets / SETTLED_TARGET) * 100, 100);
-  const demoDayPositive = avgClv != null && avgClv > 0 && pnl > 0 && settledBets >= 30;
 
   const inPlayBets = (inPlayData?.bets as any[]) ?? [];
   const upcomingBets = (upcomingData?.bets as any[]) ?? [];
@@ -190,14 +178,14 @@ export default function Overview() {
         <div>
           <h2 className="text-2xl font-bold text-white tracking-tight">Overview</h2>
           <p className="text-sm text-slate-500 mt-1">
-            {isLive ? "Live trading dashboard — real money on Betfair Exchange" : "Paper trading dashboard — simulating bets for validation"}
+            Live trading dashboard — real money on Betfair Exchange
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {!loadingSummary && (
             <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-semibold">
               {totalLive > 0 ? (
-                <>{totalLive} live on Betfair{tierSplit.tier1a > 0 ? ` (1A: ${tierSplit.tier1a}` : " ("}{tierSplit.tier1b > 0 ? `${tierSplit.tier1a > 0 ? ", " : ""}1B: ${tierSplit.tier1b}` : ""}{tierSplit.tier1Other > 0 ? `${(tierSplit.tier1a + tierSplit.tier1b) > 0 ? ", " : ""}P: ${tierSplit.tier1Other}` : ""}) · {tierSplit.tier2} paper · {formatCurrency(tierSplit.betfairStake)} staked</>
+                <>{totalLive} live on Betfair{tierSplit.tier1a > 0 ? ` (1A: ${tierSplit.tier1a}` : " ("}{tierSplit.tier1b > 0 ? `${tierSplit.tier1a > 0 ? ", " : ""}1B: ${tierSplit.tier1b}` : ""}{tierSplit.tier1Other > 0 ? `${(tierSplit.tier1a + tierSplit.tier1b) > 0 ? ", " : ""}P: ${tierSplit.tier1Other}` : ""}) · {formatCurrency(tierSplit.betfairStake)} staked</>
               ) : (
                 <>{betsToday} placed today · {pending} open</>
               )}
@@ -352,70 +340,23 @@ export default function Overview() {
         </div>
       )}
 
-      {/* Demo Day Progress */}
-      <div className="rounded-xl border p-5" style={{ background: "#1e293b", borderColor: "#334155" }}>
-        <div className="flex items-start justify-between gap-4 mb-3 flex-wrap">
-          <div>
-            <p className="text-sm font-semibold text-white">Journey to Demo Day</p>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Settled bets needed for statistical confidence. Demo Day: <span className="text-slate-300 font-medium">23 April 2026</span>
-            </p>
-          </div>
-          <div className="text-right shrink-0 flex items-center gap-4">
-            <div>
-              <p className="text-2xl font-mono font-bold text-white">
-                {settledBets} <span className="text-slate-500 text-base font-normal">/ {SETTLED_TARGET}</span>
-              </p>
-              <p className="text-xs text-slate-500">{progressPct.toFixed(1)}% complete</p>
-            </div>
-            <div className="rounded-lg px-3 py-2 text-center border" style={{ background: "#0f172a", borderColor: "#334155" }}>
-              <p className="text-2xl font-bold font-mono text-blue-400">{daysRemaining}</p>
-              <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wide">days left</p>
-            </div>
-          </div>
+      {/* Pipeline status (extracted from former Demo Day card) */}
+      {experimentsData?.grouped && (
+        <div className="rounded-xl border p-4 flex items-center gap-3 flex-wrap" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Pipeline:</span>
+          {[
+            { tier: "promoted", count: experimentsData.grouped.promoted?.length ?? 0, color: "#22c55e" },
+            { tier: "candidate", count: experimentsData.grouped.candidate?.length ?? 0, color: "#f59e0b" },
+            { tier: "experiment", count: experimentsData.grouped.experiment?.length ?? 0, color: "#8b5cf6" },
+          ].map(t => (
+            <span key={t.tier} className="inline-flex items-center gap-1.5 text-[11px]">
+              <span className="w-2 h-2 rounded-full" style={{ background: t.color }} />
+              <span className="text-slate-400">{t.count}</span>
+              <span className="text-slate-600">{t.tier}</span>
+            </span>
+          ))}
         </div>
-        <div className="h-2.5 w-full rounded-full bg-slate-700/60 overflow-hidden mb-3">
-          <div
-            className={cn("h-full rounded-full transition-all duration-700",
-              progressPct >= 100 ? "bg-emerald-500" : progressPct >= 50 ? "bg-amber-500" : "bg-blue-500")}
-            style={{ width: `${Math.max(progressPct, 0.5)}%` }}
-          />
-        </div>
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          {demoDayPositive ? (
-            <p className="text-xs font-medium text-emerald-400">
-              <CheckCircle2 className="w-3.5 h-3.5 inline mr-1" />
-              Early indicators are positive. Model is beating the market.
-            </p>
-          ) : (
-            <p className="text-xs font-medium text-amber-400">
-              <Clock className="w-3.5 h-3.5 inline mr-1" />
-              More data needed. The model is still learning.
-            </p>
-          )}
-          {readiness?.betsPerDay > 0 && settledBets < SETTLED_TARGET && (
-            <p className="text-[10px] text-slate-500 font-mono">
-              ~{readiness.betsPerDay} bets/day · est. {readiness.estDaysToTarget ?? "?"} days to target
-            </p>
-          )}
-        </div>
-        {experimentsData?.grouped && (
-          <div className="mt-3 pt-3 border-t flex items-center gap-3 flex-wrap" style={{ borderColor: "#334155" }}>
-            <span className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Pipeline:</span>
-            {[
-              { tier: "promoted", count: experimentsData.grouped.promoted?.length ?? 0, color: "#22c55e" },
-              { tier: "candidate", count: experimentsData.grouped.candidate?.length ?? 0, color: "#f59e0b" },
-              { tier: "experiment", count: experimentsData.grouped.experiment?.length ?? 0, color: "#8b5cf6" },
-            ].map(t => (
-              <span key={t.tier} className="inline-flex items-center gap-1.5 text-[11px]">
-                <span className="w-2 h-2 rounded-full" style={{ background: t.color }} />
-                <span className="text-slate-400">{t.count}</span>
-                <span className="text-slate-600">{t.tier}</span>
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
+      )}
 
       {/* World Cup 2026 Readiness */}
       {tournamentData && (

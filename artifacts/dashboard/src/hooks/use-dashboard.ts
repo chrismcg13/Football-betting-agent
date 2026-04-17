@@ -9,18 +9,20 @@ const fetcher = async (url: string, options?: RequestInit) => {
   return res.json();
 };
 
-export const useSummary = () => {
+export const useSummary = (opts: { liveOnly?: boolean } = {}) => {
+  const qs = opts.liveOnly ? "?liveOnly=true" : "";
   return useQuery({
-    queryKey: ["dashboard", "summary"],
-    queryFn: () => fetcher("/api/dashboard/summary"),
+    queryKey: ["dashboard", "summary", { liveOnly: !!opts.liveOnly }],
+    queryFn: () => fetcher(`/api/dashboard/summary${qs}`),
     refetchInterval: 30000,
   });
 };
 
-export const usePerformance = () => {
+export const usePerformance = (opts: { liveOnly?: boolean } = {}) => {
+  const qs = opts.liveOnly ? "?liveOnly=true" : "";
   return useQuery({
-    queryKey: ["dashboard", "performance"],
-    queryFn: () => fetcher("/api/dashboard/performance"),
+    queryKey: ["dashboard", "performance", { liveOnly: !!opts.liveOnly }],
+    queryFn: () => fetcher(`/api/dashboard/performance${qs}`),
     refetchInterval: 60000,
   });
 };
@@ -271,18 +273,20 @@ export const useExecutionMetrics = () => {
   });
 };
 
-export const useInPlayBets = () => {
+export const useInPlayBets = (opts: { liveOnly?: boolean } = {}) => {
+  const qs = opts.liveOnly ? "?liveOnly=true" : "";
   return useQuery({
-    queryKey: ["dashboard", "in-play"],
-    queryFn: () => fetcher("/api/dashboard/in-play"),
+    queryKey: ["dashboard", "in-play", { liveOnly: !!opts.liveOnly }],
+    queryFn: () => fetcher(`/api/dashboard/in-play${qs}`),
     refetchInterval: 30000,
   });
 };
 
-export const useUpcomingBets = () => {
+export const useUpcomingBets = (opts: { liveOnly?: boolean } = {}) => {
+  const qs = opts.liveOnly ? "?liveOnly=true" : "";
   return useQuery({
-    queryKey: ["dashboard", "upcoming-bets"],
-    queryFn: () => fetcher("/api/dashboard/upcoming-bets"),
+    queryKey: ["dashboard", "upcoming-bets", { liveOnly: !!opts.liveOnly }],
+    queryFn: () => fetcher(`/api/dashboard/upcoming-bets${qs}`),
     refetchInterval: 30000,
   });
 };

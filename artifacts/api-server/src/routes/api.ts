@@ -26,6 +26,7 @@ import {
   asc,
   like,
   ne,
+  isNotNull,
 } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
@@ -86,7 +87,13 @@ function paginate(page: unknown, limit: unknown, max = 200) {
   return { page: p, limit: l, offset: (p - 1) * l };
 }
 
-async function getSettledBetsStats() {
+async function getSettledBetsStats(liveOnly = false) {
+  const where = liveOnly
+    ? and(
+        inArray(paperBetsTable.status, ["won", "lost", "void"]),
+        isNotNull(paperBetsTable.betfairBetId),
+      )
+    : inArray(paperBetsTable.status, ["won", "lost", "void"]);
   const rows = await db
     .select({
       status: paperBetsTable.status,
@@ -99,7 +106,7 @@ async function getSettledBetsStats() {
       netPnl: paperBetsTable.netPnl,
     })
     .from(paperBetsTable)
-    .where(inArray(paperBetsTable.status, ["won", "lost", "void"]));
+    .where(where);
   return rows;
 }
 
@@ -109,11 +116,20 @@ async function getSettledBetsStats() {
 router.get("/dashboard/summary", async (req, res) => {
   const todayStartUtc = new Date();
   todayStartUtc.setUTCHours(0, 0, 0, 0);
+  const liveOnly = req.query["liveOnly"] === "true";
+
+  const pendingWhere = liveOnly
+    ? and(eq(paperBetsTable.status, "pending"), isNotNull(paperBetsTable.betfairBetId))
+    : eq(paperBetsTable.status, "pending");
+  const betsTodayWhere = liveOnly
+    ? and(gte(paperBetsTable.placedAt, todayStartUtc), isNotNull(paperBetsTable.betfairBetId))
+    : gte(paperBetsTable.placedAt, todayStartUtc);
+  const tierSplitLiveFilter = liveOnly ? sql` AND betfair_bet_id IS NOT NULL` : sql``;
 
   const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, tierSplitRows, paperModeRow, maxExposurePctRow, exposureRuleSinceRow] = await Promise.all([
     getBankroll(),
     getAgentStatus(),
-    getSettledBetsStats(),
+    getSettledBetsStats(liveOnly),
     db
       .select({
         id: paperBetsTable.id,
@@ -122,18 +138,18 @@ router.get("/dashboard/summary", async (req, res) => {
         placedAt: paperBetsTable.placedAt,
       })
       .from(paperBetsTable)
-      .where(eq(paperBetsTable.status, "pending")),
+      .where(pendingWhere),
     db
       .select({ count: sql<number>`count(*)::int` })
       .from(paperBetsTable)
-      .where(gte(paperBetsTable.placedAt, todayStartUtc)),
+      .where(betsTodayWhere),
     db.execute(sql`
       SELECT
-        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1A') AS tier1a,
-        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1B') AS tier1b,
-        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND (qualification_path = 'promoted' OR qualification_path IS NULL)) AS tier1_other,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1A'${tierSplitLiveFilter}) AS tier1a,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1B'${tierSplitLiveFilter}) AS tier1b,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND (qualification_path = 'promoted' OR qualification_path IS NULL)${tierSplitLiveFilter}) AS tier1_other,
         COUNT(*) FILTER (WHERE live_tier = 'tier1' AND betfair_bet_id IS NOT NULL) AS betfair_live,
-        COUNT(*) FILTER (WHERE live_tier = 'tier2' OR live_tier IS NULL) AS tier2,
+        COUNT(*) FILTER (WHERE (live_tier = 'tier2' OR live_tier IS NULL)${tierSplitLiveFilter}) AS tier2,
         COALESCE(SUM(stake::numeric) FILTER (WHERE live_tier = 'tier1' AND betfair_bet_id IS NOT NULL AND status != 'void'), 0) AS betfair_stake
       FROM paper_bets
       WHERE placed_at >= ${todayStartUtc} AND deleted_at IS NULL
@@ -297,6 +313,18 @@ router.get("/dashboard/performance", async (req, res) => {
   const since = new Date();
   since.setUTCDate(since.getUTCDate() - 30);
   since.setUTCHours(0, 0, 0, 0);
+  const liveOnly = req.query["liveOnly"] === "true";
+
+  const settledWhere = liveOnly
+    ? and(
+        inArray(paperBetsTable.status, ["won", "lost"]),
+        gte(paperBetsTable.settledAt, since),
+        isNotNull(paperBetsTable.betfairBetId),
+      )
+    : and(
+        inArray(paperBetsTable.status, ["won", "lost"]),
+        gte(paperBetsTable.settledAt, since),
+      );
 
   const settled = await db
     .select({
@@ -306,13 +334,36 @@ router.get("/dashboard/performance", async (req, res) => {
       stake: paperBetsTable.stake,
     })
     .from(paperBetsTable)
-    .where(
-      and(
-        inArray(paperBetsTable.status, ["won", "lost"]),
-        gte(paperBetsTable.settledAt, since),
-      ),
-    )
+    .where(settledWhere)
     .orderBy(asc(paperBetsTable.settledAt));
+
+  const recentSettledWhere = liveOnly
+    ? and(
+        inArray(paperBetsTable.status, ["won", "lost", "void"]),
+        isNotNull(paperBetsTable.betfairBetId),
+      )
+    : inArray(paperBetsTable.status, ["won", "lost", "void"]);
+  const recentBets = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      homeTeam: matchesTable.homeTeam,
+      awayTeam: matchesTable.awayTeam,
+      league: matchesTable.league,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+      stake: paperBetsTable.stake,
+      status: paperBetsTable.status,
+      settlementPnl: paperBetsTable.settlementPnl,
+      settledAt: paperBetsTable.settledAt,
+      placedAt: paperBetsTable.placedAt,
+    })
+    .from(paperBetsTable)
+    .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(recentSettledWhere)
+    .orderBy(desc(paperBetsTable.settledAt))
+    .limit(15);
 
   // Daily P&L
   const dailyMap = new Map<
@@ -393,7 +444,14 @@ router.get("/dashboard/performance", async (req, res) => {
       pnl: Math.round(pnl * 100) / 100,
     }));
 
-  res.json({ dailyPnl, cumulativeProfit: cumulative, weeklyWinRate });
+  const recentBetsOut = recentBets.map((b) => ({
+    ...b,
+    oddsAtPlacement: Number(b.oddsAtPlacement),
+    stake: Number(b.stake),
+    settlementPnl: b.settlementPnl != null ? Number(b.settlementPnl) : null,
+  }));
+
+  res.json({ dailyPnl, cumulativeProfit: cumulative, weeklyWinRate, recentBets: recentBetsOut });
 });
 
 // ─────────────────────────────────────────────
@@ -2561,9 +2619,15 @@ router.get("/dashboard/execution-metrics", async (_req, res) => {
   }
 });
 
-router.get("/dashboard/in-play", async (_req, res) => {
+router.get("/dashboard/in-play", async (req, res) => {
   try {
     const now = new Date();
+    const liveOnly = req.query["liveOnly"] === "true";
+    const whereParts = [
+      eq(paperBetsTable.status, "pending"),
+      lte(matchesTable.kickoffTime, now),
+    ];
+    if (liveOnly) whereParts.push(isNotNull(paperBetsTable.betfairBetId));
     const bets = await db
       .select({
         id: paperBetsTable.id,
@@ -2590,12 +2654,7 @@ router.get("/dashboard/in-play", async (_req, res) => {
       })
       .from(paperBetsTable)
       .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
-      .where(
-        and(
-          eq(paperBetsTable.status, "pending"),
-          lte(matchesTable.kickoffTime, now),
-        ),
-      )
+      .where(and(...whereParts))
       .orderBy(desc(matchesTable.kickoffTime));
 
     res.json({
@@ -2617,9 +2676,15 @@ router.get("/dashboard/in-play", async (_req, res) => {
   }
 });
 
-router.get("/dashboard/upcoming-bets", async (_req, res) => {
+router.get("/dashboard/upcoming-bets", async (req, res) => {
   try {
     const now = new Date();
+    const liveOnly = req.query["liveOnly"] === "true";
+    const whereParts = [
+      eq(paperBetsTable.status, "pending"),
+      gte(matchesTable.kickoffTime, now),
+    ];
+    if (liveOnly) whereParts.push(isNotNull(paperBetsTable.betfairBetId));
     const bets = await db
       .select({
         id: paperBetsTable.id,
@@ -2642,12 +2707,7 @@ router.get("/dashboard/upcoming-bets", async (_req, res) => {
       })
       .from(paperBetsTable)
       .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
-      .where(
-        and(
-          eq(paperBetsTable.status, "pending"),
-          gte(matchesTable.kickoffTime, now),
-        ),
-      )
+      .where(and(...whereParts))
       .orderBy(asc(matchesTable.kickoffTime));
 
     res.json({
