@@ -186,7 +186,7 @@ function InPlaySection() {
         <span className="text-sm font-semibold text-white">In-Play ({bets.length})</span>
         <span className="text-xs text-slate-500">Matches currently being played</span>
       </div>
-      <div className="divide-y" style={{ borderColor: "#334155" }}>
+      <div className="divide-y max-h-[32rem] overflow-y-auto" style={{ borderColor: "#334155" }}>
         {bets.map((bet: any) => (
           <div key={bet.id} className="px-5 py-3 hover:bg-slate-700/20 transition-colors flex items-center gap-4">
             <div className="flex-1 min-w-0">

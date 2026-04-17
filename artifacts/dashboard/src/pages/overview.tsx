@@ -250,8 +250,8 @@ export default function Overview() {
               {inPlayBets.length} live
             </span>
           </div>
-          <div className="divide-y" style={{ borderColor: "#334155" }}>
-            {inPlayBets.slice(0, 5).map((bet: any) => (
+          <div className="divide-y max-h-96 overflow-y-auto" style={{ borderColor: "#334155" }}>
+            {inPlayBets.map((bet: any) => (
               <div key={bet.id} className="px-5 py-3.5 hover:bg-slate-700/20 transition-colors">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
