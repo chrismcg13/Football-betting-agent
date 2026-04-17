@@ -940,6 +940,70 @@ const TEAM_ALIASES: Record<string, string> = {
   "paris saint-germain fc": "paris saint germain",
   "paris saint-germain": "paris saint germain",
   "psg": "paris saint germain",
+
+  // Apr 17 2026 — additional aliases extracted from UNMATCHED near-miss diagnostics
+  // (Pinnacle coverage push, top high-confidence pairs only)
+  "epitsentr dunayivtsi": "epitsentr",
+  "fc epitsentr kamianets-podilskyi": "epitsentr",
+  "fc epitsentr kamianets podilskyi": "epitsentr",
+  "karpaty": "karpaty lviv",
+  "karpaty lviv": "karpaty lviv",
+  "hodd": "hodd",
+  "hoedd il": "hodd",
+  "hoedd": "hodd",
+  "arges pitesti": "arges",
+  "fc arges": "arges",
+  "acs champions fc arges": "arges",
+  "asan mugunghwa": "asan",
+  "chungnam asan": "asan",
+  "chungnam asan fc": "asan",
+  "guangzhou e-power": "guangzhou e power",
+  "guangzhou e power": "guangzhou e power",
+  "guandong gz-power": "guangzhou e power",
+  "guandong gz-power fc": "guangzhou e power",
+  "guandong gz power fc": "guangzhou e power",
+  "meizhou kejia": "meizhou hakka",
+  "meizhou hakka": "meizhou hakka",
+  "ha noi": "hanoi",
+  "ha noi fc": "hanoi",
+  "hanoi": "hanoi",
+  "hanoi fc": "hanoi",
+  "hong linh ha tinh": "ha tinh",
+  "ha tinh": "ha tinh",
+  "ha tinh fc": "ha tinh",
+  "hai phong": "haiphong",
+  "haiphong": "haiphong",
+  "haiphong fc": "haiphong",
+  "javor": "javor ivanjica",
+  "fk javor": "javor ivanjica",
+  "fk javor ivanjica": "javor ivanjica",
+  "javor ivanjica": "javor ivanjica",
+  "fk spartak zdrepceva krv": "spartak subotica",
+  "fk spartak subotica": "spartak subotica",
+  "spartak subotica": "spartak subotica",
+  "tsc backa topola": "tsc",
+  "fk tsc backa topola": "tsc",
+  "tsc": "tsc",
+  "sporting cp b": "sporting lisbon b",
+  "sporting lisbon b": "sporting lisbon b",
+  "felgueiras 1932": "felgueiras",
+  "fc felgueiras 1932": "felgueiras",
+  "felgueiras": "felgueiras",
+  "fortaleza ec": "fortaleza",
+  "fortaleza ec ce": "fortaleza",
+  "fortaleza": "fortaleza",
+  "crb": "crb",
+  "cr brasil": "crb",
+  "cr brasil al": "crb",
+  "chongqing tongliang long": "chongqing tonglianglong",
+  "chongqing tonglianglong": "chongqing tonglianglong",
+  "chongqing tonglianglong fc": "chongqing tonglianglong",
+  "chongqing tonglianglong fc srl": "chongqing tonglianglong",
+  "shanghai shenhua": "shanghai shenhua",
+  "shanghai shenhua fc": "shanghai shenhua",
+  "villefranche": "villefranche",
+  "fc villefranche beaujolais": "villefranche",
+  "villefranche beaujolais": "villefranche",
 };
 
 function normalizeTeam(name: string): string {
@@ -1994,7 +2058,7 @@ export async function prefetchAndStoreOddsPapiOdds(
     const marketId = MARKET_IDS["MATCH_ODDS"] ?? 101;
     if (!(await canMakeOddspapiRequest(1, "P1"))) break;
 
-    if (i > 0) await new Promise((r) => setTimeout(r, 1200));
+    if (i > 0) await new Promise((r) => setTimeout(r, 2400));
 
     const rawData = await fetchOddsPapi<RawOddsResponse>(
       "/odds",
@@ -2397,7 +2461,7 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
     const marketId = MARKET_IDS[matchOddsMarket] ?? 101;
 
     // Rate-limit guard
-    await new Promise((r) => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, 2400));
 
     const rawData = await fetchOddsPapi<RawOddsResponse>(
       "/odds",
@@ -3041,7 +3105,7 @@ export async function fetchPreKickoffSnapshots(): Promise<{
       break;
     }
 
-    await new Promise((r) => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, 2400));
 
     const marketId = MARKET_IDS[bets[0]?.marketType ?? "MATCH_ODDS"] ?? 101;
     const rawData = await fetchOddsPapi<RawOddsResponse>(
@@ -3147,7 +3211,7 @@ export async function trackLineMovements(): Promise<{
 
     if (!(await canMakeOddspapiRequest(1, "P2"))) break;
 
-    await new Promise((r) => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, 2400));
 
     const rawData = await fetchOddsPapi<RawOddsResponse>(
       "/odds",

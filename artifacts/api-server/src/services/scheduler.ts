@@ -692,7 +692,14 @@ export async function runTradingCycle(options?: {
       .select({ count: sql<number>`count(*)` })
       .from(paperBetsTable)
       .where(sql`date_trunc('day', ${paperBetsTable.placedAt} AT TIME ZONE 'UTC') = current_date AND status != 'void' AND deleted_at IS NULL`);
-    const todayCount = Number(todayBetRows[0]?.count ?? 0);
+    const todayCountRaw = Number(todayBetRows[0]?.count ?? 0);
+    // Apr 17 2026: optional same-day offset to "reset" the daily counter after
+    // a mid-day bankroll change. Only applied if `daily_bets_used_offset_date`
+    // matches the current UTC date — auto-expires at UTC midnight.
+    const offsetDate = String(cfg.daily_bets_used_offset_date ?? "");
+    const todayUtc = new Date().toISOString().slice(0, 10);
+    const offset = offsetDate === todayUtc ? Number(cfg.daily_bets_used_offset ?? "0") : 0;
+    const todayCount = Math.max(0, todayCountRaw - offset);
     const dailySlotsLeft = Math.max(0, maxDailyBets - todayCount);
 
     if (dailySlotsLeft === 0) {
