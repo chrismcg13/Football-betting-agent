@@ -570,7 +570,8 @@ export async function runTradingCycle(options?: {
     let funnelBfMarketUnavailable = 0;
     let funnelBfNoEventId = 0;
     let funnelBfTypeUnsupported = 0;
-    if (isLiveMode() && allEntriesUnfiltered.length > 0) {
+    const ENABLE_BETFAIR_PRECHECK = process.env.ENABLE_BETFAIR_PRECHECK === "true";
+    if (ENABLE_BETFAIR_PRECHECK && isLiveMode() && allEntriesUnfiltered.length > 0) {
       const liveCandidates = allEntriesUnfiltered;
       const matchIds = [...new Set(liveCandidates.map(e => e.bet.matchId))];
       const matchRows = await db
