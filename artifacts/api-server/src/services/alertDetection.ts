@@ -85,12 +85,14 @@ async function checkConnectivity(): Promise<void> {
 async function checkRiskLimits(): Promise<void> {
   const bankroll = await getBankroll();
   const deposit = await getStartingDeposit();
-  const floor = deposit > 0 ? deposit * 0.6 : 200;
+  // Floor pct lowered 0.6 → 0.10 per Apr 17 2026 authorisation (alignment with
+  // riskManager.ts and liveRiskManager.ts). Floor is now an emergency stop only.
+  const floor = deposit > 0 ? deposit * 0.10 : 200;
 
   if (bankroll < floor && deposit > 0) {
     await alert("critical", "risk", "BANKROLL_FLOOR",
       "Bankroll Below Floor",
-      `Current bankroll £${bankroll.toFixed(2)} is below the 60% floor of £${floor.toFixed(2)} (deposit: £${deposit.toFixed(2)}).`,
+      `Current bankroll £${bankroll.toFixed(2)} is below the 10% floor of £${floor.toFixed(2)} (deposit: £${deposit.toFixed(2)}).`,
       { bankroll, floor, deposit });
   }
 

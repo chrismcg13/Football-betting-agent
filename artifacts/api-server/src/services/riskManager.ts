@@ -237,15 +237,34 @@ export async function checkBankrollFloor(): Promise<boolean> {
     return false;
   }
 
-  const hwm = await updateHighWaterMark(bankroll);
-  const drawdown = hwm > 0 ? ((hwm - bankroll) / hwm) * 100 : 0;
-  if (drawdown >= 50) {
-    await setAgentStatus("stopped", "Catastrophic drawdown: >50% from high-water mark", {
+  // Use TOTAL WEALTH (available + exposure) for HWM / drawdown — exposure is
+  // deployed capital, not a loss. Comparing only "available" causes the
+  // breaker to misread normal exposure as catastrophic drawdown (this was
+  // halting trading at ~57% exposure on Apr 17 2026 despite being up £14).
+  let totalWealth = bankroll;
+  try {
+    const { isLiveMode, getAccountFunds } = await import("./betfairLive");
+    if (isLiveMode()) {
+      const funds = await getAccountFunds();
+      totalWealth = funds.availableToBetBalance + Math.abs(funds.exposure);
+    }
+  } catch {
+    // Fall back to bankroll (available) if Betfair fetch fails.
+  }
+
+  const hwm = await updateHighWaterMark(totalWealth);
+  const drawdown = hwm > 0 ? ((hwm - totalWealth) / hwm) * 100 : 0;
+  // Threshold raised 50% → 90%: this is a last-resort emergency stop, not a
+  // routine exposure limiter. Daily loss (5%) and weekly loss (10%) limits
+  // remain the real drawdown controls and are unchanged.
+  if (drawdown >= 90) {
+    await setAgentStatus("stopped", "Catastrophic drawdown: >90% from high-water mark", {
       highWaterMark: hwm,
       currentBankroll: bankroll,
+      currentTotalWealth: totalWealth,
       drawdownPct: drawdown,
     });
-    await logDrawdownEvent("catastrophic_drawdown", hwm, bankroll, drawdown, 50, false);
+    await logDrawdownEvent("catastrophic_drawdown", hwm, totalWealth, drawdown, 90, false);
     return true;
   }
   return false;

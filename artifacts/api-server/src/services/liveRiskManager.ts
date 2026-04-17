@@ -81,8 +81,13 @@ export async function getStartingDeposit(): Promise<number> {
 
 export async function getBankrollFloorFromDeposit(): Promise<number> {
   const deposit = await getStartingDeposit();
-  if (deposit <= 0) return 60;
-  return Math.round(deposit * 0.60 * 100) / 100;
+  // Floor lowered 60% → 10% per Apr 17 2026 authorisation. With 95%
+  // concurrent exposure approved, a 60% floor was firing as a routine
+  // exposure limiter. The floor is now a true emergency stop only;
+  // daily-loss (5%) and weekly-loss (10%) limits remain the real drawdown
+  // controls and are unchanged.
+  if (deposit <= 0) return 10;
+  return Math.round(deposit * 0.10 * 100) / 100;
 }
 
 export async function getLiveBalance(): Promise<number> {
