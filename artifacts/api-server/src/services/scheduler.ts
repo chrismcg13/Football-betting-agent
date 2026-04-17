@@ -464,12 +464,19 @@ export async function runTradingCycle(options?: {
 
     type OddsValidation = Awaited<ReturnType<typeof getOddspapiValidation>>;
 
-    // Validate all candidates. Cache hits (from scheduled bulk prefetch) are free.
-    // On-demand API calls capped at 100/cycle with 100k monthly budget.
-    // Bulk prefetch crons (every 4 hours) cover most fixtures.
-    const MAX_ONDEMAND_PER_CYCLE = 100;
+    // CACHE-ONLY validation. The trading cycle MUST NOT make external API calls
+    // (1.2s sleeps + HTTP latency + 429 retries previously kept cycles running
+    // 10+ minutes and blocked live bet placement). The bulk prefetch cron
+    // (every 4h) is responsible for populating oddsPapiCache. If a candidate
+    // has no cached data, it gets evaluated without the Pinnacle alignment
+    // bonus — picked up on the next cycle once the cache is refreshed.
+    //
+    // To re-enable on-demand calls (NOT recommended), set ENABLE_ONDEMAND_ODDSPAPI=true.
+    const ENABLE_ONDEMAND_ODDSPAPI = process.env.ENABLE_ONDEMAND_ODDSPAPI === "true";
     const enhancedCandidates: Array<{ bet: typeof rankedForOddsPapi[number]; validation: OddsValidation | null; effectiveScore: number }> = [];
-    let apiCallsThisCycle = 0;
+    const validationStart = Date.now();
+    let cacheHits = 0;
+    let cacheMisses = 0;
 
     for (const bet of rankedForOddsPapi) {
       try {
@@ -480,65 +487,45 @@ export async function runTradingCycle(options?: {
           const variants = selectionNameVariants(bet.selectionName);
           const raw = variants.reduce<import("./oddsPapi").OddspapiValidation | undefined>((found, v) => found ?? cachedMatch[v], undefined);
           if (raw) {
-            // Compute pinnacleAligned from cached Pinnacle implied probability vs model
             let pinnacleAligned = false;
             let isContrarian = false;
             if (raw.pinnacleImplied !== null) {
               const diff = bet.modelProbability - raw.pinnacleImplied;
               if (diff < 0) {
-                // Pinnacle more bullish than model — sharp money backs our selection
                 pinnacleAligned = true;
               } else if (Math.abs(diff) <= 0.03) {
-                // Within 3% — effectively aligned
                 pinnacleAligned = true;
               } else if (diff > 0.08) {
-                // Model significantly above Pinnacle — contrarian
                 isContrarian = true;
               }
             }
             validation = { ...raw, pinnacleAligned, isContrarian };
+            cacheHits++;
+          } else {
+            cacheMisses++;
           }
+        } else {
+          cacheMisses++;
         }
 
-        if (!validation && apiCallsThisCycle < MAX_ONDEMAND_PER_CYCLE) {
+        // OPT-IN escape hatch — disabled by default. See note above.
+        if (!validation && ENABLE_ONDEMAND_ODDSPAPI) {
           const oddspapiId = await getOddspapiFixtureId(bet.matchId);
           if (oddspapiId) {
-            // Rate-limit guard: 1.2s between API calls to avoid 429s
-            if (apiCallsThisCycle > 0) await new Promise((r) => setTimeout(r, 1200));
             validation = await getOddspapiValidation(
               oddspapiId,
               bet.marketType,
               bet.selectionName,
               bet.backOdds,
             );
-            apiCallsThisCycle++;
           }
         }
 
-        // Pinnacle scoring (enhanced):
-        // +10 if Pinnacle-aligned (sharp money agrees with our model)
-        // -10 if contrarian (Pinnacle strongly disagrees — higher risk)
-        // No flat bonus for just having Pinnacle data — focus on alignment quality
         let effectiveScore = bet.opportunityScore;
         if (validation?.hasPinnacleData) {
           if (validation.pinnacleAligned) effectiveScore += 10;
           else if (validation.isContrarian) effectiveScore -= 10;
         }
-
-        logger.info(
-          {
-            match: `${bet.homeTeam} vs ${bet.awayTeam}`,
-            market: bet.marketType,
-            selection: bet.selectionName,
-            baseScore: bet.opportunityScore,
-            effectiveScore,
-            hasPinnacleData: validation?.hasPinnacleData ?? false,
-            pinnacleAligned: validation?.pinnacleAligned ?? false,
-            isContrarian: validation?.isContrarian ?? false,
-            fromCache: !!oddsPapiCache.get(bet.matchId),
-          },
-          "OddsPapi validation scoring",
-        );
 
         enhancedCandidates.push({ bet, validation: validation ?? null, effectiveScore });
       } catch (err) {
@@ -546,6 +533,17 @@ export async function runTradingCycle(options?: {
         enhancedCandidates.push({ bet, validation: null, effectiveScore: bet.opportunityScore });
       }
     }
+
+    logger.info(
+      {
+        candidates: rankedForOddsPapi.length,
+        cacheHits,
+        cacheMisses,
+        durationMs: Date.now() - validationStart,
+        ondemandEnabled: ENABLE_ONDEMAND_ODDSPAPI,
+      },
+      "OddsPapi cache-only validation complete",
+    );
 
     // 7. Build final candidate list with effective scores
     type BetEntry = {
