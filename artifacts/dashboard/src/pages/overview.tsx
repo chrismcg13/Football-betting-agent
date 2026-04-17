@@ -313,6 +313,105 @@ export default function Overview() {
         </div>
       )}
 
+      {/* Two Columns: Upcoming Bets + Recent Results */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Upcoming Bets */}
+        <div className="rounded-xl border overflow-hidden flex flex-col" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <div className="px-5 py-4 border-b flex items-center justify-between shrink-0" style={{ borderColor: "#334155" }}>
+            <div>
+              <h3 className="text-sm font-semibold text-white">Upcoming Bets</h3>
+              <p className="text-xs text-slate-500 mt-0.5">Waiting for kickoff</p>
+            </div>
+            {upcomingBets.length > 0 && (
+              <span className="text-xs font-mono font-semibold px-2.5 py-1 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/25">
+                {upcomingBets.length}
+              </span>
+            )}
+          </div>
+          <div className="overflow-y-auto flex-1 divide-y" style={{ divideColor: "#334155", maxHeight: "440px" }}>
+            {upcomingBets.length === 0 ? (
+              <div className="px-5 py-10 text-center">
+                <p className="text-sm text-slate-500">No upcoming bets.</p>
+                <p className="text-xs text-slate-600 mt-1">The agent scans for value every 10 minutes.</p>
+              </div>
+            ) : (
+              upcomingBets.slice(0, 10).map((bet: any) => (
+                <div key={bet.id} className="px-5 py-3.5 hover:bg-slate-700/20 transition-colors">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-white truncate">{bet.homeTeam} vs {bet.awayTeam}</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5 truncate">{bet.league}</p>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        <span className="text-blue-400">{formatMarketType(bet.marketType)}</span>
+                        {" · "}{bet.selectionName}
+                      </p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <p className="text-sm font-mono font-bold text-white">{bet.oddsAtPlacement?.toFixed(2)}</p>
+                      <p className="text-xs text-slate-400 font-mono">{formatCurrency(bet.stake)}</p>
+                      {bet.countdownLabel && (
+                        <p className="text-[10px] text-blue-400 mt-0.5 flex items-center gap-1 justify-end">
+                          <Clock className="w-3 h-3" />{bet.countdownLabel}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Recent Results */}
+        <div className="rounded-xl border overflow-hidden flex flex-col" style={{ background: "#1e293b", borderColor: "#334155" }}>
+          <div className="px-5 py-4 border-b shrink-0" style={{ borderColor: "#334155" }}>
+            <h3 className="text-sm font-semibold text-white">Recent Results</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Latest settled bets</p>
+          </div>
+          <div className="overflow-y-auto flex-1 divide-y" style={{ divideColor: "#334155", maxHeight: "440px" }}>
+            {loadingPerf ? (
+              <div className="p-5 space-y-3">
+                {[...Array(5)].map((_, i) => (
+                  <div key={i} className="h-14 rounded animate-pulse" style={{ background: "#0f172a" }} />
+                ))}
+              </div>
+            ) : !perfData?.recentBets || (perfData.recentBets as any[]).length === 0 ? (
+              <div className="px-5 py-10 text-center">
+                <p className="text-sm text-slate-500">No settled bets yet.</p>
+              </div>
+            ) : (
+              (perfData.recentBets as any[]).slice(0, 15).map((bet: any) => (
+                <div
+                  key={bet.id}
+                  className={cn("px-5 py-3.5 flex items-center gap-3 border-l-[3px] transition-colors",
+                    bet.status === "won" ? "border-l-emerald-500 hover:bg-emerald-950/20"
+                    : bet.status === "lost" ? "border-l-red-500 hover:bg-red-950/20"
+                    : "border-l-slate-600 hover:bg-slate-700/10")}
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-sm font-medium text-white truncate">{bet.homeTeam} vs {bet.awayTeam}</p>
+                      <BetStatusBadge status={bet.status} />
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-0.5 truncate">
+                      {formatMarketType(bet.marketType)} · {bet.selectionName} @ {Number(bet.oddsAtPlacement).toFixed(2)}
+                    </p>
+                    <p className="text-[10px] text-slate-600 mt-0.5">{formatRelativeTime(bet.settledAt ?? bet.placedAt)}</p>
+                  </div>
+                  {bet.settlementPnl != null && (
+                    <p className={cn("text-sm font-bold font-mono shrink-0",
+                      Number(bet.settlementPnl) > 0 ? "text-emerald-400"
+                      : Number(bet.settlementPnl) < 0 ? "text-red-400" : "text-slate-500")}>
+                      {Number(bet.settlementPnl) > 0 ? "+" : ""}{formatCurrency(Number(bet.settlementPnl))}
+                    </p>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* Agent Recommendations */}
       {recommendations && (recommendations as any).recommendations?.length > 0 && (
         <div className="rounded-xl border p-5" style={{ background: "#172033", borderColor: "#334155" }}>
@@ -480,105 +579,6 @@ export default function Overview() {
             </ResponsiveContainer>
           </div>
         )}
-      </div>
-
-      {/* Two Columns: Upcoming Bets + Recent Results */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Upcoming Bets */}
-        <div className="rounded-xl border overflow-hidden flex flex-col" style={{ background: "#1e293b", borderColor: "#334155" }}>
-          <div className="px-5 py-4 border-b flex items-center justify-between shrink-0" style={{ borderColor: "#334155" }}>
-            <div>
-              <h3 className="text-sm font-semibold text-white">Upcoming Bets</h3>
-              <p className="text-xs text-slate-500 mt-0.5">Waiting for kickoff</p>
-            </div>
-            {upcomingBets.length > 0 && (
-              <span className="text-xs font-mono font-semibold px-2.5 py-1 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/25">
-                {upcomingBets.length}
-              </span>
-            )}
-          </div>
-          <div className="overflow-y-auto flex-1 divide-y" style={{ divideColor: "#334155", maxHeight: "440px" }}>
-            {upcomingBets.length === 0 ? (
-              <div className="px-5 py-10 text-center">
-                <p className="text-sm text-slate-500">No upcoming bets.</p>
-                <p className="text-xs text-slate-600 mt-1">The agent scans for value every 10 minutes.</p>
-              </div>
-            ) : (
-              upcomingBets.slice(0, 10).map((bet: any) => (
-                <div key={bet.id} className="px-5 py-3.5 hover:bg-slate-700/20 transition-colors">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium text-white truncate">{bet.homeTeam} vs {bet.awayTeam}</p>
-                      <p className="text-[11px] text-slate-500 mt-0.5 truncate">{bet.league}</p>
-                      <p className="text-[11px] text-slate-400 mt-0.5">
-                        <span className="text-blue-400">{formatMarketType(bet.marketType)}</span>
-                        {" · "}{bet.selectionName}
-                      </p>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <p className="text-sm font-mono font-bold text-white">{bet.oddsAtPlacement?.toFixed(2)}</p>
-                      <p className="text-xs text-slate-400 font-mono">{formatCurrency(bet.stake)}</p>
-                      {bet.countdownLabel && (
-                        <p className="text-[10px] text-blue-400 mt-0.5 flex items-center gap-1 justify-end">
-                          <Clock className="w-3 h-3" />{bet.countdownLabel}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-
-        {/* Recent Results */}
-        <div className="rounded-xl border overflow-hidden flex flex-col" style={{ background: "#1e293b", borderColor: "#334155" }}>
-          <div className="px-5 py-4 border-b shrink-0" style={{ borderColor: "#334155" }}>
-            <h3 className="text-sm font-semibold text-white">Recent Results</h3>
-            <p className="text-xs text-slate-500 mt-0.5">Latest settled bets</p>
-          </div>
-          <div className="overflow-y-auto flex-1 divide-y" style={{ divideColor: "#334155", maxHeight: "440px" }}>
-            {loadingPerf ? (
-              <div className="p-5 space-y-3">
-                {[...Array(5)].map((_, i) => (
-                  <div key={i} className="h-14 rounded animate-pulse" style={{ background: "#0f172a" }} />
-                ))}
-              </div>
-            ) : !perfData?.recentBets || (perfData.recentBets as any[]).length === 0 ? (
-              <div className="px-5 py-10 text-center">
-                <p className="text-sm text-slate-500">No settled bets yet.</p>
-              </div>
-            ) : (
-              (perfData.recentBets as any[]).slice(0, 15).map((bet: any) => (
-                <div
-                  key={bet.id}
-                  className={cn("px-5 py-3.5 flex items-center gap-3 border-l-[3px] transition-colors",
-                    bet.status === "won" ? "border-l-emerald-500 hover:bg-emerald-950/20"
-                    : bet.status === "lost" ? "border-l-red-500 hover:bg-red-950/20"
-                    : "border-l-slate-600 hover:bg-slate-700/10")}
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <p className="text-sm font-medium text-white truncate">{bet.homeTeam} vs {bet.awayTeam}</p>
-                      <BetStatusBadge status={bet.status} />
-                    </div>
-                    <p className="text-[11px] text-slate-500 mt-0.5 truncate">
-                      {formatMarketType(bet.marketType)} · {bet.selectionName} @ {Number(bet.oddsAtPlacement).toFixed(2)}
-                    </p>
-                    <p className="text-[10px] text-slate-600 mt-0.5">{formatRelativeTime(bet.settledAt ?? bet.placedAt)}</p>
-                  </div>
-                  {bet.settlementPnl != null && (
-                    <p className={cn("text-sm font-bold font-mono shrink-0",
-                      Number(bet.settlementPnl) > 0 ? "text-emerald-400"
-                      : Number(bet.settlementPnl) < 0 ? "text-red-400" : "text-slate-500")}>
-                      {Number(bet.settlementPnl) > 0 ? "+" : ""}{formatCurrency(Number(bet.settlementPnl))}
-                    </p>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-        </div>
       </div>
 
       {/* Agent Intelligence */}
