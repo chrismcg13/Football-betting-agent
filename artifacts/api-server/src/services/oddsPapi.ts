@@ -1445,6 +1445,243 @@ export async function runOddspapiFixtureMapping(): Promise<{
   return { total: allFixtures.length, mapped, newMappings, unmatchedDb: unmatchedDbMatches.length, unmatchedOp: unmatchedOpCount, perLeague: Object.fromEntries(Object.entries(perLeague)) };
 }
 
+// ─── Pinnacle Rescue Mapper ──────────────────────────────────────────────────
+// Aggressive second-pass mapper specifically for Pinnacle-league fixtures that
+// the standard mapping passes (1-6) rejected. Drops similarity thresholds
+// (combined >= 0.50, each side >= 0.40) and widens the date window to ±2 days,
+// constrained to fixtures in leagues flagged has_pinnacle_odds=true. Also
+// records every proposed pair for human review of potential team aliases.
+export async function rescueUnmappedPinnacleFixtures(opts: {
+  dryRun?: boolean;
+  minCombined?: number;
+  minPerSide?: number;
+  dateWindowDays?: number;
+} = {}): Promise<{
+  unmappedBefore: number;
+  candidatesEvaluated: number;
+  rescued: number;
+  proposals: Array<{
+    matchId: number; league: string; dbHome: string; dbAway: string; matchDate: string;
+    opFixtureId: string; opHome: string; opAway: string; opDate: string;
+    homeSim: number; awaySim: number; combined: number; committed: boolean;
+  }>;
+  rejected: Array<{
+    matchId: number; league: string; dbHome: string; dbAway: string;
+    bestOpHome: string; bestOpAway: string; bestCombined: number; reason: string;
+  }>;
+}> {
+  const dryRun = opts.dryRun ?? false;
+  const minCombined = opts.minCombined ?? 0.50;
+  const minPerSide = opts.minPerSide ?? 0.40;
+  const windowDays = opts.dateWindowDays ?? 2;
+
+  const key = process.env.ODDSPAPI_KEY;
+  if (!key) {
+    logger.warn("ODDSPAPI_KEY not set — cannot run Pinnacle rescue");
+    return { unmappedBefore: 0, candidatesEvaluated: 0, rescued: 0, proposals: [], rejected: [] };
+  }
+  if (!(await canMakeOddspapiRequest(2, "P4"))) {
+    logger.warn("OddsPapi budget exhausted — skipping rescue mapping");
+    return { unmappedBefore: 0, candidatesEvaluated: 0, rescued: 0, proposals: [], rejected: [] };
+  }
+
+  const now = new Date();
+  const todayDate = now.toISOString().slice(0, 10);
+  const plusSeven = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  // Pinnacle-league names
+  const pinnLeagues = await db
+    .select({ name: competitionConfigTable.name })
+    .from(competitionConfigTable)
+    .where(eq(competitionConfigTable.hasPinnacleOdds, true));
+  const pinnLeagueSet = new Set(pinnLeagues.map((l) => l.name));
+
+  // Unmapped DB fixtures in Pinnacle leagues, next 7 days
+  const upcoming = await db
+    .select()
+    .from(matchesTable)
+    .where(
+      and(
+        eq(matchesTable.status, "scheduled"),
+        gte(matchesTable.kickoffTime, new Date(now.getTime() - 1 * 60 * 60 * 1000)),
+        lte(matchesTable.kickoffTime, new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)),
+      ),
+    );
+  const unmappedTargets: typeof upcoming = [];
+  for (const m of upcoming) {
+    if (!m.league || !pinnLeagueSet.has(m.league)) continue;
+    const exists = await db
+      .select({ id: oddspapiFixtureMapTable.id })
+      .from(oddspapiFixtureMapTable)
+      .where(eq(oddspapiFixtureMapTable.matchId, m.id))
+      .limit(1);
+    if (!exists[0]) unmappedTargets.push(m);
+  }
+
+  logger.info({ count: unmappedTargets.length, dryRun, minCombined, minPerSide, windowDays }, "Pinnacle rescue: starting");
+
+  if (unmappedTargets.length === 0) {
+    return { unmappedBefore: 0, candidatesEvaluated: 0, rescued: 0, proposals: [], rejected: [] };
+  }
+
+  // Pull both with-odds and discovery fixtures (same as primary mapper) so we
+  // see fixtures that may have been posted without odds yet.
+  const withOdds = await fetchOddsPapi<RawFixture[]>("/fixtures", {
+    sportId: 10, from: todayDate, to: plusSeven, hasOdds: "true",
+  }, "fixtures_rescue", "P4") ?? [];
+  let discovery: RawFixture[] = [];
+  if (await canMakeOddspapiRequest(1, "P4")) {
+    const disc = await fetchOddsPapi<RawFixture[]>("/fixtures", {
+      sportId: 10, from: todayDate, to: plusSeven,
+    }, "fixtures_rescue_discovery", "P4");
+    if (disc && Array.isArray(disc)) {
+      const seen = new Set(withOdds.map((f) => extractFixtureStringId(f)).filter(Boolean));
+      discovery = disc.filter((f) => {
+        const id = extractFixtureStringId(f);
+        return id && !seen.has(id);
+      });
+    }
+  }
+  const allFixtures = [...withOdds, ...discovery];
+  logger.info({ withOdds: withOdds.length, discoveryOnly: discovery.length, total: allFixtures.length }, "Pinnacle rescue: OddsPapi fixtures fetched");
+
+  // Avoid stealing fixtures already bound to other DB matches
+  const usedRows = await db
+    .select({ id: oddspapiFixtureMapTable.oddspapiFixtureId })
+    .from(oddspapiFixtureMapTable);
+  const usedOpIds = new Set(usedRows.map((r) => r.id).filter(Boolean));
+
+  let candidatesEvaluated = 0;
+  let rescued = 0;
+  const proposals: Array<{
+    matchId: number; league: string; dbHome: string; dbAway: string; matchDate: string;
+    opFixtureId: string; opHome: string; opAway: string; opDate: string;
+    homeSim: number; awaySim: number; combined: number; committed: boolean;
+  }> = [];
+  const rejected: Array<{
+    matchId: number; league: string; dbHome: string; dbAway: string;
+    bestOpHome: string; bestOpAway: string; bestCombined: number; reason: string;
+  }> = [];
+
+  for (const m of unmappedTargets) {
+    const matchDateMs = m.kickoffTime.getTime();
+    const matchDateStr = m.kickoffTime.toISOString().slice(0, 10);
+    const windowMs = windowDays * 24 * 60 * 60 * 1000;
+
+    let best: { f: RawFixture; opHome: string; opAway: string; opDate: string; opId: string;
+                homeSim: number; awaySim: number; combined: number } | null = null;
+    let bestSwapped: typeof best = null;
+
+    for (const f of allFixtures) {
+      const teams = extractTeamNames(f);
+      if (!teams) continue;
+      const opDate = extractFixtureDate(f);
+      if (!opDate) continue;
+      const opMs = new Date(opDate + "T12:00:00Z").getTime();
+      if (Math.abs(opMs - matchDateMs) > windowMs + 12 * 60 * 60 * 1000) continue;
+
+      const opId = extractFixtureStringId(f);
+      if (!opId || usedOpIds.has(opId)) continue;
+
+      candidatesEvaluated++;
+
+      // Try both orientations — OddsPapi sometimes flips home/away
+      const homeSim = teamSimilarity(m.homeTeam, teams.home);
+      const awaySim = teamSimilarity(m.awayTeam, teams.away);
+      const combined = (homeSim + awaySim) / 2;
+      if (combined >= minCombined && homeSim >= minPerSide && awaySim >= minPerSide) {
+        if (!best || combined > best.combined) {
+          best = { f, opHome: teams.home, opAway: teams.away, opDate, opId, homeSim, awaySim, combined };
+        }
+      }
+
+      const homeSimSw = teamSimilarity(m.homeTeam, teams.away);
+      const awaySimSw = teamSimilarity(m.awayTeam, teams.home);
+      const combinedSw = (homeSimSw + awaySimSw) / 2;
+      if (combinedSw >= minCombined && homeSimSw >= minPerSide && awaySimSw >= minPerSide) {
+        if (!bestSwapped || combinedSw > bestSwapped.combined) {
+          bestSwapped = { f, opHome: teams.home, opAway: teams.away, opDate, opId, homeSim: homeSimSw, awaySim: awaySimSw, combined: combinedSw };
+        }
+      }
+    }
+
+    // Pick the better of normal vs swapped, with a small bias for normal orientation
+    let chosen = best;
+    if (bestSwapped && (!best || bestSwapped.combined > best.combined + 0.10)) {
+      chosen = bestSwapped;
+    }
+
+    if (!chosen) {
+      // Diagnostic: find best near-miss regardless of threshold
+      let nearMiss = { opHome: "", opAway: "", combined: 0 };
+      for (const f of allFixtures) {
+        const teams = extractTeamNames(f);
+        if (!teams) continue;
+        const opDate = extractFixtureDate(f);
+        if (!opDate) continue;
+        const opMs = new Date(opDate + "T12:00:00Z").getTime();
+        if (Math.abs(opMs - matchDateMs) > windowMs + 12 * 60 * 60 * 1000) continue;
+        const c = (teamSimilarity(m.homeTeam, teams.home) + teamSimilarity(m.awayTeam, teams.away)) / 2;
+        if (c > nearMiss.combined) nearMiss = { opHome: teams.home, opAway: teams.away, combined: c };
+      }
+      rejected.push({
+        matchId: m.id, league: m.league ?? "Unknown", dbHome: m.homeTeam, dbAway: m.awayTeam,
+        bestOpHome: nearMiss.opHome, bestOpAway: nearMiss.opAway, bestCombined: nearMiss.combined,
+        reason: nearMiss.combined === 0 ? "no candidate within ±2d" : "below loose threshold",
+      });
+      continue;
+    }
+
+    const proposal = {
+      matchId: m.id, league: m.league ?? "Unknown",
+      dbHome: m.homeTeam, dbAway: m.awayTeam, matchDate: matchDateStr,
+      opFixtureId: chosen.opId, opHome: chosen.opHome, opAway: chosen.opAway, opDate: chosen.opDate,
+      homeSim: Math.round(chosen.homeSim * 1000) / 1000,
+      awaySim: Math.round(chosen.awaySim * 1000) / 1000,
+      combined: Math.round(chosen.combined * 1000) / 1000,
+      committed: false,
+    };
+
+    if (!dryRun) {
+      try {
+        await db.insert(oddspapiFixtureMapTable).values({
+          matchId: m.id,
+          oddspapiFixtureId: chosen.opId,
+          cachedAt: new Date(),
+        }).onConflictDoUpdate({
+          target: oddspapiFixtureMapTable.matchId,
+          set: { oddspapiFixtureId: chosen.opId, cachedAt: new Date() },
+        });
+        usedOpIds.add(chosen.opId);
+        rescued++;
+        proposal.committed = true;
+        logger.info(proposal, "Pinnacle rescue: mapped via loose-threshold + swap-aware match");
+      } catch (err) {
+        logger.warn({ err, matchId: m.id }, "Pinnacle rescue: insert failed");
+      }
+    } else {
+      logger.info(proposal, "Pinnacle rescue (DRY RUN): would map");
+    }
+    proposals.push(proposal);
+  }
+
+  logger.info({
+    unmappedBefore: unmappedTargets.length,
+    candidatesEvaluated,
+    rescued,
+    rejectedCount: rejected.length,
+    dryRun,
+  }, "Pinnacle rescue complete");
+
+  return {
+    unmappedBefore: unmappedTargets.length,
+    candidatesEvaluated,
+    rescued,
+    proposals,
+    rejected,
+  };
+}
+
 // ─── Match Diagnostic — exhaustive near-miss analysis for unmapped fixtures ──
 
 export async function runMatchDiagnostic(): Promise<{

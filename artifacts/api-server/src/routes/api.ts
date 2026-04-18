@@ -1970,6 +1970,21 @@ router.get("/admin/market-availability-analysis", async (req, res) => {
   }
 });
 
+router.post("/admin/rescue-pinnacle-mapping", async (req, res) => {
+  try {
+    const dryRun = String(req.query["dryRun"] ?? req.body?.dryRun ?? "false") === "true";
+    const minCombined = Number(req.query["minCombined"] ?? req.body?.minCombined ?? 0.50);
+    const minPerSide = Number(req.query["minPerSide"] ?? req.body?.minPerSide ?? 0.40);
+    const windowDays = Number(req.query["windowDays"] ?? req.body?.windowDays ?? 2);
+    const { rescueUnmappedPinnacleFixtures } = await import("../services/oddsPapi");
+    const result = await rescueUnmappedPinnacleFixtures({ dryRun, minCombined, minPerSide, dateWindowDays: windowDays });
+    res.json({ success: true, params: { dryRun, minCombined, minPerSide, windowDays }, result });
+  } catch (err) {
+    logger.error({ err }, "Pinnacle rescue mapping failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.get("/admin/live-balance", async (_req, res) => {
   try {
     const balance = getCachedBalance();
