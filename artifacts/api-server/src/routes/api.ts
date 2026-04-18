@@ -1970,6 +1970,19 @@ router.get("/admin/market-availability-analysis", async (req, res) => {
   }
 });
 
+router.post("/admin/run-near-cycle", async (_req, res) => {
+  try {
+    const { runTradingCycle } = await import("../services/scheduler");
+    const { deduplicatePendingBets } = await import("../services/paperTrading");
+    const result = await runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 });
+    const dedup = await deduplicatePendingBets().catch((e) => ({ error: String(e) }));
+    res.json({ success: true, result, dedup });
+  } catch (err) {
+    logger.error({ err }, "run-near-cycle failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/rescue-pinnacle-mapping", async (req, res) => {
   try {
     const dryRun = String(req.query["dryRun"] ?? req.body?.dryRun ?? "false") === "true";

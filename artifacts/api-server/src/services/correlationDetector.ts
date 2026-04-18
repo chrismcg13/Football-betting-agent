@@ -8,7 +8,7 @@
  * Step 1:  Conflicting bet removal (Over vs Under same line)
  * Step 2:  Complementary bet stake reduction
  * Step 3:  Per-match overexposure stake reduction
- * Step 4:  Hard cap — max 2 bets per match
+ * Step 4:  Hard cap — max 4 bets per match
  */
 
 import { db, learningNarrativesTable, complianceLogsTable } from "@workspace/db";
@@ -263,21 +263,25 @@ export async function applyCorrelationDetection(
     }
   }
 
-  // ── 4. Hard cap: max 2 bets per match ────────────────────────────────────
-  // After all dedup, if any match still has >2 bets, keep only the top 2 by
-  // opportunity score. This prevents over-concentration on a single fixture.
+  // ── 4. Hard cap: max 4 bets per match ────────────────────────────────────
+  // After all dedup, if any match still has >4 bets, keep only the top 4 by
+  // opportunity score. Cap raised from 2 → 4 to allow capturing independent
+  // edges across MATCH_ODDS / OVER_UNDER / BTTS / cards / corners on the same
+  // fixture. Threshold-category dedup (step 0A) and cross-market correlation
+  // dedup (step 0B) still prevent correlated picks from filling the slots.
+  const MAX_BETS_PER_MATCH = 4;
   for (const [matchId, bets] of byMatch) {
     const activeBets = bets
       .filter((b) => selected.some((s) => betKey(s) === betKey(b)))
       .sort((a, b) => b.opportunityScore - a.opportunityScore);
 
-    if (activeBets.length <= 2) continue;
+    if (activeBets.length <= MAX_BETS_PER_MATCH) continue;
 
-    const toRemove = activeBets.slice(2);
-    const kept = activeBets.slice(0, 2);
-    const msg = `Max-2-bets-per-match cap applied on ${activeBets[0]?.homeTeam ?? "match"} vs ${activeBets[0]?.awayTeam ?? ""}. Kept ${kept.map((b) => `${b.selectionName} (${b.opportunityScore.toFixed(0)})`).join(" & ")}. Removed ${toRemove.length} lower-scored bets: ${toRemove.map((b) => b.selectionName).join(", ")}.`;
+    const toRemove = activeBets.slice(MAX_BETS_PER_MATCH);
+    const kept = activeBets.slice(0, MAX_BETS_PER_MATCH);
+    const msg = `Max-${MAX_BETS_PER_MATCH}-bets-per-match cap applied on ${activeBets[0]?.homeTeam ?? "match"} vs ${activeBets[0]?.awayTeam ?? ""}. Kept ${kept.map((b) => `${b.selectionName} (${b.opportunityScore.toFixed(0)})`).join(" & ")}. Removed ${toRemove.length} lower-scored bets: ${toRemove.map((b) => b.selectionName).join(", ")}.`;
     narratives.push(msg);
-    logger.info({ matchId, keptCount: 2, removedCount: toRemove.length }, "4 max-bets-per-match cap applied");
+    logger.info({ matchId, keptCount: MAX_BETS_PER_MATCH, removedCount: toRemove.length }, `max-${MAX_BETS_PER_MATCH}-bets-per-match cap applied`);
     for (const b of toRemove) {
       removeBet(selected, removed, byMatch, b);
     }

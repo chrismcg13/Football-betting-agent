@@ -574,10 +574,13 @@ export async function placePaperBet(
       }
     }
 
-    // 3. Hard cap — max 2 bets per match (pending only)
-    if (existingPending.length >= 2) {
+    // 3. Hard cap — max 4 bets per match (pending only)
+    // Raised from 2 → 4 to allow independent edges across MATCH_ODDS /
+    // OVER_UNDER / BTTS / cards / corners on the same fixture. Threshold-
+    // category dedup above (rule #2) still prevents correlated picks.
+    if (existingPending.length >= 4) {
       return logReject(
-        `Match ${matchId} already has ${existingPending.length} pending bets (max 2) — skipping ${marketType}:${selectionName}`,
+        `Match ${matchId} already has ${existingPending.length} pending bets (max 4) — skipping ${marketType}:${selectionName}`,
       );
     }
   }
@@ -1651,14 +1654,14 @@ export async function deduplicatePendingBets(): Promise<{
       removedByReason.cross_market_dedup++;
     }
 
-    // ── Step C: Max 2 bets per match ─────────────────────────────────
+    // ── Step C: Max 4 bets per match ─────────────────────────────────
     const remainingBets = activeBetsForMatch(matchId);
-    if (remainingBets.length > 2) {
+    if (remainingBets.length > 4) {
       const sorted = [...remainingBets].sort((a, b) => (b.opportunityScore ?? 0) - (a.opportunityScore ?? 0));
-      const excess = sorted.slice(2);
+      const excess = sorted.slice(4);
       logger.info(
         { matchId, removedCount: excess.length },
-        `deduplicatePendingBets [max-2 cap]: removing ${excess.length} excess bets`,
+        `deduplicatePendingBets [max-4 cap]: removing ${excess.length} excess bets`,
       );
       for (const e of excess) {
         toVoid.add(e.id);
