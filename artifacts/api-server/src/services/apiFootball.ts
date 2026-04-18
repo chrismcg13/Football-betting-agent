@@ -1754,6 +1754,7 @@ export async function calculateLeaguePerformanceScores(): Promise<LeagueScore[]>
     FROM paper_bets pb
     JOIN matches m ON pb.match_id = m.id
     WHERE pb.status IN ('won','lost')
+      AND pb.betfair_bet_id IS NOT NULL
     GROUP BY m.league
     HAVING COUNT(pb.id) >= 1
   `);

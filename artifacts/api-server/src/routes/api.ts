@@ -87,13 +87,16 @@ function paginate(page: unknown, limit: unknown, max = 200) {
   return { page: p, limit: l, offset: (p - 1) * l };
 }
 
-async function getSettledBetsStats(liveOnly = false) {
-  const where = liveOnly
-    ? and(
-        inArray(paperBetsTable.status, ["won", "lost", "void"]),
-        isNotNull(paperBetsTable.betfairBetId),
-      )
-    : inArray(paperBetsTable.status, ["won", "lost", "void"]);
+// "Real money" filter for dashboard reads.
+//   A row in paper_bets only represents real money on the exchange when the
+//   placement actually reached Betfair and we got back a bet id. Rows with
+//   betfair_bet_id IS NULL are model decisions that never executed (network
+//   failure, pre-placement filtering, paper-mode legacy, etc.) and must NOT
+//   appear in dashboard totals, PnL, ROI, CLV, upcoming/live/settled views.
+//   This is applied to every dashboard endpoint below.
+const REAL_MONEY = isNotNull(paperBetsTable.betfairBetId);
+
+async function getSettledBetsStats() {
   const rows = await db
     .select({
       status: paperBetsTable.status,
@@ -106,30 +109,30 @@ async function getSettledBetsStats(liveOnly = false) {
       netPnl: paperBetsTable.netPnl,
     })
     .from(paperBetsTable)
-    .where(where);
+    .where(
+      and(
+        inArray(paperBetsTable.status, ["won", "lost", "void"]),
+        REAL_MONEY,
+      ),
+    );
   return rows;
 }
 
 // ─────────────────────────────────────────────
 // GET /api/dashboard/summary
 // ─────────────────────────────────────────────
-router.get("/dashboard/summary", async (req, res) => {
+router.get("/dashboard/summary", async (_req, res) => {
   const todayStartUtc = new Date();
   todayStartUtc.setUTCHours(0, 0, 0, 0);
-  const liveOnly = req.query["liveOnly"] === "true";
 
-  const pendingWhere = liveOnly
-    ? and(eq(paperBetsTable.status, "pending"), isNotNull(paperBetsTable.betfairBetId))
-    : eq(paperBetsTable.status, "pending");
-  const betsTodayWhere = liveOnly
-    ? and(gte(paperBetsTable.placedAt, todayStartUtc), isNotNull(paperBetsTable.betfairBetId))
-    : gte(paperBetsTable.placedAt, todayStartUtc);
-  const tierSplitLiveFilter = liveOnly ? sql` AND betfair_bet_id IS NOT NULL` : sql``;
+  // Dashboard is real-money only — see REAL_MONEY constant at top of file.
+  const pendingWhere = and(eq(paperBetsTable.status, "pending"), REAL_MONEY);
+  const betsTodayWhere = and(gte(paperBetsTable.placedAt, todayStartUtc), REAL_MONEY);
 
   const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, tierSplitRows, paperModeRow, maxExposurePctRow, exposureRuleSinceRow] = await Promise.all([
     getBankroll(),
     getAgentStatus(),
-    getSettledBetsStats(liveOnly),
+    getSettledBetsStats(),
     db
       .select({
         id: paperBetsTable.id,
@@ -145,14 +148,15 @@ router.get("/dashboard/summary", async (req, res) => {
       .where(betsTodayWhere),
     db.execute(sql`
       SELECT
-        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1A'${tierSplitLiveFilter}) AS tier1a,
-        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1B'${tierSplitLiveFilter}) AS tier1b,
-        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND (qualification_path = 'promoted' OR qualification_path IS NULL)${tierSplitLiveFilter}) AS tier1_other,
-        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND betfair_bet_id IS NOT NULL) AS betfair_live,
-        COUNT(*) FILTER (WHERE (live_tier = 'tier2' OR live_tier IS NULL)${tierSplitLiveFilter}) AS tier2,
-        COALESCE(SUM(stake::numeric) FILTER (WHERE live_tier = 'tier1' AND betfair_bet_id IS NOT NULL AND status != 'void'), 0) AS betfair_stake
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1A') AS tier1a,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND qualification_path = '1B') AS tier1b,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1' AND (qualification_path = 'promoted' OR qualification_path IS NULL)) AS tier1_other,
+        COUNT(*) FILTER (WHERE live_tier = 'tier1') AS betfair_live,
+        COUNT(*) FILTER (WHERE (live_tier = 'tier2' OR live_tier IS NULL)) AS tier2,
+        COALESCE(SUM(stake::numeric) FILTER (WHERE live_tier = 'tier1' AND status != 'void'), 0) AS betfair_stake
       FROM paper_bets
       WHERE placed_at >= ${todayStartUtc} AND deleted_at IS NULL
+        AND betfair_bet_id IS NOT NULL
     `),
     db
       .select({ value: agentConfigTable.value })
@@ -309,22 +313,17 @@ router.get("/dashboard/summary", async (req, res) => {
 // ─────────────────────────────────────────────
 // GET /api/dashboard/performance
 // ─────────────────────────────────────────────
-router.get("/dashboard/performance", async (req, res) => {
+router.get("/dashboard/performance", async (_req, res) => {
   const since = new Date();
   since.setUTCDate(since.getUTCDate() - 30);
   since.setUTCHours(0, 0, 0, 0);
-  const liveOnly = req.query["liveOnly"] === "true";
 
-  const settledWhere = liveOnly
-    ? and(
-        inArray(paperBetsTable.status, ["won", "lost"]),
-        gte(paperBetsTable.settledAt, since),
-        isNotNull(paperBetsTable.betfairBetId),
-      )
-    : and(
-        inArray(paperBetsTable.status, ["won", "lost"]),
-        gte(paperBetsTable.settledAt, since),
-      );
+  // Dashboard is real-money only — see REAL_MONEY constant at top of file.
+  const settledWhere = and(
+    inArray(paperBetsTable.status, ["won", "lost"]),
+    gte(paperBetsTable.settledAt, since),
+    REAL_MONEY,
+  );
 
   const settled = await db
     .select({
@@ -339,12 +338,10 @@ router.get("/dashboard/performance", async (req, res) => {
 
   // Overview "Recent Results" shows wins/losses only — voids are tracked on the
   // Bets History page so they don't clutter the at-a-glance settled view.
-  const recentSettledWhere = liveOnly
-    ? and(
-        inArray(paperBetsTable.status, ["won", "lost"]),
-        isNotNull(paperBetsTable.betfairBetId),
-      )
-    : inArray(paperBetsTable.status, ["won", "lost"]);
+  const recentSettledWhere = and(
+    inArray(paperBetsTable.status, ["won", "lost"]),
+    REAL_MONEY,
+  );
   const recentBets = await db
     .select({
       id: paperBetsTable.id,
@@ -459,7 +456,7 @@ router.get("/dashboard/performance", async (req, res) => {
 // ─────────────────────────────────────────────
 // GET /api/dashboard/bets/by-league  (before /:id or ?page style)
 // ─────────────────────────────────────────────
-router.get("/dashboard/bets/by-league", async (req, res) => {
+router.get("/dashboard/bets/by-league", async (_req, res) => {
   const settled = await db
     .select({
       league: matchesTable.league,
@@ -469,7 +466,7 @@ router.get("/dashboard/bets/by-league", async (req, res) => {
     })
     .from(paperBetsTable)
     .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
-    .where(inArray(paperBetsTable.status, ["won", "lost"]));
+    .where(and(inArray(paperBetsTable.status, ["won", "lost"]), REAL_MONEY));
 
   const groups = new Map<
     string,
@@ -654,7 +651,7 @@ router.post("/admin/capture-pinnacle-snapshots", async (_req, res) => {
 // ─────────────────────────────────────────────
 // GET /api/dashboard/bets/by-market
 // ─────────────────────────────────────────────
-router.get("/dashboard/bets/by-market", async (req, res) => {
+router.get("/dashboard/bets/by-market", async (_req, res) => {
   const settled = await db
     .select({
       marketType: paperBetsTable.marketType,
@@ -663,7 +660,7 @@ router.get("/dashboard/bets/by-market", async (req, res) => {
       settlementPnl: paperBetsTable.settlementPnl,
     })
     .from(paperBetsTable)
-    .where(inArray(paperBetsTable.status, ["won", "lost"]));
+    .where(and(inArray(paperBetsTable.status, ["won", "lost"]), REAL_MONEY));
 
   const groups = new Map<
     string,
@@ -715,10 +712,12 @@ router.get("/dashboard/bets", async (req, res) => {
   );
   const statusFilter = String(req.query["status"] ?? "all");
 
+  // Dashboard is real-money only — bets list never includes never-placed shadow
+  // rows, regardless of status filter.
   const baseConditions =
     statusFilter === "all" || !statusFilter
-      ? undefined
-      : eq(paperBetsTable.status, statusFilter);
+      ? REAL_MONEY
+      : and(eq(paperBetsTable.status, statusFilter), REAL_MONEY);
 
   const [bets, countResult] = await Promise.all([
     db
@@ -803,7 +802,7 @@ router.get("/dashboard/bets", async (req, res) => {
 // ─────────────────────────────────────────────
 // GET /api/dashboard/viability
 // ─────────────────────────────────────────────
-router.get("/dashboard/viability", async (req, res) => {
+router.get("/dashboard/viability", async (_req, res) => {
   const allSettled = await db
     .select({
       stake: paperBetsTable.stake,
@@ -813,7 +812,7 @@ router.get("/dashboard/viability", async (req, res) => {
       settledAt: paperBetsTable.settledAt,
     })
     .from(paperBetsTable)
-    .where(inArray(paperBetsTable.status, ["won", "lost"]))
+    .where(and(inArray(paperBetsTable.status, ["won", "lost"]), REAL_MONEY))
     .orderBy(asc(paperBetsTable.placedAt));
 
   const totalSettledBets = allSettled.length;
@@ -1503,6 +1502,7 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
         and(
           sql`${paperBetsTable.clvPct} IS NOT NULL`,
           sql`${paperBetsTable.status} IN ('won','lost')`,
+          REAL_MONEY,
         ),
       )
       .orderBy(asc(paperBetsTable.placedAt))
@@ -1520,11 +1520,11 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
     const pinnacleClosingCount = rows.filter((r) => (r as any).closingPinnacleOdds != null).length;
     const contrarianCount = rows.filter((r) => r.isContrarian === "true").length;
 
-    // Total settled (won + lost) for coverage %
+    // Total settled (won + lost) for coverage % — real-money only
     const totalSettledRows = await db
       .select({ count: sql<number>`count(*)` })
       .from(paperBetsTable)
-      .where(sql`${paperBetsTable.status} IN ('won','lost')`);
+      .where(and(sql`${paperBetsTable.status} IN ('won','lost')`, REAL_MONEY));
     const totalSettled = Number(totalSettledRows[0]?.count ?? rows.length);
     const pinnacleClosingCoveragePct = totalSettled > 0 ? Math.round((pinnacleClosingCount / totalSettled) * 100) : 0;
 
@@ -2384,25 +2384,27 @@ router.get("/admin/coverage", async (_req, res) => {
 
 router.get("/dashboard/pinnacle-coverage", async (_req, res) => {
   try {
+    // Dashboard is real-money only.
     const totalSettled = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(paperBetsTable)
-      .where(sql`${paperBetsTable.status} IN ('won', 'lost')`);
+      .where(and(sql`${paperBetsTable.status} IN ('won', 'lost')`, REAL_MONEY));
 
     const withClv = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(paperBetsTable)
-      .where(and(sql`${paperBetsTable.status} IN ('won', 'lost')`, sql`${paperBetsTable.clvPct} IS NOT NULL`));
+      .where(and(sql`${paperBetsTable.status} IN ('won', 'lost')`, sql`${paperBetsTable.clvPct} IS NOT NULL`, REAL_MONEY));
 
     const withPinnacleClosing = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(paperBetsTable)
-      .where(and(sql`${paperBetsTable.status} IN ('won', 'lost')`, sql`${paperBetsTable.closingPinnacleOdds} IS NOT NULL`));
+      .where(and(sql`${paperBetsTable.status} IN ('won', 'lost')`, sql`${paperBetsTable.closingPinnacleOdds} IS NOT NULL`, REAL_MONEY));
 
     const byQuality = await db.execute(sql`
       SELECT clv_data_quality, count(*)::int as count
       FROM paper_bets
       WHERE status IN ('won', 'lost')
+        AND betfair_bet_id IS NOT NULL
       GROUP BY clv_data_quality
     `);
 
@@ -2781,6 +2783,7 @@ router.get("/dashboard/execution-metrics", async (_req, res) => {
           COUNT(*) FILTER (WHERE status IN ('won','lost'))::int AS week_settled
         FROM paper_bets
         WHERE placed_at >= ${weekAgo}
+          AND betfair_bet_id IS NOT NULL
       `),
     ]);
 
@@ -2825,15 +2828,15 @@ router.get("/dashboard/execution-metrics", async (_req, res) => {
   }
 });
 
-router.get("/dashboard/in-play", async (req, res) => {
+router.get("/dashboard/in-play", async (_req, res) => {
   try {
     const now = new Date();
-    const liveOnly = req.query["liveOnly"] === "true";
+    // Dashboard is real-money only.
     const whereParts = [
       eq(paperBetsTable.status, "pending"),
       lte(matchesTable.kickoffTime, now),
+      REAL_MONEY,
     ];
-    if (liveOnly) whereParts.push(isNotNull(paperBetsTable.betfairBetId));
     const bets = await db
       .select({
         id: paperBetsTable.id,
@@ -2882,15 +2885,15 @@ router.get("/dashboard/in-play", async (req, res) => {
   }
 });
 
-router.get("/dashboard/upcoming-bets", async (req, res) => {
+router.get("/dashboard/upcoming-bets", async (_req, res) => {
   try {
     const now = new Date();
-    const liveOnly = req.query["liveOnly"] === "true";
+    // Dashboard is real-money only.
     const whereParts = [
       eq(paperBetsTable.status, "pending"),
       gte(matchesTable.kickoffTime, now),
+      REAL_MONEY,
     ];
-    if (liveOnly) whereParts.push(isNotNull(paperBetsTable.betfairBetId));
     const bets = await db
       .select({
         id: paperBetsTable.id,
