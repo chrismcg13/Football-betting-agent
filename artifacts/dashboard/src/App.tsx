@@ -13,6 +13,7 @@ import Compliance from "@/pages/compliance";
 import Experiments from "@/pages/experiments";
 import Alerts from "@/pages/alerts";
 import Launch from "@/pages/launch";
+import LeagueSoftness from "@/pages/league-softness";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -36,6 +37,7 @@ function Router() {
         <Route path="/experiments" component={Experiments} />
         <Route path="/alerts" component={Alerts} />
         <Route path="/launch" component={Launch} />
+        <Route path="/softness" component={LeagueSoftness} />
         <Route component={NotFound} />
       </Switch>
     </Layout>

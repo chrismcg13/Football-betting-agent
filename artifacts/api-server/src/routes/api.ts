@@ -511,6 +511,147 @@ router.get("/dashboard/bets/by-league", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// GET /api/dashboard/league-softness
+// ─────────────────────────────────────────────
+// Per-league CLV-weighted view of where our edge actually exists on the
+// exchange. CLV is the cleanest soft-money signal: high CLV means the market
+// subsequently agreed with our price = soft counterparty. Live bets only.
+// Query params: ?days=30  ?minBets=3
+router.get("/dashboard/league-softness", async (req, res) => {
+  const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+  const minBets = Math.max(1, Number(req.query.minBets) || 1);
+  const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const rows = await db
+    .select({
+      league: matchesTable.league,
+      status: paperBetsTable.status,
+      stake: paperBetsTable.stake,
+      settlementPnl: paperBetsTable.settlementPnl,
+      clvPct: paperBetsTable.clvPct,
+      clvDataQuality: paperBetsTable.clvDataQuality,
+      calculatedEdge: paperBetsTable.calculatedEdge,
+      betfairBetId: paperBetsTable.betfairBetId,
+      placementOdds: paperBetsTable.oddsAtPlacement,
+      matchedOdds: paperBetsTable.betfairAvgPriceMatched,
+    })
+    .from(paperBetsTable)
+    .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        gte(paperBetsTable.placedAt, sinceDate),
+        isNotNull(paperBetsTable.betfairBetId), // live bets only
+      ),
+    );
+
+  type Agg = {
+    placed: number;
+    settled: number;
+    wins: number;
+    losses: number;
+    stake: number;
+    pnl: number;
+    clvSum: number;
+    clvCount: number;
+    clvCompleteCount: number;
+    edgeSum: number;
+    edgeCount: number;
+    slipSum: number;
+    slipCount: number;
+  };
+
+  const groups = new Map<string, Agg>();
+  for (const r of rows) {
+    const key = r.league ?? "Unknown";
+    const a = groups.get(key) ?? {
+      placed: 0, settled: 0, wins: 0, losses: 0, stake: 0, pnl: 0,
+      clvSum: 0, clvCount: 0, clvCompleteCount: 0,
+      edgeSum: 0, edgeCount: 0, slipSum: 0, slipCount: 0,
+    };
+    a.placed += 1;
+    if (r.status === "won" || r.status === "lost") {
+      a.settled += 1;
+      if (r.status === "won") a.wins += 1; else a.losses += 1;
+      a.stake += Number(r.stake);
+      a.pnl += Number(r.settlementPnl ?? 0);
+    }
+    if (r.clvPct != null) {
+      a.clvSum += Number(r.clvPct);
+      a.clvCount += 1;
+    }
+    if (r.clvDataQuality === "complete") a.clvCompleteCount += 1;
+    if (r.calculatedEdge != null) {
+      a.edgeSum += Number(r.calculatedEdge) * 100;
+      a.edgeCount += 1;
+    }
+    const matched = Number(r.matchedOdds);
+    const placement = Number(r.placementOdds);
+    // Skip slippage for unmatched (matched=0) anomalies
+    if (matched > 0 && placement > 0) {
+      a.slipSum += matched - placement;
+      a.slipCount += 1;
+    }
+    groups.set(key, a);
+  }
+
+  const result = Array.from(groups.entries())
+    .filter(([, a]) => a.placed >= minBets)
+    .map(([league, a]) => {
+      const winRate = a.settled > 0 ? (a.wins / a.settled) * 100 : 0;
+      const roi = a.stake > 0 ? (a.pnl / a.stake) * 100 : 0;
+      const avgClv = a.clvCount > 0 ? a.clvSum / a.clvCount : null;
+      const clvCoverage = a.placed > 0 ? (a.clvCompleteCount / a.placed) * 100 : 0;
+      const avgEdge = a.edgeCount > 0 ? a.edgeSum / a.edgeCount : null;
+      const avgSlip = a.slipCount > 0 ? a.slipSum / a.slipCount : null;
+      // Softness score: weighted combination of CLV (primary) + ROI fragments + sample
+      // CLV in [-50, +50] mapped to score; absent CLV penalised; small sample penalised
+      const sampleWeight = Math.min(1, a.placed / 20);
+      const clvScore = avgClv != null ? Math.max(-50, Math.min(80, avgClv)) : -10;
+      const roiBonus = a.settled >= 5 ? Math.max(-30, Math.min(30, roi / 2)) : 0;
+      const softness = Math.round((clvScore * 0.7 + roiBonus * 0.3) * sampleWeight * 10) / 10;
+      return {
+        league,
+        placed: a.placed,
+        settled: a.settled,
+        wins: a.wins,
+        losses: a.losses,
+        winRate: Math.round(winRate * 10) / 10,
+        stake: Math.round(a.stake * 100) / 100,
+        pnl: Math.round(a.pnl * 100) / 100,
+        roi: Math.round(roi * 10) / 10,
+        avgClv: avgClv != null ? Math.round(avgClv * 100) / 100 : null,
+        clvCoveragePct: Math.round(clvCoverage * 10) / 10,
+        avgEdgePct: avgEdge != null ? Math.round(avgEdge * 10) / 10 : null,
+        avgSlippage: avgSlip != null ? Math.round(avgSlip * 1000) / 1000 : null,
+        softnessScore: softness,
+      };
+    })
+    .sort((a, b) => b.softnessScore - a.softnessScore);
+
+  res.json({
+    windowDays: days,
+    minBets,
+    totalLeagues: result.length,
+    leagues: result,
+  });
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/capture-pinnacle-snapshots
+// Manual trigger for the multi-snapshot Pinnacle ingestion (T-60/30/15/5)
+// ─────────────────────────────────────────────
+router.post("/admin/capture-pinnacle-snapshots", async (_req, res) => {
+  try {
+    const { captureAllPendingSnapshots } = await import("../services/oddsPapi");
+    const result = await captureAllPendingSnapshots();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual capture-pinnacle-snapshots failed");
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
 // GET /api/dashboard/bets/by-market
 // ─────────────────────────────────────────────
 router.get("/dashboard/bets/by-market", async (req, res) => {

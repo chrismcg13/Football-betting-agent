@@ -3245,7 +3245,7 @@ export async function storePinnacleSnapshot(params: {
   matchId: number;
   marketType: string;
   selectionName: string;
-  snapshotType: "identification" | "pre_kickoff" | "closing";
+  snapshotType: "identification" | "pre_kickoff" | "closing" | "t60" | "t30" | "t15" | "t5";
   pinnacleOdds: number;
 }): Promise<void> {
   const pinnacleImplied = params.pinnacleOdds > 1 ? 1 / params.pinnacleOdds : null;
@@ -3391,6 +3391,164 @@ export async function fetchPreKickoffSnapshots(): Promise<{
 
   logger.info({ checked: pendingBets.length, captured, skipped }, "Pre-kickoff snapshot B complete");
   return { checked: pendingBets.length, captured, skipped };
+}
+
+// ─── Multi-snapshot Pinnacle ingestion ────────────────────────────────────────
+// Captures Pinnacle odds for pending bets at granular time-to-kickoff buckets.
+// Buckets: t60 (55-65min), t30 (25-35min), t15 (12-18min), t5 (3-7min before KO).
+// Each bet gets ONE snapshot per bucket (idempotent on bet_id + snapshot_type).
+// This data feeds: (a) "Pinnacle velocity" — did the price move toward us?,
+// (b) richer CLV — closing-line proxy when the official closing snapshot fails,
+// (c) future placement gate (steam confirmation / reverse-signal abort).
+
+export type SnapshotBucket = "t60" | "t30" | "t15" | "t5";
+
+const BUCKET_WINDOWS: Record<SnapshotBucket, { minMin: number; maxMin: number }> = {
+  t60: { minMin: 55, maxMin: 65 },
+  t30: { minMin: 25, maxMin: 35 },
+  t15: { minMin: 12, maxMin: 18 },
+  t5:  { minMin: 3,  maxMin: 7  },
+};
+
+export async function captureSnapshotForBucket(bucket: SnapshotBucket): Promise<{
+  bucket: SnapshotBucket;
+  checked: number;
+  captured: number;
+  skipped: number;
+}> {
+  const key = process.env.ODDSPAPI_KEY;
+  if (!key) return { bucket, checked: 0, captured: 0, skipped: 0 };
+
+  const window = BUCKET_WINDOWS[bucket];
+  const now = new Date();
+  const earliestKO = new Date(now.getTime() + window.minMin * 60 * 1000);
+  const latestKO   = new Date(now.getTime() + window.maxMin * 60 * 1000);
+
+  const pendingBets = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+    })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        sql`${matchesTable.kickoffTime} >= ${earliestKO}`,
+        sql`${matchesTable.kickoffTime} <= ${latestKO}`,
+      ),
+    );
+
+  if (pendingBets.length === 0) return { bucket, checked: 0, captured: 0, skipped: 0 };
+
+  // Idempotency: skip bets that already have this bucket captured
+  const existing = await db
+    .select({ betId: pinnacleOddsSnapshotsTable.betId })
+    .from(pinnacleOddsSnapshotsTable)
+    .where(
+      and(
+        inArray(pinnacleOddsSnapshotsTable.betId, pendingBets.map((b) => b.id)),
+        eq(pinnacleOddsSnapshotsTable.snapshotType, bucket),
+      ),
+    );
+  const alreadyHave = new Set(existing.map((s) => s.betId));
+  const needCapture = pendingBets.filter((b) => !alreadyHave.has(b.id));
+
+  if (needCapture.length === 0) return { bucket, checked: pendingBets.length, captured: 0, skipped: 0 };
+
+  logger.info({ bucket, count: needCapture.length }, `Multi-snapshot ${bucket}: capturing Pinnacle odds`);
+
+  let captured = 0;
+  let skipped = 0;
+
+  // Group by matchId to deduplicate fetches (and by market for the request)
+  const byMatchMarket = new Map<string, typeof needCapture>();
+  for (const bet of needCapture) {
+    const k = `${bet.matchId}:${bet.marketType}`;
+    const grp = byMatchMarket.get(k) ?? [];
+    grp.push(bet);
+    byMatchMarket.set(k, grp);
+  }
+
+  for (const [k, bets] of byMatchMarket) {
+    const matchId = bets[0].matchId;
+    const marketType = bets[0].marketType;
+
+    const oddspapiId = await getOddspapiFixtureId(matchId);
+    if (!oddspapiId) { skipped += bets.length; continue; }
+
+    if (!(await canMakeOddspapiRequest(1, "P3"))) {
+      logger.warn({ bucket }, `Multi-snapshot ${bucket}: P3 budget exhausted — stopping`);
+      skipped += bets.length;
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, 2400));
+
+    const marketId = MARKET_IDS[marketType] ?? 101;
+    const rawData = await fetchOddsPapi<RawOddsResponse>(
+      "/odds",
+      { fixtureId: oddspapiId, marketId },
+      `snapshot_${bucket}`,
+      "P3",
+    );
+
+    if (!rawData) { skipped += bets.length; continue; }
+
+    const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+    const pinnacleBySelection: Record<string, number> = {};
+    for (const bm of bookmakers) {
+      const slug = getBookmakerSlug(bm);
+      if (!slug.includes("pinnacle")) continue;
+      const selections = extractSelections(bm);
+      for (const selName of getGenericSelectionKeys(marketType)) {
+        const odds = getSelectionOdds(selections, marketType, selName);
+        if (odds) pinnacleBySelection[selName] = odds;
+      }
+    }
+
+    for (const bet of bets) {
+      try {
+        const genericKey = normaliseSelectionToGenericKey(bet.selectionName, marketType);
+        const pinnOdds = pinnacleBySelection[genericKey];
+        if (!pinnOdds) { skipped++; continue; }
+
+        await storePinnacleSnapshot({
+          betId: bet.id,
+          matchId,
+          marketType: bet.marketType,
+          selectionName: bet.selectionName,
+          snapshotType: bucket,
+          pinnacleOdds: pinnOdds,
+        });
+        captured++;
+      } catch (err) {
+        logger.error({ err, betId: bet.id, matchId, bucket }, `Multi-snapshot ${bucket} error — skipping bet`);
+        skipped++;
+      }
+    }
+  }
+
+  logger.info({ bucket, checked: pendingBets.length, captured, skipped }, `Multi-snapshot ${bucket} complete`);
+  return { bucket, checked: pendingBets.length, captured, skipped };
+}
+
+export async function captureAllPendingSnapshots(): Promise<{
+  buckets: Array<{ bucket: SnapshotBucket; checked: number; captured: number; skipped: number }>;
+}> {
+  const results = [];
+  for (const bucket of ["t60", "t30", "t15", "t5"] as SnapshotBucket[]) {
+    try {
+      const r = await captureSnapshotForBucket(bucket);
+      results.push(r);
+    } catch (err) {
+      logger.warn({ err, bucket }, "captureAllPendingSnapshots: bucket failed — continuing");
+      results.push({ bucket, checked: 0, captured: 0, skipped: 0 });
+    }
+  }
+  return { buckets: results };
 }
 
 // ─── Line Movement Tracking ────────────────────────────────────────────────────

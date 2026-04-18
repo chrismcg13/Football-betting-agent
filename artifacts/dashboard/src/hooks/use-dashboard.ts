@@ -48,6 +48,14 @@ export const useBetsByLeague = () => {
   });
 };
 
+export const useLeagueSoftness = (days = 30, minBets = 1) => {
+  return useQuery({
+    queryKey: ["dashboard", "league-softness", { days, minBets }],
+    queryFn: () => fetcher(`/api/dashboard/league-softness?days=${days}&minBets=${minBets}`),
+    refetchInterval: 120000,
+  });
+};
+
 export const useBetsByMarket = () => {
   return useQuery({
     queryKey: ["dashboard", "bets", "by-market"],

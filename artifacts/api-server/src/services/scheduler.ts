@@ -38,6 +38,7 @@ import {
   selectionNameVariants,
   derivePinnacleDCFromMatchOdds,
   backfillPinnacleUnified,
+  captureAllPendingSnapshots,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets, fetchAndStoreOddsForAllUpcoming } from "./apiFootball";
@@ -1445,6 +1446,21 @@ export function startScheduler(): void {
       .catch((err) => logger.warn({ err }, "Pre-kickoff snapshot B failed — non-fatal"));
   }, { timezone: "UTC" });
   logger.info("Pre-kickoff snapshot B cron active — every 15 minutes (1hr before kickoff)");
+
+  // Multi-snapshot Pinnacle ingestion: every 5 minutes
+  // Captures granular T-60 / T-30 / T-15 / T-5 Pinnacle snapshots per pending bet.
+  // Each bucket is idempotent (one snapshot per bet per bucket), giving us a
+  // velocity series that powers steam detection, reverse-signal aborts, and
+  // proper closing-line proxies when the official closing fetch fails.
+  cron.schedule("*/5 * * * *", () => {
+    void captureAllPendingSnapshots()
+      .then((r) => {
+        const total = r.buckets.reduce((s, b) => s + b.captured, 0);
+        if (total > 0) logger.info({ buckets: r.buckets, totalCaptured: total }, "Multi-snapshot Pinnacle cron complete");
+      })
+      .catch((err) => logger.warn({ err }, "Multi-snapshot Pinnacle cron failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Multi-snapshot Pinnacle cron active — every 5 minutes (T-60/T-30/T-15/T-5 buckets)");
 
   // Line movement tracker: every 4 hours
   // Tracks how Pinnacle odds move for fixtures with pending bets
