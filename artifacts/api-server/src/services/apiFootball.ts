@@ -960,7 +960,11 @@ async function detectAndLogLineMovement(
         direction = "drifting"; // odds getting longer = selection less likely
       }
 
-      // Log significant line movements (> 5%)
+      // Log significant line movements (> 5%) to file logs only.
+      // The full structured record is persisted in odds_history below
+      // (oddsChangePct + direction + previousOdds), so the dashboard reads
+      // significant movements directly from there. Writing duplicates into
+      // compliance_logs was bloating that table by ~120k rows/day.
       if (Math.abs(oddsChangePct) >= 5) {
         logger.info(
           {
@@ -969,14 +973,6 @@ async function detectAndLogLineMovement(
           },
           "Significant line movement detected",
         );
-        await db.insert(complianceLogsTable).values({
-          actionType: "line_movement",
-          details: {
-            matchId, marketType, selectionName, bookmaker,
-            prevOdds, currentOdds, oddsChangePct, direction, hoursToKickoff,
-          },
-          timestamp: now,
-        });
       }
     }
 
@@ -1462,13 +1458,16 @@ export async function getLineMovementsToday(): Promise<number> {
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
 
+  // Read significant movements directly from odds_history, which already
+  // stores oddsChangePct + direction per snapshot. Threshold matches the
+  // detect-and-log writer in detectAndLogLineMovement (>= 5% absolute change).
   const rows = await db
     .select({ count: sql<number>`count(*)::int` })
-    .from(complianceLogsTable)
+    .from(oddsHistoryTable)
     .where(
       and(
-        eq(complianceLogsTable.actionType, "line_movement"),
-        gte(complianceLogsTable.timestamp, todayStart),
+        gte(oddsHistoryTable.snapshotTime, todayStart),
+        sql`abs(${oddsHistoryTable.oddsChangePct}) >= 5`,
       ),
     );
 

@@ -4,7 +4,7 @@
  * and provides momentum signals for the prediction models.
  */
 
-import { db, oddsHistoryTable, matchesTable, oddsSnapshotsTable, complianceLogsTable } from "@workspace/db";
+import { db, oddsHistoryTable, matchesTable, oddsSnapshotsTable } from "@workspace/db";
 import { eq, and, gte, desc, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
@@ -78,43 +78,54 @@ export async function getOddsMomentum(
   return { momentum, direction, changePct, isSignificant };
 }
 
-/** Get all significant line movements for today's dashboard */
+/** Get all significant line movements for today's dashboard.
+ *  Reads from odds_history (the canonical store of every snapshot, which
+ *  already has oddsChangePct + direction + previousOdds + hoursToKickoff).
+ *  Joins matches for home/away team labels.
+ */
 export async function getTodayLineMovements(): Promise<LineMovementSummary[]> {
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
 
   const rows = await db
     .select({
-      matchId: complianceLogsTable.details,
-      timestamp: complianceLogsTable.timestamp,
+      matchId: oddsHistoryTable.matchId,
+      marketType: oddsHistoryTable.marketType,
+      selectionName: oddsHistoryTable.selectionName,
+      previousOdds: oddsHistoryTable.previousOdds,
+      odds: oddsHistoryTable.odds,
+      oddsChangePct: oddsHistoryTable.oddsChangePct,
+      direction: oddsHistoryTable.direction,
+      hoursToKickoff: oddsHistoryTable.hoursToKickoff,
+      snapshotTime: oddsHistoryTable.snapshotTime,
+      homeTeam: matchesTable.homeTeam,
+      awayTeam: matchesTable.awayTeam,
     })
-    .from(complianceLogsTable)
+    .from(oddsHistoryTable)
+    .leftJoin(matchesTable, eq(oddsHistoryTable.matchId, matchesTable.id))
     .where(
       and(
-        eq(complianceLogsTable.actionType, "line_movement"),
-        gte(complianceLogsTable.timestamp, todayStart),
+        gte(oddsHistoryTable.snapshotTime, todayStart),
+        sql`abs(${oddsHistoryTable.oddsChangePct}) >= 5`,
       ),
     )
-    .orderBy(desc(complianceLogsTable.timestamp))
+    .orderBy(desc(oddsHistoryTable.snapshotTime))
     .limit(50);
 
-  return rows.map((r) => {
-    const d = r.matchId as Record<string, unknown>;
-    return {
-      matchId: (d.matchId as number) ?? 0,
-      homeTeam: (d.homeTeam as string) ?? "",
-      awayTeam: (d.awayTeam as string) ?? "",
-      marketType: (d.marketType as string) ?? "",
-      selectionName: (d.selectionName as string) ?? "",
-      oddsAtFirstSeen: (d.prevOdds as number) ?? 0,
-      oddsAtLatest: (d.currentOdds as number) ?? 0,
-      oddsChangePct: (d.oddsChangePct as number) ?? 0,
-      direction: (d.direction as string) ?? "stable",
-      snapshotCount: 2,
-      hoursToKickoff: (d.hoursToKickoff as number) ?? 0,
-      isSignificant: true,
-    };
-  });
+  return rows.map((r) => ({
+    matchId: r.matchId ?? 0,
+    homeTeam: r.homeTeam ?? "",
+    awayTeam: r.awayTeam ?? "",
+    marketType: r.marketType ?? "",
+    selectionName: r.selectionName ?? "",
+    oddsAtFirstSeen: r.previousOdds != null ? Number(r.previousOdds) : 0,
+    oddsAtLatest: Number(r.odds),
+    oddsChangePct: r.oddsChangePct != null ? Number(r.oddsChangePct) : 0,
+    direction: r.direction ?? "stable",
+    snapshotCount: 2,
+    hoursToKickoff: r.hoursToKickoff != null ? Number(r.hoursToKickoff) : 0,
+    isSignificant: true,
+  }));
 }
 
 /** Get odds history sparkline for a specific match+market+selection */
@@ -147,18 +158,20 @@ export async function getOddsSparkline(
   }));
 }
 
-/** Get count of significant line movements today */
+/** Get count of significant line movements today.
+ *  Reads from odds_history (>= 5% absolute change matches the writer threshold).
+ */
 export async function getLineMovementsCountToday(): Promise<number> {
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
 
   const rows = await db
     .select({ count: sql<number>`count(*)::int` })
-    .from(complianceLogsTable)
+    .from(oddsHistoryTable)
     .where(
       and(
-        eq(complianceLogsTable.actionType, "line_movement"),
-        gte(complianceLogsTable.timestamp, todayStart),
+        gte(oddsHistoryTable.snapshotTime, todayStart),
+        sql`abs(${oddsHistoryTable.oddsChangePct}) >= 5`,
       ),
     );
 

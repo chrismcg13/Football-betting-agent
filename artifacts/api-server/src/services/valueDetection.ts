@@ -950,9 +950,10 @@ export async function detectValueBets(options?: {
       ? "synthetic"
       : (realOddsRows[0]?.source ?? "api_football_real").replace("api_football_real:", "");
 
-    complianceBuffer.push({
-      actionType: "value_detection_odds_source",
-      details: {
+    // Runtime telemetry (not audit). Was being persisted into compliance_logs
+    // at ~1k rows/cycle and bloating that table; now goes to file logs only.
+    logger.debug(
+      {
         matchId: match.id,
         homeTeam: match.homeTeam,
         awayTeam: match.awayTeam,
@@ -960,8 +961,8 @@ export async function detectValueBets(options?: {
         isSynthetic,
         oddsRowCount: oddsSource.length,
       },
-      timestamp: new Date(),
-    });
+      "value_detection_odds_source",
+    );
 
     const latestOdds = new Map<string, OddsRow>();
     for (const row of oddsSource) {
@@ -1084,9 +1085,10 @@ export async function detectValueBets(options?: {
       const effectiveMinScore = minOppScore;
       const decision = opportunityScore >= effectiveMinScore ? "value_bet" : "skip_low_score";
 
-      complianceBuffer.push({
-        actionType: "value_detection_evaluation",
-        details: {
+      // Runtime telemetry (not audit). Was being persisted into compliance_logs
+      // at ~5k rows/cycle and bloating that table; now goes to file logs only.
+      logger.debug(
+        {
           matchId: match.id,
           homeTeam: match.homeTeam,
           awayTeam: match.awayTeam,
@@ -1105,8 +1107,8 @@ export async function detectValueBets(options?: {
           oddsSource: oddsSourceLabel,
           modelVersion,
         },
-        timestamp: new Date(),
-      });
+        "value_detection_evaluation",
+      );
 
       if (opportunityScore >= effectiveMinScore) {
         byMarketType[oddsRow.marketType] = (byMarketType[oddsRow.marketType] ?? 0) + 1;
