@@ -1935,6 +1935,41 @@ router.post("/admin/resume-agent", async (_req, res) => {
   }
 });
 
+router.post("/admin/map-betfair-events", async (req, res) => {
+  try {
+    const hours = Math.max(1, Math.min(168, Number(req.query["hours"] ?? req.body?.hours ?? 72)));
+    const { mapBetfairEventsToFixtures, analysePaperOnlyCoverage } = await import("../services/betfairEventMapping");
+    const before = await analysePaperOnlyCoverage();
+    const stats = await mapBetfairEventsToFixtures(hours);
+    const after = await analysePaperOnlyCoverage();
+    res.json({ success: true, hours, mapping: stats, paperOnlyBefore: before, paperOnlyAfter: after });
+  } catch (err) {
+    logger.error({ err }, "Betfair event mapping failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/paper-only-coverage", async (_req, res) => {
+  try {
+    const { analysePaperOnlyCoverage } = await import("../services/betfairEventMapping");
+    res.json({ success: true, coverage: await analysePaperOnlyCoverage() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/market-availability-analysis", async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(300, Number(req.query["limit"] ?? 100)));
+    const { analyseMarketAvailability } = await import("../services/betfairEventMapping");
+    const report = await analyseMarketAvailability(limit);
+    res.json({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "Market availability analysis failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.get("/admin/live-balance", async (_req, res) => {
   try {
     const balance = getCachedBalance();

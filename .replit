@@ -90,6 +90,7 @@ BETFAIR_IDENTITY_PROXY_URL = "http://209.38.164.154:3001/identity"
 DEV_DATABASE_URL = "postgresql://postgres:password@helium/heliumdb?sslmode=disable"
 ENVIRONMENT = "production"
 TRADING_MODE = "LIVE"
+ENABLE_BETFAIR_PRECHECK = "true"
 
 [userenv.production]
 SHARED_DATABASE_URL = ""

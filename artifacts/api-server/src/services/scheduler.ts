@@ -1368,6 +1368,31 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("OddsPapi fixture mapping scheduler active — every 6 hours UTC");
 
+  // Betfair event mapping: every 6 hours (offset by 15 min to spread API load)
+  // Populates matches.betfair_event_id for upcoming fixtures so the precheck
+  // can skip genuinely unlisted events instead of failing at placement time.
+  cron.schedule("20 */6 * * *", () => {
+    logger.info("Betfair event mapping triggered by scheduler");
+    void trackCronExecution("betfair_event_map", async () => {
+      const { mapBetfairEventsToFixtures } = await import("./betfairEventMapping");
+      const stats = await mapBetfairEventsToFixtures(72);
+      logger.info(stats, "Betfair event mapping stats");
+      return stats.fixturesUpdated;
+    }).catch((err) => logger.error({ err }, "Betfair event mapping failed"));
+  }, { timezone: "UTC" });
+  logger.info("Betfair event mapping scheduler active — every 6 hours UTC");
+
+  // Run once on startup (after a short delay so other warmup jobs settle first)
+  setTimeout(() => {
+    logger.info("Betfair event mapping — startup run");
+    void trackCronExecution("betfair_event_map", async () => {
+      const { mapBetfairEventsToFixtures } = await import("./betfairEventMapping");
+      const stats = await mapBetfairEventsToFixtures(72);
+      logger.info(stats, "Betfair event mapping startup stats");
+      return stats.fixturesUpdated;
+    }).catch((err) => logger.error({ err }, "Betfair event mapping startup failed"));
+  }, 45_000);
+
   // OddsPapi bulk prefetch: every 4 hours (100k monthly budget)
   // Fetches 7 days of Pinnacle odds for all mapped fixtures.
   cron.schedule("10 */4 * * *", () => {
