@@ -690,16 +690,21 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   CORRECT_SCORE: "CORRECT_SCORE",
   FIRST_HALF_OU_05: "FIRST_HALF_GOALS_05",
   FIRST_HALF_OU_15: "FIRST_HALF_GOALS_15",
+  // Cards markets — Betfair Exchange uses OVER_UNDER_<line>_CARDS naming
+  TOTAL_CARDS_25: "OVER_UNDER_25_CARDS",
+  TOTAL_CARDS_35: "OVER_UNDER_35_CARDS",
+  TOTAL_CARDS_45: "OVER_UNDER_45_CARDS",
+  TOTAL_CARDS_55: "OVER_UNDER_55_CARDS",
+  // Half-time result — Betfair calls it HALF_TIME (1/X/2 outcomes for H1)
+  FIRST_HALF_RESULT: "HALF_TIME",
 };
 
 const NON_EXCHANGE_MARKETS = new Set([
+  // Corners markets are still missing Exchange equivalents (sportsbook only)
   "TOTAL_CORNERS_85",
   "TOTAL_CORNERS_95",
   "TOTAL_CORNERS_105",
   "TOTAL_CORNERS_115",
-  "TOTAL_CARDS_35",
-  "TOTAL_CARDS_45",
-  "TOTAL_CARDS_55",
 ]);
 
 interface MarketCatalogueItem {
