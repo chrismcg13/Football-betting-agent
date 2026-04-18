@@ -3,7 +3,8 @@ import { logger } from "../lib/logger";
 import { runDataIngestion } from "./dataIngestion";
 import { runFeatureEngineForUpcomingMatches } from "./featureEngine";
 import { detectValueBets } from "./valueDetection";
-import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets, backfillCornersCardsStats } from "./paperTrading";
+import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets, backfillCornersCardsStats, getConfigValue, setConfigValue } from "./paperTrading";
+import { ABSOLUTE_BANKROLL_FLOOR_GBP, checkLiveCircuitBreakers, getAvailableBalance } from "./liveRiskManager";
 import { isLiveMode, listMarketsByEventId, MARKET_TYPE_MAP as BETFAIR_MARKET_TYPE_MAP } from "./betfairLive";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
@@ -1342,6 +1343,71 @@ export function startScheduler(): void {
       });
   }, { timezone: "UTC" });
   logger.info("Trading cycle (FAR) scheduler active — every 30 minutes, fixtures 48h–168h");
+
+  // Auto-resume watchdog: every 5 minutes, check whether a `floor_halt` pause
+  // (available cash dipped below the £50 absolute floor) can now be cleared.
+  // Only auto-resumes pauses tagged with reason='floor_halt'; manual pauses
+  // and consecutive-loss `halt` pauses are left alone. Requires available
+  // cash to have recovered to ≥ 2× the floor (£100) to provide headroom and
+  // prevent flapping. Re-runs the full circuit-breaker check to ensure no
+  // other condition (e.g. consecutive losses, timed pause) is also active.
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const status = await getAgentStatus();
+        if (status === "running") {
+          // Already running — clear any stale pause tags.
+          const stale = await getConfigValue("pause_reason");
+          if (stale) {
+            await setConfigValue("pause_reason", "");
+            await setConfigValue("paused_at", "");
+          }
+          return;
+        }
+        if (status !== "paused") return;
+
+        const reason = await getConfigValue("pause_reason");
+        if (reason !== "floor_halt") {
+          return; // Only auto-resume bankroll-floor pauses.
+        }
+
+        if (!isLiveMode()) return;
+
+        const available = await getAvailableBalance();
+        const resumeThreshold = ABSOLUTE_BANKROLL_FLOOR_GBP * 2;
+        if (available < resumeThreshold) {
+          logger.info(
+            { available, resumeThreshold, floor: ABSOLUTE_BANKROLL_FLOOR_GBP },
+            "Auto-resume watchdog: cash still below 2× floor — staying paused",
+          );
+          return;
+        }
+
+        // Double-check no other circuit breaker is active.
+        const cb = await checkLiveCircuitBreakers();
+        if (cb.triggered) {
+          logger.warn(
+            { available, cbAction: cb.action, cbReason: cb.reason },
+            "Auto-resume watchdog: cash recovered but another circuit breaker is active — staying paused",
+          );
+          return;
+        }
+
+        const pausedAtStr = await getConfigValue("paused_at");
+        await setConfigValue("agent_status", "running");
+        await setConfigValue("pause_reason", "");
+        await setConfigValue("paused_at", "");
+        logger.info(
+          { available, resumeThreshold, pausedAt: pausedAtStr },
+          "Auto-resume watchdog: bankroll recovered above 2× floor — agent resumed",
+        );
+
+      } catch (err) {
+        logger.error({ err }, "Auto-resume watchdog failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Auto-resume watchdog active — every 5 minutes (resumes floor_halt pauses when cash ≥ 2× floor)");
 
   // API-Football: fetch real odds every 2 hours — fresh odds for every trading cycle
   // With 75,000 req/day budget, each scan uses ~30-50 reqs, plenty of headroom

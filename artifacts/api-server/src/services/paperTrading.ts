@@ -482,6 +482,12 @@ export async function placePaperBet(
     const action = liveCircuitBreaker.action;
     if (action === "halt" || action === "floor_halt") {
       await setConfigValue("agent_status", "paused");
+      // Tag the pause so the auto-resume watchdog (scheduler.ts) knows
+      // whether this is recoverable. Only `floor_halt` (cash dipped below
+      // the £50 absolute floor) auto-resumes once cash recovers; `halt`
+      // (consecutive-loss kill-switch) requires manual restart.
+      await setConfigValue("pause_reason", action);
+      await setConfigValue("paused_at", new Date().toISOString());
     }
     return logReject(`Live circuit breaker: ${liveCircuitBreaker.reason}`);
   }
