@@ -1239,7 +1239,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
 
     const stake = Number(bet.stake);
     const odds = Number(bet.oddsAtPlacement);
-    const outcome = determineBetWon(
+    let outcome = determineBetWon(
       bet.marketType,
       bet.selectionName,
       match.homeScore,
@@ -1247,7 +1247,33 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       { totalCorners: match.totalCorners ?? null, totalCards: match.totalCards ?? null },
     );
 
-    // null = void (data unavailable) — refund stake, no PnL impact
+    // ─── Real-money unmatched-bet guard (Apr 18 2026) ──────────────────
+    // If this is a Betfair real-money bet (betfairBetId present) and the
+    // matched size is zero (offer placed but never filled, then cancelled
+    // at kickoff), no actual position was ever taken — real-money P/L is
+    // £0. Force the outcome to void regardless of the match result so we
+    // don't credit a phantom win/loss based on placement stake. Bug fix:
+    // previously bets like #90 (matched=£0, won by result) were credited
+    // the full notional payout even though no money was wagered.
+    const matchedSize = Number(bet.betfairSizeMatched ?? 0);
+    if (bet.betfairBetId && matchedSize <= 0) {
+      logger.warn(
+        {
+          betId: bet.id,
+          betfairBetId: bet.betfairBetId,
+          marketType: bet.marketType,
+          selectionName: bet.selectionName,
+          matchedSize,
+          stake: Number(bet.stake),
+          determinedOutcome: outcome,
+        },
+        "Real-money bet has zero matched size — voiding settlement (no actual Betfair position taken)",
+      );
+      outcome = null;
+    }
+    // ───────────────────────────────────────────────────────────────────
+
+    // null = void (data unavailable or unmatched) — refund stake, no PnL impact
     const isVoid = outcome === null;
     const betWon = outcome === true;
 
