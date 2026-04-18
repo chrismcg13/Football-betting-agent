@@ -85,6 +85,25 @@ async function updateHighWaterMark(bankroll: number): Promise<number> {
   return current;
 }
 
+// Returns TOTAL WEALTH (available + |exposure|) in live mode, falling back to
+// the configured paper bankroll. This is the correct denominator for HWM /
+// drawdown checks — counting only "available" treats normal in-flight
+// exposure as if it were a realised loss and mis-fires daily/weekly breakers
+// (same bug pattern as the catastrophic-drawdown fix at line 244-249, and
+// the available-vs-total bugs fixed across the codebase on Apr 17-18 2026).
+async function getTotalWealthForRisk(): Promise<number> {
+  try {
+    const { isLiveMode, getAccountFunds } = await import("./betfairLive");
+    if (isLiveMode()) {
+      const funds = await getAccountFunds();
+      return (funds.availableToBetBalance ?? 0) + Math.abs(funds.exposure ?? 0);
+    }
+  } catch {
+    // Fall through to paper bankroll
+  }
+  return await getBankroll();
+}
+
 async function getTodaysSettledLoss(): Promise<number> {
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
@@ -158,8 +177,11 @@ export async function checkDailyLoss(): Promise<boolean> {
     return false;
   }
 
-  const hwm = await updateHighWaterMark(bankroll);
-  const drawdown = hwm > 0 ? ((hwm - bankroll) / hwm) * 100 : 0;
+  // Use TOTAL WEALTH as the denominator. Available cash alone treats normal
+  // in-flight exposure as a realised loss and mis-fires the breaker.
+  const totalWealth = await getTotalWealthForRisk();
+  const hwm = await updateHighWaterMark(totalWealth);
+  const drawdown = hwm > 0 ? ((hwm - totalWealth) / hwm) * 100 : 0;
   const dailyLimitPct = Number((await getConfigValue("daily_drawdown_limit_pct")) ?? "10");
 
   if (drawdown >= dailyLimitPct) {
@@ -167,12 +189,13 @@ export async function checkDailyLoss(): Promise<boolean> {
     if (todayNet < 0) {
       await setAgentStatus("paused_daily", "Daily net drawdown limit reached", {
         highWaterMark: hwm,
+        currentTotalWealth: totalWealth,
         currentBankroll: bankroll,
         drawdownPct: drawdown,
         dailyLimitPct,
         todayNetPnl: todayNet,
       });
-      await logDrawdownEvent("daily_drawdown_trigger", hwm, bankroll, drawdown, dailyLimitPct, false,
+      await logDrawdownEvent("daily_drawdown_trigger", hwm, totalWealth, drawdown, dailyLimitPct, false,
         { todayNetPnl: todayNet });
       return true;
     }
@@ -199,8 +222,10 @@ export async function checkWeeklyLoss(): Promise<boolean> {
     return false;
   }
 
-  const hwm = await updateHighWaterMark(bankroll);
-  const drawdown = hwm > 0 ? ((hwm - bankroll) / hwm) * 100 : 0;
+  // Use TOTAL WEALTH as the denominator (see checkDailyLoss for rationale).
+  const totalWealth = await getTotalWealthForRisk();
+  const hwm = await updateHighWaterMark(totalWealth);
+  const drawdown = hwm > 0 ? ((hwm - totalWealth) / hwm) * 100 : 0;
   const weeklyLimitPct = Number((await getConfigValue("weekly_drawdown_limit_pct")) ?? "20");
 
   if (drawdown >= weeklyLimitPct) {
@@ -208,12 +233,13 @@ export async function checkWeeklyLoss(): Promise<boolean> {
     if (weeklyNet < 0) {
       await setAgentStatus("paused_weekly", "Weekly net drawdown limit reached", {
         highWaterMark: hwm,
+        currentTotalWealth: totalWealth,
         currentBankroll: bankroll,
         drawdownPct: drawdown,
         weeklyLimitPct,
         weeklyNetPnl: weeklyNet,
       });
-      await logDrawdownEvent("weekly_drawdown_trigger", hwm, bankroll, drawdown, weeklyLimitPct, false,
+      await logDrawdownEvent("weekly_drawdown_trigger", hwm, totalWealth, drawdown, weeklyLimitPct, false,
         { weeklyNetPnl: weeklyNet });
       return true;
     }
