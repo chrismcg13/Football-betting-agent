@@ -52,7 +52,7 @@ import {
 import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import { getCircuitBreakerStatus, resumeAgent } from "../services/riskManager";
-import { getCachedBalance, isLiveMode, getAccountFunds } from "../services/betfairLive";
+import { getCachedBalance, isLiveMode, getAccountFunds, cancelOrders } from "../services/betfairLive";
 import { getDataRichnessSummary } from "../services/dataRichness";
 import { getLiveOppScoreThreshold } from "../services/liveThresholdReview";
 import {
@@ -2047,6 +2047,22 @@ router.get("/admin/circuit-breaker-status", async (_req, res) => {
     });
   } catch (err) {
     logger.error({ err }, "Failed to get circuit breaker status");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/cancel-bet", async (req, res) => {
+  try {
+    const { internalBetId } = req.body;
+    if (!internalBetId) return res.status(400).json({ error: "internalBetId required" });
+    const result0 = await db.execute(sql`SELECT betfair_market_id, betfair_bet_id, betfair_status, betfair_size_matched, stake FROM paper_bets WHERE id=${internalBetId}`);
+    const rows = (result0 as any).rows ?? result0;
+    if (!rows || rows.length === 0) return res.status(404).json({ error: "bet not found" });
+    const b = rows[0];
+    if (!b.betfair_bet_id || !b.betfair_market_id) return res.status(400).json({ error: "no betfair ids" });
+    const result = await cancelOrders(b.betfair_market_id, [{ betId: b.betfair_bet_id }]);
+    res.json({ success: true, internalBetId, betfair: b, cancelResult: result });
+  } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
   }
 });

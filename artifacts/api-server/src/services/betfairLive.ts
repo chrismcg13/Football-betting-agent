@@ -370,6 +370,21 @@ export interface PlaceOrderResult {
   errorCode?: string;
 }
 
+export async function cancelOrders(
+  marketId: string,
+  instructions: { betId: string; sizeReduction?: number }[],
+): Promise<unknown> {
+  logger.warn({ marketId, instructions }, "LIVE: Cancelling order(s) on Betfair");
+  const result = await apiRequest<unknown>(
+    "betting",
+    "/cancelOrders/",
+    { marketId, instructions },
+    2,
+  );
+  logger.warn({ marketId, result }, "LIVE: Betfair cancelOrders response");
+  return result;
+}
+
 export async function placeOrders(
   marketId: string,
   instructions: PlaceInstruction[],
