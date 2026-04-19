@@ -2081,6 +2081,17 @@ router.post("/admin/set-config", async (req, res) => {
   }
 });
 
+router.post("/admin/reconcile-settlements", async (_req, res) => {
+  try {
+    const { reconcileSettlements } = await import("../services/betfairLive");
+    const result = await reconcileSettlements();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "reconcileSettlements failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/resume-agent", async (_req, res) => {
   try {
     await resumeAgent();

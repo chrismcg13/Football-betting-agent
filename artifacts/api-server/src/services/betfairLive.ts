@@ -572,8 +572,9 @@ export async function reconcileSettlements(): Promise<{
   matched: number;
   discrepancies: number;
   unmatched: number;
+  voided: number;
 }> {
-  if (!isLiveMode()) return { matched: 0, discrepancies: 0, unmatched: 0 };
+  if (!isLiveMode()) return { matched: 0, discrepancies: 0, unmatched: 0, voided: 0 };
 
   const now = new Date();
   const lookback = new Date(now.getTime() - 48 * 60 * 60 * 1000);
@@ -595,43 +596,95 @@ export async function reconcileSettlements(): Promise<{
     );
 
   if (betsWithBetfairId.length === 0) {
-    return { matched: 0, discrepancies: 0, unmatched: 0 };
+    return { matched: 0, discrepancies: 0, unmatched: 0, voided: 0 };
   }
 
   const betfairIds = betsWithBetfairId
     .map((b) => b.betfairBetId)
     .filter(Boolean) as string[];
 
-  let clearedOrders: ClearedOrder[];
+  // Query all 4 cleared-order statuses. SETTLED takes precedence if a bet
+  // appears in both SETTLED and one of {LAPSED, CANCELLED, VOIDED} (e.g. a
+  // partially-matched bet whose unmatched remainder lapsed at suspension —
+  // the SETTLED record carries the real PnL). For bets that only appear in
+  // LAPSED/CANCELLED/VOIDED, treat as a £0-PnL void: no bankroll impact
+  // (settlement-only model — pending bets were never debited).
+  const dateRange = { from: lookback.toISOString(), to: now.toISOString() };
+  const orderByBetId = new Map<
+    string,
+    { betfairStatus: "SETTLED" | "VOIDED" | "LAPSED" | "CANCELLED"; order: ClearedOrder }
+  >();
+  const statusPriority: Record<string, number> = {
+    SETTLED: 0,
+    VOIDED: 1,
+    CANCELLED: 2,
+    LAPSED: 3,
+  };
   try {
-    clearedOrders = await listClearedOrders(
-      {
-        from: lookback.toISOString(),
-        to: now.toISOString(),
-      },
-      betfairIds,
-    );
+    for (const status of ["SETTLED", "VOIDED", "LAPSED", "CANCELLED"] as const) {
+      const cleared = await listClearedOrders(dateRange, betfairIds, status);
+      for (const order of cleared) {
+        const existing = orderByBetId.get(order.betId);
+        if (!existing || statusPriority[status] < statusPriority[existing.betfairStatus]) {
+          orderByBetId.set(order.betId, { betfairStatus: status, order });
+        }
+      }
+    }
   } catch (err) {
     logger.error({ err }, "Failed to fetch cleared orders for reconciliation");
-    return { matched: 0, discrepancies: 0, unmatched: 0 };
-  }
-
-  const clearedByBetId = new Map<string, ClearedOrder>();
-  for (const order of clearedOrders) {
-    clearedByBetId.set(order.betId, order);
+    return { matched: 0, discrepancies: 0, unmatched: 0, voided: 0 };
   }
 
   let matched = 0;
   let discrepancies = 0;
   let unmatched = 0;
+  let voided = 0;
 
   for (const bet of betsWithBetfairId) {
-    const cleared = clearedByBetId.get(bet.betfairBetId!);
-    if (!cleared) {
+    const hit = orderByBetId.get(bet.betfairBetId!);
+    if (!hit) {
       unmatched++;
       continue;
     }
 
+    const { betfairStatus, order: cleared } = hit;
+
+    if (betfairStatus !== "SETTLED") {
+      // CANCELLED / LAPSED / VOIDED — never matched (or matched portion is in
+      // the SETTLED record above). Treat as a £0-PnL void of the unmatched
+      // stake. Update both betfair_* mirror fields AND the internal status,
+      // because settleBets() keys off matches.status='finished' and won't fire
+      // for bets whose markets were cancelled before kickoff.
+      const newStatus = betfairStatus === "VOIDED" ? "void" : "cancelled";
+      await db
+        .update(paperBetsTable)
+        .set({
+          betfairSettledAt: cleared.settledDate ? new Date(cleared.settledDate) : new Date(),
+          betfairPnl: "0.00",
+          betfairStatus: newStatus,
+          // Only flip internal status if still pending — never overwrite a
+          // resolved row (won/lost/cancelled/void/placement_failed).
+          ...(bet.status === "pending"
+            ? { status: newStatus, settlementPnl: bet.settlementPnl ?? "0.00", settledAt: new Date() }
+            : {}),
+        })
+        .where(eq(paperBetsTable.id, bet.id));
+
+      voided++;
+      logger.info(
+        {
+          betId: bet.id,
+          betfairBetId: bet.betfairBetId,
+          betfairStatus,
+          sizeCancelled: cleared.sizeCancelled,
+          previouslyPending: bet.status === "pending",
+        },
+        "reconcileSettlements: voided bet from Betfair non-SETTLED cleared status",
+      );
+      continue;
+    }
+
+    // SETTLED — existing real-money reconciliation path.
     // Defensive numeric coercion — Betfair occasionally returns undefined for
     // profit/commission on settled-but-zero-matched orders (cancelled-pre-match
     // edge case). Without this, `undefined - undefined = NaN` was being written
@@ -694,11 +747,11 @@ export async function reconcileSettlements(): Promise<{
   }
 
   logger.info(
-    { matched, discrepancies, unmatched },
+    { matched, discrepancies, unmatched, voided },
     "Betfair settlement reconciliation complete",
   );
 
-  return { matched, discrepancies, unmatched };
+  return { matched, discrepancies, unmatched, voided };
 }
 
 export async function runStartupHealthCheck(): Promise<{
