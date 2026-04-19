@@ -2092,6 +2092,113 @@ router.post("/admin/resume-agent", async (_req, res) => {
   }
 });
 
+// TEMPORARY route — Apr 19 2026 cleanup of stale pre-cutoff pending bets.
+// Read-only ground-truth check against Betfair listCurrentOrders. Writes the
+// full classified response to compliance_logs as an audit trail before any
+// cancellation/void action is taken. Remove after the cleanup is complete.
+router.get("/admin/betfair-ground-truth", async (_req, res) => {
+  try {
+    const { listCurrentOrders } = await import("../services/betfairLive");
+    const { paperBetsTable, complianceLogsTable, db } = await import("@workspace/db");
+    const { sql, and, eq, isNotNull } = await import("drizzle-orm");
+
+    const candidates = await db
+      .select({
+        id: paperBetsTable.id,
+        matchId: paperBetsTable.matchId,
+        marketType: paperBetsTable.marketType,
+        selectionName: paperBetsTable.selectionName,
+        stake: paperBetsTable.stake,
+        betfairBetId: paperBetsTable.betfairBetId,
+        betfairMarketId: paperBetsTable.betfairMarketId,
+        betfairStatus: paperBetsTable.betfairStatus,
+        betfairSizeMatched: paperBetsTable.betfairSizeMatched,
+        placedAt: paperBetsTable.placedAt,
+      })
+      .from(paperBetsTable)
+      .where(
+        and(
+          eq(paperBetsTable.status, "pending"),
+          sql`deleted_at IS NULL`,
+          sql`placed_at < '2026-04-19T20:00:00Z'`,
+          isNotNull(paperBetsTable.betfairBetId),
+          sql`betfair_status IN ('EXECUTABLE','EXECUTION_COMPLETE')`,
+        ),
+      );
+
+    const betIds = candidates
+      .map((c) => c.betfairBetId)
+      .filter((x): x is string => Boolean(x));
+    const live = await listCurrentOrders(betIds);
+    const liveByBetId = new Map(live.map((o) => [o.betId, o]));
+
+    const reconciled = candidates.map((c) => {
+      const bf = c.betfairBetId ? liveByBetId.get(c.betfairBetId) : undefined;
+      const classification = !bf
+        ? "stale_in_db__not_on_betfair"
+        : bf.status === "EXECUTABLE" && (bf.sizeRemaining ?? 0) > 0
+          ? "still_live__needs_cancellation"
+          : bf.status === "EXECUTION_COMPLETE"
+            ? "fully_matched__awaiting_settlement"
+            : `other:${bf.status}`;
+      return {
+        paperBetId: c.id,
+        matchId: c.matchId,
+        marketType: c.marketType,
+        selectionName: c.selectionName,
+        stake: Number(c.stake),
+        betfairBetId: c.betfairBetId,
+        betfairMarketId: c.betfairMarketId,
+        ourDbStatus: c.betfairStatus,
+        ourDbSizeMatched: Number(c.betfairSizeMatched ?? 0),
+        placedAt: c.placedAt,
+        betfairLiveStatus: bf?.status ?? null,
+        betfairLiveSizeMatched: bf?.sizeMatched ?? null,
+        betfairLiveSizeRemaining: bf?.sizeRemaining ?? null,
+        betfairLiveSizeCancelled: bf?.sizeCancelled ?? null,
+        betfairLivePrice: bf?.priceSize?.price ?? null,
+        betfairLiveSize: bf?.priceSize?.size ?? null,
+        classification,
+      };
+    });
+
+    const summary = reconciled.reduce<Record<string, number>>((acc, r) => {
+      acc[r.classification] = (acc[r.classification] ?? 0) + 1;
+      return acc;
+    }, {});
+
+    await db.insert(complianceLogsTable).values({
+      actionType: "betfair_ground_truth_audit",
+      details: {
+        queriedAt: new Date().toISOString(),
+        candidatesQueriedFromDb: candidates.length,
+        betfairReturnedLive: live.length,
+        classificationSummary: summary,
+        reconciledRows: reconciled,
+        purpose:
+          "Pre-cancellation ground-truth check before cleanup of pre-cutoff stale pending bets (dup-bug remediation 2026-04-19)",
+      },
+      timestamp: new Date(),
+    });
+
+    logger.warn(
+      { candidatesQueried: candidates.length, betfairLive: live.length, summary },
+      "Betfair ground-truth audit complete",
+    );
+
+    res.json({
+      success: true,
+      candidatesQueried: candidates.length,
+      betfairReturnedLive: live.length,
+      classificationSummary: summary,
+      detail: reconciled,
+    });
+  } catch (err) {
+    logger.error({ err }, "Betfair ground-truth check failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/map-betfair-events", async (req, res) => {
   try {
     const hours = Math.max(1, Math.min(168, Number(req.query["hours"] ?? req.body?.hours ?? 72)));

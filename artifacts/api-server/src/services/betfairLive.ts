@@ -370,6 +370,71 @@ export interface PlaceOrderResult {
   errorCode?: string;
 }
 
+export interface CurrentOrder {
+  betId: string;
+  marketId: string;
+  selectionId: number;
+  handicap: number;
+  priceSize: { price: number; size: number };
+  bspLiability: number;
+  side: "BACK" | "LAY";
+  status: "EXECUTION_COMPLETE" | "EXECUTABLE";
+  persistenceType: string;
+  orderType: string;
+  placedDate: string;
+  matchedDate?: string;
+  averagePriceMatched?: number;
+  sizeMatched?: number;
+  sizeRemaining?: number;
+  sizeLapsed?: number;
+  sizeCancelled?: number;
+  sizeVoided?: number;
+  customerOrderRef?: string;
+  customerStrategyRef?: string;
+}
+
+interface CurrentOrdersResponse {
+  currentOrders: CurrentOrder[];
+  moreAvailable: boolean;
+}
+
+/**
+ * Fetch current (unsettled) orders from Betfair. When `betIds` is provided,
+ * only those specific orders are returned — useful for ground-truth checks
+ * before reconciliation or cancellation.
+ *
+ * Read-only. Safe to call without confirmation.
+ */
+export async function listCurrentOrders(
+  betIds?: string[],
+): Promise<CurrentOrder[]> {
+  if (!isLiveMode()) return [];
+  const all: CurrentOrder[] = [];
+  let moreAvailable = true;
+  let fromRecord = 0;
+  while (moreAvailable) {
+    const params: Record<string, unknown> = {
+      orderProjection: "ALL",
+      fromRecord,
+      recordCount: 1000,
+    };
+    if (betIds && betIds.length > 0) {
+      params["betIds"] = betIds;
+    }
+    const result = await apiRequest<CurrentOrdersResponse>(
+      "betting",
+      "/listCurrentOrders/",
+      params,
+      2,
+    );
+    all.push(...(result.currentOrders ?? []));
+    moreAvailable = Boolean(result.moreAvailable);
+    fromRecord += result.currentOrders?.length ?? 0;
+    if ((result.currentOrders?.length ?? 0) === 0) break;
+  }
+  return all;
+}
+
 export async function cancelOrders(
   marketId: string,
   instructions: { betId: string; sizeReduction?: number }[],
@@ -566,7 +631,22 @@ export async function reconcileSettlements(): Promise<{
       continue;
     }
 
-    const betfairPnl = cleared.profit - cleared.commission;
+    // Defensive numeric coercion — Betfair occasionally returns undefined for
+    // profit/commission on settled-but-zero-matched orders (cancelled-pre-match
+    // edge case). Without this, `undefined - undefined = NaN` was being written
+    // into betfair_pnl as the literal numeric NaN, breaking pnlDiff comparison
+    // (Math.abs(NaN - x) = NaN, which silently fails the `> 0.02` check).
+    const profit = Number(cleared.profit ?? 0);
+    const commission = Number(cleared.commission ?? 0);
+    const betfairPnl = Number.isFinite(profit) && Number.isFinite(commission)
+      ? profit - commission
+      : 0;
+    if (!Number.isFinite(profit) || !Number.isFinite(commission)) {
+      logger.warn(
+        { betId: bet.id, betfairBetId: bet.betfairBetId, rawProfit: cleared.profit, rawCommission: cleared.commission },
+        "reconcileSettlements: non-finite profit/commission from Betfair — treating as 0",
+      );
+    }
     const internalPnl = Number(bet.settlementPnl ?? 0);
     const pnlDiff = Math.abs(betfairPnl - internalPnl);
 
