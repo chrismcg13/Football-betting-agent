@@ -909,6 +909,56 @@ export async function runTradingCycle(options?: {
       }
     }
 
+    // ─── CARDS-MARKET PAUSE FILTER (scope v3 §7 follow-up, 2026-04-19) ───
+    // TOTAL_CARDS_25 / TOTAL_CARDS_35 measured at −13% to −17% mean CLV (n=20 captured).
+    // Documented negative expectation → pause until root-cause diagnosis. Default OFF.
+    // Toggle via enable_total_cards_markets config flag ("true" to re-enable).
+    {
+      const cardsFlagRaw = (await getConfigValue("enable_total_cards_markets")) ?? "false";
+      const cardsEnabled = cardsFlagRaw.toLowerCase() === "true";
+      if (cardsEnabled) {
+        logger.warn(
+          { tier, candidates: selectedBets.length },
+          "Cards-market pause DISABLED via enable_total_cards_markets=true (cards will be placed)",
+        );
+        funnel["07b_cards_pause"] = "disabled" as unknown as number;
+      } else if (selectedBets.length > 0) {
+        const before = selectedBets.length;
+        const cardRejections: Array<{ matchId: number; market: string; selection: string; odds: number }> = [];
+        const kept: BetCandidate[] = [];
+        for (const c of selectedBets) {
+          if (c.marketType.startsWith("TOTAL_CARDS_")) {
+            cardRejections.push({
+              matchId: c.matchId,
+              market: c.marketType,
+              selection: c.selectionName,
+              odds: c.odds,
+            });
+            continue;
+          }
+          kept.push(c);
+        }
+        selectedBets.length = 0;
+        selectedBets.push(...kept);
+        const rejected = before - selectedBets.length;
+        if (rejected > 0) {
+          logger.warn(
+            {
+              tier,
+              before,
+              after: selectedBets.length,
+              rejected,
+              rejections: cardRejections,
+              scope: "v3_section7_cards_pause",
+              reason: "documented_negative_clv_-13_to_-17pct",
+            },
+            "Cards-market pause rejected TOTAL_CARDS_* candidates",
+          );
+        }
+        funnel["07b_rejected_cards_markets_paused"] = rejected;
+      }
+    }
+
     // ─── STRATEGY OVERRIDE FILTER (today-only, self-expiring at strategy_overrides_expire_at) ───
     // Reads 3 config keys: strategy_disabled_markets (CSV), strategy_max_odds, strategy_max_hours_to_kickoff.
     // Auto-disables once strategy_overrides_expire_at is past — no manual revert needed.
