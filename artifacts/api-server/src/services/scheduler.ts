@@ -820,6 +820,95 @@ export async function runTradingCycle(options?: {
 
     funnel["07_post_correlation"] = selectedBets.length;
 
+    // ─── PINNACLE-LEAGUE SELECTION FILTER (scope v3 §6 step 1) ───
+    // Reject any candidate whose match league is NOT in competition_config WHERE has_pinnacle_odds=true.
+    // Rationale: if we cannot validate CLV against a genuine Pinnacle line, we do not bet the match.
+    // Toggle via reject_non_pinnacle_leagues config flag (default "true"). Logs every rejection
+    // for the first 7 days for audit. Set flag to "false" for instant rollback without redeploy.
+    {
+      const flagRaw = (await getConfigValue("reject_non_pinnacle_leagues")) ?? "true";
+      const flagEnabled = flagRaw.toLowerCase() === "true";
+      if (!flagEnabled) {
+        logger.warn(
+          { tier, candidates: selectedBets.length },
+          "Pinnacle-league filter DISABLED via reject_non_pinnacle_leagues=false (rollback mode)",
+        );
+        funnel["07a_pinnacle_league_filter"] = "disabled" as unknown as number;
+      } else if (selectedBets.length > 0) {
+        const ccRows = await db.execute(sql`
+          SELECT LOWER(name) AS name, LOWER(country) AS country
+          FROM competition_config WHERE has_pinnacle_odds = true
+        `);
+        const ccData = ((ccRows as unknown as { rows?: Array<{ name: string; country: string }> }).rows
+          ?? (ccRows as unknown as Array<{ name: string; country: string }>));
+        const pinKey = new Set<string>();
+        const pinName = new Set<string>();
+        for (const r of ccData) {
+          pinName.add(r.name);
+          pinKey.add(`${r.name}|${r.country}`);
+        }
+
+        const matchIds = Array.from(new Set(selectedBets.map((b) => b.matchId)));
+        const matchRows = await db.execute(sql`
+          SELECT id, LOWER(league) AS league, LOWER(COALESCE(country, '')) AS country
+          FROM matches WHERE id = ANY(${matchIds})
+        `);
+        const matchMeta = new Map<number, { league: string; country: string }>();
+        for (const r of ((matchRows as unknown as { rows?: Array<{ id: number; league: string; country: string }> }).rows
+          ?? (matchRows as unknown as Array<{ id: number; league: string; country: string }>))) {
+          matchMeta.set(Number(r.id), { league: r.league ?? "", country: r.country ?? "" });
+        }
+
+        const before = selectedBets.length;
+        const rejectionDetails: Array<{ matchId: number; league: string; country: string; market: string; selection: string }> = [];
+        const kept: BetCandidate[] = [];
+        for (const c of selectedBets) {
+          const meta = matchMeta.get(c.matchId);
+          const league = meta?.league ?? "";
+          const country = meta?.country ?? "";
+          // Strict country match when matches.country is populated; fall back to name-only otherwise.
+          const inPinLeague = country
+            ? (pinKey.has(`${league}|${country}`) || (pinName.has(league) && country === ""))
+            : pinName.has(league);
+          if (!inPinLeague) {
+            rejectionDetails.push({
+              matchId: c.matchId,
+              league: league || "(unknown)",
+              country: country || "(unknown)",
+              market: c.marketType,
+              selection: c.selectionName,
+            });
+            continue;
+          }
+          kept.push(c);
+        }
+        selectedBets.length = 0;
+        selectedBets.push(...kept);
+        const rejected = before - selectedBets.length;
+        if (rejected > 0) {
+          logger.warn(
+            {
+              tier,
+              before,
+              after: selectedBets.length,
+              rejected,
+              pinLeaguesLoaded: pinName.size,
+              sampleRejections: rejectionDetails.slice(0, 25),
+              totalRejections: rejectionDetails.length,
+              scope: "v3_section6_step1_audit",
+            },
+            "Pinnacle-league selection filter rejected non-Pinnacle-league candidates",
+          );
+        } else {
+          logger.info(
+            { tier, kept: selectedBets.length, pinLeaguesLoaded: pinName.size },
+            "Pinnacle-league filter: all candidates in Pinnacle leagues",
+          );
+        }
+        funnel["07a_rejected_non_pinnacle_league"] = rejected;
+      }
+    }
+
     // ─── STRATEGY OVERRIDE FILTER (today-only, self-expiring at strategy_overrides_expire_at) ───
     // Reads 3 config keys: strategy_disabled_markets (CSV), strategy_max_odds, strategy_max_hours_to_kickoff.
     // Auto-disables once strategy_overrides_expire_at is past — no manual revert needed.
