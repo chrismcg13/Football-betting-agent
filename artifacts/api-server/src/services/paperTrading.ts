@@ -28,6 +28,21 @@ import {
 } from "./liveRiskManager";
 import { detectCurrentRegime } from "./marketRegime";
 
+// ===================== Selection-name canonicalization =====================
+// 2026-04-19: Bookmakers serve OU selections as both "Over 2.5" and
+// "Over 2.5 Goals" — the dedup logic compared raw strings and missed the
+// variant, allowing duplicate placements on the same selection. Canonical form
+// strips trailing " Goals", lowercases, and trims. Used by both the dedup
+// pre-check and persisted to selection_canonical for the partial unique index
+// that race-protects parallel cycles.
+export function canonicalSelectionName(_marketType: string, name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/\s+goals?$/i, "")
+    .replace(/\s+/g, " ");
+}
+
 // ===================== Config helpers =====================
 
 export async function getConfigValue(key: string): Promise<string | null> {
@@ -545,7 +560,12 @@ export async function placePaperBet(
   }
 
   // ── Duplicate / per-match cap guard ─────────────────────────────────────────
-  // Enforced at placement time so duplicates never reach the DB.
+  // Enforced at placement time so duplicates never reach the DB. Two layers:
+  //   1. App-level pre-check (this block) — friendly, fast-path rejection.
+  //   2. DB-level partial unique index (paper_bets_unique_pending_canonical_idx)
+  //      — race-proof guarantee against parallel cycles. Index uses canonical
+  //      selection name to collapse "Over 2.5" / "Over 2.5 Goals" variants.
+  const selectionCanonical = canonicalSelectionName(marketType, selectionName);
   {
     const recentVoidCutoff = new Date(Date.now() - 2 * 60 * 60 * 1000);
     const existingBets = await db
@@ -553,6 +573,7 @@ export async function placePaperBet(
         id: paperBetsTable.id,
         marketType: paperBetsTable.marketType,
         selectionName: paperBetsTable.selectionName,
+        selectionCanonical: paperBetsTable.selectionCanonical,
         status: paperBetsTable.status,
       })
       .from(paperBetsTable)
@@ -560,20 +581,27 @@ export async function placePaperBet(
         and(
           eq(paperBetsTable.matchId, matchId),
           sql`deleted_at IS NULL`,
-          sql`(${paperBetsTable.status} = 'pending' OR (${paperBetsTable.status} = 'void' AND ${paperBetsTable.settledAt} >= ${recentVoidCutoff}))`,
+          sql`(${paperBetsTable.status} IN ('pending','pending_placement') OR (${paperBetsTable.status} = 'void' AND ${paperBetsTable.settledAt} >= ${recentVoidCutoff}))`,
         ),
       );
 
-    const existingPending = existingBets.filter((b) => b.status === "pending");
+    const existingPending = existingBets.filter(
+      (b) => b.status === "pending" || b.status === "pending_placement",
+    );
     const allRelevant = existingBets;
 
-    // 1. Exact duplicate — same market + selection already pending or recently voided
+    // 1. Exact duplicate — same market + canonical-selection already pending or recently voided.
+    // Compares against persisted selection_canonical when present, falls back to recomputing
+    // canonical from raw selection_name for legacy rows that pre-date the column.
     const exactDup = allRelevant.find(
-      (b) => b.marketType === marketType && b.selectionName === selectionName,
+      (b) =>
+        b.marketType === marketType &&
+        (b.selectionCanonical ?? canonicalSelectionName(b.marketType, b.selectionName)) ===
+          selectionCanonical,
     );
     if (exactDup) {
       return logReject(
-        `Duplicate: ${exactDup.status} bet already exists for ${marketType}:${selectionName} on match ${matchId}`,
+        `Duplicate: ${exactDup.status} bet already exists for ${marketType}:${selectionName} (canonical "${selectionCanonical}") on match ${matchId}`,
       );
     }
 
@@ -765,6 +793,7 @@ export async function placePaperBet(
         matchId,
         marketType,
         selectionName,
+        selectionCanonical,
         betType: "back",
         oddsAtPlacement: String(backOdds),
         stake: String(stake),
@@ -828,6 +857,22 @@ export async function placePaperBet(
     await pgClient.query("COMMIT");
   } catch (txErr) {
     await pgClient.query("ROLLBACK");
+    // Postgres unique-violation (23505) → race-blocked duplicate from a parallel
+    // trading cycle. The dedup pre-check above passed (no row visible at SELECT
+    // time) but the partial unique index caught it at INSERT time. Convert to a
+    // friendly logReject so the cycle continues placing other candidates.
+    const code = (txErr as { code?: string })?.code;
+    const constraint = (txErr as { constraint?: string })?.constraint;
+    if (code === "23505" && constraint === "paper_bets_unique_pending_canonical_idx") {
+      logger.warn(
+        { matchId, marketType, selectionName, selectionCanonical, constraint },
+        "Duplicate-bet race blocked by partial unique index — parallel cycle won the insert",
+      );
+      // Fall through to finally — single release path. The `return` triggers finally.
+      return logReject(
+        `Duplicate (race-blocked at DB): ${marketType}:${selectionName} on match ${matchId}`,
+      );
+    }
     logger.error({ err: txErr, matchId, marketType }, "Transaction failed for bet placement");
     throw txErr;
   } finally {

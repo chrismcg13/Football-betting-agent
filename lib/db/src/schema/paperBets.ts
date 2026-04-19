@@ -7,7 +7,9 @@ import {
   numeric,
   boolean,
   real,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { matchesTable } from "./matches";
@@ -79,7 +81,14 @@ export const paperBetsTable = pgTable("paper_bets", {
   commissionRate: numeric("commission_rate", { precision: 6, scale: 4 }),
   commissionAmount: numeric("commission_amount", { precision: 12, scale: 2 }),
   netPnl: numeric("net_pnl", { precision: 12, scale: 2 }),
-});
+  selectionCanonical: text("selection_canonical"),
+}, (table) => ({
+  uniquePendingBet: uniqueIndex("paper_bets_unique_pending_canonical_idx")
+    .on(table.matchId, table.marketType, table.selectionCanonical)
+    .where(
+      sql`status IN ('pending','pending_placement') AND deleted_at IS NULL AND selection_canonical IS NOT NULL AND placed_at >= '2026-04-19T20:00:00Z'`,
+    ),
+}));
 
 export const insertPaperBetSchema = createInsertSchema(paperBetsTable).omit({
   id: true,
