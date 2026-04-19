@@ -2199,6 +2199,208 @@ router.get("/admin/betfair-ground-truth", async (_req, res) => {
   }
 });
 
+// TEMPORARY route — Apr 19 2026 cleanup. Investigation step (C):
+// For the 7 betIds that our DB says are EXECUTABLE/EXECUTION_COMPLETE but
+// listCurrentOrders did not return, query listClearedOrders to find out
+// where they actually went (settled, lapsed, voided on the exchange, etc).
+// Read-only against Betfair; one compliance_logs row written.
+router.get("/admin/betfair-cleared-orders-check", async (_req, res) => {
+  try {
+    const { listClearedOrders } = await import("../services/betfairLive");
+    const { complianceLogsTable, db } = await import("@workspace/db");
+    const { sql } = await import("drizzle-orm");
+
+    const stale = await db.execute(sql`
+      SELECT row->>'betfairBetId' AS betfair_bet_id,
+             (row->>'paperBetId')::int AS paper_bet_id,
+             row->>'placedAt' AS placed_at
+      FROM compliance_logs cl,
+           jsonb_array_elements(cl.details->'reconciledRows') AS row
+      WHERE cl.action_type = 'betfair_ground_truth_audit'
+        AND cl.id = (SELECT max(id) FROM compliance_logs WHERE action_type='betfair_ground_truth_audit')
+        AND row->>'classification' = 'stale_in_db__not_on_betfair'
+    `);
+    const staleRows = stale.rows as Array<{
+      betfair_bet_id: string;
+      paper_bet_id: number;
+      placed_at: string;
+    }>;
+    const betIds = staleRows.map((r) => r.betfair_bet_id);
+    if (betIds.length === 0) {
+      res.json({ success: true, message: "No stale rows in latest audit" });
+      return;
+    }
+
+    const earliest = staleRows.reduce(
+      (acc, r) => (r.placed_at < acc ? r.placed_at : acc),
+      staleRows[0]!.placed_at,
+    );
+    const fromDate = new Date(new Date(earliest).getTime() - 60 * 60 * 1000)
+      .toISOString();
+    const dateRange = { from: fromDate, to: new Date().toISOString() };
+    const statuses: Array<"SETTLED" | "VOIDED" | "LAPSED" | "CANCELLED"> = [
+      "SETTLED",
+      "VOIDED",
+      "LAPSED",
+      "CANCELLED",
+    ];
+    const allByBetId = new Map<
+      string,
+      { status: string; order: import("../services/betfairLive").ClearedOrder }
+    >();
+    const perStatusCounts: Record<string, number> = {};
+    for (const status of statuses) {
+      const cleared = await listClearedOrders(dateRange, betIds, status);
+      perStatusCounts[status] = cleared.length;
+      for (const o of cleared) {
+        if (!allByBetId.has(o.betId)) allByBetId.set(o.betId, { status, order: o });
+      }
+    }
+
+    const reconciled = staleRows.map((r) => {
+      const hit = allByBetId.get(r.betfair_bet_id);
+      return {
+        paperBetId: r.paper_bet_id,
+        betfairBetId: r.betfair_bet_id,
+        placedAt: r.placed_at,
+        foundInBetStatus: hit?.status ?? null,
+        betOutcome: hit?.order.betOutcome ?? null,
+        sizeSettled: hit?.order.sizeSettled ?? null,
+        sizeCancelled: hit?.order.sizeCancelled ?? null,
+        priceMatched: hit?.order.priceMatched ?? null,
+        profit: hit?.order.profit ?? null,
+        commission: hit?.order.commission ?? null,
+        settledDate: hit?.order.settledDate ?? null,
+        side: hit?.order.side ?? null,
+      };
+    });
+
+    await db.insert(complianceLogsTable).values({
+      actionType: "betfair_cleared_orders_investigation",
+      details: {
+        queriedAt: new Date().toISOString(),
+        purpose:
+          "Phase C: locate the 7 stale rows in cleared-orders to understand why listCurrentOrders did not return them",
+        betIdsQueried: betIds,
+        perStatusCounts,
+        totalMatched: allByBetId.size,
+        reconciledRows: reconciled,
+      },
+      timestamp: new Date(),
+    });
+
+    res.json({
+      success: true,
+      betIdsQueried: betIds.length,
+      perStatusCounts,
+      totalMatched: allByBetId.size,
+      detail: reconciled,
+    });
+  } catch (err) {
+    logger.error({ err }, "Betfair cleared-orders investigation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// TEMPORARY route — Apr 19 2026 cleanup. Action step (A):
+// Cancel the orders classified as `still_live__needs_cancellation` in the
+// most recent betfair_ground_truth_audit. Groups by betfairMarketId, calls
+// cancelOrders per market, and writes the full per-instruction response to
+// compliance_logs. Does NOT modify paper_bets rows — reconcileSettlements
+// will pick them up via Betfair's cleared-orders endpoint.
+router.post("/admin/cancel-orphan-orders", async (_req, res) => {
+  try {
+    const { cancelOrders } = await import("../services/betfairLive");
+    const { complianceLogsTable, db } = await import("@workspace/db");
+    const { sql } = await import("drizzle-orm");
+
+    const stale = await db.execute(sql`
+      SELECT row->>'betfairBetId' AS betfair_bet_id,
+             row->>'betfairMarketId' AS betfair_market_id,
+             (row->>'paperBetId')::int AS paper_bet_id,
+             (row->>'stake')::numeric AS stake
+      FROM compliance_logs cl,
+           jsonb_array_elements(cl.details->'reconciledRows') AS row
+      WHERE cl.action_type = 'betfair_ground_truth_audit'
+        AND cl.id = (SELECT max(id) FROM compliance_logs WHERE action_type='betfair_ground_truth_audit')
+        AND row->>'classification' = 'still_live__needs_cancellation'
+    `);
+    const targets = stale.rows as Array<{
+      betfair_bet_id: string;
+      betfair_market_id: string;
+      paper_bet_id: number;
+      stake: string;
+    }>;
+    if (targets.length === 0) {
+      res.json({ success: true, message: "Nothing to cancel" });
+      return;
+    }
+
+    const byMarket = new Map<string, typeof targets>();
+    for (const t of targets) {
+      const arr = byMarket.get(t.betfair_market_id) ?? [];
+      arr.push(t);
+      byMarket.set(t.betfair_market_id, arr);
+    }
+
+    const perMarketResults: Array<{
+      marketId: string;
+      betIds: string[];
+      paperBetIds: number[];
+      response?: unknown;
+      error?: string;
+    }> = [];
+
+    for (const [marketId, group] of byMarket.entries()) {
+      const instructions = group.map((g) => ({ betId: g.betfair_bet_id }));
+      try {
+        const response = await cancelOrders(marketId, instructions);
+        perMarketResults.push({
+          marketId,
+          betIds: group.map((g) => g.betfair_bet_id),
+          paperBetIds: group.map((g) => g.paper_bet_id),
+          response,
+        });
+      } catch (err) {
+        perMarketResults.push({
+          marketId,
+          betIds: group.map((g) => g.betfair_bet_id),
+          paperBetIds: group.map((g) => g.paper_bet_id),
+          error: String(err),
+        });
+      }
+    }
+
+    await db.insert(complianceLogsTable).values({
+      actionType: "betfair_orphan_cancellation",
+      details: {
+        executedAt: new Date().toISOString(),
+        purpose:
+          "Phase A: cancel pre-cutoff EXECUTABLE orders confirmed live on Betfair via ground-truth audit",
+        marketsAttempted: byMarket.size,
+        ordersAttempted: targets.length,
+        perMarketResults,
+      },
+      timestamp: new Date(),
+    });
+
+    logger.warn(
+      { marketsAttempted: byMarket.size, ordersAttempted: targets.length },
+      "Orphan order cancellation batch complete",
+    );
+
+    res.json({
+      success: true,
+      marketsAttempted: byMarket.size,
+      ordersAttempted: targets.length,
+      perMarketResults,
+    });
+  } catch (err) {
+    logger.error({ err }, "Orphan order cancellation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/map-betfair-events", async (req, res) => {
   try {
     const hours = Math.max(1, Math.min(168, Number(req.query["hours"] ?? req.body?.hours ?? 72)));

@@ -530,9 +530,10 @@ export interface ClearedOrdersResponse {
 export async function listClearedOrders(
   settledDateRange?: { from: string; to: string },
   betIds?: string[],
+  betStatus: "SETTLED" | "VOIDED" | "LAPSED" | "CANCELLED" = "SETTLED",
 ): Promise<ClearedOrder[]> {
   const filter: Record<string, unknown> = {
-    betStatus: "SETTLED",
+    betStatus,
   };
 
   if (settledDateRange) {
