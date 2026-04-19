@@ -182,7 +182,10 @@ export async function checkDailyLoss(): Promise<boolean> {
   const totalWealth = await getTotalWealthForRisk();
   const hwm = await updateHighWaterMark(totalWealth);
   const drawdown = hwm > 0 ? ((hwm - totalWealth) / hwm) * 100 : 0;
-  const dailyLimitPct = Number((await getConfigValue("daily_drawdown_limit_pct")) ?? "10");
+  const stratExpiresStr = await getConfigValue("strategy_overrides_expire_at");
+  const stratActive = stratExpiresStr ? new Date(stratExpiresStr).getTime() > Date.now() : false;
+  const dailyOverride = stratActive ? await getConfigValue("strategy_daily_drawdown_limit_pct") : null;
+  const dailyLimitPct = Number(dailyOverride ?? (await getConfigValue("daily_drawdown_limit_pct")) ?? "10");
 
   if (drawdown >= dailyLimitPct) {
     const todayNet = await getTodaysNetPnl();
@@ -226,7 +229,10 @@ export async function checkWeeklyLoss(): Promise<boolean> {
   const totalWealth = await getTotalWealthForRisk();
   const hwm = await updateHighWaterMark(totalWealth);
   const drawdown = hwm > 0 ? ((hwm - totalWealth) / hwm) * 100 : 0;
-  const weeklyLimitPct = Number((await getConfigValue("weekly_drawdown_limit_pct")) ?? "20");
+  const stratExpiresStrW = await getConfigValue("strategy_overrides_expire_at");
+  const stratActiveW = stratExpiresStrW ? new Date(stratExpiresStrW).getTime() > Date.now() : false;
+  const weeklyOverride = stratActiveW ? await getConfigValue("strategy_weekly_drawdown_limit_pct") : null;
+  const weeklyLimitPct = Number(weeklyOverride ?? (await getConfigValue("weekly_drawdown_limit_pct")) ?? "20");
 
   if (drawdown >= weeklyLimitPct) {
     const weeklyNet = await getWeeklyNetPnl();

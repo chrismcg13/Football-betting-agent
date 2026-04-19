@@ -511,9 +511,16 @@ export async function placePaperBet(
       }
     }
 
-    const dailyLossLimitPct = liveLimits
-      ? liveLimits.config.maxDailyLossPct
-      : Number((await getConfigValue("daily_loss_limit_pct")) ?? "0.05");
+    // Strategy override (today-only, self-expiring at strategy_overrides_expire_at)
+    // lets us raise the hardcoded RISK_LEVELS daily cap without editing the table.
+    const stratExpiresStr = await getConfigValue("strategy_overrides_expire_at");
+    const stratActive = stratExpiresStr ? new Date(stratExpiresStr).getTime() > Date.now() : false;
+    const dailyOverrideStr = stratActive ? await getConfigValue("strategy_max_daily_loss_pct") : null;
+    const dailyLossLimitPct = dailyOverrideStr
+      ? Number(dailyOverrideStr)
+      : liveLimits
+        ? liveLimits.config.maxDailyLossPct
+        : Number((await getConfigValue("daily_loss_limit_pct")) ?? "0.05");
     const dailyLoss = await getTodaysLoss();
     const dailyLossLimit = effectiveBankroll * dailyLossLimitPct;
     if (dailyLoss >= dailyLossLimit) {
@@ -522,9 +529,12 @@ export async function placePaperBet(
       );
     }
 
-    const weeklyLossLimitPct = liveLimits
-      ? liveLimits.config.maxWeeklyLossPct
-      : Number((await getConfigValue("weekly_loss_limit_pct")) ?? "0.10");
+    const weeklyOverrideStr = stratActive ? await getConfigValue("strategy_max_weekly_loss_pct") : null;
+    const weeklyLossLimitPct = weeklyOverrideStr
+      ? Number(weeklyOverrideStr)
+      : liveLimits
+        ? liveLimits.config.maxWeeklyLossPct
+        : Number((await getConfigValue("weekly_loss_limit_pct")) ?? "0.10");
     const weeklyLoss = await getWeeklyLoss();
     const weeklyLossLimit = effectiveBankroll * weeklyLossLimitPct;
     if (weeklyLoss >= weeklyLossLimit) {

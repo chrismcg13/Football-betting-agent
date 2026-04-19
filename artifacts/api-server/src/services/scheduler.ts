@@ -820,6 +820,62 @@ export async function runTradingCycle(options?: {
 
     funnel["07_post_correlation"] = selectedBets.length;
 
+    // ─── STRATEGY OVERRIDE FILTER (today-only, self-expiring at strategy_overrides_expire_at) ───
+    // Reads 3 config keys: strategy_disabled_markets (CSV), strategy_max_odds, strategy_max_hours_to_kickoff.
+    // Auto-disables once strategy_overrides_expire_at is past — no manual revert needed.
+    {
+      const expiresAtStr = await getConfigValue("strategy_overrides_expire_at");
+      const expiresAtMs = expiresAtStr ? new Date(expiresAtStr).getTime() : 0;
+      if (expiresAtMs > Date.now() && selectedBets.length > 0) {
+        const disabledCsv = (await getConfigValue("strategy_disabled_markets")) ?? "";
+        const disabled = new Set(
+          disabledCsv.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean),
+        );
+        const maxOdds = Number((await getConfigValue("strategy_max_odds")) ?? "9999");
+        const maxHrsToKo = Number((await getConfigValue("strategy_max_hours_to_kickoff")) ?? "9999");
+
+        const matchIds = Array.from(new Set(selectedBets.map((b) => b.matchId)));
+        const koMap = new Map<number, number>();
+        if (matchIds.length > 0) {
+          const rows = await db
+            .select({ id: matchesTable.id, ko: matchesTable.kickoffTime })
+            .from(matchesTable)
+            .where(inArray(matchesTable.id, matchIds));
+          for (const r of rows) {
+            if (r.ko) koMap.set(r.id, new Date(r.ko).getTime());
+          }
+        }
+
+        const before = selectedBets.length;
+        const nowMs = Date.now();
+        let dropMarket = 0, dropOdds = 0, dropKo = 0;
+        const kept: BetCandidate[] = [];
+        for (const c of selectedBets) {
+          if (disabled.has(c.marketType.toUpperCase())) { dropMarket++; continue; }
+          const odds = ((c as BetCandidate & Record<string, unknown>)._backOdds as number | undefined) ?? c.backOdds;
+          if (odds > maxOdds) { dropOdds++; continue; }
+          const koMs = koMap.get(c.matchId);
+          if (koMs != null) {
+            const hrs = (koMs - nowMs) / 3600000;
+            if (hrs > maxHrsToKo) { dropKo++; continue; }
+          }
+          kept.push(c);
+        }
+        selectedBets.length = 0;
+        selectedBets.push(...kept);
+        logger.warn(
+          {
+            tier, before, after: selectedBets.length,
+            droppedByMarket: dropMarket, droppedByOdds: dropOdds, droppedByKickoff: dropKo,
+            disabledMarkets: [...disabled], maxOdds, maxHrsToKo,
+            expiresAt: new Date(expiresAtMs).toISOString(),
+          },
+          "Strategy override filter applied (today-only, self-expiring)",
+        );
+        funnel["07b_post_strategy_override"] = selectedBets.length;
+      }
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // PHASE 2: SIGNAL → EXECUTION SPLIT
     // Signal generation is complete. Now build structured bet orders,
