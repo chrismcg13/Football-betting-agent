@@ -537,15 +537,28 @@ export async function checkLiveCircuitBreakers(): Promise<LiveCircuitBreakerResu
   }
 
   if (consecutiveLosses >= 3) {
-    const resumeAt = new Date(Date.now() + 60 * 60 * 1000);
-    await setConfigValue("live_breaker_paused_until", resumeAt.toISOString());
-    logger.warn({ consecutiveLosses, resumeAt: resumeAt.toISOString() }, "Circuit breaker: 1hr pause persisted");
-    return {
-      triggered: true,
-      action: "pause_1hr",
-      reason: `${consecutiveLosses} consecutive live losses — pausing until ${resumeAt.toISOString()}`,
-      autoResumeAt: resumeAt,
-    };
+    // Strategy override (today-only, self-expiring) bypasses the 3-loss 1hr pause
+    // ONLY when it would block a corrected strategy. The 5+ and 8+ guards above
+    // remain in force as catastrophic stops. Daily/weekly drawdown caps still apply.
+    const stratExpiresStr = await getConfigValue("strategy_overrides_expire_at");
+    const stratActive = stratExpiresStr ? new Date(stratExpiresStr).getTime() > Date.now() : false;
+    const bypassStreakGuard = stratActive && (await getConfigValue("strategy_bypass_loss_streak_guard")) === "true";
+    if (bypassStreakGuard) {
+      logger.warn(
+        { consecutiveLosses, expiresAt: stratExpiresStr },
+        "Strategy override: bypassing 3-loss 1hr pause (5+ and 8+ guards still active, daily/weekly caps still apply)",
+      );
+    } else {
+      const resumeAt = new Date(Date.now() + 60 * 60 * 1000);
+      await setConfigValue("live_breaker_paused_until", resumeAt.toISOString());
+      logger.warn({ consecutiveLosses, resumeAt: resumeAt.toISOString() }, "Circuit breaker: 1hr pause persisted");
+      return {
+        triggered: true,
+        action: "pause_1hr",
+        reason: `${consecutiveLosses} consecutive live losses — pausing until ${resumeAt.toISOString()}`,
+        autoResumeAt: resumeAt,
+      };
+    }
   }
 
   // Absolute £50 floor (Apr 17 2026 authorisation). Compares Betfair AVAILABLE
