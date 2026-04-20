@@ -52,7 +52,7 @@ import {
 import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } from "../services/leagueDiscovery";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import { getCircuitBreakerStatus, resumeAgent } from "../services/riskManager";
-import { getCachedBalance, isLiveMode, getAccountFunds, cancelOrders } from "../services/betfairLive";
+import { getCachedBalance, isLiveMode, getAccountFunds, cancelOrders, type ClearedOrder } from "../services/betfairLive";
 import { getDataRichnessSummary } from "../services/dataRichness";
 import { getLiveOppScoreThreshold } from "../services/liveThresholdReview";
 import {
@@ -2077,6 +2077,226 @@ router.post("/admin/set-config", async (req, res) => {
     const verify = await getConfigValue(key);
     res.json({ success: true, key, value: verify });
   } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// TEMPORARY route — Apr 19 2026 cleanup. Settlement remediation pass.
+// Two operations, both auditable:
+//   (A) Re-settle the 14 rows where status='void' AND betfair_status='won'.
+//       These are bets the agent voided internally (FIRST_HALF_RESULT
+//       always-null in determineBetWon, OR stale matchedSize race) but
+//       Betfair actually paid out. We pull the real SETTLED data, rewrite
+//       status + settlement_pnl + betfair_pnl, and apply the cumulative
+//       PnL delta to the bankroll in one transaction with a paired
+//       compliance_logs entry per bet plus a bankroll-update entry.
+//   (B) Backfill betfair_pnl for the 131 legacy rows where the value is
+//       literally 'NaN'. Mirror-field-only — does NOT change status,
+//       settlement_pnl, or bankroll (those were already settled internally
+//       under the old paper logic). Pure data-correctness fix.
+router.post("/admin/remediate-settlement-errors", async (_req, res) => {
+  try {
+    const { listClearedOrders } = await import("../services/betfairLive");
+    const { paperBetsTable, complianceLogsTable, db } = await import("@workspace/db");
+    const { sql, eq } = await import("drizzle-orm");
+    const { getBankroll, setConfigValue } = await import("../services/paperTrading");
+
+    // ─── (A) Mismatch repair ─────────────────────────────────────
+    const mismatchRows = (
+      await db.execute(sql`
+        SELECT id, betfair_bet_id, stake::text AS stake, settlement_pnl::text AS settlement_pnl, status
+        FROM paper_bets
+        WHERE status='void' AND betfair_status='won' AND betfair_bet_id IS NOT NULL
+      `)
+    ).rows as Array<{
+      id: number;
+      betfair_bet_id: string;
+      stake: string;
+      settlement_pnl: string | null;
+      status: string;
+    }>;
+
+    let mismatchSettled: ClearedOrder[] = [];
+    if (mismatchRows.length > 0) {
+      const mismatchBetIds = mismatchRows.map((r) => r.betfair_bet_id);
+      // Wide window — these go back to Apr 17.
+      mismatchSettled = await listClearedOrders(
+        { from: "2026-04-15T00:00:00Z", to: new Date().toISOString() },
+        mismatchBetIds,
+        "SETTLED",
+      );
+    }
+    const mismatchByBetId = new Map(mismatchSettled.map((o) => [o.betId, o]));
+
+    let cumulativePnlDelta = 0;
+    const mismatchResults: Array<Record<string, unknown>> = [];
+    for (const row of mismatchRows) {
+      const cleared = mismatchByBetId.get(row.betfair_bet_id);
+      if (!cleared) {
+        mismatchResults.push({
+          paperBetId: row.id,
+          status: "skipped_no_settled_data",
+          betfairBetId: row.betfair_bet_id,
+        });
+        continue;
+      }
+      const profit = Number(cleared.profit ?? 0);
+      const commission = Number(cleared.commission ?? 0);
+      if (!Number.isFinite(profit) || !Number.isFinite(commission)) {
+        mismatchResults.push({
+          paperBetId: row.id,
+          status: "skipped_non_finite_pnl",
+          rawProfit: cleared.profit,
+          rawCommission: cleared.commission,
+        });
+        continue;
+      }
+      const netPnl = profit - commission;
+      const previousSettlementPnl = Number(row.settlement_pnl ?? 0);
+      const delta = netPnl - previousSettlementPnl;
+      const newStatus = cleared.betOutcome === "WON" ? "won" : cleared.betOutcome === "LOST" ? "lost" : "void";
+
+      await db.execute(sql`
+        UPDATE paper_bets
+        SET status = ${newStatus},
+            settlement_pnl = ${netPnl.toFixed(2)},
+            betfair_pnl = ${netPnl.toFixed(2)},
+            betfair_status = ${cleared.betOutcome === "WON" ? "won" : cleared.betOutcome === "LOST" ? "lost" : "void"},
+            betfair_settled_at = ${new Date(cleared.settledDate).toISOString()},
+            settled_at = COALESCE(settled_at, ${new Date().toISOString()})
+        WHERE id = ${row.id}
+      `);
+
+      cumulativePnlDelta += delta;
+
+      await db.insert(complianceLogsTable).values({
+        actionType: "settlement_mismatch_repaired",
+        details: {
+          paperBetId: row.id,
+          betfairBetId: row.betfair_bet_id,
+          previousInternalStatus: row.status,
+          newInternalStatus: newStatus,
+          previousSettlementPnl,
+          newSettlementPnl: netPnl,
+          bankrollDeltaApplied: delta,
+          betfairProfit: profit,
+          betfairCommission: commission,
+          betOutcome: cleared.betOutcome,
+          settledDate: cleared.settledDate,
+          rootCause:
+            "Internal settleBets voided due to FIRST_HALF_RESULT always-null OR stale matchedSize=0 race. settleBets now defers all matched real-money bets to reconcileSettlements.",
+        },
+        timestamp: new Date(),
+      });
+
+      mismatchResults.push({
+        paperBetId: row.id,
+        status: "repaired",
+        previousStatus: row.status,
+        newStatus,
+        previousSettlementPnl,
+        newSettlementPnl: netPnl,
+        bankrollDelta: delta,
+      });
+    }
+
+    let bankrollBefore: number | null = null;
+    let bankrollAfter: number | null = null;
+    if (Math.abs(cumulativePnlDelta) > 0.01) {
+      bankrollBefore = await getBankroll();
+      bankrollAfter = Math.round((bankrollBefore + cumulativePnlDelta) * 100) / 100;
+      await setConfigValue("bankroll", String(bankrollAfter));
+      await db.insert(complianceLogsTable).values({
+        actionType: "bankroll_updated",
+        details: {
+          bankrollBefore,
+          bankrollAfter,
+          delta: cumulativePnlDelta,
+          source: "settlement_mismatch_remediation",
+          rowsRepaired: mismatchResults.filter((r) => r.status === "repaired").length,
+        },
+        timestamp: new Date(),
+      });
+    }
+
+    // ─── (B) NaN backfill ─────────────────────────────────────────
+    const nanRows = (
+      await db.execute(sql`
+        SELECT id, betfair_bet_id
+        FROM paper_bets
+        WHERE betfair_pnl::text = 'NaN' AND betfair_bet_id IS NOT NULL
+      `)
+    ).rows as Array<{ id: number; betfair_bet_id: string }>;
+
+    let nanRepaired = 0;
+    let nanNoData = 0;
+    if (nanRows.length > 0) {
+      const nanBetIds = nanRows.map((r) => r.betfair_bet_id);
+      // Chunk into batches of 100 to keep payload sizes reasonable.
+      const chunkSize = 100;
+      const nanByBetId = new Map<string, ClearedOrder>();
+      for (let i = 0; i < nanBetIds.length; i += chunkSize) {
+        const chunk = nanBetIds.slice(i, i + chunkSize);
+        const cleared = await listClearedOrders(
+          { from: "2026-04-15T00:00:00Z", to: new Date().toISOString() },
+          chunk,
+          "SETTLED",
+        );
+        for (const o of cleared) nanByBetId.set(o.betId, o);
+      }
+      for (const row of nanRows) {
+        const cleared = nanByBetId.get(row.betfair_bet_id);
+        if (!cleared) {
+          nanNoData++;
+          continue;
+        }
+        const profit = Number(cleared.profit ?? 0);
+        const commission = Number(cleared.commission ?? 0);
+        if (!Number.isFinite(profit) || !Number.isFinite(commission)) {
+          nanNoData++;
+          continue;
+        }
+        const netPnl = profit - commission;
+        await db.execute(sql`
+          UPDATE paper_bets
+          SET betfair_pnl = ${netPnl.toFixed(2)}
+          WHERE id = ${row.id}
+        `);
+        nanRepaired++;
+      }
+      await db.insert(complianceLogsTable).values({
+        actionType: "betfair_pnl_nan_backfill",
+        details: {
+          executedAt: new Date().toISOString(),
+          totalNanRows: nanRows.length,
+          rowsRepaired: nanRepaired,
+          rowsNoData: nanNoData,
+          purpose:
+            "One-shot backfill of legacy NaN betfair_pnl values written before the Number(x ?? 0) defensive coercion fix.",
+        },
+        timestamp: new Date(),
+      });
+    }
+
+    res.json({
+      success: true,
+      mismatchRepair: {
+        candidates: mismatchRows.length,
+        repaired: mismatchResults.filter((r) => r.status === "repaired").length,
+        skipped: mismatchResults.filter((r) => r.status !== "repaired").length,
+        cumulativePnlDelta: Math.round(cumulativePnlDelta * 100) / 100,
+        bankrollBefore,
+        bankrollAfter,
+        rows: mismatchResults,
+      },
+      nanBackfill: {
+        candidates: nanRows.length,
+        repaired: nanRepaired,
+        noData: nanNoData,
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, "Settlement remediation failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });

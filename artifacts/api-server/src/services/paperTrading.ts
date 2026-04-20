@@ -1292,6 +1292,27 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     if (!match) continue;
     if (match.homeScore === null || match.awayScore === null) continue;
 
+    // ─── Real-money matched-bet deferral (Apr 19 2026) ─────────────────
+    // For any Betfair real-money bet that has matched size > 0, Betfair
+    // is the authoritative source of truth for the outcome. Defer to
+    // reconcileSettlements (which queries listClearedOrders across
+    // SETTLED/LAPSED/CANCELLED/VOIDED) instead of computing the outcome
+    // from the match score. Fixes two prior bugs:
+    //   (a) FIRST_HALF_RESULT and other markets that always returned null
+    //       in determineBetWon (no HT data) being incorrectly voided —
+    //       silently swallowing real Betfair winnings.
+    //   (b) Stale `betfair_size_matched` reads racing settleBets and
+    //       triggering the unmatched-bet guard below for fully-matched
+    //       bets, voiding real wins/losses.
+    const matchedSize = Number(bet.betfairSizeMatched ?? 0);
+    if (bet.betfairBetId && matchedSize > 0) {
+      logger.debug(
+        { betId: bet.id, betfairBetId: bet.betfairBetId, matchedSize },
+        "settleBets: real-money matched bet — deferring to reconcileSettlements",
+      );
+      continue;
+    }
+
     const stake = Number(bet.stake);
     const odds = Number(bet.oddsAtPlacement);
     let outcome = determineBetWon(
@@ -1307,10 +1328,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     // matched size is zero (offer placed but never filled, then cancelled
     // at kickoff), no actual position was ever taken — real-money P/L is
     // £0. Force the outcome to void regardless of the match result so we
-    // don't credit a phantom win/loss based on placement stake. Bug fix:
-    // previously bets like #90 (matched=£0, won by result) were credited
-    // the full notional payout even though no money was wagered.
-    const matchedSize = Number(bet.betfairSizeMatched ?? 0);
+    // don't credit a phantom win/loss based on placement stake.
     if (bet.betfairBetId && matchedSize <= 0) {
       logger.warn(
         {
