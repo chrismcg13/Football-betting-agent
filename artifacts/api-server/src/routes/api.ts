@@ -2278,6 +2278,82 @@ router.post("/admin/remediate-settlement-errors", async (_req, res) => {
       });
     }
 
+    // ─── (C) Backfill gross_pnl / commission_amount / commission_rate / net_pnl
+    // Targets any settled real-money won/lost row where settlement_pnl is set
+    // but the breakdown columns weren't populated (the original bug in (A)
+    // of this route, plus any other historical writer that only set
+    // settlement_pnl). Re-fetches authoritative profit/commission from Betfair
+    // and rewrites all four breakdown columns so the dashboard's commission
+    // tracking card reconciles with the headline ROI/bankroll figures.
+    const breakdownRows = (
+      await db.execute(sql`
+        SELECT id, betfair_bet_id, settlement_pnl::text AS settlement_pnl
+        FROM paper_bets
+        WHERE status IN ('won','lost')
+          AND betfair_bet_id IS NOT NULL
+          AND deleted_at IS NULL
+          AND ABS(COALESCE(settlement_pnl::numeric, 0) - COALESCE(net_pnl::numeric, 0)) > 0.02
+      `)
+    ).rows as Array<{ id: number; betfair_bet_id: string; settlement_pnl: string }>;
+
+    let breakdownRepaired = 0;
+    let breakdownNoData = 0;
+    if (breakdownRows.length > 0) {
+      const betIds = breakdownRows.map((r) => r.betfair_bet_id);
+      const chunkSize = 100;
+      const byBetId = new Map<string, ClearedOrder>();
+      for (let i = 0; i < betIds.length; i += chunkSize) {
+        const chunk = betIds.slice(i, i + chunkSize);
+        const cleared = await listClearedOrders(
+          { from: "2026-04-15T00:00:00Z", to: new Date().toISOString() },
+          chunk,
+          "SETTLED",
+        );
+        for (const o of cleared) byBetId.set(o.betId, o);
+      }
+      for (const row of breakdownRows) {
+        const cleared = byBetId.get(row.betfair_bet_id);
+        if (!cleared) {
+          breakdownNoData++;
+          continue;
+        }
+        const profit = Number(cleared.profit ?? 0);
+        const commission = Number(cleared.commission ?? 0);
+        if (!Number.isFinite(profit) || !Number.isFinite(commission)) {
+          breakdownNoData++;
+          continue;
+        }
+        const grossPnl = profit;
+        const commissionAmount = commission;
+        const netPnl = profit - commission;
+        const commissionRate = profit > 0 ? Math.round((commission / profit) * 10000) / 10000 : 0;
+
+        await db.execute(sql`
+          UPDATE paper_bets
+          SET gross_pnl = ${grossPnl.toFixed(2)},
+              commission_amount = ${commissionAmount.toFixed(2)},
+              commission_rate = ${commissionRate.toString()},
+              net_pnl = ${netPnl.toFixed(2)},
+              settlement_pnl = ${netPnl.toFixed(2)},
+              betfair_pnl = ${netPnl.toFixed(2)}
+          WHERE id = ${row.id}
+        `);
+        breakdownRepaired++;
+      }
+      await db.insert(complianceLogsTable).values({
+        actionType: "pnl_breakdown_backfill",
+        details: {
+          executedAt: new Date().toISOString(),
+          candidates: breakdownRows.length,
+          repaired: breakdownRepaired,
+          noData: breakdownNoData,
+          purpose:
+            "Backfill gross_pnl/commission_amount/commission_rate/net_pnl for rows where settlement_pnl != net_pnl. Caused by remediation route (A) only writing settlement_pnl+betfair_pnl. Reconciles dashboard commission card with headline ROI.",
+        },
+        timestamp: new Date(),
+      });
+    }
+
     res.json({
       success: true,
       mismatchRepair: {
@@ -2293,6 +2369,11 @@ router.post("/admin/remediate-settlement-errors", async (_req, res) => {
         candidates: nanRows.length,
         repaired: nanRepaired,
         noData: nanNoData,
+      },
+      breakdownBackfill: {
+        candidates: breakdownRows.length,
+        repaired: breakdownRepaired,
+        noData: breakdownNoData,
       },
     });
   } catch (err) {
