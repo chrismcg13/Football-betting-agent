@@ -14,6 +14,23 @@
 import { db, learningNarrativesTable, complianceLogsTable } from "@workspace/db";
 import { logger } from "../lib/logger";
 import type { ValueBet } from "./valueDetection";
+import { getConfigValue } from "./paperTrading";
+
+// Read a haircut multiplier from config; clamp to (0, 1] to prevent
+// pathological values (e.g. negative or >1 multipliers that would amplify
+// rather than reduce risk). Returns the default if the key is unset or
+// unparseable.
+async function readHaircut(key: string, defaultValue: number): Promise<number> {
+  try {
+    const raw = await getConfigValue(key);
+    if (!raw) return defaultValue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || n > 1) return defaultValue;
+    return n;
+  } catch {
+    return defaultValue;
+  }
+}
 
 export interface BetCandidate extends ValueBet {
   stakeMultiplier: number;
@@ -45,6 +62,26 @@ const COMPLEMENTARY_RULES: ComplementaryRule[] = [
     market1: "MATCH_ODDS", sel1Includes: "Away",
     market2: "OVER_UNDER_25", sel2Includes: "Over",
     thesis: "away team attacking dominance",
+  },
+  // FIRST_HALF_RESULT + MATCH_ODDS same-side: positively correlated (same
+  // team-strength thesis), but resolve independently — keep both, haircut
+  // stakes 20% to right-size exposure. Historical: 35/36 paired bets were
+  // same-side; aligned pairs delivered +39% ROI on £1.7k combined stake.
+  // Different-side pairings are NOT flagged (genuinely independent edges).
+  {
+    market1: "FIRST_HALF_RESULT", sel1Includes: "Home",
+    market2: "MATCH_ODDS", sel2Includes: "Home",
+    thesis: "home dominance across both halves",
+  },
+  {
+    market1: "FIRST_HALF_RESULT", sel1Includes: "Away",
+    market2: "MATCH_ODDS", sel2Includes: "Away",
+    thesis: "away dominance across both halves",
+  },
+  {
+    market1: "FIRST_HALF_RESULT", sel1Includes: "Draw",
+    market2: "MATCH_ODDS", sel2Includes: "Draw",
+    thesis: "low-scoring stalemate across both halves",
   },
 ];
 
@@ -229,19 +266,29 @@ export async function applyCorrelationDetection(
   }
 
   // ── 2. Complementary bet detection ───────────────────────────────────────
+  // Per-rule haircut multiplier (default 0.8 = -20%). Tunable for the
+  // FHR+MO same-side rules via config keys so calibration doesn't need a
+  // redeploy. Other rules retain the global 0.8 default.
+  const fhrMoHaircut = await readHaircut("complementary_haircut_fhr_mo", 0.8);
   for (const [matchId, bets] of byMatch) {
     for (const rule of COMPLEMENTARY_RULES) {
       const b1 = bets.find((b) => ruleMatch(b, rule.market1, rule.sel1Includes));
       const b2 = bets.find((b) => ruleMatch(b, rule.market2, rule.sel2Includes));
       if (!b1 || !b2) continue;
 
-      const msg = `Complementary bets on ${b1.homeTeam} vs ${b1.awayTeam}: ${b1.selectionName} + ${b2.selectionName} share the thesis '${rule.thesis}'. Stakes reduced 20% to manage correlated risk.`;
+      const isFhrMo =
+        (rule.market1 === "FIRST_HALF_RESULT" && rule.market2 === "MATCH_ODDS") ||
+        (rule.market1 === "MATCH_ODDS" && rule.market2 === "FIRST_HALF_RESULT");
+      const haircut = isFhrMo ? fhrMoHaircut : 0.8;
+      const reductionPct = Math.round((1 - haircut) * 100);
+
+      const msg = `Complementary bets on ${b1.homeTeam} vs ${b1.awayTeam}: ${b1.selectionName} + ${b2.selectionName} share the thesis '${rule.thesis}'. Stakes reduced ${reductionPct}% to manage correlated risk.`;
       narratives.push(msg);
-      logger.info({ matchId, thesis: rule.thesis }, "Complementary bets detected — stakes reduced 20%");
+      logger.info({ matchId, thesis: rule.thesis, haircut, isFhrMo }, `Complementary bets detected — stakes reduced ${reductionPct}%`);
 
       for (const b of [b1, b2]) {
         const idx = selected.findIndex((s) => betKey(s) === betKey(b));
-        if (idx >= 0) selected[idx]!.stakeMultiplier *= 0.8;
+        if (idx >= 0) selected[idx]!.stakeMultiplier *= haircut;
       }
     }
   }
