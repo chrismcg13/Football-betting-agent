@@ -82,6 +82,21 @@ export async function getBankroll(): Promise<number> {
 
 // ===================== Bet placement pre-checks =====================
 
+// Read a stake-multiplier from config; clamp to (0, 1] to prevent
+// pathological values that would amplify rather than reduce stake.
+// Returns the default if the key is unset or unparseable.
+async function readMultiplierConfig(key: string, defaultValue: number): Promise<number> {
+  try {
+    const raw = await getConfigValue(key);
+    if (!raw) return defaultValue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || n > 1) return defaultValue;
+    return n;
+  } catch {
+    return defaultValue;
+  }
+}
+
 async function getTotalPendingExposure(): Promise<number> {
   // Only count bets placed on or after exposure_rule_since — pre-rule bets are grandfathered.
   // Paper bets (qualification_path='paper') are excluded — they are NOT real money.
@@ -676,6 +691,39 @@ export async function placePaperBet(
 
   // Contrarian stake reduction removed — dev data shows +18.4% ROI on contrarian bets
   if (stakeMultiplier !== 1.0) stake = Math.round(stake * stakeMultiplier * 100) / 100;
+
+  // ─── Low-odds stake multiplier ──────────────────────────────────────────
+  // 90d analysis: bets at odds <3.0 with stake ≥£35 returned -23.6% ROI on
+  // £5,507 of stake (-£1,302). Bets at odds ≥3.0 returned +80% to +166% ROI
+  // across stake sizes. The model's edge estimates are systematically
+  // over-confident on short-priced selections — Kelly stakes them too
+  // aggressively for the slim true margin. Apply a tiered haircut on
+  // low-odds stakes (after all conviction-based sizing, before candidate-
+  // tier and hard-cap). All three tiers tunable via config; set any to
+  // 1.0 for instant rollback.
+  if (backOdds < 3.0) {
+    let lowOddsMult = 1.0;
+    let lowOddsBand = "";
+    if (backOdds < 2.0) {
+      lowOddsMult = await readMultiplierConfig("low_odds_stake_mult_under_2_0", 0.4);
+      lowOddsBand = "<2.0";
+    } else if (backOdds < 2.5) {
+      lowOddsMult = await readMultiplierConfig("low_odds_stake_mult_2_0_to_2_5", 0.6);
+      lowOddsBand = "2.0-2.5";
+    } else {
+      lowOddsMult = await readMultiplierConfig("low_odds_stake_mult_2_5_to_3_0", 0.8);
+      lowOddsBand = "2.5-3.0";
+    }
+    if (lowOddsMult < 1.0) {
+      const preLowOddsStake = stake;
+      stake = Math.round(stake * lowOddsMult * 100) / 100;
+      logger.info(
+        { matchId, marketType, backOdds, lowOddsBand, lowOddsMult, preLowOddsStake, postLowOddsStake: stake },
+        "Low-odds stake multiplier applied",
+      );
+    }
+  }
+
   if (dataTier === "candidate") {
     const CANDIDATE_STAKE_MULT = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");
     const originalStake = stake;
