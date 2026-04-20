@@ -12,7 +12,15 @@ import { logger } from "../lib/logger";
 import { retrainIfNeeded } from "./predictionEngine";
 import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch, isApiFootballCircuitOpen } from "./apiFootball";
 import { getThresholdCategory } from "./correlationDetector";
-import { isLiveMode, placeLiveBetOnBetfair, isBalanceStale, getLiveBankroll } from "./betfairLive";
+import {
+  isLiveMode,
+  placeLiveBetOnBetfair,
+  isBalanceStale,
+  getLiveBankroll,
+  markMarketUnavailable,
+  recordPlacementFailure,
+  clearPlacementFailures,
+} from "./betfairLive";
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
 import { getLiveOppScoreThreshold } from "./liveThresholdReview";
 import { storePinnacleSnapshot } from "./oddsPapi";
@@ -1028,6 +1036,28 @@ export async function placePaperBet(
             await db.update(paperBetsTable)
               .set({ status: "placement_failed", betfairStatus: `FAILED: ${liveResult.error ?? "unknown"}` })
               .where(eq(paperBetsTable.id, bet.id));
+
+            // Suppression bookkeeping: hard-suppress on "market unavailable",
+            // otherwise increment circuit-breaker counter for this (match, market).
+            // Skip the breaker for global/account-level errors (insufficient
+            // funds, balance issues) — those aren't a market-specific problem
+            // and would unfairly ban the market when bankroll is the cause.
+            if (liveResult.unavailableOnExchange) {
+              markMarketUnavailable(matchId, marketType);
+            } else {
+              const errLower = (liveResult.error ?? "").toLowerCase();
+              const isGlobalError =
+                errLower.includes("nsufficient") ||      // Insufficient/INSUFFICIENT
+                errLower.includes("account") ||
+                errLower.includes("balance") ||
+                errLower.includes("bankroll") ||
+                errLower.includes("no betfaireventid");
+              if (!isGlobalError) {
+                recordPlacementFailure(matchId, marketType);
+              }
+            }
+          } else {
+            clearPlacementFailures(matchId, marketType);
           }
         } else {
           logger.warn(

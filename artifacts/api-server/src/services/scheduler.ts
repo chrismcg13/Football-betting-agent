@@ -5,7 +5,7 @@ import { runFeatureEngineForUpcomingMatches } from "./featureEngine";
 import { detectValueBets } from "./valueDetection";
 import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets, backfillCornersCardsStats, getConfigValue, setConfigValue } from "./paperTrading";
 import { ABSOLUTE_BANKROLL_FLOOR_GBP, checkLiveCircuitBreakers, getAvailableBalance } from "./liveRiskManager";
-import { isLiveMode, listMarketsByEventId, MARKET_TYPE_MAP as BETFAIR_MARKET_TYPE_MAP } from "./betfairLive";
+import { isLiveMode, listMarketsByEventId, MARKET_TYPE_MAP as BETFAIR_MARKET_TYPE_MAP, isMarketSuppressed, getSuppressionStats } from "./betfairLive";
 import { runAllRiskChecks } from "./riskManager";
 import { getModelVersion } from "./predictionEngine";
 import { runLearningLoop } from "./learningLoop";
@@ -572,6 +572,7 @@ export async function runTradingCycle(options?: {
     let funnelBfMarketUnavailable = 0;
     let funnelBfNoEventId = 0;
     let funnelBfTypeUnsupported = 0;
+    let funnelBfSuppressed = 0;
     const ENABLE_BETFAIR_PRECHECK = process.env.ENABLE_BETFAIR_PRECHECK === "true";
     if (ENABLE_BETFAIR_PRECHECK && isLiveMode() && allEntriesUnfiltered.length > 0) {
       const liveCandidates = allEntriesUnfiltered;
@@ -739,9 +740,25 @@ export async function runTradingCycle(options?: {
     let funnelDupSkip = 0, funnelScoreSkip = 0, funnelLeagueSkip = 0, funnelMarketSkip = 0, funnelCycleCapHit = 0;
 
     for (const entry of allEntries) {
-      if (preCorrelation.length >= maxPerCycle) { funnelCycleCapHit++; continue; }
-
       const { bet, effectiveScore, validation } = entry;
+
+      // Drop candidates whose (match, market) is currently suppressed —
+      // either market is unavailable on Betfair (hard, 4h TTL) or has tripped
+      // the circuit breaker (3+ consecutive failures, 30min TTL).
+      // Done BEFORE the per-cycle cap so freed slots go to next-best candidates.
+      if (isLiveMode()) {
+        const sup = isMarketSuppressed(bet.matchId, bet.marketType);
+        if (sup.suppressed) {
+          funnelBfSuppressed++;
+          logger.debug(
+            { matchId: bet.matchId, market: bet.marketType, reason: sup.reason, expiresAt: sup.expiresAt },
+            "Skipping candidate — market suppressed",
+          );
+          continue;
+        }
+      }
+
+      if (preCorrelation.length >= maxPerCycle) { funnelCycleCapHit++; continue; }
 
       // Skip if we already have a pending bet on this match+market+selection
       const dupKey = `${bet.matchId}|${bet.marketType}|${bet.selectionName}`;
@@ -1338,6 +1355,13 @@ export async function runTradingCycle(options?: {
     funnel["pinnacle_coverage_pct"] = allUpcoming.length > 0
       ? Math.round((oddsPapiCache.size / allUpcoming.length) * 100)
       : 0;
+
+    // Market suppression visibility — drops from cache + total active suppressions
+    funnel["suppressed_dropped_this_cycle"] = funnelBfSuppressed;
+    const suppStats = getSuppressionStats();
+    funnel["suppressed_active_total"] = suppStats.total;
+    funnel["suppressed_active_unavailable"] = suppStats.unavailable;
+    funnel["suppressed_active_circuit_breaker"] = suppStats.circuitBreaker;
 
     logger.info({ funnel }, "=== TRADING CYCLE FUNNEL REPORT ===");
 

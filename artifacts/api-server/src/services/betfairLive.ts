@@ -309,6 +309,124 @@ export function getCachedBalance(): CachedBalance | null {
   return cachedBalance;
 }
 
+// ── Market suppression cache ─────────────────────────────────────────────────
+// Suppresses (matchId, marketType) pairs that have proven un-placeable so the
+// scheduler can drop their candidates before placement, freeing per-cycle
+// slots for the next-best candidates.
+//
+// Two suppression triggers:
+//   - HARD: market unavailable on Betfair (catalogue lookup returned no
+//     results) → suppressed for 4h.
+//   - CIRCUIT BREAKER: 3+ consecutive cycle-level placement failures of any
+//     kind on the same (match, market) → suppressed for 4h.
+//
+// Successful placement clears the failure counter for that pair.
+
+type SuppressionEntry = {
+  reason: "market_unavailable" | "circuit_breaker";
+  failureCount: number;
+  lastFailureAt: number;
+  expiresAt: number;
+};
+
+// Hard suppression (confirmed market unavailable on Betfair): 4h TTL.
+// Circuit-breaker suppression (consecutive failures of mixed cause): 30min TTL,
+// since these can include transient API issues that may resolve quickly.
+const MARKET_UNAVAILABLE_TTL_MS = 4 * 60 * 60 * 1000;
+const CIRCUIT_BREAKER_TTL_MS = 30 * 60 * 1000;
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const marketSuppression = new Map<string, SuppressionEntry>();
+
+function suppressionKey(matchId: number, marketType: string): string {
+  return `${matchId}::${marketType}`;
+}
+
+export function isMarketSuppressed(
+  matchId: number,
+  marketType: string,
+): { suppressed: boolean; reason?: string; expiresAt?: number } {
+  const key = suppressionKey(matchId, marketType);
+  const entry = marketSuppression.get(key);
+  if (!entry) return { suppressed: false };
+  if (Date.now() >= entry.expiresAt) {
+    marketSuppression.delete(key);
+    return { suppressed: false };
+  }
+  if (entry.failureCount >= CIRCUIT_BREAKER_THRESHOLD || entry.reason === "market_unavailable") {
+    return { suppressed: true, reason: entry.reason, expiresAt: entry.expiresAt };
+  }
+  return { suppressed: false };
+}
+
+export function markMarketUnavailable(matchId: number, marketType: string): void {
+  const key = suppressionKey(matchId, marketType);
+  marketSuppression.set(key, {
+    reason: "market_unavailable",
+    failureCount: CIRCUIT_BREAKER_THRESHOLD,
+    lastFailureAt: Date.now(),
+    expiresAt: Date.now() + MARKET_UNAVAILABLE_TTL_MS,
+  });
+  logger.info(
+    { matchId, marketType, ttlMs: MARKET_UNAVAILABLE_TTL_MS },
+    "Market suppressed (unavailable on Betfair)",
+  );
+}
+
+export function recordPlacementFailure(matchId: number, marketType: string): void {
+  const key = suppressionKey(matchId, marketType);
+  const existing = marketSuppression.get(key);
+  const now = Date.now();
+  const newCount = (existing?.failureCount ?? 0) + 1;
+  const reason: "market_unavailable" | "circuit_breaker" =
+    existing?.reason === "market_unavailable" ? "market_unavailable" : "circuit_breaker";
+  // Keep the longer TTL if this slot is already a hard "market_unavailable" suppression.
+  const ttl = reason === "market_unavailable" ? MARKET_UNAVAILABLE_TTL_MS : CIRCUIT_BREAKER_TTL_MS;
+  marketSuppression.set(key, {
+    reason,
+    failureCount: newCount,
+    lastFailureAt: now,
+    expiresAt: now + ttl,
+  });
+  if (newCount >= CIRCUIT_BREAKER_THRESHOLD) {
+    logger.warn(
+      { matchId, marketType, failureCount: newCount, ttlMs: ttl },
+      "Circuit breaker tripped — market suppressed after consecutive failures",
+    );
+  }
+}
+
+export function clearPlacementFailures(matchId: number, marketType: string): void {
+  marketSuppression.delete(suppressionKey(matchId, marketType));
+}
+
+export function getSuppressionStats(): { total: number; unavailable: number; circuitBreaker: number } {
+  let unavailable = 0;
+  let circuitBreaker = 0;
+  const now = Date.now();
+  for (const [key, entry] of marketSuppression) {
+    if (now >= entry.expiresAt) {
+      marketSuppression.delete(key);
+      continue;
+    }
+    if (entry.reason === "market_unavailable") unavailable++;
+    else if (entry.failureCount >= CIRCUIT_BREAKER_THRESHOLD) circuitBreaker++;
+  }
+  return { total: marketSuppression.size, unavailable, circuitBreaker };
+}
+
+// Refresh balance if cached value is older than the given window. Used as a
+// pre-flight check before each live placement to prevent INSUFFICIENT_FUNDS
+// cascades during placement bursts.
+const BALANCE_PREFLIGHT_MAX_AGE_MS = 30_000;
+export async function refreshBalanceIfStale(maxAgeMs: number = BALANCE_PREFLIGHT_MAX_AGE_MS): Promise<void> {
+  if (cachedBalance && Date.now() - cachedBalance.fetchedAt <= maxAgeMs) return;
+  try {
+    await getAccountFunds();
+  } catch (err) {
+    logger.warn({ err }, "refreshBalanceIfStale: balance refresh failed — using existing cached value");
+  }
+}
+
 export function isBalanceStale(): boolean {
   if (!cachedBalance) return true;
   return Date.now() - cachedBalance.fetchedAt > BALANCE_STALE_MS;
@@ -1234,6 +1352,11 @@ export async function placeLiveBetOnBetfair(params: {
     logger.warn({ internalBetId }, msg);
     return { success: false, error: msg };
   }
+
+  // Pre-flight: refresh balance if the cached value is older than 30s. Stops
+  // INSUFFICIENT_FUNDS cascades during placement bursts where multiple bets
+  // in the same cycle drain the bankroll faster than the periodic refresh.
+  await refreshBalanceIfStale();
 
   const balance = getCachedBalance();
   if (balance && stake > balance.available) {
