@@ -769,36 +769,48 @@ export async function reconcileSettlements(): Promise<{
 
     if (betfairStatus !== "SETTLED") {
       // CANCELLED / LAPSED / VOIDED — never matched (or matched portion is in
-      // the SETTLED record above). Treat as a £0-PnL void of the unmatched
-      // stake. Update both betfair_* mirror fields AND the internal status,
-      // because settleBets() keys off matches.status='finished' and won't fire
-      // for bets whose markets were cancelled before kickoff.
+      // the SETTLED record above). Real-money impact is £0 — no position taken.
+      // Betfair is the authoritative source: ALWAYS overwrite internal fields
+      // to reflect this, even if settleBets() previously stamped a (wrong)
+      // won/lost/void status from match-score logic. The pre-fix behavior of
+      // "only update if status=pending" left ~150 dashboard rows showing
+      // phantom wins/losses on bets that never actually executed on Betfair.
       const newStatus = betfairStatus === "VOIDED" ? "void" : "cancelled";
+      const internalStatusChanged = bet.status !== newStatus && bet.status !== "pending";
       await db
         .update(paperBetsTable)
         .set({
           betfairSettledAt: cleared.settledDate ? new Date(cleared.settledDate) : new Date(),
           betfairPnl: "0.00",
           betfairStatus: newStatus,
-          // Only flip internal status if still pending — never overwrite a
-          // resolved row (won/lost/cancelled/void/placement_failed).
-          ...(bet.status === "pending"
-            ? { status: newStatus, settlementPnl: bet.settlementPnl ?? "0.00", settledAt: new Date() }
-            : {}),
+          status: newStatus,
+          settlementPnl: "0.00",
+          netPnl: "0.00",
+          grossPnl: "0.00",
+          commissionAmount: "0.00",
+          settledAt: new Date(),
         })
         .where(eq(paperBetsTable.id, bet.id));
 
       voided++;
-      logger.info(
-        {
-          betId: bet.id,
-          betfairBetId: bet.betfairBetId,
-          betfairStatus,
-          sizeCancelled: cleared.sizeCancelled,
-          previouslyPending: bet.status === "pending",
-        },
-        "reconcileSettlements: voided bet from Betfair non-SETTLED cleared status",
-      );
+      if (internalStatusChanged) {
+        logger.warn(
+          {
+            betId: bet.id,
+            betfairBetId: bet.betfairBetId,
+            previousStatus: bet.status,
+            newStatus,
+            betfairStatus,
+            sizeCancelled: cleared.sizeCancelled,
+          },
+          "reconcileSettlements: CORRECTING previously mis-settled bet — Betfair reports non-matched",
+        );
+      } else {
+        logger.info(
+          { betId: bet.id, betfairBetId: bet.betfairBetId, betfairStatus, sizeCancelled: cleared.sizeCancelled },
+          "reconcileSettlements: voided bet from Betfair non-SETTLED cleared status",
+        );
+      }
       continue;
     }
 
@@ -870,30 +882,45 @@ export async function reconcileSettlements(): Promise<{
       : 0;
     const wasPending = bet.status === "pending";
 
+    // Betfair is the authoritative source of truth for SETTLED bets. ALWAYS
+    // sync internal fields to the cleared-order values, regardless of whether
+    // the bet was previously settled by paperTrading.settleBets() (e.g. with
+    // wrong status from match-score logic, or marked 'void' due to missing
+    // HT data on FIRST_HALF_RESULT). The pre-fix policy of "only update if
+    // pending" left the dashboard with phantom wins/losses worth ~£700/30d.
+    const previousStatusForLog = bet.status;
+    const internalStatusChanged = previousStatusForLog !== internalStatus && previousStatusForLog !== "pending";
     await db
       .update(paperBetsTable)
       .set({
         betfairSettledAt: new Date(cleared.settledDate),
         betfairPnl: String(betfairPnl.toFixed(2)),
         betfairStatus: cleared.betOutcome === "WON" ? "won" : cleared.betOutcome === "LOST" ? "lost" : "void",
-        // Promote internal fields only if still pending — never overwrite a
-        // previously settled row's status/PnL silently. Discrepancies are
-        // logged below for audit.
-        ...(wasPending
-          ? {
-              status: internalStatus,
-              settlementPnl: String(betfairPnl.toFixed(2)),
-              grossPnl: String(grossPnl.toFixed(2)),
-              commissionAmount: String(commissionAmount.toFixed(2)),
-              commissionRate: String(commissionRate),
-              netPnl: String(betfairPnl.toFixed(2)),
-              settledAt: new Date(),
-              closingOddsProxy: closingOddsProxy != null ? String(closingOddsProxy) : null,
-              clvPct: clvPct != null ? String(clvPct) : null,
-            }
-          : {}),
+        status: internalStatus,
+        settlementPnl: String(betfairPnl.toFixed(2)),
+        grossPnl: String(grossPnl.toFixed(2)),
+        commissionAmount: String(commissionAmount.toFixed(2)),
+        commissionRate: String(commissionRate),
+        netPnl: String(betfairPnl.toFixed(2)),
+        settledAt: new Date(),
+        ...(closingOddsProxy != null ? { closingOddsProxy: String(closingOddsProxy) } : {}),
+        ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
       })
       .where(eq(paperBetsTable.id, bet.id));
+
+    if (internalStatusChanged) {
+      logger.warn(
+        {
+          betId: bet.id,
+          betfairBetId: bet.betfairBetId,
+          previousStatus: previousStatusForLog,
+          newStatus: internalStatus,
+          previousPnl: internalPnl,
+          newPnl: betfairPnl,
+        },
+        "reconcileSettlements: CORRECTING previously mis-settled bet — Betfair is authoritative",
+      );
+    }
 
     if (pnlDiff > 0.02) {
       discrepancies++;
