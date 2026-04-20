@@ -18,6 +18,8 @@ export const matchesTable = pgTable("matches", {
   status: text("status").notNull().default("scheduled"),
   homeScore: integer("home_score"),
   awayScore: integer("away_score"),
+  homeScoreHt: integer("home_score_ht"),
+  awayScoreHt: integer("away_score_ht"),
   betfairEventId: text("betfair_event_id"),
   apiFixtureId: integer("api_fixture_id"),
   totalCorners: integer("total_corners"),

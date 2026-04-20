@@ -1225,10 +1225,33 @@ function determineBetWon(
       return null;
     }
 
-    case "FIRST_HALF_RESULT":
+    case "FIRST_HALF_RESULT": {
+      // Resolved from halftime scores captured during syncMatchResults
+      // (matches.home_score_ht / away_score_ht). When HT scores are not
+      // available (older fixtures, feeds without halftime data), return
+      // null so the bet voids — but for any matched real-money bet,
+      // _settleBetsInner has already deferred to reconcileSettlements
+      // (Betfair listClearedOrders) before reaching this function.
+      const htHome = (match as { homeScoreHt?: number | null }).homeScoreHt;
+      const htAway = (match as { awayScoreHt?: number | null }).awayScoreHt;
+      if (htHome === null || htHome === undefined || htAway === null || htAway === undefined) return null;
+      if (selectionName === "Home") return htHome > htAway;
+      if (selectionName === "Draw") return htHome === htAway;
+      if (selectionName === "Away") return htAway > htHome;
+      return null;
+    }
+
     case "FIRST_HALF_OU_05":
-    case "FIRST_HALF_OU_15":
-      return null; // void — no half-time score data available
+    case "FIRST_HALF_OU_15": {
+      const htHome = (match as { homeScoreHt?: number | null }).homeScoreHt;
+      const htAway = (match as { awayScoreHt?: number | null }).awayScoreHt;
+      if (htHome === null || htHome === undefined || htAway === null || htAway === undefined) return null;
+      const htTotal = htHome + htAway;
+      const threshold = marketType === "FIRST_HALF_OU_05" ? 0.5 : 1.5;
+      if (selectionName.startsWith("Over")) return htTotal > threshold;
+      if (selectionName.startsWith("Under")) return htTotal < threshold;
+      return null;
+    }
 
     default:
       return null; // void unknown markets rather than forcing a loss

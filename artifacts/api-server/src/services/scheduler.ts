@@ -960,14 +960,21 @@ export async function runTradingCycle(options?: {
     }
 
     // ─── PERMANENT MARKET DISABLE FILTER ─────────────────────────────────────
-    // FIRST_HALF_RESULT is permanently disabled because there is no reliable
-    // half-time score data feed in the project — bets on this market cannot
-    // be verified or settled deterministically. The agent previously placed
-    // these and Betfair settled them via reconcileSettlements, but we cannot
-    // independently audit the outcomes against ground truth. Disabling at
-    // signal selection prevents the agent from staking new positions.
+    // DOUBLE_CHANCE: disabled Apr 20 2026 after 30-day P&L review showed it
+    // generating −£579 / −31.2% ROI on 43 bets — a structural loss source
+    // accounting for ~75% of total monthly profit drag. The synthetic odds
+    // derivation from MATCH_ODDS (vig-removed implied probability) appears
+    // to systematically over-estimate edge. Re-enable only with a model
+    // change or a sharp upstream odds source for this market.
+    //
+    // FIRST_HALF_RESULT was previously here (no HT data → cannot audit). Now
+    // re-enabled because: (a) HT scores are captured into matches.home_score_ht
+    // / away_score_ht during syncMatchResults, (b) determineBetWon resolves
+    // it deterministically from those columns, and (c) for any matched
+    // real-money bet, reconcileSettlements is the authoritative source via
+    // Betfair listClearedOrders.
     {
-      const PERMANENT_DISABLED_MARKETS = new Set(["FIRST_HALF_RESULT"]);
+      const PERMANENT_DISABLED_MARKETS = new Set(["DOUBLE_CHANCE"]);
       if (selectedBets.length > 0) {
         const before = selectedBets.length;
         const kept = selectedBets.filter(
@@ -979,9 +986,46 @@ export async function runTradingCycle(options?: {
           selectedBets.push(...kept);
           logger.warn(
             { tier, before, after: selectedBets.length, dropped, disabled: [...PERMANENT_DISABLED_MARKETS] },
-            "Permanent market disable filter applied (FIRST_HALF_RESULT — no HT verification)",
+            "Permanent market disable filter applied (DOUBLE_CHANCE — structural −31% ROI, see Apr 20 2026 review)",
           );
           funnel["07a_rejected_permanent_disabled_markets"] = dropped;
+        }
+      }
+    }
+
+    // ─── PER-MARKET EDGE FLOOR FILTER ─────────────────────────────────────────
+    // Tighter edge requirement on markets that have shown poor realized ROI
+    // despite passing the global min_edge_threshold gate. OVER_UNDER_25
+    // generated −£111 / −2.0% ROI on 199 bets in the trailing 30 days
+    // (41% of all stake volume) — barely break-even on the highest-volume
+    // market. Raising the floor halves exposure while preserving the strongest
+    // CLV-positive picks.
+    //
+    // Tunable via config keys; defaults below if unset.
+    {
+      if (selectedBets.length > 0) {
+        const cfg = await Promise.all([
+          getConfigValue("market_edge_floor_over_under_25"),
+        ]);
+        const floors: Record<string, number> = {
+          OVER_UNDER_25: Number(cfg[0] ?? "0.06"),
+        };
+        const before = selectedBets.length;
+        const kept = selectedBets.filter((c) => {
+          const floor = floors[c.marketType.toUpperCase()];
+          if (floor === undefined) return true;
+          const edge = Number(c.edge ?? 0);
+          return edge >= floor;
+        });
+        const dropped = before - kept.length;
+        if (dropped > 0) {
+          selectedBets.length = 0;
+          selectedBets.push(...kept);
+          logger.warn(
+            { tier, before, after: selectedBets.length, dropped, floors },
+            "Per-market edge floor filter applied (OVER_UNDER_25 — see Apr 20 2026 review)",
+          );
+          funnel["07c_rejected_per_market_edge_floor"] = dropped;
         }
       }
     }
@@ -1389,6 +1433,10 @@ export async function syncMatchResults(daysBack = 2): Promise<number> {
     const homeGoals = fixture.goals?.home ?? fixture.score?.fulltime?.home;
     const awayGoals = fixture.goals?.away ?? fixture.score?.fulltime?.away;
     if (homeGoals === null || homeGoals === undefined || awayGoals === null || awayGoals === undefined) continue;
+    // Halftime scores (nullable — older fixtures or feeds may not provide).
+    // Captured to enable independent settlement of FIRST_HALF_RESULT bets.
+    const htHome = fixture.score?.halftime?.home;
+    const htAway = fixture.score?.halftime?.away;
 
     let dbMatch = fixtureIdIndex.get(fixture.fixture.id);
     if (dbMatch && matchedDbIds.has(dbMatch.id)) dbMatch = undefined;
@@ -1412,6 +1460,9 @@ export async function syncMatchResults(daysBack = 2): Promise<number> {
         status: "finished",
         homeScore: homeGoals,
         awayScore: awayGoals,
+        ...(htHome !== null && htHome !== undefined && htAway !== null && htAway !== undefined
+          ? { homeScoreHt: htHome, awayScoreHt: htAway }
+          : {}),
         apiFixtureId: fixture.fixture.id,
         ...(matchStats !== null
           ? { totalCorners: matchStats.totalCorners, totalCards: matchStats.totalCards }
