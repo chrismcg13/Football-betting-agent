@@ -959,6 +959,33 @@ export async function runTradingCycle(options?: {
       }
     }
 
+    // ─── PERMANENT MARKET DISABLE FILTER ─────────────────────────────────────
+    // FIRST_HALF_RESULT is permanently disabled because there is no reliable
+    // half-time score data feed in the project — bets on this market cannot
+    // be verified or settled deterministically. The agent previously placed
+    // these and Betfair settled them via reconcileSettlements, but we cannot
+    // independently audit the outcomes against ground truth. Disabling at
+    // signal selection prevents the agent from staking new positions.
+    {
+      const PERMANENT_DISABLED_MARKETS = new Set(["FIRST_HALF_RESULT"]);
+      if (selectedBets.length > 0) {
+        const before = selectedBets.length;
+        const kept = selectedBets.filter(
+          (c) => !PERMANENT_DISABLED_MARKETS.has(c.marketType.toUpperCase()),
+        );
+        const dropped = before - kept.length;
+        if (dropped > 0) {
+          selectedBets.length = 0;
+          selectedBets.push(...kept);
+          logger.warn(
+            { tier, before, after: selectedBets.length, dropped, disabled: [...PERMANENT_DISABLED_MARKETS] },
+            "Permanent market disable filter applied (FIRST_HALF_RESULT — no HT verification)",
+          );
+          funnel["07a_rejected_permanent_disabled_markets"] = dropped;
+        }
+      }
+    }
+
     // ─── STRATEGY OVERRIDE FILTER (today-only, self-expiring at strategy_overrides_expire_at) ───
     // Reads 3 config keys: strategy_disabled_markets (CSV), strategy_max_odds, strategy_max_hours_to_kickoff.
     // Auto-disables once strategy_overrides_expire_at is past — no manual revert needed.

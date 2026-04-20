@@ -1,8 +1,8 @@
 import axios, { type AxiosInstance } from "axios";
 import { logger } from "../lib/logger";
 import { db } from "@workspace/db";
-import { paperBetsTable, complianceLogsTable } from "@workspace/db";
-import { eq, and, isNotNull, isNull, sql } from "drizzle-orm";
+import { paperBetsTable, complianceLogsTable, oddsSnapshotsTable } from "@workspace/db";
+import { eq, and, isNotNull, isNull, sql, desc } from "drizzle-orm";
 import { BETFAIR_TICKS } from "./orderManager";
 
 function roundDownToTick(price: number): number {
@@ -704,12 +704,76 @@ export async function reconcileSettlements(): Promise<{
     const internalPnl = Number(bet.settlementPnl ?? 0);
     const pnlDiff = Math.abs(betfairPnl - internalPnl);
 
+    // ── CLV: compare placement odds vs latest market snapshot (proxy) ──
+    // Ported from paperTrading.settleBets which used to compute this for all
+    // bets. Now that settleBets defers all matched real-money bets to this
+    // function, we must compute CLV here or every future real-money bet
+    // would have null CLV/closingOddsProxy. Best-effort — failure does not
+    // block settlement.
+    let closingOddsProxy: number | null = null;
+    let clvPct: number | null = null;
+    try {
+      const latestSnapshot = await db
+        .select({ backOdds: oddsSnapshotsTable.backOdds })
+        .from(oddsSnapshotsTable)
+        .where(
+          and(
+            eq(oddsSnapshotsTable.matchId, bet.matchId),
+            eq(oddsSnapshotsTable.marketType, bet.marketType),
+            eq(oddsSnapshotsTable.selectionName, bet.selectionName),
+          ),
+        )
+        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+        .limit(1);
+      if (latestSnapshot[0]?.backOdds) {
+        closingOddsProxy = Number(latestSnapshot[0].backOdds);
+        if (closingOddsProxy > 1) {
+          const placementOdds = Number(bet.oddsAtPlacement ?? 0);
+          if (placementOdds > 1) {
+            clvPct = ((placementOdds - closingOddsProxy) / closingOddsProxy) * 100;
+            clvPct = Math.round(clvPct * 1000) / 1000;
+          }
+        }
+      }
+    } catch {
+      // best-effort; never block settlement on CLV failure
+    }
+
+    // Determine internal status flip semantics. Cleared.betOutcome is the
+    // authoritative result. We rewrite the full P&L breakdown so dashboard
+    // and reports stay consistent.
+    const internalStatus = cleared.betOutcome === "WON" ? "won"
+      : cleared.betOutcome === "LOST" ? "lost"
+      : "void";
+    const grossPnl = Number.isFinite(profit) ? profit : 0;
+    const commissionAmount = Number.isFinite(commission) ? commission : 0;
+    const commissionRate = grossPnl > 0
+      ? Math.round((commissionAmount / grossPnl) * 10000) / 10000
+      : 0;
+    const wasPending = bet.status === "pending";
+
     await db
       .update(paperBetsTable)
       .set({
         betfairSettledAt: new Date(cleared.settledDate),
         betfairPnl: String(betfairPnl.toFixed(2)),
-        betfairStatus: cleared.betOutcome === "WON" ? "won" : "lost",
+        betfairStatus: cleared.betOutcome === "WON" ? "won" : cleared.betOutcome === "LOST" ? "lost" : "void",
+        // Promote internal fields only if still pending — never overwrite a
+        // previously settled row's status/PnL silently. Discrepancies are
+        // logged below for audit.
+        ...(wasPending
+          ? {
+              status: internalStatus,
+              settlementPnl: String(betfairPnl.toFixed(2)),
+              grossPnl: String(grossPnl.toFixed(2)),
+              commissionAmount: String(commissionAmount.toFixed(2)),
+              commissionRate: String(commissionRate),
+              netPnl: String(betfairPnl.toFixed(2)),
+              settledAt: new Date(),
+              closingOddsProxy: closingOddsProxy != null ? String(closingOddsProxy) : null,
+              clvPct: clvPct != null ? String(clvPct) : null,
+            }
+          : {}),
       })
       .where(eq(paperBetsTable.id, bet.id));
 
