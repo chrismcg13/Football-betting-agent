@@ -1,0 +1,20 @@
+PROMPT 1 — Quarantine (do this first, ship in next 15 minutes)Urgent. Add four markets to the production placement banned list. This is a hard block to stop live placement on markets with confirmed negative CLV and a pricing-pipeline bug we're about to fix separately.What to change:In paperTrading.ts around line 163, locate the BANNED_MARKETS array (or equivalent constant). Add the following market types:
+OVER_UNDER_25
+OVER_UNDER_35
+FIRST_HALF_RESULT
+DOUBLE_CHANCE
+Match the exact string format already used in that array — do not guess the casing or naming convention. Open the file, read the existing entries, and mirror them.Rules:
+Do not modify valueDetection.ts in this task. The data_tier override bug and the pricing-pipeline bug are separate and tracked for follow-up work.
+Do not modify the experiment registry or write to the database. The block is code-level only.
+Do not modify any tests or mocks. If existing tests rely on placements in these markets, note that in your output but do not change the tests.
+Add a single-line comment above each new entry referencing the CLV diagnostic (e.g. // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic).
+Verification required before you mark this complete:
+Show me the diff of paperTrading.ts.
+Restart the dev workflow and confirm the server starts cleanly.
+Run a single SELECT against dev Neon confirming how many EXECUTABLE (still-pending) bets currently exist across these four markets — I need to know what's already in flight that the ban won't retroactively cancel.
+Confirm that the production scheduler is disabled (as per the standard prod isolation setup) and that the ban will take effect on the next dev scheduler cycle.
+Do not:
+Cancel or modify any pending bets already on Betfair. Let them run their course.
+Touch prod Neon for any reason.
+Assume the array name is BANNED_MARKETS — confirm by inspection first.
+When done, paste the diff, the verification SELECT results, and confirmation that the server restarted cleanly.

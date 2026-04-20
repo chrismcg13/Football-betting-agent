@@ -171,6 +171,14 @@ export const BANNED_MARKETS: ReadonlySet<string> = new Set([
   "TOTAL_CORNERS_105", // Edge concentration: ALL corners suspended
   "TOTAL_CORNERS_115", // Edge concentration: ALL corners suspended
   "FIRST_HALF_OU_05",  // Too easy; FIRST_HALF_OU_15 retained instead
+  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
+  "OVER_UNDER_25",
+  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
+  "OVER_UNDER_35",
+  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
+  "FIRST_HALF_RESULT",
+  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
+  "DOUBLE_CHANCE",
 ]);
 
 function kellyFractionForScore(opportunityScore: number, marketType?: string): number {
