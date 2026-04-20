@@ -11,7 +11,8 @@
  * Step 4:  Hard cap — max 4 bets per match
  */
 
-import { db, learningNarrativesTable, complianceLogsTable } from "@workspace/db";
+import { db, learningNarrativesTable, complianceLogsTable, paperBetsTable } from "@workspace/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import type { ValueBet } from "./valueDetection";
 import { getConfigValue } from "./paperTrading";
@@ -83,6 +84,47 @@ const COMPLEMENTARY_RULES: ComplementaryRule[] = [
     market2: "MATCH_ODDS", sel2Includes: "Draw",
     thesis: "low-scoring stalemate across both halves",
   },
+  // ─── Same-side BTTS+OU (goals direction) ────────────────────────────────
+  // 60d data: 2-bet matches with BTTS+OU pairs returned -57% ROI on £652
+  // stake (-£373). 3 of 8 had BOTH bets lose (correlated wrong). The
+  // BTTS:Yes+OU:Over case is already dominated/dropped via CORRELATED_PAIRS,
+  // but the bearish-side pairs (BTTS:No + OU:Under) and stronger-bullish
+  // (BTTS:Yes + OU3.5:Over) are not. Tunable via complementary_haircut_btts_ou
+  // (default 0.7 = 30% reduction).
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "OVER_UNDER_25", sel2Includes: "Under",
+    thesis: "low-tempo defensive game (BTTS No + Under 2.5)",
+  },
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "OVER_UNDER_35", sel2Includes: "Under",
+    thesis: "low-tempo defensive game (BTTS No + Under 3.5)",
+  },
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "OVER_UNDER_35", sel2Includes: "Over",
+    thesis: "high-tempo open game (BTTS Yes + Over 3.5)",
+  },
+  // ─── Same-side MO+OU (result + goals direction) ─────────────────────────
+  // Mirror of existing MO:Away+OU:Over rule: home dominance can also express
+  // as MO:Home + OU:Over (home wins by scoring multiple goals). Tunable via
+  // complementary_haircut_mo_ou (default 0.8 = 20% reduction).
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Home",
+    market2: "OVER_UNDER_25", sel2Includes: "Over",
+    thesis: "home dominance expressed via attacking output",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Home",
+    market2: "OVER_UNDER_35", sel2Includes: "Over",
+    thesis: "home dominance expressed via heavy attacking output",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Away",
+    market2: "OVER_UNDER_35", sel2Includes: "Over",
+    thesis: "away dominance expressed via heavy attacking output",
+  },
 ];
 
 interface ConflictingRule {
@@ -137,6 +179,53 @@ const CORRELATED_PAIRS: CorrelatedPair[] = [
     market1: "BTTS", sel1Includes: "Yes",
     market2: "OVER_UNDER_15", sel2Includes: "Over",
     reason: "BTTS Yes implies both teams score, making Over 1.5 near-certain — correlated",
+  },
+  // ─── BTTS:Yes + DOUBLE_CHANCE pairs (60d data: BTTS:Yes+DC:X2 leaked
+  // -£147 over 9 occurrences with 5/9 BOTH-lost). BTTS:Yes is dominated by
+  // any DC selection that includes the side BTTS Yes implies high-tempo for —
+  // adding both pays vig twice for one underlying view.
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "DOUBLE_CHANCE", sel2Includes: "X2",
+    reason: "BTTS Yes + DC X2 share thesis 'away/draw side scoring' — correlated",
+  },
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "DOUBLE_CHANCE", sel2Includes: "1X",
+    reason: "BTTS Yes + DC 1X share thesis 'home/draw side scoring' — correlated",
+  },
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "DOUBLE_CHANCE", sel2Includes: "Away or Draw",
+    reason: "BTTS Yes + DC Away or Draw share thesis 'away/draw side scoring' — correlated",
+  },
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "DOUBLE_CHANCE", sel2Includes: "Home or Draw",
+    reason: "BTTS Yes + DC Home or Draw share thesis 'home/draw side scoring' — correlated",
+  },
+  // ─── MO:Draw + DOUBLE_CHANCE subset domination ─────────────────────────
+  // Draw is a strict subset of every DC selection containing "Draw".
+  // Placing both is mathematically dominated.
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Draw",
+    market2: "DOUBLE_CHANCE", sel2Includes: "1X",
+    reason: "Draw is a strict subset of DC 1X — dominated",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Draw",
+    market2: "DOUBLE_CHANCE", sel2Includes: "X2",
+    reason: "Draw is a strict subset of DC X2 — dominated",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Draw",
+    market2: "DOUBLE_CHANCE", sel2Includes: "Home or Draw",
+    reason: "Draw is a strict subset of DC Home or Draw — dominated",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Draw",
+    market2: "DOUBLE_CHANCE", sel2Includes: "Away or Draw",
+    reason: "Draw is a strict subset of DC Away or Draw — dominated",
   },
 ];
 
@@ -198,6 +287,83 @@ export async function applyCorrelationDetection(
     const arr = byMatch.get(bet.matchId) ?? [];
     arr.push(bet);
     byMatch.set(bet.matchId, arr);
+  }
+
+  // ── 0C. Cross-cycle correlation check ─────────────────────────────────────
+  // 60d data analysis: most 2-bet matches that lost both bets had the two
+  // bets placed in DIFFERENT cycles (avg gap 16+ hours). The within-cycle
+  // correlation rules can't catch these because by the time bet #2 is being
+  // evaluated, bet #1 is already in the pending state — not in the candidate
+  // pool. Fix: fetch pending bets per match upfront and drop any new candidate
+  // that would form a CORRELATED_PAIRS subset-domination pair with one.
+  // Estimated impact: -£250 to -£400 per 60d in eliminated cross-cycle leakage.
+  const matchIds = [...byMatch.keys()];
+  if (matchIds.length > 0) {
+    const pendingBets = await db
+      .select({
+        matchId: paperBetsTable.matchId,
+        marketType: paperBetsTable.marketType,
+        selectionName: paperBetsTable.selectionName,
+      })
+      .from(paperBetsTable)
+      .where(
+        and(
+          inArray(paperBetsTable.matchId, matchIds),
+          inArray(paperBetsTable.status, ["pending", "pending_placement"]),
+          sql`${paperBetsTable.deletedAt} IS NULL`,
+        ),
+      );
+
+    const pendingByMatch = new Map<number, Array<{ marketType: string; selectionName: string }>>();
+    for (const pb of pendingBets) {
+      const arr = pendingByMatch.get(pb.matchId) ?? [];
+      arr.push({ marketType: pb.marketType, selectionName: pb.selectionName });
+      pendingByMatch.set(pb.matchId, arr);
+    }
+
+    let crossCycleDrops = 0;
+    for (const [matchId, bets] of byMatch) {
+      const pending = pendingByMatch.get(matchId);
+      if (!pending || pending.length === 0) continue;
+
+      // For each candidate on this match, check if it would form a correlated
+      // pair with any pending bet. If yes, drop the candidate (cannot drop
+      // the pending bet — it's already placed).
+      for (const cand of [...bets]) {
+        for (const pb of pending) {
+          let matched: CorrelatedPair | null = null;
+          for (const rule of CORRELATED_PAIRS) {
+            const candIs1 = ruleMatch(cand, rule.market1, rule.sel1Includes);
+            const candIs2 = ruleMatch(cand, rule.market2, rule.sel2Includes);
+            const pendIs1 = pb.marketType === rule.market1 && pb.selectionName.includes(rule.sel1Includes);
+            const pendIs2 = pb.marketType === rule.market2 && pb.selectionName.includes(rule.sel2Includes);
+            if ((candIs1 && pendIs2) || (candIs2 && pendIs1)) {
+              matched = rule;
+              break;
+            }
+          }
+          if (matched) {
+            const msg = `Cross-cycle correlation on ${cand.homeTeam} vs ${cand.awayTeam}: candidate ${cand.marketType}:${cand.selectionName} correlates with pending ${pb.marketType}:${pb.selectionName}. ${matched.reason}. Candidate dropped.`;
+            narratives.push(msg);
+            logger.info(
+              {
+                matchId,
+                candidate: betKey(cand),
+                pending: `${matchId}::${pb.marketType}::${pb.selectionName}`,
+                rule: matched.reason,
+              },
+              "0C cross-cycle correlation: candidate dropped",
+            );
+            removeBet(selected, removed, byMatch, cand);
+            crossCycleDrops++;
+            break;
+          }
+        }
+      }
+    }
+    if (crossCycleDrops > 0) {
+      logger.info({ crossCycleDrops, totalCandidates: candidates.length }, "0C cross-cycle correlation summary");
+    }
   }
 
   // ── 0A. Same-category threshold dedup ────────────────────────────────────
@@ -266,10 +432,14 @@ export async function applyCorrelationDetection(
   }
 
   // ── 2. Complementary bet detection ───────────────────────────────────────
-  // Per-rule haircut multiplier (default 0.8 = -20%). Tunable for the
-  // FHR+MO same-side rules via config keys so calibration doesn't need a
-  // redeploy. Other rules retain the global 0.8 default.
+  // Per-rule haircut multiplier with config-tunable keys per rule family.
+  // - FHR+MO: 0.8 default (35/36 paired bets historically same-side, +39% ROI)
+  // - BTTS+OU same-side (No+Under, Yes+Over3.5): 0.7 default (60d data shows
+  //   -57% ROI on £652 of these bets, stronger correlation → bigger haircut)
+  // - MO+OU same-side: 0.8 default (mirrors existing MO:Away+OU:Over rule)
   const fhrMoHaircut = await readHaircut("complementary_haircut_fhr_mo", 0.8);
+  const bttsOuHaircut = await readHaircut("complementary_haircut_btts_ou", 0.7);
+  const moOuHaircut = await readHaircut("complementary_haircut_mo_ou", 0.8);
   for (const [matchId, bets] of byMatch) {
     for (const rule of COMPLEMENTARY_RULES) {
       const b1 = bets.find((b) => ruleMatch(b, rule.market1, rule.sel1Includes));
@@ -279,7 +449,16 @@ export async function applyCorrelationDetection(
       const isFhrMo =
         (rule.market1 === "FIRST_HALF_RESULT" && rule.market2 === "MATCH_ODDS") ||
         (rule.market1 === "MATCH_ODDS" && rule.market2 === "FIRST_HALF_RESULT");
-      const haircut = isFhrMo ? fhrMoHaircut : 0.8;
+      const isBttsOu =
+        (rule.market1 === "BTTS" && rule.market2.startsWith("OVER_UNDER_")) ||
+        (rule.market1.startsWith("OVER_UNDER_") && rule.market2 === "BTTS");
+      const isMoOu =
+        (rule.market1 === "MATCH_ODDS" && rule.market2.startsWith("OVER_UNDER_")) ||
+        (rule.market1.startsWith("OVER_UNDER_") && rule.market2 === "MATCH_ODDS");
+      let haircut = 0.8;
+      if (isFhrMo) haircut = fhrMoHaircut;
+      else if (isBttsOu) haircut = bttsOuHaircut;
+      else if (isMoOu) haircut = moOuHaircut;
       const reductionPct = Math.round((1 - haircut) * 100);
 
       const msg = `Complementary bets on ${b1.homeTeam} vs ${b1.awayTeam}: ${b1.selectionName} + ${b2.selectionName} share the thesis '${rule.thesis}'. Stakes reduced ${reductionPct}% to manage correlated risk.`;
