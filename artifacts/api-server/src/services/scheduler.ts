@@ -42,7 +42,7 @@ import {
   captureAllPendingSnapshots,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets, fetchAndStoreOddsForAllUpcoming } from "./apiFootball";
+import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets, fetchAndStoreOddsForAllUpcoming, backfillPinnacleSnapshotsFromAf } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
@@ -1635,11 +1635,16 @@ export function startScheduler(): void {
   // With 75,000 req/day budget, each scan uses ~30-50 reqs, plenty of headroom
   cron.schedule("0 */2 * * *", () => {
     logger.info("API-Football odds refresh triggered by scheduler");
-    void fetchAndStoreOddsForAllUpcoming().catch((err) => {
-      logger.error({ err }, "API-Football odds refresh failed");
-    });
+    void fetchAndStoreOddsForAllUpcoming()
+      .then(async () => {
+        const r = await backfillPinnacleSnapshotsFromAf();
+        logger.info(r, "Post-AF Pinnacle snapshot backfill complete");
+      })
+      .catch((err) => {
+        logger.error({ err }, "API-Football odds refresh failed");
+      });
   }, { timezone: "UTC" });
-  logger.info("API-Football odds scheduler active — every 2 hours UTC");
+  logger.info("API-Football odds scheduler active — every 2 hours UTC (with Pinnacle snapshot backfill)");
 
   // API-Football: fetch team stats every 12 hours (~20 req)
   cron.schedule("0 */12 * * *", () => {
@@ -1682,9 +1687,12 @@ export function startScheduler(): void {
     }).catch((err) => logger.error({ err }, "Betfair event mapping startup failed"));
   }, 45_000);
 
-  // OddsPapi bulk prefetch: every 4 hours (100k monthly budget)
-  // Fetches 7 days of Pinnacle odds for all mapped fixtures.
-  cron.schedule("10 */4 * * *", () => {
+  // OddsPapi bulk prefetch: every 2 hours (was 4h — increased to lift Pinnacle
+  // coverage on newly-mapped fixtures; per-run cap stays at 1000 and the
+  // daily cap of 5000 is enforced by getEffectiveDailyCap, so we cannot
+  // exceed budget. In practice cache reuse means runs after the first stay
+  // small.)
+  cron.schedule("10 */2 * * *", () => {
     logger.info("OddsPapi bulk prefetch triggered (7-day window, 1000 req max)");
     void runDedicatedBulkPrefetch(7, 1000)
       .then(async (r) => {
@@ -1696,7 +1704,7 @@ export function startScheduler(): void {
       })
       .catch((err) => logger.error({ err }, "OddsPapi bulk prefetch pipeline failed"));
   }, { timezone: "UTC" });
-  logger.info("OddsPapi bulk prefetch scheduler active — every 4 hours UTC (1000 req max)");
+  logger.info("OddsPapi bulk prefetch scheduler active — every 2 hours UTC (1000 req max, 5000 daily cap enforced)");
 
   // OddsPapi budget summary: daily at 00:01 UTC
   cron.schedule("1 0 * * *", () => {

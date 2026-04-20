@@ -1240,6 +1240,44 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   return { fixturesProcessed: mappings.length, oddsStored, mappings: mappings.length, leaguesScanned, pinnacleLeaguesFetched, pinnacleLeaguesTotal: pinnacleLeagueMatchCount };
 }
 
+// ─── Pinnacle backfill from AF source ─────────────────────────────────────────
+// Copies fresh `api_football_real:Pinnacle` rows from `odds_snapshots` into the
+// dedicated `pinnacle_odds_snapshots` table for upcoming-72h matches that have
+// no entry yet. This dramatically expands CLV-quality data without using any
+// extra API budget — it's pure DB → DB. Idempotent (only inserts where row
+// doesn't already exist).
+export async function backfillPinnacleSnapshotsFromAf(): Promise<{
+  rowsInserted: number;
+}> {
+  const result = await db.execute(sql`
+    INSERT INTO pinnacle_odds_snapshots
+      (match_id, market_type, selection_name, snapshot_type, pinnacle_odds, pinnacle_implied, captured_at)
+    SELECT DISTINCT ON (o.match_id, o.market_type, o.selection_name)
+      o.match_id,
+      o.market_type,
+      o.selection_name,
+      'identification',
+      o.back_odds,
+      CASE WHEN o.back_odds > 1 THEN ROUND((1.0 / o.back_odds)::numeric, 6) ELSE NULL END,
+      o.snapshot_time
+    FROM odds_snapshots o
+    JOIN matches m ON m.id = o.match_id
+    WHERE o.source = 'api_football_real:Pinnacle'
+      AND o.back_odds IS NOT NULL
+      AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '72 hours'
+      AND NOT EXISTS (
+        SELECT 1 FROM pinnacle_odds_snapshots pos
+        WHERE pos.match_id = o.match_id
+          AND pos.market_type = o.market_type
+          AND pos.selection_name = o.selection_name
+      )
+    ORDER BY o.match_id, o.market_type, o.selection_name, o.snapshot_time DESC
+  `);
+  const inserted = (result as { rowCount?: number }).rowCount ?? 0;
+  logger.info({ rowsInserted: inserted }, "Pinnacle backfill from AF complete");
+  return { rowsInserted: inserted };
+}
+
 // ─── Team Statistics ──────────────────────────────────────────────────────────
 
 interface ApiTeamStats {
