@@ -303,7 +303,11 @@ export async function runLeagueDiscovery(): Promise<LeagueDiscoveryResult> {
         hasStatistics,
         hasLineups,
         hasEvents,
-        hasPinnacleOdds,
+        // Ratchet upward only: never demote a Pinnacle flag that was promoted
+        // dynamically (e.g. via updatePinnacleOddsFromActualMappings or manual
+        // operator action). The static KNOWN_PINNACLE_LEAGUE_IDS list is a
+        // floor, not a ceiling.
+        hasPinnacleOdds: sql`${competitionConfigTable.hasPinnacleOdds} OR ${hasPinnacleOdds}`,
         currentSeason,
         pollingFrequency,
         coverageCheckedAt: new Date(),
@@ -394,12 +398,15 @@ export async function runLeagueDiscovery(): Promise<LeagueDiscoveryResult> {
       if (status === "active") result.activatedLeagues.push(leagueName);
       else result.monitoringLeagues.push(leagueName);
     } else {
-      // Update existing entry
+      // Update existing entry. Ratchet hasPinnacleOdds upward only so that
+      // dynamic promotion (from updatePinnacleOddsFromActualMappings or manual
+      // operator action) is not wiped by the static KNOWN_PINNACLE_LEAGUE_IDS
+      // floor.
       await db.update(discoveredLeaguesTable)
         .set({
           lastChecked: new Date(),
           fixtureCount,
-          hasPinnacleOdds,
+          hasPinnacleOdds: sql`${discoveredLeaguesTable.hasPinnacleOdds} OR ${hasPinnacleOdds}`,
           hasApiFootballOdds,
           status,
         })
