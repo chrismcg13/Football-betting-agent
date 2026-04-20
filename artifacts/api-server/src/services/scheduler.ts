@@ -849,14 +849,23 @@ export async function runTradingCycle(options?: {
         }
 
         const matchIds = Array.from(new Set(selectedBets.map((b) => b.matchId)));
-        const matchRows = await db.execute(sql`
-          SELECT id, LOWER(league) AS league, LOWER(COALESCE(country, '')) AS country
-          FROM matches WHERE id = ANY(${matchIds})
-        `);
+        // Fix: drizzle's sql template interpolates JS arrays as ($1, $2, ...)
+        // tuples, which Postgres rejects for ANY(). Use inArray() for proper
+        // array binding. Also short-circuit on empty input to avoid an
+        // invalid empty-IN query.
         const matchMeta = new Map<number, { league: string; country: string }>();
-        for (const r of ((matchRows as unknown as { rows?: Array<{ id: number; league: string; country: string }> }).rows
-          ?? (matchRows as unknown as Array<{ id: number; league: string; country: string }>))) {
-          matchMeta.set(Number(r.id), { league: r.league ?? "", country: r.country ?? "" });
+        if (matchIds.length > 0) {
+          const matchRows = await db
+            .select({
+              id: matchesTable.id,
+              league: sql<string>`LOWER(${matchesTable.league})`.as("league"),
+              country: sql<string>`LOWER(COALESCE(${matchesTable.country}, ''))`.as("country"),
+            })
+            .from(matchesTable)
+            .where(inArray(matchesTable.id, matchIds));
+          for (const r of matchRows) {
+            matchMeta.set(Number(r.id), { league: r.league ?? "", country: r.country ?? "" });
+          }
         }
 
         const before = selectedBets.length;
