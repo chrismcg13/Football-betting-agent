@@ -1,0 +1,51 @@
+Prompt for Replit:
+I need you to run a diagnostic analysis before building any fixes. Do not write or modify application code in this task. This is a read-only investigation against the dev Neon database.
+Context: We just shipped a reconciliation fix that corrected 216 bets with phantom P&L. The underlying finding was that we have 152 cancelled bets in the last 30 days (orders placed above fair value that never matched and lapsed at kickoff). 58% of cancellations are concentrated in OVER_UNDER_25 and OVER_UNDER_35. Before I decide whether to build a pre-placement sanity gate, stale-order watchdog, or demote the OU models, I need to know whether the cancelled OU bets had genuine edge or were miscalibrated.
+What I need you to do:
+
+Pull every cancelled bet from the last 30 days where market_type is in (OVER_UNDER_25, OVER_UNDER_35). For each bet, I need:
+
+match_id, market_type, selection (over/under)
+Our placement odds (placement_odds or equivalent column — confirm the exact column name first by inspecting the bets table schema)
+Our placement timestamp
+Pinnacle fair odds at placement time (the odds the model compared against when deciding to place)
+Pinnacle closing odds (last Pinnacle price before kickoff/market suspension)
+League, experiment_tag, opportunity_score
+
+
+For each bet, compute:
+
+Implied probability at placement (1 / our_odds)
+Pinnacle implied probability at placement (1 / pinnacle_fair_at_placement, de-vigged if the stored number is raw two-way)
+Pinnacle implied probability at close (same treatment)
+CLV proxy: (pinnacle_close_implied_prob − our_implied_prob_at_placement). Positive = market moved toward our price = we had genuine edge. Negative = market moved away from our price = model was wrong.
+
+
+Produce a summary table grouped by market_type (OU25 vs OU35) and by selection (over vs under), showing:
+
+Count of cancelled bets
+Mean CLV proxy
+Median CLV proxy
+% of bets with positive CLV proxy
+Mean gap between our odds and Pinnacle fair at placement (the "greed gap")
+Mean gap between our odds and Pinnacle close
+
+
+Produce the same summary grouped by experiment_tag so I can see which specific league-market combos are driving the cancellations.
+Cross-check: pull the same CLV metrics for the 139 matched OU bets over the same period, as a control group. If the matched bets have positive CLV and the cancelled bets also have positive CLV, the model is right and we need faster placement. If cancelled bets have negative CLV but matched bets have positive CLV, we're filling the good ones and correctly failing to fill the bad ones — cancellations are protective and we should leave them alone. If both cohorts have negative CLV, the OU model is broken and should be demoted.
+
+Output format:
+
+SQL queries used (so I can re-run them)
+Raw result tables (CSV or markdown)
+A short written summary at the end stating which of the three scenarios above the data supports
+
+Critical rules:
+
+Do not modify any application code or migrations in this task
+Do not write to the database — read-only queries only
+Do not assume column names — inspect the relevant tables (bets, odds_snapshots, pinnacle_odds or whatever the current schema uses) and confirm the actual column names before writing the final queries
+If any required data is missing (e.g. Pinnacle closing odds weren't stored for some bets), tell me exactly how many bets are affected and proceed with the subset that has complete data — do not fabricate or interpolate missing values
+Confirm dev database, not prod, before running anything
+
+When you're done, paste the full SQL, the result tables, and your written conclusion back to me. I'll decide the fix based on the data.
