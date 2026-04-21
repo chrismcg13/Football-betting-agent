@@ -1001,17 +1001,15 @@ export async function runStartupHealthCheck(): Promise<{
       });
     }
 
-    const dbUrl = process.env["DATABASE_URL"] ?? "";
-    const isDevDb =
-      dbUrl.includes("helium") ||
-      dbUrl.includes("localhost") ||
-      dbUrl.includes("127.0.0.1");
+    const { verifyDbHostForEnvironment } = await import("../lib/startupChecks");
+    const dbCheck = verifyDbHostForEnvironment(
+      process.env["ENVIRONMENT"] ?? "development",
+      process.env["DATABASE_URL"] ?? "",
+    );
     checks.push({
       name: "Database is production (not dev)",
-      passed: !isDevDb,
-      detail: isDevDb
-        ? "CRITICAL: Connected to dev database in LIVE mode!"
-        : "Connected to production database",
+      passed: !dbCheck.fatal,
+      detail: dbCheck.message,
     });
 
     startSessionRefreshTimer();

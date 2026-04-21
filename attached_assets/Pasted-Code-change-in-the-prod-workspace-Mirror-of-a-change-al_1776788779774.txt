@@ -1,0 +1,69 @@
+Code change in the prod workspace. Mirror of a change already deployed and verified in dev. Do not modify paper_mode or any other runtime config in prod. Do not touch the BANNED_MARKETS quarantine. Do not place any bets. Only add the hostname safety check.
+In dev, a helper function was created at artifacts/api-server/src/lib/startupChecks.ts that exports verifyDbHostForEnvironment(environment, dbUrl). It returns { fatal, level, message } and handles the logic:
+
+If ENVIRONMENT=development, DB host must contain billowing-lab. If it contains rough-flower, FATAL abort.
+If ENVIRONMENT=production, DB host must contain rough-flower. If it contains billowing-lab, FATAL abort. Also FATAL if host is helium / localhost / 127.0.0.1.
+Unknown hosts produce a WARN, not a fatal error.
+
+Create the same helper file in this prod workspace (artifacts/api-server/src/lib/startupChecks.ts) with the same logic as dev. Use this exact content:
+typescriptconst KNOWN_LOCAL_DEV_HOSTS = ["helium", "localhost", "127.0.0.1"];
+
+export function verifyDbHostForEnvironment(
+  environment: string,
+  dbUrl: string,
+): { fatal: boolean; level: "info" | "warn" | "error"; message: string } {
+  let hostname: string;
+  try {
+    hostname = new URL(dbUrl).hostname;
+  } catch {
+    return {
+      fatal: false,
+      level: "warn",
+      message: `Could not parse DATABASE_URL hostname — skipping host verification`,
+    };
+  }
+
+  if (environment === "development") {
+    if (hostname.includes("rough-flower")) {
+      return { fatal: true, level: "error",
+        message: `Dev workspace is pointed at prod DB — refusing to start` };
+    }
+    if (hostname.includes("billowing-lab")) {
+      return { fatal: false, level: "info",
+        message: `Startup safety check PASSED — ENVIRONMENT=development, DB host contains billowing-lab` };
+    }
+    return { fatal: false, level: "warn",
+      message: `Unknown DB host for dev environment — ${hostname}` };
+  }
+
+  if (environment === "production") {
+    if (KNOWN_LOCAL_DEV_HOSTS.some((h) => hostname.includes(h))) {
+      return { fatal: true, level: "error",
+        message: `Prod workspace is pointed at a known local dev host (${hostname}) — refusing to start` };
+    }
+    if (hostname.includes("billowing-lab")) {
+      return { fatal: true, level: "error",
+        message: `Prod workspace is pointed at dev DB — refusing to start` };
+    }
+    if (hostname.includes("rough-flower")) {
+      return { fatal: false, level: "info",
+        message: `Startup safety check PASSED — ENVIRONMENT=production, DB host contains rough-flower` };
+    }
+    return { fatal: false, level: "warn",
+      message: `Unknown DB host for production environment — ${hostname}` };
+  }
+
+  return { fatal: false, level: "warn",
+    message: `Unknown ENVIRONMENT value "${environment}" — skipping DB host check` };
+}
+Then update artifacts/api-server/src/index.ts to import and use the helper in place of the existing KNOWN_DEV_HOSTS block. Update artifacts/api-server/src/services/betfairLive.ts at the existing dev-host check inside runStartupHealthCheck() to use the helper. Match the dev diff exactly — same import path, same call pattern.
+After the code change, restart the workflow.
+Paste:
+
+The diff of all three files (the new startupChecks.ts, index.ts, betfairLive.ts).
+The full startup log showing the new safety check firing. I want to see the exact INFO: Startup safety check PASSED — ENVIRONMENT=production, DB host contains rough-flower line.
+Confirmation that paper_mode in agent_config has not been changed (SELECT it before and after, show both results).
+Confirmation that the four BANNED_MARKETS entries (OVER_UNDER_25, OVER_UNDER_35, FIRST_HALF_RESULT, DOUBLE_CHANCE) are still present in paperTrading.ts — grep for them and paste the matching lines.
+
+If the server fails to boot for any reason, STOP and report the error. Do not attempt to fix the safety check. Do not revert the change. Do not restart again. Just tell me what the error is.
+Do not touch dev.

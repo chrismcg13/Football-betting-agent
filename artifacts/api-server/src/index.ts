@@ -8,17 +8,21 @@ import { runStartupHealthCheck, isLiveMode } from "./services/betfairLive";
 import { recalculateAllDataRichness } from "./services/dataRichness";
 import { db, complianceLogsTable, matchesTable, leagueEdgeScoresTable } from "@workspace/db";
 import { sql, count } from "drizzle-orm";
+import { verifyDbHostForEnvironment } from "./lib/startupChecks";
 
 const ENVIRONMENT = process.env["ENVIRONMENT"] ?? "development";
 
-if (ENVIRONMENT === "production" && process.env["DATABASE_URL"]) {
-  const dbUrl = new URL(process.env["DATABASE_URL"]);
-  const KNOWN_DEV_HOSTS = ["helium", "localhost", "127.0.0.1"];
-  if (KNOWN_DEV_HOSTS.includes(dbUrl.hostname)) {
-    console.error("FATAL: Production DATABASE_URL points to a known dev host:", dbUrl.hostname, ". Aborting.");
+if (process.env["DATABASE_URL"]) {
+  const result = verifyDbHostForEnvironment(ENVIRONMENT, process.env["DATABASE_URL"]);
+  if (result.fatal) {
+    console.error(`FATAL: ${result.message}`);
     process.exit(1);
   }
-  console.log("Startup safety check PASSED: Production DB host is", dbUrl.hostname);
+  if (result.level === "warn") {
+    console.warn(`WARN: ${result.message}`);
+  } else {
+    console.log(`INFO: ${result.message}`);
+  }
 }
 
 const rawPort = process.env["PORT"];
