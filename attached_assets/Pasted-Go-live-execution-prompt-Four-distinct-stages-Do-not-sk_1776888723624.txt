@@ -1,0 +1,137 @@
+Go-live execution prompt. Four distinct stages. Do not skip stages. Do not auto-fix on failure — stop and report. Show diffs before applying code changes.
+
+CONTEXT: All four pre-go-live changes (A dedup, B thresholds, C view+tagging, D BANNED_MARKETS confirmation) are shipped and verified. Three outstanding items need resolution before flipping TRADING_MODE to live: (1) high-water mark reset, (2) three endpoints still reading paper_bets directly need to switch to paper_bets_current, (3) agent_status hygiene — clear stale pause_reason/paused_at and handle the stopped-state case.
+
+Prod's current guardrails: agent_status currently paused_weekly (may drift to stopped — handle both), paper_mode=false, live_breaker_paused_until=2026-04-23T00:00:00Z, TRADING_MODE=LIVE. BANNED_MARKETS contains OVER_UNDER_25, OVER_UNDER_35, FIRST_HALF_RESULT, DOUBLE_CHANCE.
+
+STAGE 1 — Pre-flight state confirmation
+
+Before anything else, report current state:
+
+1. agent_status value right now (paused_weekly, stopped, or something else)
+2. bankroll value
+3. high_water_mark value  
+4. paper_mode value
+5. pause_reason and paused_at values
+6. live_breaker_paused_until value
+7. Betfair balance: available, exposure, total (from a fresh health check)
+8. Count of rows in paper_bets (should be 799)
+9. Count of rows in paper_bets_current (should also be 799 — no rows flagged legacy yet)
+10. Count of open pending bets with betfair_bet_id IS NOT NULL (the legacy live exposure)
+
+Report all 10. Do not modify anything yet. STOP after Stage 1 and wait for my approval to proceed to Stage 2.
+
+STAGE 2 — Code changes for the three remaining endpoints
+
+After I approve Stage 1, apply the three missing paper_bets → paper_bets_current swaps:
+
+2a. /dashboard/execution-metrics (api.ts around line 3401). Three sub-queries at lines 3411, 3424, 3433 read FROM paper_bets directly. Swap to paper_bets_current. Confirm the column references inside those sub-queries don't need qualification changes.
+
+2b. /admin/go-live-readiness (api.ts around lines 2865-2868). Swap the four raw SQL references to paper_bets_current. Note: this endpoint will show 0/0/0 (zero settled bets, 0% win rate, 0 CLV) immediately after go-live. That's expected — the readiness score reflects post-go-live performance only.
+
+2c. /dashboard/summary tier-split sub-query (api.ts lines 155-163). The raw FROM paper_bets WHERE placed_at >= todayStartUtc AND betfair_bet_id IS NOT NULL sub-query. Swap to paper_bets_current.
+
+Show the consolidated diff for all three before applying.
+
+After applying: restart workflow. Confirm clean boot with all three safety lines. Confirm paper_bets_current view still exists and returns 799 rows.
+
+STOP after Stage 2. Wait for my approval.
+
+STAGE 3 — High-water mark reset decision
+
+This is a decision point I need to make, not you. You will propose values, I will choose one, then you apply.
+
+Current HWM is £4,154.30. That figure was set when the account had that much in it, before withdrawals. Current total wealth is approximately £343.59. The 90% catastrophic-drawdown breaker trips continuously because (4154.30 - 343.59) / 4154.30 = 91.73%.
+
+Report:
+
+3a. What is the current Betfair availableToBetBalance? Not total — just available cash. That's the starting point for the new regime.
+
+3b. Show me the exact SQL needed to reset HWM. My expectation:
+UPDATE agent_config SET value = '<VALUE>' WHERE key = 'high_water_mark';
+UPDATE agent_config SET value = NOW()::text WHERE key = 'hwm_updated_at';
+
+3c. Propose three candidate HWM values and explain the implications of each:
+- Option HWM-1: Set HWM to the current availableToBetBalance (probably £100). Tightest floor. The 90% catastrophic breaker trips if total wealth falls below 10% of this — ~£10. Very permissive during early trading.
+- Option HWM-2: Set HWM to the current total wealth (~£343.59, including unsettled legacy exposure). Catastrophic breaker trips below ~£34. Accounts for the fact that £243 of exposure will settle as either wins or losses over the next few days.
+- Option HWM-3: Set HWM to a round number that provides a sensible floor for the post-go-live regime, e.g. £150 or £200. Catastrophic breaker trips below ~£15-20.
+
+3d. Confirm: after HWM reset, every subsequent risk check will recalculate drawdown against the new HWM. If total wealth then grows above the new HWM (because a bet wins), updateHighWaterMark auto-ratchets it up. So whatever we set, it's a starting point, not a ceiling.
+
+Report these. STOP and wait for me to choose an HWM value. Do not apply anything.
+
+STAGE 4 — Go-live execution (only after HWM choice confirmed)
+
+Once I've chosen the HWM value from Stage 3, execute the go-live sequence. Each sub-step MUST be verified before the next one runs.
+
+4a. Apply HWM reset (SQL chosen in Stage 3):
+- UPDATE agent_config SET value = '<chosen value>' WHERE key = 'high_water_mark';
+- UPDATE agent_config SET value = NOW()::text WHERE key = 'hwm_updated_at';
+- SELECT back both values. Confirm.
+
+4b. Clear the stale pause hygiene:
+- UPDATE agent_config SET value = '' WHERE key = 'pause_reason';
+- UPDATE agent_config SET value = '' WHERE key = 'paused_at';
+
+4c. Capture the dashboard_reset_at timestamp:
+- INSERT INTO agent_config (key, value) VALUES ('dashboard_reset_at', NOW()::text) ON CONFLICT (key) DO UPDATE SET value = NOW()::text, updated_at = NOW();
+- SELECT it back. This is the canonical T=0 timestamp.
+
+4d. Legacy backfill using the dashboard_reset_at timestamp:
+- First confirm the count: SELECT COUNT(*) FROM paper_bets WHERE legacy_regime = false;
+- Then: UPDATE paper_bets SET legacy_regime = true WHERE legacy_regime = false AND placed_at < (SELECT value::timestamptz FROM agent_config WHERE key = 'dashboard_reset_at');
+- Report the rowcount affected.
+- Confirm: SELECT COUNT(*) FROM paper_bets_current; — should now be 0 (view filters out legacy rows).
+
+4e. Clear the live_breaker:
+- UPDATE agent_config SET value = '' WHERE key = 'live_breaker_paused_until';
+- Or set it to a past timestamp if empty string isn't accepted. Check the breaker read logic and use whatever format clears it.
+
+4f. Flip agent_status to running. Handle both current states:
+- If agent_status is 'paused_weekly' currently: POST to /api/agent/control with action=start. The endpoint accepts paused_weekly → running.
+- If agent_status is 'stopped' currently: the /api/agent/control endpoint refuses. Use direct SQL: UPDATE agent_config SET value = 'running' WHERE key = 'agent_status';
+- Either way, confirm by SELECT.
+
+4g. Restart the workflow. This picks up all config changes cleanly.
+
+4h. Post-restart verification — MUST all pass:
+
+- Startup log shows all three safety lines: ENVIRONMENT=production, DB host rough-flower, TRADING_MODE=LIVE.
+- Trading mode: LIVE log line present.
+- Migrations complete (no new migrations expected this restart).
+- First scheduler cycle fires within 5 minutes. The cycle should NOT short-circuit on bankrollFloor anymore (HWM is reset). It may still show risk_events if drawdown hits other thresholds, but not the catastrophic 90% one.
+- Value detection runs. Funnel report is emitted.
+- Funnel report shows the new thresholds taking effect: min_edge_threshold=0.005, min_opportunity_score=60. Counters 02a_rej_no_betfair_exchange and 02b_rej_no_fair_value_source appear with counts.
+- Exchange sweep continues running at 10-minute cadence. Fresh betfair_exchange rows arrive in odds_snapshots.
+- If any candidate survives filters and reaches placement: a live bet placement should fire. Report the bet_id, betfair_bet_id, market, selection, stake, actionable_price, fair_value_odds, fair_value_source.
+
+4i. Dashboard verification — sample three endpoints:
+- GET /dashboard/summary — report what it shows. Total bets 0 (or 1 if a placement fired), exposure close to £0 (pending bets from the view only).
+- GET /dashboard/bets — should return empty unless a post-go-live bet was placed.
+- GET /dashboard/bets?includeLegacy=true — should return 799 rows (the backfilled legacy bets visible via toggle).
+
+HARD RULES:
+
+- Do not touch dev at any point.
+- Do not modify BANNED_MARKETS.
+- Do not modify the startup safety checks.
+- Do not bypass the dedup logic or the pricing-pipeline filter.
+- Do not touch LIVE_BETFAIR_KEY, BETFAIR_USERNAME, BETFAIR_PASSWORD.
+- Do not modify riskManager.ts:357-364 or scheduler.ts:1660-1715.
+- If ANY verification step fails at ANY stage, stop and report. Do not auto-fix. Do not retry silently. Do not proceed to the next stage.
+
+FAILURE RECOVERY:
+
+If Stage 4 verification fails and a live bet has already placed:
+- Do not place more bets. The existing bet rides out.
+- Flip paper_mode=true immediately (UPDATE agent_config SET value='true' WHERE key='paper_mode'). This halts further placements regardless of TRADING_MODE.
+- Report what happened and what you did to halt further placement.
+
+If Stage 4 verification fails before any live bet places:
+- Flip agent_status back to paused_weekly (UPDATE agent_config SET value='paused_weekly' WHERE key='agent_status').
+- Restore live_breaker_paused_until to a future timestamp (24 hours out).
+- Report what happened.
+
+OUTPUT:
+
+Report Stage 1 first. Stop and wait. Then Stage 2, stop and wait. Then Stage 3, stop and wait for my HWM choice. Then Stage 4 end-to-end with all verifications. At the end, paste the complete post-go-live state summary.
