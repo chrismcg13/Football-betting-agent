@@ -1,0 +1,118 @@
+Code changes in the prod workspace only. Port the pricing-pipeline fix verbatim from the dev implementation reference.
+
+DO NOT touch dev. DO NOT modify paper_mode, TRADING_MODE, agent_status, pause_reason, paused_at, BANNED_MARKETS, or the hardened safety checks. DO NOT touch riskManager.ts:357-364 or scheduler.ts:1660-1715. DO NOT add the Pinnacle sanity gate (that's a later prompt). DO NOT modify valueDetection.ts:1080 (the data_tier override — separate future task).
+
+The exchange-book sweep is now operational in prod and writing source='betfair_exchange' rows to odds_snapshots. The picker will have data to anchor on.
+
+FIVE FILES CHANGE:
+
+CHANGE A — lib/db/src/schema/paperBets.ts
+
+Add 5 new columns after oddsSource:
+
+  // ── Pricing-pipeline fix: actionable vs fair-value separation ─────────
+  // actionable_* = price actually placed on, sourced from Betfair Exchange only.
+  // fair_value_* = sharp-consensus reference used for CLV-style edge calc.
+  // odds_at_placement / odds_source above are kept as backwards-compatible
+  // mirrors of actionable_price / actionable_source for new rows.
+  // validator_best_odds = diagnostic only — captured but NOT used for placement.
+  actionablePrice: numeric("actionable_price", { precision: 10, scale: 4 }),
+  actionableSource: text("actionable_source"),
+  fairValueOdds: numeric("fair_value_odds", { precision: 10, scale: 4 }),
+  fairValueSource: text("fair_value_source"),
+  validatorBestOdds: numeric("validator_best_odds", { precision: 10, scale: 4 }),
+
+CHANGE B — artifacts/api-server/src/lib/migrate.ts
+
+Additive idempotent ALTER:
+
+  ALTER TABLE paper_bets
+    ADD COLUMN IF NOT EXISTS actionable_price NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS actionable_source TEXT,
+    ADD COLUMN IF NOT EXISTS fair_value_odds NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS fair_value_source TEXT,
+    ADD COLUMN IF NOT EXISTS validator_best_odds NUMERIC(10,4)
+
+CHANGE C — artifacts/api-server/src/services/valueDetection.ts
+
+Apply the full helper + replacement logic as designed:
+
+1. Insert the selectPricingSources helper immediately before detectValueBets. Include the PriceQuote, FairValueSource, RejectReason, and PricingResult types. Implementation: iterate rows (pre-sorted by snapshotTime DESC), track first seen row per category (actionable = betfair_exchange, fair value priorities = oddspapi_pinnacle > api_football_real:Pinnacle > betfair_exchange), enforce 1.01 < backOdds sanity. On missing actionable → reject no_betfair_exchange. On missing fair value → reject no_fair_value_source.
+
+2. Extend ValueBet interface: add actionablePrice, actionableSource, fairValueOdds, fairValueSource fields.
+
+3. Extend EvaluationSummary interface: add pricingRejectNoBetfairExchange and pricingRejectNoFairValueSource counters.
+
+4. Declare the two counters inside detectValueBets near the other counter variables.
+
+5. Replace the buggy picker at the per-match loop (current lines ~933-984 in prod) with group-by-(market, selection) logic followed by a selectPricingSources call. On reject, increment the appropriate counter and continue. On ok, bind actionablePrice/actionableSource/fairValueOdds/fairValueSource and a legacy-compat oddsRow adapter so the downstream structure stays unchanged.
+
+6. Switch the edge formula from modelProb − (1/actionablePrice) to (1/fairValueOdds) − (1/actionablePrice). Include a comment explaining the CLV-style semantic: positive edge = exchange back price better than sharp consensus implies fair.
+
+7. Extend valueBets.push with actionablePrice, actionableSource, fairValueOdds, fairValueSource fields.
+
+8. Extend the return statement to include the two new counters.
+
+CHANGE D — artifacts/api-server/src/services/scheduler.ts
+
+1. Replace the validator override at the current line ~802 where backOdds is assigned. New logic: backOdds = bet.backOdds always (= actionablePrice from valueDetection). Capture validation?.bestOdds ?? null as validatorBestOdds diagnostic field. The validator's output is NEVER used to modify the placed price.
+
+2. Update the thesis text to reference actionableSource and fairValueSource instead of bookmaker name + Pinnacle implied. Include a validatorDelta suffix showing the validator's shopped price as diagnostic ("Validator-best-shop=X.XX (NOT used)") when it diverges from actionable.
+
+3. Extend BetOrder interface: add actionablePrice, actionableSource, fairValueOdds, fairValueSource, validatorBestOdds fields.
+
+4. Wire all five new fields through preCorrelation.push, betOrders.push, and the placePaperBet call.
+
+5. Add two new funnel counters to the cycle report: 08c_rejected_no_betfair_exchange and 08d_rejected_no_fair_value_source, sourced from valueSummary.pricingRejectNoBetfairExchange and pricingRejectNoFairValueSource.
+
+CHANGE E — artifacts/api-server/src/services/paperTrading.ts
+
+1. Extend PaperBetOptions interface: add actionablePrice, actionableSource, fairValueOdds, fairValueSource, validatorBestOdds optional fields.
+
+2. Destructure in placePaperBet.
+
+3. Update the INSERT in placePaperBet:
+   - oddsAtPlacement = String(actionablePrice ?? backOdds) — actionable wins when present, fallback to legacy backOdds
+   - oddsSource = actionableSource ?? oddsSource ?? "synthetic" — actionable wins
+   - Populate the 5 new columns (actionable_price, actionable_source, fair_value_odds, fair_value_source, validator_best_odds) with their respective values
+
+DISCIPLINE REMINDER — the Prompt 3 near-miss:
+
+When modifying function signatures or return shapes, grep every return statement inside the modified function and verify each returns the full shape. Prompt 3's agent caught a missed return path during verification; audit all return paths in detectValueBets, runTradingCycle, and any modified function BEFORE restarting and running checkpoints.
+
+VERIFICATION after applying:
+
+1. Show consolidated diff before applying.
+
+2. Restart workflow. Confirm clean boot with all three safety lines:
+   - ENVIRONMENT=production, DB host contains rough-flower
+   - ENVIRONMENT=production, TRADING_MODE=LIVE
+   - Trading mode: LIVE
+
+3. Migration: SELECT column_name FROM information_schema.columns WHERE table_name = 'paper_bets' AND column_name IN ('actionable_price', 'actionable_source', 'fair_value_odds', 'fair_value_source', 'validator_best_odds'); — 5 rows expected.
+
+4. Wait for two full trading cycles. Paste both funnel reports. Confirm the two new counters appear (08c_rejected_no_betfair_exchange, 08d_rejected_no_fair_value_source).
+
+5. Confirm prod is still gated by paused_weekly — the trading cycle will skip placement via the risk path, but the pre-risk portion (value detection, pricing selection, counter accumulation) still runs and the funnel report should show non-zero values for 01_matches_evaluated, 03_value_bets_found, etc.
+
+6. Critical check — is the picker actually consuming betfair_exchange rows? Run:
+   SELECT source, COUNT(*) FROM odds_snapshots WHERE snapshot_time > NOW() - INTERVAL '30 minutes' GROUP BY source ORDER BY COUNT(*) DESC;
+   Betfair_exchange should appear with a non-zero count (the sweep is running at 10-min cadence).
+
+7. If any live bets were placed during verification (which they shouldn't be given paused_weekly) run:
+   SELECT actionable_source, COUNT(*) FROM paper_bets WHERE placed_at > (current workflow start time) AND betfair_bet_id IS NOT NULL AND actionable_source IS NOT NULL GROUP BY actionable_source;
+   Should show betfair_exchange only.
+
+8. Funnel report health check: compare the number of candidates reaching stage 07_post_correlation against 08c_rejected_no_betfair_exchange + 08d_rejected_no_fair_value_source + any survivors. The sum should account for all post-correlation candidates with no mystery drops.
+
+9. Plain-English summary: given an Over 2.5 candidate with pool {1xBet @ 9.0, Marathonbet @ 4.39, Betfair Exchange @ 2.10, oddspapi_pinnacle @ 2.05}, what does the picker now do? One paragraph showing actionable_price, actionable_source, fair_value_odds, fair_value_source, and the CLV-style edge calculation.
+
+10. Confirm no side effects:
+    - agent_status still paused_weekly
+    - paper_mode still false
+    - live_breaker_paused_until still 2026-04-23T00:00:00Z
+    - BANNED_MARKETS intact
+    - Zero live bets placed during verification
+    - Exchange sweep still running and writing rows
+
+If any step fails, stop and report. Do not auto-fix.

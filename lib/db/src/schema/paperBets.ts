@@ -37,6 +37,17 @@ export const paperBetsTable = pgTable("paper_bets", {
   opportunityScore: numeric("opportunity_score", { precision: 6, scale: 2 }),
   modelVersion: text("model_version"),
   oddsSource: text("odds_source").default("synthetic"),
+  // ── Pricing-pipeline fix: actionable vs fair-value separation ─────────
+  // actionable_* = price actually placed on, sourced from Betfair Exchange only.
+  // fair_value_* = sharp-consensus reference used for CLV-style edge calc.
+  // odds_at_placement / odds_source above are kept as backwards-compatible
+  // mirrors of actionable_price / actionable_source for new rows.
+  // validator_best_odds = diagnostic only — captured but NOT used for placement.
+  actionablePrice: numeric("actionable_price", { precision: 10, scale: 4 }),
+  actionableSource: text("actionable_source"),
+  fairValueOdds: numeric("fair_value_odds", { precision: 10, scale: 4 }),
+  fairValueSource: text("fair_value_source"),
+  validatorBestOdds: numeric("validator_best_odds", { precision: 10, scale: 4 }),
   enhancedOpportunityScore: numeric("enhanced_opportunity_score", { precision: 6, scale: 2 }),
   pinnacleOdds: numeric("pinnacle_odds", { precision: 10, scale: 4 }),
   pinnacleImplied: numeric("pinnacle_implied", { precision: 8, scale: 6 }),

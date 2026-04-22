@@ -466,6 +466,9 @@ export async function runTradingCycle(options?: {
       "01_matches_evaluated": valueSummary.matchesEvaluated,
       "02_selections_evaluated": valueSummary.selectionsEvaluated,
       "03_value_bets_found": valueSummary.valueBets.length,
+      // Pricing-pipeline rejection visibility (Prompt 5)
+      "02a_rej_no_betfair_exchange": valueSummary.pricingRejectNoBetfairExchange,
+      "02b_rej_no_fair_value_source": valueSummary.pricingRejectNoFairValueSource,
     };
 
     logger.info(
@@ -825,19 +828,25 @@ export async function runTradingCycle(options?: {
       const marketCount = marketCounts[bet.marketType] ?? 0;
       if (marketCount >= maxPerMarket) { funnelMarketSkip++; continue; }
 
-      // Generate thesis
-      const backOdds = validation?.bestOdds ?? bet.backOdds;
+      // Pricing-pipeline (Prompt 5): we ALWAYS place at the actionable
+      // (Betfair Exchange) price selected by the picker. The validator's
+      // bestOdds is captured for diagnostics only, never for placement.
+      const backOdds = bet.actionablePrice;
+      const validatorBestOdds = validation?.bestOdds ?? null;
       const pinnacleAligned = validation?.pinnacleAligned ?? false;
       const leagueEdgeScore = leagueEdgeMap.get(bet.league) ?? 50;
       const leagueBonusStr = leagueEdgeScore !== 50 ? ` League edge score: ${leagueEdgeScore.toFixed(0)}.` : "";
-      const thesis = validation?.hasPinnacleData
-        ? `Backing ${bet.selectionName} at ${backOdds.toFixed(2)} from ${validation.bestBookmaker ?? "best available"}. ` +
-          `Model: ${(bet.modelProbability * 100).toFixed(1)}%, Pinnacle implies: ${((validation.pinnacleImplied ?? 0) * 100).toFixed(1)}%. ` +
-          `Edge: ${(bet.edge * 100).toFixed(1)}% using best available price. ` +
-          (validation.sharpSoftSpread ? `Sharp-soft spread: ${(validation.sharpSoftSpread * 100).toFixed(1)}%. ` : "") +
-          (isContrarian ? "CONTRARIAN — Pinnacle-misaligned." : pinnacleAligned ? "Pinnacle-aligned." : "") +
-          leagueBonusStr
-        : `Backing ${bet.selectionName} at ${bet.backOdds.toFixed(2)}. Model: ${(bet.modelProbability * 100).toFixed(1)}%, Edge: ${(bet.edge * 100).toFixed(1)}%.${leagueBonusStr}`;
+      const thesis =
+        `Backing ${bet.selectionName} at ${backOdds.toFixed(2)} (${bet.actionableSource}). ` +
+        `Model: ${(bet.modelProbability * 100).toFixed(1)}%, ` +
+        `fair value ${bet.fairValueOdds.toFixed(2)} (${bet.fairValueSource}, implies ${((1 / bet.fairValueOdds) * 100).toFixed(1)}%). ` +
+        `CLV-style edge: ${(bet.edge * 100).toFixed(2)}%.` +
+        (validation?.hasPinnacleData
+          ? ` Pinnacle implies ${((validation.pinnacleImplied ?? 0) * 100).toFixed(1)}%.` +
+            (validation.sharpSoftSpread ? ` Sharp-soft spread: ${(validation.sharpSoftSpread * 100).toFixed(1)}%.` : "") +
+            (isContrarian ? " CONTRARIAN — Pinnacle-misaligned." : pinnacleAligned ? " Pinnacle-aligned." : "")
+          : "") +
+        leagueBonusStr;
 
       // Estimate Kelly stake for correlation check
       const kellyFraction = Math.min(0.02 * (effectiveScore / 65), 0.05);
@@ -852,6 +861,7 @@ export async function runTradingCycle(options?: {
         _validation: validation,
         _thesis: thesis,
         _backOdds: backOdds,
+        _validatorBestOdds: validatorBestOdds,
         _effectiveScore: effectiveScore,
         _isContrarian: isContrarian,
       } as BetCandidate & Record<string, unknown>);
@@ -1191,6 +1201,13 @@ export async function runTradingCycle(options?: {
       oddsSource: string;
       enhanced: boolean;
       signalGeneratedAt: number;
+      // Pricing-pipeline (Prompt 5): actionable = price we place on,
+      // fair_value = sharp consensus reference for CLV-style edge.
+      actionablePrice: number;
+      actionableSource: string;
+      fairValueOdds: number;
+      fairValueSource: string;
+      validatorBestOdds: number | null;
     }
 
     const betOrders: BetOrder[] = [];
@@ -1200,6 +1217,7 @@ export async function runTradingCycle(options?: {
       const validation = extra._validation as Awaited<ReturnType<typeof getOddspapiValidation>> | null;
       const isContrarian = (extra._isContrarian as boolean | undefined) ?? false;
       const backOdds = (extra._backOdds as number | undefined) ?? candidate.backOdds;
+      const validatorBestOdds = (extra._validatorBestOdds as number | null | undefined) ?? null;
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
@@ -1267,6 +1285,11 @@ export async function runTradingCycle(options?: {
         oddsSource: candidate.oddsSource,
         enhanced: candidate.enhanced ?? false,
         signalGeneratedAt: signalCompleteAt,
+        actionablePrice: candidate.actionablePrice,
+        actionableSource: candidate.actionableSource,
+        fairValueOdds: candidate.fairValueOdds,
+        fairValueSource: candidate.fairValueSource,
+        validatorBestOdds,
       });
     }
 
@@ -1315,6 +1338,11 @@ export async function runTradingCycle(options?: {
           syncEligible: order.syncEligible,
           pinnacleEdgeCategory: order.pinnacleEdgeCategory,
           lineDirection: order.lineDirection,
+          actionablePrice: order.actionablePrice,
+          actionableSource: order.actionableSource,
+          fairValueOdds: order.fairValueOdds,
+          fairValueSource: order.fairValueSource,
+          validatorBestOdds: order.validatorBestOdds,
         },
       );
 

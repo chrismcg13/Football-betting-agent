@@ -534,6 +534,14 @@ export interface PaperBetOptions {
   pinnacleEdgeCategory?: "high_confidence" | "standard" | "filtered" | null;
   lineDirection?: "toward" | "away" | "stable" | "unknown" | null;
   liveTier?: string | null;
+  // Pricing-pipeline (Prompt 5): wired through from value detection so the
+  // bet row records BOTH the actionable (placed) price and the fair-value
+  // reference, plus the validator best-price diagnostic.
+  actionablePrice?: number | null;
+  actionableSource?: string | null;
+  fairValueOdds?: number | null;
+  fairValueSource?: string | null;
+  validatorBestOdds?: number | null;
 }
 
 export async function placePaperBet(
@@ -562,6 +570,11 @@ export async function placePaperBet(
     syncEligible = false,
     pinnacleEdgeCategory = null,
     lineDirection = null,
+    actionablePrice = null,
+    actionableSource = null,
+    fairValueOdds = null,
+    fairValueSource = null,
+    validatorBestOdds = null,
   } = options;
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;
@@ -1127,7 +1140,7 @@ export async function placePaperBet(
         selectionName,
         selectionCanonical,
         betType: "back",
-        oddsAtPlacement: String(backOdds),
+        oddsAtPlacement: String(actionablePrice ?? backOdds),
         stake: String(stake),
         potentialProfit: String(potentialProfit),
         modelProbability: String(modelProbability),
@@ -1135,7 +1148,7 @@ export async function placePaperBet(
         calculatedEdge: String(edge),
         opportunityScore: String(score),
         modelVersion: modelVersion ?? null,
-        oddsSource: oddsSource ?? "synthetic",
+        oddsSource: actionableSource ?? oddsSource ?? "synthetic",
         enhancedOpportunityScore: enhancedOpportunityScore != null ? String(enhancedOpportunityScore) : null,
         pinnacleOdds: pinnacleOdds != null ? String(pinnacleOdds) : null,
         pinnacleImplied: pinnacleImplied != null ? String(pinnacleImplied) : null,
@@ -1160,6 +1173,12 @@ export async function placePaperBet(
         betfairBestLaySize: exchangeSnapshot?.bestLaySize != null ? String(exchangeSnapshot.bestLaySize) : null,
         exchangeFetchAt: exchangeSnapshot?.fetchedAt ?? null,
         betfairSelectionId: exchangeSnapshot?.selectionId != null ? String(exchangeSnapshot.selectionId) : null,
+        // Prompt 5 pricing-pipeline columns
+        actionablePrice: actionablePrice != null ? String(actionablePrice) : null,
+        actionableSource: actionableSource ?? null,
+        fairValueOdds: fairValueOdds != null ? String(fairValueOdds) : null,
+        fairValueSource: fairValueSource ?? null,
+        validatorBestOdds: validatorBestOdds != null ? String(validatorBestOdds) : null,
       })
       .returning();
 

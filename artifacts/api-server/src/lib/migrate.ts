@@ -623,6 +623,15 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS exchange_fetch_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS betfair_selection_id NUMERIC(20,0)
     `);
+    // Prompt 5: actionable / fair-value pricing-pipeline columns (additive, idempotent)
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS actionable_price NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS actionable_source TEXT,
+        ADD COLUMN IF NOT EXISTS fair_value_odds NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS fair_value_source TEXT,
+        ADD COLUMN IF NOT EXISTS validator_best_odds NUMERIC(10,4)
+    `);
     await db.execute(sql`
       ALTER TABLE compliance_logs
         ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ

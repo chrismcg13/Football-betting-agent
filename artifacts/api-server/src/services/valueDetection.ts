@@ -49,6 +49,14 @@ export interface ValueBet {
   originalOpportunityScore: number;
   boostedOpportunityScore: number;
   syncEligible: boolean;
+  // Pricing-pipeline fix (Prompt 5): the price we will place on, the sharp
+  // consensus reference, and which sources each came from. actionablePrice
+  // is always sourced from betfair_exchange. fairValueOdds is the highest-
+  // priority sharp source available (oddspapi_pinnacle > AF Pinnacle > exchange).
+  actionablePrice: number;
+  actionableSource: string;
+  fairValueOdds: number;
+  fairValueSource: string;
 }
 
 export interface EvaluationSummary {
@@ -60,6 +68,9 @@ export interface EvaluationSummary {
   realOddsCount: number;
   syntheticOddsCount: number;
   byMarketType: Record<string, number>;
+  // Pricing-pipeline rejection counters (Prompt 5)
+  pricingRejectNoBetfairExchange: number;
+  pricingRejectNoFairValueSource: number;
 }
 
 // ─── Segment stats ────────────────────────────────────────────────────────────
@@ -662,6 +673,63 @@ export function computeEnhancedOpportunityScore(params: EnhancedScoringParams): 
 // placement always agree on what's banned.
 import { BANNED_MARKETS } from "./paperTrading";
 
+// ─── Pricing-pipeline picker (Prompt 5) ───────────────────────────────────
+// Separate the price we PLACE ON (actionable, exchange-only) from the price
+// we use to ESTIMATE FAIR VALUE (sharp consensus). The CLV-style edge is
+// then (1/fairValueOdds) - (1/actionablePrice): positive iff the exchange
+// back price beats sharp implied probability.
+//
+// Caller MUST pass rows pre-sorted by snapshotTime DESC so first-seen wins.
+
+type PriceQuote = { backOdds: number; source: string };
+type FairValueSource = "oddspapi_pinnacle" | "api_football_real:Pinnacle" | "betfair_exchange";
+type RejectReason = "no_betfair_exchange" | "no_fair_value_source";
+type PricingResult =
+  | {
+      ok: true;
+      actionablePrice: number;
+      actionableSource: "betfair_exchange";
+      fairValueOdds: number;
+      fairValueSource: FairValueSource;
+    }
+  | { ok: false; reason: RejectReason };
+
+function selectPricingSources(
+  rows: Array<{ source?: string | null; backOdds: string | number | null }>,
+): PricingResult {
+  let actionable: PriceQuote | null = null;
+  let oddspapiPinnacle: PriceQuote | null = null;
+  let afPinnacle: PriceQuote | null = null;
+  let exchangeForFv: PriceQuote | null = null;
+
+  for (const r of rows) {
+    if (r.backOdds == null) continue;
+    const bo = Number(r.backOdds);
+    if (!(bo > 1.01)) continue;
+    const src = r.source ?? "";
+    if (src === "betfair_exchange") {
+      if (!actionable) actionable = { backOdds: bo, source: "betfair_exchange" };
+      if (!exchangeForFv) exchangeForFv = { backOdds: bo, source: "betfair_exchange" };
+    } else if (src === "oddspapi_pinnacle") {
+      if (!oddspapiPinnacle) oddspapiPinnacle = { backOdds: bo, source: "oddspapi_pinnacle" };
+    } else if (src === "api_football_real:Pinnacle") {
+      if (!afPinnacle) afPinnacle = { backOdds: bo, source: "api_football_real:Pinnacle" };
+    }
+  }
+
+  if (!actionable) return { ok: false, reason: "no_betfair_exchange" };
+  const fv = oddspapiPinnacle ?? afPinnacle ?? exchangeForFv;
+  if (!fv) return { ok: false, reason: "no_fair_value_source" };
+
+  return {
+    ok: true,
+    actionablePrice: actionable.backOdds,
+    actionableSource: "betfair_exchange",
+    fairValueOdds: fv.backOdds,
+    fairValueSource: fv.source as FairValueSource,
+  };
+}
+
 // ─── Main detection function ──────────────────────────────────────────────────
 
 export async function detectValueBets(options?: {
@@ -705,6 +773,9 @@ export async function detectValueBets(options?: {
   let selectionsEvaluated = 0;
   let syntheticOddsCount = 0;
   let realOddsCount = 0;
+  // Pricing-pipeline rejection counters (Prompt 5) — accumulated per (match, market, selection)
+  let pricingRejectNoBetfairExchange = 0;
+  let pricingRejectNoFairValueSource = 0;
   const byMarketType: Record<string, number> = {};
 
   // Buffer compliance log inserts and bulk-flush at the end. Per-row inserts
@@ -930,64 +1001,75 @@ export async function detectValueBets(options?: {
       featureMap[f.featureName] = Number(f.featureValue);
     }
 
-    // Determine odds source priority — both api_football_real and oddspapi are real market odds
-    const realOddsRows = oddsRows.filter(
-      (r) => r.source?.startsWith("api_football_real") || r.source?.startsWith("oddspapi"),
-    );
-    const isSynthetic = realOddsRows.length === 0;
-
-    if (isSynthetic) {
-      syntheticOddsCount++;
-    } else {
-      realOddsCount++;
-    }
-
+    // ── Pricing-pipeline picker (Prompt 5) ────────────────────────────────
+    // Group oddsRows (already snapshotTime DESC) by (market, selection), then
+    // run selectPricingSources per group: actionable = betfair_exchange only;
+    // fair value = oddspapi_pinnacle > AF Pinnacle > exchange. Synthetic odds
+    // are no longer used as a fallback — without an exchange row we cannot
+    // place at a real market price, so the candidate is rejected.
     type OddsRow = { marketType: string; selectionName: string; backOdds: string | number | null; source?: string | null };
-    const oddsSource: OddsRow[] = isSynthetic ? generateSyntheticOdds(featureMap) : oddsRows;
 
-    // Log which odds source was used
-    const oddsSourceLabel = isSynthetic
-      ? "synthetic"
-      : (realOddsRows[0]?.source ?? "api_football_real").replace("api_football_real:", "");
-
-    // Runtime telemetry (not audit). Was being persisted into compliance_logs
-    // at ~1k rows/cycle and bloating that table; now goes to file logs only.
-    logger.debug(
-      {
-        matchId: match.id,
-        homeTeam: match.homeTeam,
-        awayTeam: match.awayTeam,
-        oddsSource: oddsSourceLabel,
-        isSynthetic,
-        oddsRowCount: oddsSource.length,
-      },
-      "value_detection_odds_source",
+    const hasAnyRealOdds = oddsRows.some(
+      (r) =>
+        r.source === "betfair_exchange" ||
+        r.source?.startsWith("api_football_real") ||
+        r.source?.startsWith("oddspapi"),
     );
+    if (hasAnyRealOdds) realOddsCount++;
+    else syntheticOddsCount++;
 
-    const latestOdds = new Map<string, OddsRow>();
-    for (const row of oddsSource) {
-      const key = `${row.marketType}:${row.selectionName}`;
-      if (!latestOdds.has(key)) latestOdds.set(key, row);
+    const groups = new Map<string, OddsRow[]>();
+    for (const r of oddsRows) {
+      const key = `${r.marketType}\u0000${r.selectionName}`;
+      const arr = groups.get(key) ?? [];
+      arr.push(r);
+      groups.set(key, arr);
     }
 
-    for (const [, oddsRow] of latestOdds) {
-      if (!oddsRow.backOdds) continue;
-      const backOdds = Number(oddsRow.backOdds);
-      if (backOdds <= 1.01) continue;
+    for (const [groupKey, groupRows] of groups) {
+      const sep = groupKey.indexOf("\u0000");
+      const marketType = groupKey.slice(0, sep);
+      const selectionName = groupKey.slice(sep + 1);
 
-      // Fix 1: Skip banned near-certainty markets — they have no genuine edge
-      if (BANNED_MARKETS.has(oddsRow.marketType)) continue;
+      // Banned-market hardstop (cheap check before pricing selection)
+      if (BANNED_MARKETS.has(marketType)) continue;
 
-      // Fix 2: Minimum odds floor — below this the reward doesn't justify the risk
-      if (backOdds < minOddsThreshold) continue;
+      const pricing = selectPricingSources(groupRows);
+      if (!pricing.ok) {
+        if (pricing.reason === "no_betfair_exchange") {
+          pricingRejectNoBetfairExchange++;
+        } else {
+          pricingRejectNoFairValueSource++;
+        }
+        continue;
+      }
+      const { actionablePrice, actionableSource, fairValueOdds, fairValueSource } = pricing;
 
-      const impliedProb = 1 / backOdds;
+      // Minimum odds floor on the actionable (placed) price
+      if (actionablePrice < minOddsThreshold) continue;
 
-      const modelProb = getModelProbability(oddsRow.marketType, oddsRow.selectionName, featureMap);
+      const modelProb = getModelProbability(marketType, selectionName, featureMap);
       if (modelProb === null) continue;
 
       selectionsEvaluated++;
-      const edge = modelProb - impliedProb;
+
+      // Legacy-compat oddsRow adapter so downstream code (scoring, logging,
+      // etc.) keeps the same shape it had before the pricing-pipeline split.
+      const oddsRow: OddsRow = {
+        marketType,
+        selectionName,
+        backOdds: actionablePrice,
+        source: actionableSource,
+      };
+      const backOdds = actionablePrice;
+      const impliedProb = 1 / actionablePrice;
+      const isSynthetic = false;
+      const oddsSourceLabel = actionableSource;
+
+      // CLV-style edge: positive iff the exchange back price beats sharp
+      // consensus implied probability. Replaces the legacy modelProb-based
+      // edge formula which conflated forecast accuracy with price quality.
+      const edge = (1 / fairValueOdds) - (1 / actionablePrice);
 
       const effectiveMinEdge = DERIVED_MARKETS.has(oddsRow.marketType)
         ? Math.max(minEdge, 0.08)
@@ -1136,6 +1218,10 @@ export async function detectValueBets(options?: {
           originalOpportunityScore: baseOpportunityScore,
           boostedOpportunityScore: opportunityScore,
           syncEligible,
+          actionablePrice,
+          actionableSource,
+          fairValueOdds,
+          fairValueSource,
         });
       }
     }
@@ -1184,7 +1270,15 @@ export async function detectValueBets(options?: {
   }
 
   logger.info(
-    { matchesEvaluated: matches.length, selectionsEvaluated, valueBetsFound: valueBets.length, realOddsCount, syntheticOddsCount },
+    {
+      matchesEvaluated: matches.length,
+      selectionsEvaluated,
+      valueBetsFound: valueBets.length,
+      realOddsCount,
+      syntheticOddsCount,
+      pricingRejectNoBetfairExchange,
+      pricingRejectNoFairValueSource,
+    },
     "Value detection complete",
   );
 
@@ -1197,5 +1291,7 @@ export async function detectValueBets(options?: {
     realOddsCount,
     syntheticOddsCount,
     byMarketType,
+    pricingRejectNoBetfairExchange,
+    pricingRejectNoFairValueSource,
   };
 }
