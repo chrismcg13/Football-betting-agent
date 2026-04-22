@@ -1,0 +1,116 @@
+Prompt 3 — Port foundational fixes to prod
+Code changes in the prod workspace only. Do not touch dev. Do not modify placement logic or pricing logic — those come in later prompts. Do not clear agent_status or pause_reason.
+
+Port three foundational fixes from dev to prod. Show the consolidated diff before applying.
+
+CHANGE A — Add verifyTradingModeForEnvironment to startupChecks.ts
+
+This helper exists in dev but not in prod. Port it verbatim from the version shipped in dev earlier today. Changes:
+
+1. In artifacts/api-server/src/lib/startupChecks.ts, add the verifyTradingModeForEnvironment function. Use the exact code from dev:
+
+export function verifyTradingModeForEnvironment(
+  environment: string,
+  tradingMode: string | undefined,
+): { fatal: boolean; level: "info" | "warn" | "error"; message: string } {
+  const mode = (tradingMode ?? "PAPER").toUpperCase();
+
+  if (environment === "development" && mode === "LIVE") {
+    return {
+      fatal: true,
+      level: "error",
+      message: `Dev workspace has TRADING_MODE=LIVE — refusing to start (dev must be PAPER)`,
+    };
+  }
+
+  if (environment === "production" && mode === "LIVE") {
+    return {
+      fatal: false,
+      level: "info",
+      message: `Startup safety check PASSED — ENVIRONMENT=production, TRADING_MODE=LIVE`,
+    };
+  }
+
+  return {
+    fatal: false,
+    level: "info",
+    message: `Startup safety check PASSED — ENVIRONMENT=${environment}, TRADING_MODE=${mode}`,
+  };
+}
+
+2. In artifacts/api-server/src/index.ts, import and call the helper after the existing verifyDbHostForEnvironment block. Match the pattern from dev: fatal → process.exit(1), otherwise log INFO or WARN.
+
+3. In artifacts/api-server/src/services/betfairLive.ts runStartupHealthCheck(), add a new check that calls verifyTradingModeForEnvironment and appends a health check entry. Follow the pattern from dev.
+
+CHANGE B — determineBetWon ReferenceError fix
+
+Three edits in paperTrading.ts to fix the missing homeScoreHt/awayScoreHt parameter:
+
+1. Extend the matchStats parameter type in determineBetWon to include homeScoreHt?: number | null and awayScoreHt?: number | null.
+
+2. Replace both (match as { homeScoreHt?: ... }).homeScoreHt reads in FIRST_HALF_RESULT and FIRST_HALF_OU_* cases with matchStats?.homeScoreHt and matchStats?.awayScoreHt.
+
+3. At both call sites (_settleBetsInner and backfillCornersCardsStats), extend the matchStats literal with:
+   homeScoreHt: match.homeScoreHt ?? null,
+   awayScoreHt: match.awayScoreHt ?? null,
+
+CHANGE C — Void logic: 72h retry timeout + dormant abandonment-void branch
+
+Port the consolidated Prompt B changes from dev exactly:
+
+1. Add migration to migrate.ts (additive, idempotent):
+   ALTER TABLE paper_bets
+     ADD COLUMN IF NOT EXISTS settlement_attempts INTEGER NOT NULL DEFAULT 0,
+     ADD COLUMN IF NOT EXISTS last_settlement_attempt_at TIMESTAMPTZ
+
+2. Update Drizzle schema lib/db/src/schema/paperBets.ts: add settlementAttempts (integer, not null, default 0) and lastSettlementAttemptAt (timestamp with timezone) columns.
+
+3. In paperTrading.ts _settleBetsInner:
+   - Add SETTLEMENT_MATCH_STATUSES = ["finished", "abandoned", "postponed", "cancelled", "suspended"] and ABANDONMENT_STATUSES = new Set(["abandoned", "postponed", "cancelled", "suspended"]).
+   - Change the match query to use inArray over SETTLEMENT_MATCH_STATUSES.
+   - Add abandonment-void check FIRST in the per-bet loop (gated on ABANDONMENT_STATUSES.has(match.status) && !bet.betfairBetId, voids with zero P&L, distinct log message "Paper bet voided — fixture status=X").
+   - Add 72h-timeout retry/loss logic: when determineBetWon returns null AND !bet.betfairBetId, if hours_since_kickoff < 72 increment settlement_attempts and leave pending; if >= 72 set outcome = false and log "settled as lost after 72h timeout".
+   - Update SettlementResult interface to add paperPendingRetry, paperTimeoutLoss, paperAbandonmentVoid counters.
+   - Update the concurrent-skip early return to include the three new counter fields as zeros.
+
+4. Update scheduler.ts settleBets call sites (both the cron one around L334 and the pipeline one around L1573) to include the three new counter fields in the log line.
+
+HARD RULES:
+
+- Do not touch dev.
+- Do not modify paper_mode.
+- Do not modify TRADING_MODE.
+- Do not modify agent_status, pause_reason, or paused_at.
+- Do not modify BANNED_MARKETS.
+- Do not modify the pricing pipeline (that's a later prompt).
+- Do not add C1 capture (that's a later prompt).
+- Do not add the Pinnacle sanity gate (that's a later prompt).
+- Do not modify riskManager.ts lines 357-364 (the dev-mode bypass gate). Do not modify scheduler.ts lines 1660-1715 (the auto-resume watchdog). If any planned change brushes these line ranges, stop and flag for review before applying.
+
+Show the consolidated diff before applying.
+
+VERIFICATION after applying:
+
+1. Restart the workflow. Confirm startup log shows ALL of:
+   - Startup safety check PASSED — ENVIRONMENT=production, DB host contains rough-flower
+   - Startup safety check PASSED — ENVIRONMENT=production, TRADING_MODE=LIVE (this is the NEW line)
+   - Trading mode: LIVE
+   - Migrations complete
+
+2. Migration applied: SELECT column_name FROM information_schema.columns WHERE table_name = 'paper_bets' AND column_name IN ('settlement_attempts', 'last_settlement_attempt_at'); — 2 rows expected.
+
+3. Confirm agent_status is still 'paused_weekly': SELECT value FROM agent_config WHERE key = 'agent_status'; — should be 'paused_weekly', NOT 'running'.
+
+4. Confirm paper_mode still false: SELECT value FROM agent_config WHERE key = 'paper_mode';
+
+5. Confirm live_breaker_paused_until is still 2026-04-23T00:00:00Z: SELECT value FROM agent_config WHERE key = 'live_breaker_paused_until';
+
+6. Run one settlement cycle. Paste the settlement log showing the new counters (paper_bets_pending_retry, paper_bets_timeout_lost, paper_bets_abandonment_void) even if zero.
+
+7. Grep logs for "ReferenceError: match is not defined" — should be zero post-fix.
+
+8. Confirm BANNED_MARKETS still contains OVER_UNDER_25, OVER_UNDER_35, FIRST_HALF_RESULT, DOUBLE_CHANCE. Grep paperTrading.ts and paste the matches.
+
+9. Confirm no live bets were placed during verification. Run: SELECT COUNT(*) FROM paper_bets WHERE placed_at > (current workflow start time) AND betfair_bet_id IS NOT NULL; — should be 0.
+
+If server fails to boot, stop and report. Do not auto-fix.
