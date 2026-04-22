@@ -42,27 +42,13 @@ UPDATE agent_config
  WHERE key = 'live_opp_score_threshold'
    AND value <> '60';
 
--- 3) Mark pre-cutover bets as legacy_regime = true.
---    Cutover timestamp = 2026-04-19T20:00Z (matches the unique-pending index
---    in lib/db/src/schema/paperBets.ts).  Any bet placed before this point
---    used the old pricing pipeline and must be hidden from dashboard /
---    metric / experiment queries that read paper_bets_current.
-UPDATE paper_bets
-   SET legacy_regime = true
- WHERE placed_at < '2026-04-19T20:00:00Z'
-   AND legacy_regime = false;
+-- NOTE: Legacy backfill (UPDATE paper_bets SET legacy_regime = true …) is
+--       NOT part of this script. It runs in the go-live prompt with the
+--       exact paper_mode/TRADING_MODE flip timestamp as the cutover.
 
 -- ── Sanity checks (read-only) ────────────────────────────────────────────────
 SELECT key, value FROM agent_config
- WHERE key IN ('min_edge_threshold','opp_score_threshold')
+ WHERE key IN ('min_edge_threshold','min_opportunity_score','live_opp_score_threshold')
  ORDER BY key;
-
-SELECT
-  count(*)                                          AS total_bets,
-  count(*) FILTER (WHERE legacy_regime = true)      AS legacy_bets,
-  count(*) FILTER (WHERE legacy_regime = false)     AS current_bets
-FROM paper_bets;
-
-SELECT count(*) AS rows_in_view FROM paper_bets_current;
 
 COMMIT;
