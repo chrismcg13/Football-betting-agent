@@ -1,0 +1,31 @@
+Good catch. Do not ship Prompt 5 to prod. Option D — investigate first, report back, hold for my decision.
+
+Before the investigation, I need to verify dev's state too — there's a real possibility that dev has the same ingestion gap and has been rejecting all candidates since Prompt 5 shipped there. The dev agent's verification output didn't explicitly confirm non-zero betfair_exchange rows were being written, just that the code change was applied.
+
+If you have read access to the dev workspace's Neon branch (ep-billowing-lab-abs5nv2i-pooler), run the same query against dev:
+
+SELECT source, COUNT(*) AS n FROM odds_snapshots GROUP BY source ORDER BY n DESC;
+
+Report the full source distribution in dev. Specifically, does dev have non-zero betfair_exchange rows?
+
+If you don't have dev access from this workspace, say so. We'll need to investigate from dev separately.
+
+Then, regardless of dev's state, investigate prod's situation:
+
+1. Grep the entire prod codebase for any code path that writes rows with source = 'betfair_exchange' to odds_snapshots. Specifically look for:
+   - INSERT INTO odds_snapshots ... with source = 'betfair_exchange'
+   - Any function that calls Betfair Exchange endpoints and persists results to odds_snapshots
+   - Any scheduled cron that sweeps upcoming fixtures and populates exchange back/lay data
+
+2. If such a code path exists but isn't running, report why (disabled, commented out, conditional-gated, etc.).
+
+3. If no such code path exists at all, report what WOULD need to be built. Expected shape: a periodic cron that iterates over NEAR-window fixtures with Betfair event IDs, calls listMarketBook for each, and writes the best back/lay to odds_snapshots with source = 'betfair_exchange' for consumption by selectPricingSources.
+
+4. Check whether any of the following existing code paths could be adapted:
+   - The C1 captureExchangeSnapshot helper — this fetches exchange data at placement time into paper_bets columns. Could it also write to odds_snapshots?
+   - The dataIngestionBetfair.ts file (the agent noted earlier that listMarketBook is imported there) — does it already fetch exchange data? Where does it write?
+   - Any existing per-cycle odds fetchers that could be extended to include Betfair Exchange?
+
+5. If an adapter or new ingester is needed, report an implementation sketch with file paths, cron cadence, and API budget cost estimate.
+
+Report findings. Do not modify code. Do not touch dev. Do not ship Prompt 5. Standing by for decision after findings.
