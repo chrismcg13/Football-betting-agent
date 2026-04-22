@@ -158,7 +158,7 @@ router.get("/dashboard/summary", async (_req, res) => {
         COUNT(*) FILTER (WHERE live_tier = 'tier1') AS betfair_live,
         COUNT(*) FILTER (WHERE (live_tier = 'tier2' OR live_tier IS NULL)) AS tier2,
         COALESCE(SUM(stake::numeric) FILTER (WHERE live_tier = 'tier1' AND status != 'void'), 0) AS betfair_stake
-      FROM paper_bets
+      FROM paper_bets_current
       WHERE placed_at >= ${todayStartUtc} AND deleted_at IS NULL
         AND betfair_bet_id IS NOT NULL
     `),
@@ -2862,10 +2862,10 @@ router.get("/admin/go-live-readiness", async (_req, res) => {
 
     const [bankroll, summaryResult, promotedResult, clvResult, betsPerDayResult] = await Promise.all([
       getBankroll(),
-      pool.query(`SELECT COUNT(*)::int as total_settled, COUNT(*) FILTER (WHERE status='won')::int as wins, COUNT(*) FILTER (WHERE status='lost')::int as losses FROM paper_bets WHERE status IN ('won','lost')`),
+      pool.query(`SELECT COUNT(*)::int as total_settled, COUNT(*) FILTER (WHERE status='won')::int as wins, COUNT(*) FILTER (WHERE status='lost')::int as losses FROM paper_bets_current WHERE status IN ('won','lost')`),
       pool.query(`SELECT COUNT(*)::int as cnt FROM experiment_registry WHERE data_tier='promoted'`),
-      pool.query(`SELECT AVG(clv_pct::numeric)::float as avg_clv FROM paper_bets WHERE clv_pct IS NOT NULL AND status IN ('won','lost')`),
-      pool.query(`SELECT COUNT(*)::float / GREATEST(1, EXTRACT(EPOCH FROM (MAX(placed_at)-MIN(placed_at))) / 86400) as bets_per_day FROM paper_bets WHERE placed_at > NOW() - INTERVAL '14 days'`),
+      pool.query(`SELECT AVG(clv_pct::numeric)::float as avg_clv FROM paper_bets_current WHERE clv_pct IS NOT NULL AND status IN ('won','lost')`),
+      pool.query(`SELECT COUNT(*)::float / GREATEST(1, EXTRACT(EPOCH FROM (MAX(placed_at)-MIN(placed_at))) / 86400) as bets_per_day FROM paper_bets_current WHERE placed_at > NOW() - INTERVAL '14 days'`),
     ]);
 
     const totalSettled = summaryResult.rows[0]?.total_settled ?? 0;
@@ -3414,7 +3414,7 @@ router.get("/dashboard/execution-metrics", async (_req, res) => {
           ROUND(AVG(CASE WHEN betfair_size_matched IS NOT NULL AND stake::numeric > 0
             THEN (betfair_size_matched::numeric / stake::numeric) * 100 END)::numeric, 1) AS avg_fill_pct,
           COUNT(*) FILTER (WHERE placed_at >= ${dayAgo} AND betfair_bet_id IS NOT NULL)::int AS placed_24h
-        FROM paper_bets
+        FROM paper_bets_current
         WHERE betfair_bet_id IS NOT NULL
       `),
       db.execute(sql`
@@ -3422,13 +3422,13 @@ router.get("/dashboard/execution-metrics", async (_req, res) => {
           ROUND(AVG(EXTRACT(EPOCH FROM (betfair_placed_at - placed_at)))::numeric, 1) AS avg_signal_to_place_secs,
           ROUND(AVG(CASE WHEN betfair_settled_at IS NOT NULL
             THEN EXTRACT(EPOCH FROM (betfair_settled_at - betfair_placed_at)) END)::numeric, 0) AS avg_time_to_settle_secs
-        FROM paper_bets
+        FROM paper_bets_current
         WHERE betfair_placed_at IS NOT NULL
       `),
       db.execute(sql`
         SELECT COUNT(*)::int AS week_bets,
           COUNT(*) FILTER (WHERE status IN ('won','lost'))::int AS week_settled
-        FROM paper_bets
+        FROM paper_bets_current
         WHERE placed_at >= ${weekAgo}
           AND betfair_bet_id IS NOT NULL
       `),
