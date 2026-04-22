@@ -1,0 +1,84 @@
+Prompt 6 — Add Pinnacle sanity gate + legacy data tagging
+Two new changes unique to prod go-live. Do not touch dev.
+
+CHANGE A — Pinnacle sanity gate
+
+Add a new rejection in selectPricingSources: if the difference (fairValueImpliedProb − actionableImpliedProb) is MORE NEGATIVE than -0.03 (i.e. our actionable price implies a probability more than 3 percentage points BELOW Pinnacle's implied probability, meaning we're offering a price significantly WORSE than sharp consensus suggests is fair), reject with reason "pinnacle_sanity_gate".
+
+Semantics check: positive edge means actionable < fair (exchange offering better than fair — good). Negative edge beyond -3pp means we'd be taking a price that's significantly worse than sharps think fair — the "too good to be true from the wrong direction" scenario, or a sanity signal that something's off with the pricing.
+
+Alternative framing: reject if actionablePrice is more than X above fairValueOdds by enough that the implied-prob gap exceeds 3pp. Use implied-prob difference for the check, not raw odds ratio.
+
+Implementation:
+
+1. In valueDetection.ts selectPricingSources, after computing actionable and fair value rows, compute:
+   actionableImplied = 1 / actionablePrice
+   fairValueImplied = 1 / fairValueOdds
+   if ((fairValueImplied - actionableImplied) < -0.03) return { kind: "reject", reason: "pinnacle_sanity_gate" };
+
+Actually wait — the direction depends on what we're trying to catch. Reconsider:
+
+- If Betfair offers 9.0 on something Pinnacle prices at 2.0: actionableImplied = 0.111, fairValueImplied = 0.5. Gap = +0.389. That's the "too good to be true" case.
+- If Betfair offers 2.0 on something Pinnacle prices at 9.0: actionableImplied = 0.5, fairValueImplied = 0.111. Gap = -0.389. We'd be paying way over sharp fair — also weird.
+
+Both directions of large gap are suspicious. The sanity gate should reject when the absolute gap is too large.
+
+Corrected implementation:
+   const impliedGap = Math.abs(fairValueImplied - actionableImplied);
+   if (impliedGap > 0.03) return { kind: "reject", reason: "pinnacle_sanity_gate" };
+
+Wait — that rejects ALL large edges, which defeats the purpose.
+
+Think about this differently. The purpose is to catch "too good to be true" offerings, which means exchange price WAY better than sharps think reasonable. That's fairValueImplied < actionableImplied by a large amount (sharps say "unlikely", exchange says "even more unlikely"). The CLV-style edge formula is (fairValueImplied − actionableImplied). If this is very positive, it's "too good" — reject.
+
+So:
+   const clvEdge = fairValueImplied - actionableImplied;
+   if (clvEdge > 0.03) return { kind: "reject", reason: "pinnacle_sanity_gate" };
+
+But this rejects the CLV-positive cases we WANT to take. So this can't be right either.
+
+ACTUALLY the correct interpretation: sanity-gate rejection is reserved for EXTREME gaps, not ordinary +3% CLV. Set the threshold much higher than the normal edge threshold. E.g. reject if clvEdge > 0.15 (15pp implied-prob gap, i.e. something like Betfair 9.0 vs Pinnacle 2.0).
+
+Please investigate this before implementing. Read the earlier CLV diagnostic findings and the pricing-pipeline investigation. Report:
+
+1. What is the distribution of (fairValueImplied − actionableImplied) on historical dev paper bets placed since the pricing fix shipped (last ~6 hours)? Run the SQL to compute this distribution bucketed at 0-1pp, 1-3pp, 3-5pp, 5-10pp, 10-20pp, >20pp.
+
+2. Based on the distribution, recommend a threshold that rejects obvious outliers (probably >15pp or >20pp) without rejecting legitimate edge candidates.
+
+3. DO NOT implement until I approve the threshold.
+
+CHANGE B — Legacy data tagging for dashboard reset
+
+Add a reset_timestamp to agent_config and tag historical bets as legacy:
+
+1. Add a new agent_config row: dashboard_reset_at with value = current UTC timestamp at the moment of Prompt 7 (go-live). Do not set this yet — we'll set it right before flipping to live. Prep the schema and query logic now.
+
+2. Add a legacy_regime boolean column to paper_bets (default false, backfill existing rows to true):
+
+   ALTER TABLE paper_bets ADD COLUMN IF NOT EXISTS legacy_regime BOOLEAN NOT NULL DEFAULT false;
+   
+   -- One-time backfill of existing rows as legacy (run separately, confirm count first):
+   SELECT COUNT(*) FROM paper_bets WHERE legacy_regime = false;
+   -- Then:
+   UPDATE paper_bets SET legacy_regime = true WHERE legacy_regime = false AND placed_at < 'PROMPT_7_TIMESTAMP';
+   -- (Placeholder — actual timestamp set at Prompt 7 execution.)
+
+3. Update dashboard query layer to filter on legacy_regime = false by default. Find all dashboard endpoints and queries that compute P&L, ROI, win rate, CLV, or any performance metric. Wrap them with AND legacy_regime = false in the WHERE clause.
+
+4. Add a toggle on the dashboard to "Include legacy regime" that flips the filter, for audit purposes.
+
+5. DO NOT actually backfill existing rows yet. Report:
+   - How many rows currently exist in paper_bets.
+   - Which dashboard endpoints/queries need updating.
+   - The exact SQL you would run for backfill.
+
+Wait for my approval before executing the backfill and dashboard query updates.
+
+HARD RULES:
+
+- Do not touch dev.
+- Do not modify paper_mode or TRADING_MODE yet.
+- Do not execute the backfill until I approve.
+- Do not implement the Pinnacle sanity gate until I approve the threshold.
+
+Report both investigations. Wait for my sign-off on both before any code changes.
