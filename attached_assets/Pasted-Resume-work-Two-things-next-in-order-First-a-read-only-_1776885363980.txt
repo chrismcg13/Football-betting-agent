@@ -1,0 +1,31 @@
+Resume work. Two things next, in order.
+
+First — a read-only feasibility investigation on an alternative legacy-tagging approach.
+
+Rather than patching ~16 endpoints and ~13 service-layer aggregators with individual WHERE clauses, I'm considering a database-view approach:
+
+1. Add legacy_regime BOOLEAN column to paper_bets (default false, same as your original plan).
+2. Create a view: CREATE VIEW paper_bets_current AS SELECT * FROM paper_bets WHERE legacy_regime = false;
+3. Change the endpoints that show dashboard/performance/P&L/ROI/CLV/win-rate metrics to read from paper_bets_current instead of paper_bets.
+4. Leave endpoints that need full history (settlement reconciliation, compliance audit, operational state, risk manager weekly-loss calculation) reading from paper_bets directly.
+
+Investigate and report:
+
+1. Is this approach feasible in the current Drizzle + Postgres setup? Specifically: can Drizzle be pointed at a view as easily as a table? Or does the drizzle-zod schema layer require a real table?
+
+2. If views work with Drizzle: how many of the ~16 endpoints and ~13 services could switch to the view cleanly (i.e. the endpoint's current queries only need rows excluded by the legacy filter)? How many would need more complex handling?
+
+3. For each endpoint and service from your prior investigation, classify it as:
+   - Class A: "read from view by default" (dashboard/perf)
+   - Class B: "read from raw table always" (settlement, audit, ops)
+   - Class C: "needs a toggle between the two" (filtered-bets listing, maybe others)
+
+4. What's the LOC estimate for the view-based approach vs the original patch-every-endpoint approach?
+
+5. Are there any edge cases where using a view would behave differently from the original approach — e.g. performance considerations, write visibility, transaction semantics?
+
+Report findings. Do not modify anything.
+
+Second — after reporting on the view approach, continue holding on the Pinnacle sanity gate until there are at least 100 matching betfair_exchange × oddspapi_pinnacle pairs in the last 24h window. Periodically (every few hours or after obvious data accumulation), re-run the distribution analysis you already designed and surface results. When the sample is rich enough, I'll pick the threshold.
+
+Guardrails unchanged: paused_weekly, paper_mode=false, live_breaker_paused_until=2026-04-23T00:00:00Z, BANNED_MARKETS intact.
