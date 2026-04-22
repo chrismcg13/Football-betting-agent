@@ -48,3 +48,32 @@ export function verifyDbHostForEnvironment(
   return { fatal: false, level: "warn",
     message: `Unknown ENVIRONMENT value "${environment}" — skipping DB host check` };
 }
+
+export function verifyTradingModeForEnvironment(
+  environment: string,
+  tradingMode: string | undefined,
+): { fatal: boolean; level: "info" | "warn" | "error"; message: string } {
+  const mode = (tradingMode ?? "PAPER").toUpperCase();
+
+  if (environment === "development" && mode === "LIVE") {
+    return {
+      fatal: true,
+      level: "error",
+      message: `Dev workspace has TRADING_MODE=LIVE — refusing to start (dev must be PAPER)`,
+    };
+  }
+
+  if (environment === "production" && mode === "LIVE") {
+    return {
+      fatal: false,
+      level: "info",
+      message: `Startup safety check PASSED — ENVIRONMENT=production, TRADING_MODE=LIVE`,
+    };
+  }
+
+  return {
+    fatal: false,
+    level: "info",
+    message: `Startup safety check PASSED — ENVIRONMENT=${environment}, TRADING_MODE=${mode}`,
+  };
+}

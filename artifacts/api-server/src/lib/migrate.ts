@@ -609,6 +609,11 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
     `);
     await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS settlement_attempts INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS last_settlement_attempt_at TIMESTAMPTZ
+    `);
+    await db.execute(sql`
       ALTER TABLE compliance_logs
         ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
     `);

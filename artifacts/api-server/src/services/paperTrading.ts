@@ -1212,7 +1212,12 @@ function determineBetWon(
   selectionName: string,
   homeScore: number,
   awayScore: number,
-  matchStats?: { totalCorners: number | null; totalCards: number | null } | null,
+  matchStats?: {
+    totalCorners: number | null;
+    totalCards: number | null;
+    homeScoreHt?: number | null;
+    awayScoreHt?: number | null;
+  } | null,
 ): boolean | null {
   const totalGoals = homeScore + awayScore;
 
@@ -1318,8 +1323,8 @@ function determineBetWon(
       // null so the bet voids — but for any matched real-money bet,
       // _settleBetsInner has already deferred to reconcileSettlements
       // (Betfair listClearedOrders) before reaching this function.
-      const htHome = (match as { homeScoreHt?: number | null }).homeScoreHt;
-      const htAway = (match as { awayScoreHt?: number | null }).awayScoreHt;
+      const htHome = matchStats?.homeScoreHt;
+      const htAway = matchStats?.awayScoreHt;
       if (htHome === null || htHome === undefined || htAway === null || htAway === undefined) return null;
       if (selectionName === "Home") return htHome > htAway;
       if (selectionName === "Draw") return htHome === htAway;
@@ -1329,8 +1334,8 @@ function determineBetWon(
 
     case "FIRST_HALF_OU_05":
     case "FIRST_HALF_OU_15": {
-      const htHome = (match as { homeScoreHt?: number | null }).homeScoreHt;
-      const htAway = (match as { awayScoreHt?: number | null }).awayScoreHt;
+      const htHome = matchStats?.homeScoreHt;
+      const htAway = matchStats?.awayScoreHt;
       if (htHome === null || htHome === undefined || htAway === null || htAway === undefined) return null;
       const htTotal = htHome + htAway;
       const threshold = marketType === "FIRST_HALF_OU_05" ? 0.5 : 1.5;
@@ -1351,14 +1356,28 @@ export interface SettlementResult {
   won: number;
   lost: number;
   totalPnl: number;
+  paperPendingRetry: number;
+  paperTimeoutLoss: number;
+  paperAbandonmentVoid: number;
 }
+
+const SETTLEMENT_MATCH_STATUSES = ["finished", "abandoned", "postponed", "cancelled", "suspended"] as const;
+const ABANDONMENT_STATUSES = new Set<string>(["abandoned", "postponed", "cancelled", "suspended"]);
 
 let settlingInProgress = false;
 
 export async function settleBets(): Promise<SettlementResult> {
   if (settlingInProgress) {
     logger.debug("settleBets already in progress — skipping concurrent call");
-    return { settled: 0, won: 0, lost: 0, totalPnl: 0 };
+    return {
+      settled: 0,
+      won: 0,
+      lost: 0,
+      totalPnl: 0,
+      paperPendingRetry: 0,
+      paperTimeoutLoss: 0,
+      paperAbandonmentVoid: 0,
+    };
   }
   settlingInProgress = true;
   try {
@@ -1375,7 +1394,15 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     .where(and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`));
 
   if (pendingBets.length === 0) {
-    return { settled: 0, won: 0, lost: 0, totalPnl: 0 };
+    return {
+      settled: 0,
+      won: 0,
+      lost: 0,
+      totalPnl: 0,
+      paperPendingRetry: 0,
+      paperTimeoutLoss: 0,
+      paperAbandonmentVoid: 0,
+    };
   }
 
   const uniqueMatchIds = [...new Set(pendingBets.map((b) => b.matchId))];
@@ -1385,7 +1412,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     .where(
       and(
         inArray(matchesTable.id, uniqueMatchIds),
-        eq(matchesTable.status, "finished"),
+        inArray(matchesTable.status, SETTLEMENT_MATCH_STATUSES as unknown as string[]),
       ),
     );
 
@@ -1395,10 +1422,37 @@ async function _settleBetsInner(): Promise<SettlementResult> {
   let won = 0;
   let lost = 0;
   let totalPnl = 0;
+  let paperPendingRetry = 0;
+  let paperTimeoutLoss = 0;
+  let paperAbandonmentVoid = 0;
 
   for (const bet of pendingBets) {
     const match = matchMap.get(bet.matchId);
     if (!match) continue;
+
+    // ─── Abandonment-void branch (Apr 22 2026) ─────────────────────────
+    // Fixture won't complete; void any unmatched paper-bet side. Real-money
+    // matched bets are settled by reconcileSettlements (Betfair listClearedOrders),
+    // so we only act on bets without a betfair_bet_id.
+    if (ABANDONMENT_STATUSES.has(match.status) && !bet.betfairBetId) {
+      await db.update(paperBetsTable).set({
+        status: "void",
+        settlementPnl: "0",
+        grossPnl: "0",
+        commissionAmount: "0",
+        netPnl: "0",
+        settledAt: new Date(),
+      }).where(eq(paperBetsTable.id, bet.id));
+
+      logger.info(
+        { betId: bet.id, matchId: match.id, fixtureStatus: match.status },
+        `Paper bet voided — fixture status=${match.status}`,
+      );
+      paperAbandonmentVoid++;
+      settled++;
+      continue;
+    }
+
     if (match.homeScore === null || match.awayScore === null) continue;
 
     // ─── Real-money matched-bet deferral (Apr 19 2026) ─────────────────
@@ -1429,7 +1483,12 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       bet.selectionName,
       match.homeScore,
       match.awayScore,
-      { totalCorners: match.totalCorners ?? null, totalCards: match.totalCards ?? null },
+      {
+        totalCorners: match.totalCorners ?? null,
+        totalCards: match.totalCards ?? null,
+        homeScoreHt: match.homeScoreHt ?? null,
+        awayScoreHt: match.awayScoreHt ?? null,
+      },
     );
 
     // ─── Real-money unmatched-bet guard (Apr 18 2026) ──────────────────
@@ -1454,6 +1513,43 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       outcome = null;
     }
     // ───────────────────────────────────────────────────────────────────
+
+    // ─── 72h retry/timeout for paper bets where determineBetWon returned null ───
+    //     Only applies to bets without a betfair_bet_id (real-money matched bets
+    //     are handled above). For paper bets, give the data feed a window to catch
+    //     up; after 72h post-kickoff, accept the loss rather than leaving pending forever.
+    if (outcome === null && !bet.betfairBetId) {
+      const hoursSinceKickoff =
+        (Date.now() - new Date(match.kickoffTime).getTime()) / 3_600_000;
+      if (hoursSinceKickoff < 72) {
+        await db.update(paperBetsTable).set({
+          settlementAttempts: (bet.settlementAttempts ?? 0) + 1,
+          lastSettlementAttemptAt: new Date(),
+        }).where(eq(paperBetsTable.id, bet.id));
+        paperPendingRetry++;
+        logger.debug(
+          {
+            betId: bet.id,
+            matchId: match.id,
+            marketType: bet.marketType,
+            hoursSinceKickoff: Math.round(hoursSinceKickoff * 10) / 10,
+          },
+          "Paper bet pending — outcome unresolved, will retry",
+        );
+        continue;
+      }
+      outcome = false;
+      paperTimeoutLoss++;
+      logger.warn(
+        {
+          betId: bet.id,
+          matchId: match.id,
+          marketType: bet.marketType,
+          hoursSinceKickoff: Math.round(hoursSinceKickoff * 10) / 10,
+        },
+        "Paper bet settled as lost after 72h timeout — determineBetWon could not resolve",
+      );
+    }
 
     // null = void (data unavailable or unmatched) — refund stake, no PnL impact
     const isVoid = outcome === null;
@@ -1607,7 +1703,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     }
   }
 
-  return { settled, won, lost, totalPnl };
+  return { settled, won, lost, totalPnl, paperPendingRetry, paperTimeoutLoss, paperAbandonmentVoid };
 }
 
 // ===================== Backfill stats for voided corners/cards bets =====================
@@ -1721,7 +1817,12 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
       bet.selectionName,
       match.homeScore,
       match.awayScore,
-      { totalCorners: match.totalCorners ?? null, totalCards: match.totalCards ?? null },
+      {
+        totalCorners: match.totalCorners ?? null,
+        totalCards: match.totalCards ?? null,
+        homeScoreHt: match.homeScoreHt ?? null,
+        awayScoreHt: match.awayScoreHt ?? null,
+      },
     );
 
     if (outcome === null) continue;

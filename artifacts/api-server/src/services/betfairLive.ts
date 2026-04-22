@@ -1001,7 +1001,7 @@ export async function runStartupHealthCheck(): Promise<{
       });
     }
 
-    const { verifyDbHostForEnvironment } = await import("../lib/startupChecks");
+    const { verifyDbHostForEnvironment, verifyTradingModeForEnvironment } = await import("../lib/startupChecks");
     const dbCheck = verifyDbHostForEnvironment(
       process.env["ENVIRONMENT"] ?? "development",
       process.env["DATABASE_URL"] ?? "",
@@ -1010,6 +1010,16 @@ export async function runStartupHealthCheck(): Promise<{
       name: "Database is production (not dev)",
       passed: !dbCheck.fatal,
       detail: dbCheck.message,
+    });
+
+    const tmCheck = verifyTradingModeForEnvironment(
+      process.env["ENVIRONMENT"] ?? "development",
+      process.env["TRADING_MODE"],
+    );
+    checks.push({
+      name: "Trading mode matches environment",
+      passed: !tmCheck.fatal,
+      detail: tmCheck.message,
     });
 
     startSessionRefreshTimer();

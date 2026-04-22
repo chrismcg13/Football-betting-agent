@@ -332,7 +332,15 @@ export async function runTradingCycle(options?: {
     // 1. Settle any finished bets first
     const settlement = await settleBets();
     logger.info(
-      { settled: settlement.settled, won: settlement.won, lost: settlement.lost, pnl: settlement.totalPnl },
+      {
+        settled: settlement.settled,
+        won: settlement.won,
+        lost: settlement.lost,
+        pnl: settlement.totalPnl,
+        paper_bets_pending_retry: settlement.paperPendingRetry,
+        paper_bets_timeout_lost: settlement.paperTimeoutLoss,
+        paper_bets_abandonment_void: settlement.paperAbandonmentVoid,
+      },
       "Settlement complete",
     );
 
@@ -1567,7 +1575,19 @@ async function runSettlementPipeline(deep = false): Promise<void> {
     if (synced > 0) logger.info({ synced, daysBack }, "Settlement pipeline: match results synced");
 
     const r = await settleBets();
-    if (r.settled > 0) logger.info(r, "Settlement pipeline: bets settled");
+    if (r.settled > 0)
+      logger.info(
+        {
+          settled: r.settled,
+          won: r.won,
+          lost: r.lost,
+          totalPnl: r.totalPnl,
+          paper_bets_pending_retry: r.paperPendingRetry,
+          paper_bets_timeout_lost: r.paperTimeoutLoss,
+          paper_bets_abandonment_void: r.paperAbandonmentVoid,
+        },
+        "Settlement pipeline: bets settled",
+      );
 
     const backfill = await backfillCornersCardsStats();
     if (backfill.matchesUpdated > 0 || backfill.betsResettled > 0) {
@@ -2130,7 +2150,19 @@ export function startScheduler(): void {
 export async function runSettlementNow(): Promise<{ synced: number; settled: Awaited<ReturnType<typeof settleBets>>; backfill: { matchesUpdated: number; betsResettled: number } }> {
   if (settlementRunning) {
     logger.info("Manual settlement skipped — pipeline already running");
-    return { synced: 0, settled: { settled: 0, won: 0, lost: 0, totalPnl: 0 }, backfill: { matchesUpdated: 0, betsResettled: 0 } };
+    return {
+      synced: 0,
+      settled: {
+        settled: 0,
+        won: 0,
+        lost: 0,
+        totalPnl: 0,
+        paperPendingRetry: 0,
+        paperTimeoutLoss: 0,
+        paperAbandonmentVoid: 0,
+      },
+      backfill: { matchesUpdated: 0, betsResettled: 0 },
+    };
   }
   settlementRunning = true;
   try {

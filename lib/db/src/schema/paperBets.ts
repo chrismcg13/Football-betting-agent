@@ -82,6 +82,8 @@ export const paperBetsTable = pgTable("paper_bets", {
   commissionAmount: numeric("commission_amount", { precision: 12, scale: 2 }),
   netPnl: numeric("net_pnl", { precision: 12, scale: 2 }),
   selectionCanonical: text("selection_canonical"),
+  settlementAttempts: integer("settlement_attempts").notNull().default(0),
+  lastSettlementAttemptAt: timestamp("last_settlement_attempt_at", { withTimezone: true }),
 }, (table) => ({
   uniquePendingBet: uniqueIndex("paper_bets_unique_pending_canonical_idx")
     .on(table.matchId, table.marketType, table.selectionCanonical)

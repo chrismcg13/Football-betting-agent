@@ -8,12 +8,25 @@ import { runStartupHealthCheck, isLiveMode } from "./services/betfairLive";
 import { recalculateAllDataRichness } from "./services/dataRichness";
 import { db, complianceLogsTable, matchesTable, leagueEdgeScoresTable } from "@workspace/db";
 import { sql, count } from "drizzle-orm";
-import { verifyDbHostForEnvironment } from "./lib/startupChecks";
+import { verifyDbHostForEnvironment, verifyTradingModeForEnvironment } from "./lib/startupChecks";
 
 const ENVIRONMENT = process.env["ENVIRONMENT"] ?? "development";
 
 if (process.env["DATABASE_URL"]) {
   const result = verifyDbHostForEnvironment(ENVIRONMENT, process.env["DATABASE_URL"]);
+  if (result.fatal) {
+    console.error(`FATAL: ${result.message}`);
+    process.exit(1);
+  }
+  if (result.level === "warn") {
+    console.warn(`WARN: ${result.message}`);
+  } else {
+    console.log(`INFO: ${result.message}`);
+  }
+}
+
+{
+  const result = verifyTradingModeForEnvironment(ENVIRONMENT, process.env["TRADING_MODE"]);
   if (result.fatal) {
     console.error(`FATAL: ${result.message}`);
     process.exit(1);
