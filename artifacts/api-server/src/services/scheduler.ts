@@ -1391,10 +1391,6 @@ export async function runTradingCycle(options?: {
         durationMs: cycleDurationMs,
       });
     } catch (_) {}
-    logger.info(
-      { tier, exchange_capture: getExchangeCaptureCounters() },
-      "C1: exchange-book capture stats for cycle",
-    );
     return {
       betsPlaced,
       betsSettled: settlement.settled,
@@ -1420,6 +1416,15 @@ export async function runTradingCycle(options?: {
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   } finally {
     tradingCycleRunning = false;
+    // C1: emit per-cycle exchange-book capture stats on every exit path
+    // (success / risk-triggered early-return / error). Counters were reset at
+    // cycle start via resetExchangeCaptureCounters().
+    try {
+      logger.info(
+        { tier, exchange_capture: getExchangeCaptureCounters() },
+        "C1: exchange-book capture stats for cycle",
+      );
+    } catch (_) {}
   }
 }
 
