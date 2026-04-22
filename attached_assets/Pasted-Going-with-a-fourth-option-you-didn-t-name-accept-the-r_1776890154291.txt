@@ -1,0 +1,63 @@
+Going with a fourth option you didn't name: accept the ratchet, let the natural sequence play out, reset HWM as part of Stage 4 just before unpausing.
+
+Reasoning: adding novel code (Option 2 freeze window) at go-live time is a risk I don't want to take when a simpler operational fix exists. The HWM being "wrong" during the wait window has zero operational consequence because agent_status=paused_weekly blocks all placement. The breakers can trip in the background; they're cosmetic while we're paused.
+
+REVISED STAGE 4 SEQUENCE:
+
+Once bet 744 settles and exposure drops to £0 (or near it):
+
+4a. Capture post-settlement state:
+    - SELECT status, settlement_pnl, settled_at FROM paper_bets WHERE id = 744;
+    - Latest Betfair: available, exposure, total
+    - Current HWM value (will be ratcheted to ~£343 or higher)
+    - Current agent_status (may have flipped to paused_daily or paused_weekly due to drawdown trips — that's fine, expected)
+
+4b. Reset HWM to match post-settlement totalWealth. This is the critical step:
+    UPDATE agent_config SET value = '<post_settlement_totalWealth>', updated_at = NOW() WHERE key = 'high_water_mark';
+    UPDATE agent_config SET value = NOW()::text WHERE key = 'hwm_updated_at';
+    
+    Use the ACTUAL post-settlement totalWealth value, whatever that is. If the bet won, it'll be ~£183. If lost, ~£100. Either way, HWM resets to the new real baseline.
+
+4c. Clear stale pause hygiene:
+    - UPDATE agent_config SET value = '' WHERE key = 'pause_reason';
+    - UPDATE agent_config SET value = '' WHERE key = 'paused_at';
+
+4d. Capture dashboard_reset_at timestamp:
+    - INSERT INTO agent_config (key, value, updated_at) VALUES ('dashboard_reset_at', NOW()::text, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+
+4e. Legacy backfill:
+    - SELECT COUNT(*) FROM paper_bets WHERE legacy_regime = false; (pre-count)
+    - UPDATE paper_bets SET legacy_regime = true WHERE legacy_regime = false AND placed_at < (SELECT value::timestamptz FROM agent_config WHERE key = 'dashboard_reset_at');
+    - Report rowcount
+    - SELECT COUNT(*) FROM paper_bets_current; (should be 0 or very near 0)
+
+4f. Clear live_breaker:
+    - UPDATE agent_config SET value = '' WHERE key = 'live_breaker_paused_until';
+
+4g. Flip agent_status to running:
+    - If currently paused_weekly/paused_daily: POST /api/agent/control with action=start
+    - If stopped: UPDATE agent_config SET value = 'running' WHERE key = 'agent_status';
+
+4h. Restart workflow.
+
+4i. Post-restart verification:
+    - All three safety lines in startup
+    - First trading cycle fires without bankrollFloor/weeklyLoss/dailyLoss trips (because HWM now matches totalWealth so drawdown = 0%)
+    - Funnel report emits with new thresholds
+    - If a live bet places: confirm it uses actionable_source='betfair_exchange'
+    - Exchange sweep continues running
+
+4j. Dashboard verification:
+    - /dashboard/summary shows £0 P&L, empty metrics
+    - /dashboard/bets returns empty
+    - /dashboard/bets?includeLegacy=true returns 799+ rows
+
+CONTINUING THE WAIT:
+
+Resume monitoring bet 744. Check approximately every 5-10 minutes starting at 21:10 UTC. When settlement is detected, report immediately — do not auto-proceed to Stage 4. I'll approve each sub-step.
+
+During the wait, it's expected that HWM may continue ratcheting up slightly if any minor fluctuations in Betfair balance happen. It's also expected that agent_status may drift to paused_daily or paused_weekly as risk checks trip. Do NOT intervene in any of this — it's all going to be reset in Stage 4. Just report deviations.
+
+If anything unexpected happens (code changes attempted by automated processes, exchange sweep stops running, live bets somehow place, etc.), stop and report.
+
+Hold.
