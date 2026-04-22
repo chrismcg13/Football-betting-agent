@@ -1,0 +1,29 @@
+Prompt 1 — Pre-flight check on prodRead-only investigation in the prod workspace. Do not modify anything. I need to confirm prod's current state before porting dev improvements.
+
+Report:
+
+1. Current values of all agent_config rows. SELECT key, value FROM agent_config ORDER BY key;
+
+2. Current TRADING_MODE, ENVIRONMENT, and DATABASE_URL hostname (redact credentials, show host only). Confirm DATABASE_URL host contains "rough-flower".
+
+3. The startup safety check output from the most recent boot — both the verifyDbHostForEnvironment and verifyTradingModeForEnvironment lines.
+
+4. Run: SELECT COUNT(*) FROM paper_bets WHERE status = 'pending' AND betfair_bet_id IS NOT NULL; — live bets still awaiting settlement.
+
+5. Run: SELECT COUNT(*) FROM paper_bets WHERE status IN ('placement_failed', 'pending_placement'); — stuck placements.
+
+6. Run: SELECT status, COUNT(*) FROM paper_bets WHERE placed_at > NOW() - INTERVAL '24 hours' GROUP BY status; — last 24h bet status breakdown.
+
+7. Current Betfair account balance and matched exposure per the most recent startup health check.
+
+8. Confirm BANNED_MARKETS contains OVER_UNDER_25, OVER_UNDER_35, FIRST_HALF_RESULT, DOUBLE_CHANCE. Grep paperTrading.ts and paste the matching entries.
+
+9. Confirm the pricing-pipeline fix is NOT yet applied to prod. Read valueDetection.ts:967-984 and confirm the code still contains the old "first row wins" picker (the bug we fixed in dev).
+
+10. Confirm the void-logic fixes from Prompt B (72h timeout, dormant abandonment) are NOT yet applied. Check paperTrading.ts for the settlement_attempts column reference in _settleBetsInner.
+
+11. Confirm the determineBetWon fix from earlier today is NOT yet applied. Check paperTrading.ts determineBetWon function signature — if matchStats param only has totalCorners/totalCards and no homeScoreHt/awayScoreHt, it's unfixed.
+
+12. Confirm C1 exchange capture is NOT yet applied. Check for captureExchangeSnapshot function and betfair_best_back column — both should be absent in prod.
+
+Report findings. Do not modify anything. I need to know the exact starting state before shipping changes.
