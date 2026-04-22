@@ -1,0 +1,102 @@
+Here's Prompt 4:
+Code changes in the prod workspace only. Do not touch dev. Port C1 exchange capture from dev verbatim — same code, same behaviour.
+
+Port five files exactly as shipped in dev:
+
+CHANGE A — lib/db/src/schema/paperBets.ts
+
+Add 6 new columns after exchangeId:
+  betfairBestBack: numeric("betfair_best_back", { precision: 10, scale: 4 }),
+  betfairBestBackSize: numeric("betfair_best_back_size", { precision: 12, scale: 2 }),
+  betfairBestLay: numeric("betfair_best_lay", { precision: 10, scale: 4 }),
+  betfairBestLaySize: numeric("betfair_best_lay_size", { precision: 12, scale: 2 }),
+  exchangeFetchAt: timestamp("exchange_fetch_at", { withTimezone: true }),
+  betfairSelectionId: numeric("betfair_selection_id", { precision: 20, scale: 0 }),
+
+Include the same block comment as dev explaining these are C1 capture columns.
+
+CHANGE B — artifacts/api-server/src/lib/migrate.ts
+
+Add an additive idempotent ALTER block:
+  ALTER TABLE paper_bets
+    ADD COLUMN IF NOT EXISTS betfair_best_back NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS betfair_best_back_size NUMERIC(12,2),
+    ADD COLUMN IF NOT EXISTS betfair_best_lay NUMERIC(10,4),
+    ADD COLUMN IF NOT EXISTS betfair_best_lay_size NUMERIC(12,2),
+    ADD COLUMN IF NOT EXISTS exchange_fetch_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS betfair_selection_id NUMERIC(20,0)
+
+CHANGE C — artifacts/api-server/src/services/betfairLive.ts
+
+Change findSelectionId from function to export function (one-word change).
+
+CHANGE D — artifacts/api-server/src/services/paperTrading.ts
+
+Add exactly what was shipped in dev:
+
+1. Imports at top: listMarketCatalogue, listMarketBook, MarketCatalogueItem type, MarketBook type from ./betfair.
+2. CATALOGUE_TTL_MS = 5 * 60 * 1000 and catalogueCache Map.
+3. getCatalogueForEvent helper with the 5-minute TTL cache.
+4. exchangeCaptureCounters struct with fields: attempted, captured, failed_no_event, failed_no_market, failed_no_selection, failed_api, cross_spread_samples, queue_position_samples.
+5. resetExchangeCaptureCounters() and getExchangeCaptureCounters() exports — same computed fields as dev (capture_rate_pct, avg_cross_spread_vs_lay, avg_queue_position_vs_back, fills_immediately_count, fills_immediately_pct, sample_count).
+6. ExchangeSnapshot interface.
+7. captureExchangeSnapshot async helper with:
+   - The allowlist regex /^\d+$/ for Betfair event IDs (rejects af_*, fd_*, and other foreign prefixes)
+   - Counter increment on attempted
+   - Catalogue fetch via getCatalogueForEvent
+   - Market lookup by marketType
+   - Dynamic import of findSelectionId from ./betfairLive
+   - listMarketBook call for the resolved marketId
+   - Runner lookup by selectionId
+   - Graceful failure at each step — increment appropriate counter, return null, never throw
+8. Inside placePaperBet, before the bet insert: fetch match info (homeTeam, awayTeam, betfairEventId) from matches table, call captureExchangeSnapshot, populate the 6 new columns from the snapshot. On failure, insert with null columns and log WARN. If bestBack is non-null, increment captured counter and push the two sample metrics.
+
+Use the exact code from the dev implementation. Copy verbatim from the dev files if possible.
+
+CHANGE E — artifacts/api-server/src/services/scheduler.ts
+
+1. Import resetExchangeCaptureCounters and getExchangeCaptureCounters from ./paperTrading.
+2. In runTradingCycle after markStart("trading"): resetExchangeCaptureCounters().
+3. Before the final return in runTradingCycle: logger.info({ tier, exchange_capture: getExchangeCaptureCounters() }, "C1: exchange-book capture stats for cycle").
+
+HARD RULES:
+
+- Do not touch dev.
+- Do not modify paper_mode, TRADING_MODE, or BANNED_MARKETS.
+- Do not modify agent_status, pause_reason, or paused_at.
+- Do not modify riskManager.ts lines 357-364 or scheduler.ts lines 1660-1715.
+- Use BETFAIR_APP_KEY (delayed) only via the existing listMarketBook/listMarketCatalogue wrappers at betfair.ts. Do not call placeOrders. Do not touch LIVE_BETFAIR_KEY anywhere in the capture path.
+- Do not modify the pricing pipeline (that's Prompt 5).
+- Do not add the Pinnacle sanity gate (that's Prompt 6).
+
+DISCIPLINE REMINDER after the Prompt 3 near-miss:
+
+When modifying function signatures or return shapes, grep every return statement inside the modified function and verify each one returns the full shape. The Prompt 3 agent missed the main-path return literal and only caught it during verification. Don't repeat that — audit every return path BEFORE restarting and running checkpoints.
+
+VERIFICATION after applying:
+
+1. Show consolidated diff before applying.
+
+2. Restart. Confirm startup log shows all three safety lines green:
+   - ENVIRONMENT=production, DB host contains rough-flower
+   - ENVIRONMENT=production, TRADING_MODE=LIVE
+   - Trading mode: LIVE
+
+3. Migration: SELECT column_name FROM information_schema.columns WHERE table_name = 'paper_bets' AND column_name IN ('betfair_best_back', 'betfair_best_back_size', 'betfair_best_lay', 'betfair_best_lay_size', 'exchange_fetch_at', 'betfair_selection_id'); — 6 rows expected.
+
+4. Wait for two trading cycles to fire. Paste both C1 cycle log objects. Expected shape (most fields may be zero if no candidates survive filters):
+   exchange_capture: { attempted, captured, failed_no_event, failed_no_market, failed_no_selection, failed_api, capture_rate_pct, avg_cross_spread_vs_lay, avg_queue_position_vs_back, fills_immediately_count, fills_immediately_pct, sample_count }
+
+5. Confirm no placeOrders calls have been made. Grep logs for "placeOrders" — should only show listMarketCatalogue and listMarketBook activity if any.
+
+6. Confirm agent_status still paused_weekly. SELECT value FROM agent_config WHERE key = 'agent_status';
+
+7. Confirm paper_mode still false. SELECT value FROM agent_config WHERE key = 'paper_mode';
+
+8. Confirm live_breaker_paused_until still 2026-04-23T00:00:00Z.
+
+9. Confirm BANNED_MARKETS still contains the four markets.
+
+10. Confirm no new live bets placed during verification. SELECT COUNT(*) FROM paper_bets WHERE placed_at > (current workflow start time) AND betfair_bet_id IS NOT NULL;
+
+If any step fails, stop and report. Do not auto-fix.

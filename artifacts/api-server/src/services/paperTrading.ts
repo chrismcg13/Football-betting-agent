@@ -21,6 +21,12 @@ import {
   recordPlacementFailure,
   clearPlacementFailures,
 } from "./betfairLive";
+import {
+  listMarketCatalogue,
+  listMarketBook,
+  type MarketCatalogueItem,
+  type MarketBook,
+} from "./betfair";
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
 import { getLiveOppScoreThreshold } from "./liveThresholdReview";
 import { storePinnacleSnapshot } from "./oddsPapi";
@@ -35,6 +41,219 @@ import {
   isBetfairApiPaused,
 } from "./liveRiskManager";
 import { detectCurrentRegime } from "./marketRegime";
+
+// ===================== C1: Exchange-book capture (delayed app key) ========
+// Captured at placement time via listMarketCatalogue + listMarketBook on the
+// delayed app key (BETFAIR_APP_KEY, NOT LIVE_BETFAIR_KEY). Capture is purely
+// analytical — it never blocks, throws, or talks to placeOrders. All failure
+// paths increment a counter and return null so the bet still goes in.
+
+const CATALOGUE_TTL_MS = 5 * 60 * 1000;
+const catalogueCache = new Map<string, { fetchedAt: number; items: MarketCatalogueItem[] }>();
+
+async function getCatalogueForEvent(eventId: string): Promise<MarketCatalogueItem[]> {
+  const cached = catalogueCache.get(eventId);
+  if (cached && Date.now() - cached.fetchedAt < CATALOGUE_TTL_MS) {
+    return cached.items;
+  }
+  const items = await listMarketCatalogue([eventId]);
+  catalogueCache.set(eventId, { fetchedAt: Date.now(), items });
+  return items;
+}
+
+interface ExchangeCaptureCounters {
+  attempted: number;
+  captured: number;
+  failed_no_event: number;
+  failed_no_market: number;
+  failed_no_selection: number;
+  failed_api: number;
+  cross_spread_samples: number[];
+  queue_position_samples: number[];
+}
+
+let exchangeCaptureCounters: ExchangeCaptureCounters = {
+  attempted: 0,
+  captured: 0,
+  failed_no_event: 0,
+  failed_no_market: 0,
+  failed_no_selection: 0,
+  failed_api: 0,
+  cross_spread_samples: [],
+  queue_position_samples: [],
+};
+
+export function resetExchangeCaptureCounters(): void {
+  exchangeCaptureCounters = {
+    attempted: 0,
+    captured: 0,
+    failed_no_event: 0,
+    failed_no_market: 0,
+    failed_no_selection: 0,
+    failed_api: 0,
+    cross_spread_samples: [],
+    queue_position_samples: [],
+  };
+}
+
+export function getExchangeCaptureCounters(): {
+  attempted: number;
+  captured: number;
+  failed_no_event: number;
+  failed_no_market: number;
+  failed_no_selection: number;
+  failed_api: number;
+  capture_rate_pct: number;
+  avg_cross_spread_vs_lay: number | null;
+  avg_queue_position_vs_back: number | null;
+  fills_immediately_count: number;
+  fills_immediately_pct: number;
+  sample_count: number;
+} {
+  const c = exchangeCaptureCounters;
+  const sample_count = c.cross_spread_samples.length;
+  const avg_cross_spread_vs_lay =
+    sample_count > 0
+      ? c.cross_spread_samples.reduce((a, b) => a + b, 0) / sample_count
+      : null;
+  const avg_queue_position_vs_back =
+    c.queue_position_samples.length > 0
+      ? c.queue_position_samples.reduce((a, b) => a + b, 0) / c.queue_position_samples.length
+      : null;
+  // "Fills immediately" = our backed price is at or above the prevailing best
+  // back (queue position sample <= 0 means we're at-or-better than the front
+  // of the queue, i.e. would match instantly on a real exchange order).
+  const fills_immediately_count = c.queue_position_samples.filter((q) => q <= 0).length;
+  const fills_immediately_pct =
+    c.queue_position_samples.length > 0
+      ? (fills_immediately_count / c.queue_position_samples.length) * 100
+      : 0;
+  const capture_rate_pct = c.attempted > 0 ? (c.captured / c.attempted) * 100 : 0;
+  return {
+    attempted: c.attempted,
+    captured: c.captured,
+    failed_no_event: c.failed_no_event,
+    failed_no_market: c.failed_no_market,
+    failed_no_selection: c.failed_no_selection,
+    failed_api: c.failed_api,
+    capture_rate_pct: Math.round(capture_rate_pct * 100) / 100,
+    avg_cross_spread_vs_lay:
+      avg_cross_spread_vs_lay != null
+        ? Math.round(avg_cross_spread_vs_lay * 10000) / 10000
+        : null,
+    avg_queue_position_vs_back:
+      avg_queue_position_vs_back != null
+        ? Math.round(avg_queue_position_vs_back * 10000) / 10000
+        : null,
+    fills_immediately_count,
+    fills_immediately_pct: Math.round(fills_immediately_pct * 100) / 100,
+    sample_count,
+  };
+}
+
+interface ExchangeSnapshot {
+  bestBack: number | null;
+  bestBackSize: number | null;
+  bestLay: number | null;
+  bestLaySize: number | null;
+  selectionId: number | null;
+  fetchedAt: Date;
+}
+
+// Allowlist: only numeric Betfair event IDs. Rejects "af_*", "fd_*", and any
+// other foreign-source prefixes that may have leaked into matches.betfair_event_id.
+const BETFAIR_EVENT_ID_RE = /^\d+$/;
+
+async function captureExchangeSnapshot(args: {
+  betfairEventId: string | null;
+  marketType: string;
+  selectionName: string;
+  homeTeam: string;
+  awayTeam: string;
+  matchId: number;
+}): Promise<ExchangeSnapshot | null> {
+  exchangeCaptureCounters.attempted += 1;
+  const { betfairEventId, marketType, selectionName, homeTeam, awayTeam, matchId } = args;
+
+  if (!betfairEventId || !BETFAIR_EVENT_ID_RE.test(betfairEventId)) {
+    exchangeCaptureCounters.failed_no_event += 1;
+    return null;
+  }
+
+  let catalogue: MarketCatalogueItem[];
+  try {
+    catalogue = await getCatalogueForEvent(betfairEventId);
+  } catch (err) {
+    exchangeCaptureCounters.failed_api += 1;
+    logger.warn(
+      { err, matchId, betfairEventId, marketType },
+      "C1 capture: listMarketCatalogue failed",
+    );
+    return null;
+  }
+
+  const market = catalogue.find(
+    (m) => m.description?.marketType === marketType,
+  );
+  if (!market) {
+    exchangeCaptureCounters.failed_no_market += 1;
+    return null;
+  }
+
+  const runners = market.runners ?? [];
+  let selectionId: number | null;
+  try {
+    const { findSelectionId } = await import("./betfairLive");
+    selectionId = findSelectionId(runners, selectionName, homeTeam, awayTeam);
+  } catch (err) {
+    exchangeCaptureCounters.failed_no_selection += 1;
+    logger.warn(
+      { err, matchId, betfairEventId, marketType, selectionName },
+      "C1 capture: findSelectionId import/call failed",
+    );
+    return null;
+  }
+  if (selectionId == null) {
+    exchangeCaptureCounters.failed_no_selection += 1;
+    return null;
+  }
+
+  let books: MarketBook[];
+  try {
+    books = await listMarketBook([market.marketId]);
+  } catch (err) {
+    exchangeCaptureCounters.failed_api += 1;
+    logger.warn(
+      { err, matchId, betfairEventId, marketId: market.marketId },
+      "C1 capture: listMarketBook failed",
+    );
+    return null;
+  }
+
+  const book = books[0];
+  if (!book) {
+    exchangeCaptureCounters.failed_api += 1;
+    return null;
+  }
+
+  const runner = book.runners.find((r) => r.selectionId === selectionId);
+  if (!runner) {
+    exchangeCaptureCounters.failed_no_selection += 1;
+    return null;
+  }
+
+  const back = runner.ex?.availableToBack?.[0];
+  const lay = runner.ex?.availableToLay?.[0];
+
+  return {
+    bestBack: back?.price ?? null,
+    bestBackSize: back?.size ?? null,
+    bestLay: lay?.price ?? null,
+    bestLaySize: lay?.size ?? null,
+    selectionId,
+    fetchedAt: new Date(),
+  };
+}
 
 // ===================== Selection-name canonicalization =====================
 // 2026-04-19: Bookmakers serve OU selections as both "Over 2.5" and
@@ -845,6 +1064,55 @@ export async function placePaperBet(
 
   const kellyFraction = kellyFractionForScore(score);
 
+  // ── C1: capture Betfair exchange snapshot before insert ───────────────────
+  // Fetch home/away/event id from matches table, then capture best back+lay
+  // and selection id via the delayed app key. Failure → null columns + WARN,
+  // never blocks the bet.
+  let exchangeSnapshot: ExchangeSnapshot | null = null;
+  try {
+    const matchRow = await db
+      .select({
+        homeTeam: matchesTable.homeTeam,
+        awayTeam: matchesTable.awayTeam,
+        betfairEventId: matchesTable.betfairEventId,
+      })
+      .from(matchesTable)
+      .where(eq(matchesTable.id, matchId))
+      .limit(1);
+    const m = matchRow[0];
+    if (m) {
+      exchangeSnapshot = await captureExchangeSnapshot({
+        betfairEventId: m.betfairEventId ?? null,
+        marketType,
+        selectionName,
+        homeTeam: m.homeTeam ?? "",
+        awayTeam: m.awayTeam ?? "",
+        matchId,
+      });
+    }
+  } catch (err) {
+    logger.warn(
+      { err, matchId, marketType, selectionName },
+      "C1 capture: pre-insert match lookup failed — inserting with null exchange columns",
+    );
+    exchangeSnapshot = null;
+  }
+  if (exchangeSnapshot && exchangeSnapshot.bestBack != null) {
+    exchangeCaptureCounters.captured += 1;
+    // Cross-spread vs lay: how far our backed price is from the prevailing
+    // best lay. Positive = we're inside the spread relative to lay (good).
+    if (exchangeSnapshot.bestLay != null) {
+      exchangeCaptureCounters.cross_spread_samples.push(
+        backOdds - exchangeSnapshot.bestLay,
+      );
+    }
+    // Queue position vs back: how far our backed price is from the front of
+    // the back queue. <=0 means we'd fill immediately on a real exchange.
+    exchangeCaptureCounters.queue_position_samples.push(
+      exchangeSnapshot.bestBack - backOdds,
+    );
+  }
+
   const { pool } = await import("@workspace/db");
   const pgClient = await pool.connect();
   let bet: any;
@@ -886,6 +1154,12 @@ export async function placePaperBet(
         lineDirection: lineDirection ?? null,
         pinnacleSnapshotCount: pinnacleOdds ? 1 : 0,
         clvDataQuality: pinnacleOdds ? "incomplete" : "incomplete",
+        betfairBestBack: exchangeSnapshot?.bestBack != null ? String(exchangeSnapshot.bestBack) : null,
+        betfairBestBackSize: exchangeSnapshot?.bestBackSize != null ? String(exchangeSnapshot.bestBackSize) : null,
+        betfairBestLay: exchangeSnapshot?.bestLay != null ? String(exchangeSnapshot.bestLay) : null,
+        betfairBestLaySize: exchangeSnapshot?.bestLaySize != null ? String(exchangeSnapshot.bestLaySize) : null,
+        exchangeFetchAt: exchangeSnapshot?.fetchedAt ?? null,
+        betfairSelectionId: exchangeSnapshot?.selectionId != null ? String(exchangeSnapshot.selectionId) : null,
       })
       .returning();
 

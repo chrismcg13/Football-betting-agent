@@ -3,7 +3,7 @@ import { logger } from "../lib/logger";
 import { runDataIngestion } from "./dataIngestion";
 import { runFeatureEngineForUpcomingMatches } from "./featureEngine";
 import { detectValueBets } from "./valueDetection";
-import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets, backfillCornersCardsStats, getConfigValue, setConfigValue } from "./paperTrading";
+import { placePaperBet, settleBets, getAgentStatus, getBankroll, deduplicatePendingBets, backfillCornersCardsStats, getConfigValue, setConfigValue, resetExchangeCaptureCounters, getExchangeCaptureCounters } from "./paperTrading";
 import { ABSOLUTE_BANKROLL_FLOOR_GBP, checkLiveCircuitBreakers, getAvailableBalance } from "./liveRiskManager";
 import { isLiveMode, listMarketsByEventId, MARKET_TYPE_MAP as BETFAIR_MARKET_TYPE_MAP, isMarketSuppressed, getSuppressionStats } from "./betfairLive";
 import { runAllRiskChecks } from "./riskManager";
@@ -325,6 +325,7 @@ export async function runTradingCycle(options?: {
 
   tradingCycleRunning = true;
   markStart("trading");
+  resetExchangeCaptureCounters();
 
   try {
     logger.info({ tier, minHours, maxHours }, "Starting trading cycle");
@@ -1390,6 +1391,10 @@ export async function runTradingCycle(options?: {
         durationMs: cycleDurationMs,
       });
     } catch (_) {}
+    logger.info(
+      { tier, exchange_capture: getExchangeCaptureCounters() },
+      "C1: exchange-book capture stats for cycle",
+    );
     return {
       betsPlaced,
       betsSettled: settlement.settled,

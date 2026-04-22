@@ -1255,7 +1255,7 @@ async function findMarketForBet(
   }
 }
 
-function findSelectionId(
+export function findSelectionId(
   runners: Array<{ selectionId: number; runnerName: string; sortPriority: number }>,
   selectionName: string,
   homeTeam: string,

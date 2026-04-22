@@ -613,6 +613,16 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS settlement_attempts INTEGER NOT NULL DEFAULT 0,
         ADD COLUMN IF NOT EXISTS last_settlement_attempt_at TIMESTAMPTZ
     `);
+    // C1: Betfair exchange snapshot capture columns (additive, idempotent)
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS betfair_best_back NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS betfair_best_back_size NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS betfair_best_lay NUMERIC(10,4),
+        ADD COLUMN IF NOT EXISTS betfair_best_lay_size NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS exchange_fetch_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS betfair_selection_id NUMERIC(20,0)
+    `);
     await db.execute(sql`
       ALTER TABLE compliance_logs
         ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ

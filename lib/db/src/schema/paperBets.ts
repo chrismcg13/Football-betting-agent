@@ -77,6 +77,19 @@ export const paperBetsTable = pgTable("paper_bets", {
   clvDataQuality: text("clv_data_quality").default("incomplete"),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   exchangeId: integer("exchange_id"),
+  // ── C1: Betfair exchange snapshot capture ──────────────────────────────
+  // Captured at placement time from listMarketCatalogue + listMarketBook
+  // (delayed app key). Used post-hoc to compute (a) cross-spread realism
+  // for our backed price vs the market's best lay, and (b) queue position
+  // vs the prevailing best back. Null if capture failed (no event id, no
+  // catalogue, no market, no selection, or upstream API error). Never
+  // blocks placement.
+  betfairBestBack: numeric("betfair_best_back", { precision: 10, scale: 4 }),
+  betfairBestBackSize: numeric("betfair_best_back_size", { precision: 12, scale: 2 }),
+  betfairBestLay: numeric("betfair_best_lay", { precision: 10, scale: 4 }),
+  betfairBestLaySize: numeric("betfair_best_lay_size", { precision: 12, scale: 2 }),
+  exchangeFetchAt: timestamp("exchange_fetch_at", { withTimezone: true }),
+  betfairSelectionId: numeric("betfair_selection_id", { precision: 20, scale: 0 }),
   grossPnl: numeric("gross_pnl", { precision: 12, scale: 2 }),
   commissionRate: numeric("commission_rate", { precision: 6, scale: 4 }),
   commissionAmount: numeric("commission_amount", { precision: 12, scale: 2 }),
