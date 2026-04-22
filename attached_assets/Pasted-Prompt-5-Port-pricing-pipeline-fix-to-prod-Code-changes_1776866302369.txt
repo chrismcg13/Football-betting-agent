@@ -1,0 +1,59 @@
+Prompt 5 — Port pricing-pipeline fix to prod
+Code changes in the prod workspace only. This is the largest change in the port sequence — port the pricing-pipeline fix from dev verbatim.
+
+CONTEXT: Replaces the bookmaker-shopping anti-pattern at valueDetection.ts:967-984 with strict venue-anchored selection. actionablePrice = Betfair Exchange only. fairValueOdds = oddspapi_pinnacle > api_football_real:Pinnacle > betfair_exchange. Edge formula switches to (1/fairValueOdds) − (1/actionablePrice).
+
+Apply exactly the same 5-file diff shipped to dev:
+
+1. lib/db/src/schema/paperBets.ts — add 5 columns: actionable_price, actionable_source, fair_value_odds, fair_value_source, validator_best_odds.
+
+2. migrate.ts — additive idempotent ALTER for same 5 columns.
+
+3. valueDetection.ts:
+   - Add selectPricingSources helper above detectValueBets.
+   - Add pricingRejectNoBetfairExchange and pricingRejectNoFairValueSource counters to EvaluationSummary interface and detectValueBets locals.
+   - Replace the buggy picker at L933-984 with group-by-(market,selection) + selectPricingSources call.
+   - Switch edge formula from modelProb − (1/actionablePrice) to (1/fairValueOdds) − (1/actionablePrice). Include comment explaining the semantic shift.
+   - Extend ValueBet push with actionablePrice, actionableSource, fairValueOdds, fairValueSource fields.
+   - Return the two new counters from detectValueBets.
+
+4. scheduler.ts:
+   - Replace the validator override at L802: backOdds = bet.backOdds (not validation?.bestOdds ?? bet.backOdds). Capture validation?.bestOdds ?? null as validatorBestOdds diagnostic field — NEVER used for placement.
+   - Update thesis text to reference actionableSource and fairValueSource instead of bookmaker name + Pinnacle implied.
+   - Extend BetOrder interface with actionablePrice, actionableSource, fairValueOdds, fairValueSource, validatorBestOdds fields.
+   - Wire all 5 fields through betOrders.push and the placePaperBet call.
+   - Surface new funnel counters 08c_rejected_no_betfair_exchange and 08d_rejected_no_fair_value_source.
+
+5. paperTrading.ts:
+   - Extend PaperBetOptions with the 5 new optional fields.
+   - Destructure in placePaperBet.
+   - Update INSERT: set odds_at_placement = actionablePrice ?? backOdds and odds_source = actionableSource ?? oddsSource ?? "synthetic" as backwards-compat mirrors. Populate the 5 new columns.
+
+Use the exact code from the dev implementation. Match function signatures, comments, and logic verbatim to keep the two environments in sync.
+
+HARD RULES:
+
+- Do not touch dev.
+- Do not modify paper_mode, TRADING_MODE, or BANNED_MARKETS.
+- Do not modify valueDetection.ts:1080 data_tier override (separate future task).
+- Do not add Pinnacle sanity gate yet (next prompt).
+- Do not widen Pinnacle allowlist.
+- Do not modify startup safety check or C1 capture.
+
+Show consolidated diff. Apply, restart, verify:
+
+1. Startup log: both safety checks green.
+
+2. Migration: SELECT column_name FROM information_schema.columns WHERE table_name = 'paper_bets' AND column_name IN ('actionable_price', 'actionable_source', 'fair_value_odds', 'fair_value_source', 'validator_best_odds'); — 5 rows.
+
+3. Wait for two trading cycles. Paste both funnel reports showing 08c_rejected_no_betfair_exchange and 08d_rejected_no_fair_value_source.
+
+4. Run: SELECT actionable_source, COUNT(*) FROM paper_bets WHERE placed_at > NOW() - INTERVAL '30 minutes' AND actionable_source IS NOT NULL GROUP BY actionable_source; — should show only betfair_exchange. Any soft-book source = incomplete fix.
+
+5. Run: SELECT fair_value_source, COUNT(*) FROM paper_bets WHERE placed_at > NOW() - INTERVAL '30 minutes' AND fair_value_source IS NOT NULL GROUP BY fair_value_source; — should be oddspapi_pinnacle, api_football_real:Pinnacle, or betfair_exchange only.
+
+6. Plain-English summary: given an Over 2.5 candidate with {1xBet @ 9.0, Marathonbet @ 4.39, Betfair Exchange @ 2.10, oddspapi_pinnacle @ 2.05}, what does prod now do? One paragraph.
+
+7. Report placement volume vs pre-fix. Expect a drop. If volume collapses to zero, stop and report — indicates betfair_exchange ingestion is incomplete in prod.
+
+If server fails to boot, stop and report.
