@@ -162,12 +162,6 @@ export async function runMigrations() {
       logger.info({ deletedCount }, "Startup cleanup: removed synthetic 2.1721 test bets");
     }
 
-    // ── Ensure bankroll is set to 500 (reset if it was never updated from the default)
-    await db.execute(sql`
-      UPDATE agent_config SET value = '500', updated_at = NOW()
-      WHERE key = 'bankroll' AND value::numeric < 500
-    `);
-
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)
       VALUES ('min_opportunity_score', '48', NOW())
