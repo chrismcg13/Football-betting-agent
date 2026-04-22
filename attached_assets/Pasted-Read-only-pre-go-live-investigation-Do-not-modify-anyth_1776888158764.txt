@@ -1,0 +1,42 @@
+Read-only pre-go-live investigation. Do not modify anything.
+
+Three topics:
+
+TOPIC 1 — Bankroll floor breaker
+
+The last trading cycle fired bankrollFloor: true in the risk checks. Investigate why.
+
+1. What is the current value of bankroll_floor in agent_config? What is bankroll set to?
+2. What calculation does runAllRiskChecks perform for bankrollFloor? Show the code. Specifically: does it compare available balance, total wealth (available + exposure), or some other metric against the floor?
+3. What is the actual Betfair state right now? available, exposure, total — paste the numbers from the latest health check.
+4. Given those numbers and that calculation, at what bankroll_floor value would the check pass? What value would it fail?
+5. Did anything change today that would have caused this check to start firing when it wasn't before? (E.g. bankroll value updated, floor value updated, calculation logic changed)
+
+TOPIC 2 — agent_status flipping
+
+Earlier today agent_status was paused_weekly. Now it's stopped. Trace when and why the change happened.
+
+6. Grep compliance_logs for action_type='agent_control' entries in the last 24h. Show the transitions.
+7. Is there a code path that auto-sets agent_status=stopped under any condition? E.g. when drawdown exceeds some threshold, when weekly loss hits a limit, when bankroll floor trips multiple times?
+8. For go-live, we need to flip agent_status=running. Confirm the command to do this cleanly: is it POST /api/agent/control with action=start, or a direct UPDATE, or something else? Does the flip clear pause_reason and paused_at automatically?
+
+TOPIC 3 — Dashboard reset scope
+
+User wants ALL dashboard metrics to reset to zero at go-live. The legacy_regime view handles most of this for post-go-live bets. Walk through each dashboard endpoint and confirm what it will show:
+
+9. For /dashboard/summary, /dashboard/performance, /dashboard/bets/by-league, /dashboard/bets/by-market, /dashboard/viability, /trading/corrected-stats, /dashboard/clv-stats, /dashboard/scan-stats, /dashboard/edge-segments, /dashboard/model-health, /dashboard/edge-decay, /dashboard/execution-metrics, /dashboard/live-summary — after the legacy-flag backfill runs, what will each endpoint report? 
+
+Specifically confirm:
+- P&L widgets start at £0
+- ROI calculations show "no data" or 0 until first post-go-live settled bet
+- CLV stats show no data until first post-go-live bet with both actionable and fair_value populated
+- Win/loss counts start at 0/0
+- Aggregation functions don't NaN or divide-by-zero when the view returns zero rows
+
+10. Exposure widgets — where does dashboard exposure get calculated from? If it's derived from `paper_bets` with status='pending' AND betfair_bet_id IS NOT NULL, the view will filter those out and exposure will show £0 on dashboard. If it reads directly from Betfair's live balance/exposure API, the dashboard will show the £243.59 matched on legacy bets until those settle. Identify which and report.
+
+11. Is there any dashboard metric that currently reads from paper_bets that we might have missed in the Class A endpoint list? Specifically check for widgets showing things like: total bets placed, daily bet count, streak tracking, hot/cold markets, rolling N-day P&L charts.
+
+12. Are there any cached/memoised metrics (Redis, in-memory caches) that need manual invalidation at go-live to prevent stale pre-reset numbers displaying?
+
+Report findings. Do not modify anything. Do not restart. No writes to prod.
