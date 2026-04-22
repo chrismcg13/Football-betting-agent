@@ -1,0 +1,89 @@
+Prompt for the exchange-book sweep:
+Code changes in the prod workspace only. Build a new exchange-book ingester that populates odds_snapshots with source='betfair_exchange' rows, so the Prompt 5 pricing picker has venue-anchored data to consume.
+
+DO NOT touch dev. DO NOT modify the existing dataIngestionBetfair.ts file. DO NOT change the data_source config. DO NOT modify agent_status, paper_mode, TRADING_MODE, BANNED_MARKETS, or the hardened safety checks. DO NOT touch riskManager.ts:357-364 or scheduler.ts:1660-1715.
+
+CHANGE A — new file: artifacts/api-server/src/services/exchangeBookSweep.ts
+
+Export one function:
+
+export async function runExchangeBookSweep(opts?: { hoursAhead?: number }): Promise<{
+  events: number;
+  markets: number;
+  runners: number;
+  snapshotsWritten: number;
+  errors: number;
+  durationMs: number;
+  apiCalls: number;
+}>
+
+Implementation requirements:
+
+1. Query matches where status='scheduled', betfair_event_id is not null, betfair_event_id matches the regex /^\d+$/ (allowlist — same pattern as C1 captureExchangeSnapshot), and kickoff_time BETWEEN NOW() AND NOW() + INTERVAL (hoursAhead ?? 24) hours.
+
+2. For each unique betfair_event_id, fetch catalogue via the existing getCatalogueForEvent helper in paperTrading.ts. Reuse the 5-minute TTL cache — do not bypass it. If getCatalogueForEvent isn't exported, export it with a small diff.
+
+3. Filter catalogue entries to market types the picker cares about: MATCH_ODDS, OVER_UNDER_25, OVER_UNDER_35, BOTH_TEAMS_TO_SCORE, DOUBLE_CHANCE, FIRST_HALF_RESULT. Confirm this market set matches what valueDetection actually evaluates — inspect the code first and match the list exactly.
+
+4. Batch marketIds in chunks of 40 (Betfair's listMarketBook limit). Call listMarketBook with priceProjection { priceData: ["EX_BEST_OFFERS"], exBestOffersOverrides: { bestPricesDepth: 1 } }.
+
+5. For each ACTIVE runner with at least one of availableToBack or availableToLay populated, INSERT into odds_snapshots. Use source: "betfair_exchange". Populate back_odds from best availableToBack[0].price if present, lay_odds from best availableToLay[0].price if present. Include selection_name derived from the runner's runnerName in the catalogue. Confirm the odds_snapshots INSERT shape by reading an existing writer (e.g. the apiFootball.ts insert around line 1055) and matching the column set.
+
+6. Error handling: per-event try/catch. If a single event fails, increment errors counter, log WARN, continue to next event. Never throw out of the function. Total API call count tracked and returned.
+
+7. Rate limiting: use the existing throttle/bettingRequest mechanism in betfair.ts rather than raw fetch. Do not bypass existing rate limits.
+
+8. Structured log at the end: one logger.info line with { events, markets, runners, snapshotsWritten, errors, durationMs, apiCalls } and a message like "Exchange book sweep complete".
+
+CHANGE B — register cron in scheduler.ts
+
+In the cron registration block around scheduler.ts L1655 where other near-window crons are registered, add a new cron for runExchangeBookSweep. Cadence: every 10 minutes. Use the same safeRun* wrapper pattern as adjacent crons (skip-if-running guard, trackCronExecution, markRun). Timezone UTC.
+
+Do NOT gate this cron on data_source config value. It must run unconditionally whenever Betfair credentials are configured.
+
+Also register a single one-off runExchangeBookSweep() call at server startup, scheduled for ~30 seconds after boot, so the first population doesn't have to wait 10 minutes. Same pattern as other startup warmups in the existing code.
+
+CHANGE C — export getCatalogueForEvent from paperTrading.ts (if not already exported)
+
+One-line diff. The sweep needs to reuse the existing 5-minute TTL cache rather than creating a parallel cache. Inspect current export status first.
+
+VERIFICATION after applying:
+
+1. Show the consolidated diff before applying.
+
+2. Restart the workflow. Confirm clean boot:
+   - Startup safety check PASSED — ENVIRONMENT=production, DB host contains rough-flower
+   - Startup safety check PASSED — ENVIRONMENT=production, TRADING_MODE=LIVE
+   - Trading mode: LIVE
+   - Migrations complete (no new migrations in this prompt)
+   - New log line: "Exchange book sweep scheduler active" or similar
+   - The startup warmup sweep completes within ~60 seconds of boot and logs its summary
+
+3. Confirm the first sweep wrote rows:
+   SELECT source, COUNT(*) FROM odds_snapshots WHERE snapshot_time > NOW() - INTERVAL '10 minutes' GROUP BY source;
+   Should show betfair_exchange with a non-zero count.
+
+4. Confirm the sweep covered the expected scope:
+   SELECT COUNT(DISTINCT match_id) FROM odds_snapshots WHERE source = 'betfair_exchange' AND snapshot_time > NOW() - INTERVAL '10 minutes';
+   Report the count. Compare to: SELECT COUNT(*) FROM matches WHERE status='scheduled' AND betfair_event_id ~ '^\d+$' AND kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '24 hours'; — how many eligible events were there total? Coverage should be >50% of eligible events; if less, report why (API errors, markets not listed, etc.).
+
+5. Sample rows — paste 5 example rows showing back_odds, lay_odds, selection_name, market_type, match_id for verification of data shape.
+
+6. Wait one full cron cycle (10 minutes). Confirm a second sweep ran and added more rows. Compare counts before and after.
+
+7. Confirm API budget is within expectation. Report the apiCalls count from the last 2 sweep summary log lines. Expected: 20-30 API calls per sweep given the NEAR window.
+
+8. Confirm no side effects:
+   - agent_status still paused_weekly
+   - paper_mode still false
+   - live_breaker_paused_until still 2026-04-23T00:00:00Z
+   - BANNED_MARKETS still intact
+   - Zero live bets placed during verification
+
+If any step fails, stop and report. Do not auto-fix.
+
+If the first sweep returns zero snapshotsWritten, the investigation should focus on:
+- Whether the catalogue is returning ACTIVE markets for the queried events
+- Whether selectionName derivation from runnerName is correct
+- Whether the listMarketBook call succeeded or failed silently
+Report these details rather than guessing at a fix.

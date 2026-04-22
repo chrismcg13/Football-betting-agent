@@ -55,6 +55,7 @@ import { reviewLiveThreshold } from "./liveThresholdReview";
 import { checkRelayHealth, isRelayConfigured, relayGetLiquidity, relayGetMarket } from "./vpsRelay";
 import { runOrderManagement, getTicksWithin } from "./orderManager";
 import { liquiditySnapshotsTable } from "@workspace/db";
+import { runExchangeBookSweep } from "./exchangeBookSweep";
 
 // ===================== Status tracking =====================
 
@@ -66,11 +67,12 @@ export interface JobStatus {
 }
 
 const jobStatus: Record<string, JobStatus> = {
-  ingestion:       { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
-  features:        { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
-  trading:         { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
-  learning:        { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
-  oddspapi_map:    { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  ingestion:           { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  features:            { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  trading:             { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  learning:            { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  oddspapi_map:        { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
+  exchange_book_sweep: { lastRunAt: null, lastRunResult: null, isRunning: false, runCount: 0 },
 };
 
 export function getSchedulerStatus(): Record<string, JobStatus> {
@@ -130,6 +132,7 @@ async function trackCronExecution(
 let ingestionRunning = false;
 let featureRunning = false;
 let tradingCycleRunning = false;
+let exchangeBookSweepRunning = false;
 
 // ===================== Safe wrappers =====================
 
@@ -173,6 +176,34 @@ async function safeRunFeatures(): Promise<void> {
     markRun("features", "error");
   } finally {
     featureRunning = false;
+  }
+}
+
+// ===================== Exchange book sweep =====================
+// Populates odds_snapshots with source='betfair_exchange' rows so the Prompt 5
+// venue-anchored pricing picker has live exchange data to consume. Runs
+// unconditionally whenever Betfair credentials are configured — NOT gated on
+// agent_config.data_source.
+
+async function safeRunExchangeBookSweep(): Promise<void> {
+  if (exchangeBookSweepRunning) {
+    logger.warn("Exchange book sweep already in progress — skipping this run");
+    markRun("exchange_book_sweep", "skipped");
+    return;
+  }
+  exchangeBookSweepRunning = true;
+  markStart("exchange_book_sweep");
+  try {
+    await trackCronExecution("exchange_book_sweep", async () => {
+      const r = await runExchangeBookSweep();
+      return r.snapshotsWritten;
+    });
+    markRun("exchange_book_sweep", "success");
+  } catch (err) {
+    logger.error({ err }, "Scheduled exchange book sweep failed");
+    markRun("exchange_book_sweep", "error");
+  } finally {
+    exchangeBookSweepRunning = false;
   }
 }
 
@@ -1654,6 +1685,19 @@ export function startScheduler(): void {
   // Data ingestion: every 30 min, 24/7 (matches scheduled globally at all hours)
   cron.schedule("*/30 * * * *", () => { void safeRunIngestion(); }, { timezone: "UTC" });
   logger.info("Ingestion scheduler active — every 30 min, 24/7");
+
+  // Exchange book sweep: every 10 minutes, populates odds_snapshots with
+  // source='betfair_exchange' for the venue-anchored pricing picker. Runs
+  // unconditionally, independent of data_source config flag.
+  cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep(); }, { timezone: "UTC" });
+  logger.info("Exchange book sweep scheduler active — every 10 minutes (24h NEAR window)");
+
+  // Startup warmup: run one sweep ~30s after boot so the first population
+  // doesn't have to wait the full 10-minute cron interval.
+  setTimeout(() => {
+    logger.info("Exchange book sweep startup warmup triggered (T+30s)");
+    void safeRunExchangeBookSweep();
+  }, 30_000);
 
   // Feature computation: every 6 hours
   cron.schedule("0 */6 * * *", () => { void safeRunFeatures(); }, { timezone: "UTC" });

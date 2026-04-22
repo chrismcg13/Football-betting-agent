@@ -51,7 +51,7 @@ import { detectCurrentRegime } from "./marketRegime";
 const CATALOGUE_TTL_MS = 5 * 60 * 1000;
 const catalogueCache = new Map<string, { fetchedAt: number; items: MarketCatalogueItem[] }>();
 
-async function getCatalogueForEvent(eventId: string): Promise<MarketCatalogueItem[]> {
+export async function getCatalogueForEvent(eventId: string): Promise<MarketCatalogueItem[]> {
   const cached = catalogueCache.get(eventId);
   if (cached && Date.now() - cached.fetchedAt < CATALOGUE_TTL_MS) {
     return cached.items;
