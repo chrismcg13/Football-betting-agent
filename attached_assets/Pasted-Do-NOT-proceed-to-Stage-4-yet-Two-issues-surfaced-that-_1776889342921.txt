@@ -1,0 +1,45 @@
+Do NOT proceed to Stage 4 yet. Two issues surfaced that need investigation before we flip to live.
+
+ISSUE 1 — HWM ratchet behaviour
+
+You flagged that updateHighWaterMark will ratchet HWM up to totalWealth (£343.59) on the next risk check, undoing the HWM-1 setting immediately. I need to understand exactly when and how this happens before deciding the right course.
+
+Report:
+
+1. Show the updateHighWaterMark function in full. What's its trigger condition, what's the comparison, what does it write?
+
+2. Does updateHighWaterMark fire on every risk check, or only conditionally?
+
+3. Is the comparison it uses totalWealth (available + exposure) or just available?
+
+4. If totalWealth: the £243.59 exposure is from a single legacy pending bet. When that bet settles:
+   - If it wins, availableToBetBalance rises by the win amount (roughly 2x the matched stake depending on odds). HWM ratchets up to that peak.
+   - If it loses, the £243.59 exposure disappears, availableToBetBalance stays at £100, exposure becomes £0, totalWealth drops to £100. HWM would have been set to £343 before this happens, then drawdown from £343 to £100 is 71%.
+   
+   In the "loses" scenario, the catastrophic breaker doesn't trip (71% < 90%) but we're still at 70% drawdown which is severe. Is that acceptable calibration for a go-live state? 
+
+5. What options exist to suppress the ratchet during the go-live transition window? E.g. disable HWM updates for N hours, force HWM to stay at £100 until the legacy bet settles, etc.
+
+6. Alternative: is there a way to compute totalWealth excluding legacy-regime pending exposure, so only post-go-live exposure counts? That would let HWM anchor to real ongoing capital.
+
+ISSUE 2 — Bankroll startup writer
+
+Someone wrote bankroll=500 at server boot. Find the writer.
+
+7. Grep the codebase for anywhere that writes to agent_config.key='bankroll'. Paste the call sites.
+
+8. For each writer, what's the trigger condition? Is it boot seed, a sync job, a manual admin endpoint, or something else?
+
+9. If there's a startup path that stamps bankroll based on some source of truth (e.g. Betfair cleared balance), what's the source? Is it reading available balance, total wealth, configured constant, or something stale?
+
+10. If we reset bankroll to £100 and restart, what happens? Will the startup writer re-stamp it to 500 on boot? If yes, how do we disable that temporarily or fix the source to use real available cash?
+
+11. Kelly-sizing implication: if bankroll=500 and max_stake_pct=0.03 (you mentioned 0.03 earlier), max stake = £15 per bet. But real cash is £100. A £15 stake is 15% of real capital on a single bet. Is that the correct stake, or should max_stake_pct scale against real cash, not bankroll? Paste the Kelly-sizing code path so we can see what number it actually uses.
+
+Do not modify anything. Report both investigations. Based on findings I'll decide whether to:
+- Proceed with Stage 4 as-is, accepting the ratchet and bankroll drift
+- Adjust HWM-1 value to handle the ratchet differently
+- Fix the bankroll writer first
+- Defer go-live until these are resolved cleanly
+
+Current state: HWM=100, bankroll=500, agent_status=paused_weekly, paper_mode=false, live_breaker_paused_until=2026-04-23T00:00:00Z. Breaker is still in effect. No live bets placed.
