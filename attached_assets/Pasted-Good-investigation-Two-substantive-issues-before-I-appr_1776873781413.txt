@@ -1,0 +1,25 @@
+Good investigation. Two substantive issues before I approve anything.
+
+First — you appear to have skipped Prompt 5. The previous prompt I sent was the pricing-pipeline port (selectPricingSources helper, edge formula switch, 5 new paper_bets columns, validator override fix, new funnel counters). Your current investigation references "the new pricing cols" as if they exist, which implies Prompt 5 either shipped or the schema migration landed. I need ground truth.
+
+Run these read-only checks and report:
+
+1. Does Prompt 5's schema migration exist in prod? Run:
+   SELECT column_name FROM information_schema.columns WHERE table_name = 'paper_bets' AND column_name IN ('actionable_price', 'actionable_source', 'fair_value_odds', 'fair_value_source', 'validator_best_odds');
+   Report: 0 rows, partial rows, or all 5 rows.
+
+2. Does selectPricingSources exist in prod's valueDetection.ts? Grep for the function name and report yes/no with line number.
+
+3. Does the Prompt 5 edge formula switch exist? Grep for the comment mentioning "CLV-style" or "fairValueImplied - impliedProb" or similar.
+
+4. Does scheduler.ts's validator override preservation exist? Look at the current line around where `backOdds` was being set via validation?.bestOdds. Does it still overwrite, or is it now preserving bet.backOdds?
+
+5. Do the funnel counters 08c_rejected_no_betfair_exchange and 08d_rejected_no_fair_value_source appear in recent cycle logs?
+
+Report findings explicitly. If Prompt 5 was not shipped, say so. If it was partially shipped, list which parts.
+
+Second — the Pinnacle sanity gate threshold analysis is thorough but the sample size (9 pairs) is too small to draw conclusions from. Given the sweep is now running at 10-minute cadence and will accumulate many more pairs over the coming cycles, redo the distribution analysis after there are at least 100 matching betfair_exchange × oddspapi_pinnacle pairs in the last 24 hours. The threshold decision should wait for that richer sample.
+
+HOLD on Change B (legacy tagging) until Prompt 5's state is resolved and we've decided the right next step.
+
+Report the Prompt 5 status check first. Do not modify anything.
