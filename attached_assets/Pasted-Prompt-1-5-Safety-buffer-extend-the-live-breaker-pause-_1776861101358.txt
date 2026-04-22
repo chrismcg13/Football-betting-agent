@@ -1,0 +1,62 @@
+Prompt 1.5 — Safety buffer: extend the live breaker pause
+Small agent_config update in prod. Do not touch dev. Do not restart the workflow.
+
+The live_breaker_paused_until value of 2026-04-22T06:32:24Z is already in the past, which means the live breaker is no longer actively blocking placements. The only remaining safeties before new live bets go out are agent_status='paused_weekly' and BANNED_MARKETS. That's not enough defence-in-depth for the several hours of porting work coming up.
+
+Extend the live breaker to buy a working window:
+
+UPDATE agent_config SET value = '2026-04-23T00:00:00Z' WHERE key = 'live_breaker_paused_until';
+
+Then confirm with:
+
+SELECT value FROM agent_config WHERE key = 'live_breaker_paused_until';
+
+Report the result. This is a one-row update. Do not modify anything else.
+
+Prompt 1.6 — Investigate the 179 stuck placements
+Read-only investigation in prod. Do not modify anything.
+
+There are 179 paper_bets rows in status IN ('placement_failed', 'pending_placement'). I need to understand what they are before the void/settlement fix touches them.
+
+Report:
+
+1. Breakdown by status:
+   SELECT status, COUNT(*) FROM paper_bets WHERE status IN ('placement_failed', 'pending_placement') GROUP BY status;
+
+2. Age distribution — how old are these rows:
+   SELECT status, DATE_TRUNC('day', placed_at) AS day, COUNT(*) FROM paper_bets WHERE status IN ('placement_failed', 'pending_placement') GROUP BY status, day ORDER BY day DESC LIMIT 30;
+
+3. Market type breakdown:
+   SELECT market_type, status, COUNT(*) FROM paper_bets WHERE status IN ('placement_failed', 'pending_placement') GROUP BY market_type, status ORDER BY COUNT(*) DESC;
+
+4. Look at 3 sample rows from each status — show placed_at, market_type, selection_name, stake, odds_at_placement, betfair_bet_id (whether null or populated), and any error_reason or rejection columns that exist on paper_bets.
+
+5. Are any of these rows for matches that have already kicked off and finished?
+   SELECT pb.status, COUNT(*) FROM paper_bets pb JOIN matches m ON pb.match_id = m.id WHERE pb.status IN ('placement_failed', 'pending_placement') AND m.status = 'finished' GROUP BY pb.status;
+
+6. For any rows with betfair_bet_id populated, has the match finished? These are bets that may have matched on Betfair but failed our internal status update.
+   SELECT pb.id, pb.status, pb.betfair_bet_id, pb.market_type, m.status AS match_status FROM paper_bets pb JOIN matches m ON pb.match_id = m.id WHERE pb.status IN ('placement_failed', 'pending_placement') AND pb.betfair_bet_id IS NOT NULL LIMIT 10;
+
+7. Any patterns in error messages? Check compliance_logs or equivalent for placement failure audit entries from the last 7 days:
+   SELECT details FROM compliance_logs WHERE action_type LIKE '%placement%' AND created_at > NOW() - INTERVAL '7 days' LIMIT 20;
+
+Report findings. I'll decide whether the stuck rows need pre-port remediation or whether the void-logic fix will handle them naturally.
+
+Prompt 1.7 — Check how agent_status='paused_weekly' clears
+Read-only investigation. Do not modify anything.
+
+agent_status is currently 'paused_weekly' with paused_at = 2026-04-19T16:31:04.679Z. I need to know what would clear this status before go-live.
+
+Report:
+
+1. Grep the codebase for all writers of agent_status. Paste the call sites and conditions under which they set or clear the 'paused_weekly' state.
+
+2. Is there an automatic clearing mechanism? E.g. does the status auto-clear at the start of a new week, or does it require manual intervention?
+
+3. If manual: what's the recommended way to clear it? UPDATE agent_config SET value = 'running' WHERE key = 'agent_status'? Or is there an admin endpoint that handles related cleanup (clearing paused_at, pause_reason, etc.)?
+
+4. Does the existing 'paused_weekly' state currently block anything we care about? Specifically: does it block the trading cycle from running (i.e. no value detection, no placements), or does it only block the final placement step?
+
+5. Is there any risk that running the port prompts (code changes + workflow restarts) will auto-clear or auto-modify agent_status?
+
+Report findings. Do not modify anything yet. Based on what you find, I'll decide whether to keep 'paused_weekly' as a safety during porting or flip it to 'running' before the port and rely on live_breaker_paused_until + BANNED_MARKETS.
