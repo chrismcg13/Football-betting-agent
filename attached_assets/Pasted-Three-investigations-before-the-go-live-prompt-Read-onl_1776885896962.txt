@@ -1,0 +1,120 @@
+Three investigations before the go-live prompt. Read-only, do not modify anything.
+
+INVESTIGATION 1 — Once Caldas vs Internacional de Bogota triple-bet forensic
+
+User reports three Over 2.5 bets placed on this fixture. We should have had cross-cycle correlation dedup and pending-duplicate dedup in place preventing this. Find the three bets and diagnose how they slipped through.
+
+Report:
+
+1. The three paper_bets rows: id, placed_at, market_type, selection_name, stake, status, betfair_bet_id, odds_at_placement.
+2. Were they placed in the same trading cycle or different cycles? Look at the placed_at timestamps and correlate with scheduler cycle boundaries.
+3. For each bet, what was the status of the prior bet on the same (match_id, market_type) combination at the moment of placement? If the first bet was pending, the second and third bets should have been rejected at the duplicate-pending dedup stage. If they weren't, why?
+4. Inspect the dedup logic that's supposed to catch this:
+   - paperTrading.ts deduplicatePendingBets function — what rules does it apply?
+   - Cross-cycle correlation check in scheduler.ts — what criteria does it use?
+   - Are either of these code paths firing for same-market same-selection duplicates, or only for correlated-different-market combinations?
+5. If the dedup logic is supposed to catch same-market-same-selection duplicates but didn't, what's the bug?
+6. If the dedup logic was never designed to catch same-market-same-selection duplicates, what's missing?
+
+Report findings. Do not fix anything yet — I need to decide whether this needs a fix before go-live or can wait.
+
+INVESTIGATION 2 — Threshold calibration for high-conviction regime
+
+User wants to raise the bar so fewer but higher-conviction bets get placed live. Analyse the current candidate pool and recommend specific threshold values.
+
+Report:
+
+1. Current values: min_edge_threshold, min_opportunity_score, live_opp_score_threshold, and any other placement-gating thresholds from agent_config.
+
+2. Run this distribution analysis on recent paper_bets (the 799 historical rows — pre-fix, but the best proxy for what the candidate flow looks like):
+
+SELECT 
+  ROUND((edge * 100)::numeric, 1) AS edge_pct_bucket,
+  COUNT(*) AS n,
+  ROUND(AVG(opportunity_score)::numeric, 1) AS avg_opp_score,
+  ROUND(AVG(CASE WHEN status = 'won' THEN 1.0 WHEN status = 'lost' THEN 0.0 ELSE NULL END)::numeric, 3) AS win_rate
+FROM paper_bets 
+WHERE status IN ('won', 'lost')
+GROUP BY 1
+ORDER BY 1;
+
+3. Same analysis but bucketed by opportunity_score:
+
+SELECT 
+  FLOOR(opportunity_score / 10) * 10 AS opp_score_bucket,
+  COUNT(*) AS n,
+  ROUND(AVG(CASE WHEN status = 'won' THEN 1.0 WHEN status = 'lost' THEN 0.0 ELSE NULL END)::numeric, 3) AS win_rate,
+  ROUND(SUM(CASE WHEN status = 'won' THEN (odds_at_placement - 1) * stake WHEN status = 'lost' THEN -stake ELSE 0 END)::numeric, 2) AS raw_pnl
+FROM paper_bets
+WHERE status IN ('won', 'lost')
+GROUP BY 1
+ORDER BY 1;
+
+4. Caveat: these are pre-pricing-fix bets. Their edge numbers are inflated (bookmaker-shopping artifact) and their opportunity scores are computed against the old fair-value logic. The absolute numbers won't match what post-fix bets will show. Use the data directionally: which edge ranges actually produced wins vs losses, which opp_score ranges actually distinguished good from bad bets.
+
+5. Based on the distributions, recommend:
+   - A higher min_edge_threshold (currently 3%). Candidates: 4%, 5%, 6%, 7%.
+   - A higher min_opportunity_score (currently 48). Candidates: 52, 55, 58, 60.
+   - Explain tradeoff between conviction and learning speed. At £100 bankroll and 2% max stake, how many bets per week would each recommended threshold produce based on historical candidate volume?
+
+6. Don't pick a single answer — present 2-3 options along the conservative-to-aggressive spectrum with the tradeoffs named. I'll make the call.
+
+INVESTIGATION 3 — Full port audit for go-live readiness
+
+Produce a comprehensive audit of what's in prod vs what should be in prod, so we both have confidence before flipping to live. For each item, confirm status with code references:
+
+A. Startup safety checks:
+   - verifyDbHostForEnvironment for both prod and dev hosts
+   - verifyTradingModeForEnvironment
+   - Pre-boot and post-boot firing correctly
+
+B. Foundational fixes (Prompt 3):
+   - determineBetWon matchStats.homeScoreHt/awayScoreHt fix applied at all sites
+   - settlement_attempts + last_settlement_attempt_at columns on paper_bets
+   - Abandonment-void branch in _settleBetsInner (dormant until ingestion writes abandoned statuses)
+   - 72h timeout logic for paper bets with missing data
+   - Counter fields wired through SettlementResult and all return paths
+
+C. Exchange capture (Prompt 4):
+   - 6 new paper_bets columns for exchange snapshot
+   - captureExchangeSnapshot helper with allowlist regex
+   - findSelectionId exported from betfairLive.ts
+   - Catalogue cache with 5-min TTL
+   - Counter reset at cycle start, log at cycle end (in finally block for all exit paths)
+
+D. Exchange book sweep:
+   - exchangeBookSweep.ts file exists
+   - Cron registered at 10-min cadence
+   - Startup warmup scheduled
+   - Writes source='betfair_exchange' rows
+   - Covers MATCH_ODDS, OVER_UNDER_15/25/35, BTTS (the picker's expected set)
+   - Currently producing rows at expected cadence
+
+E. Pricing-pipeline fix (Prompt 5):
+   - 5 new paper_bets columns
+   - selectPricingSources helper
+   - CLV-style edge formula switch
+   - Validator override preservation (backOdds = bet.actionablePrice, validator captured as diagnostic)
+   - Thesis text updated
+   - Counters 02a/02b wired into funnel
+
+F. Guardrails currently active:
+   - agent_status = paused_weekly
+   - paper_mode = false
+   - live_breaker_paused_until = 2026-04-23T00:00:00Z
+   - BANNED_MARKETS contains OVER_UNDER_25, OVER_UNDER_35, FIRST_HALF_RESULT, DOUBLE_CHANCE
+   - 0 live bets placed during any port work
+
+G. Known incomplete items that aren't blockers:
+   - dev workspace offline since 16 April (not required for prod go-live)
+   - data_tier override bug at valueDetection.ts:1080 (separate future task)
+   - apiFootball.ts sort collision (hygiene fix for future)
+   - cron-death watchdog (future reliability work)
+
+For each of A through F, paste the specific line numbers or SQL confirming the item is in place. For each of G, confirm it's noted and won't affect go-live.
+
+Then give me your overall readiness verdict: GREEN (ready for go-live), AMBER (specific concerns to address first), or RED (not ready — major gaps).
+
+If AMBER or RED, list the specific concerns with recommended actions.
+
+No code changes. Report only.
