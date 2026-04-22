@@ -1,4 +1,4 @@
-import { db, paperBetsTable, matchesTable, modelStateTable, learningNarrativesTable, complianceLogsTable } from "@workspace/db";
+import { db, paperBetsCurrentView, matchesTable, modelStateTable, learningNarrativesTable, complianceLogsTable } from "@workspace/db";
 import { inArray, desc, sql, gte, and, isNotNull, eq } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { getMarketFamily } from "./edgeConcentration";
@@ -76,10 +76,10 @@ async function computeTrends(): Promise<TrendMetrics> {
   for (const period of periods) {
     const whereClause = period.since
       ? and(
-          inArray(paperBetsTable.status, ["won", "lost"]),
-          gte(paperBetsTable.settledAt, period.since),
+          inArray(paperBetsCurrentView.status, ["won", "lost"]),
+          gte(paperBetsCurrentView.settledAt, period.since),
         )
-      : inArray(paperBetsTable.status, ["won", "lost"]);
+      : inArray(paperBetsCurrentView.status, ["won", "lost"]);
 
     const result = await db.execute(sql`
       SELECT
@@ -87,7 +87,7 @@ async function computeTrends(): Promise<TrendMetrics> {
         COALESCE(SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0), 0) AS win_rate,
         COALESCE(SUM(settlement_pnl::numeric) / NULLIF(SUM(stake::numeric), 0) * 100, 0) AS roi,
         COALESCE(AVG(clv_pct::numeric) FILTER (WHERE clv_pct IS NOT NULL), 0) AS clv
-      FROM paper_bets
+      FROM paper_bets_current
       WHERE status IN ('won', 'lost')
       ${period.since ? sql`AND settled_at >= ${period.since}` : sql``}
     `);
@@ -121,7 +121,7 @@ async function computeLeagueMarketPerformance(): Promise<{
       COALESCE(SUM(pb.stake::numeric), 0) AS total_stake,
       COALESCE(SUM(CASE WHEN pb.status = 'won' THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0), 0) AS win_rate,
       COALESCE(AVG(pb.clv_pct::numeric) FILTER (WHERE pb.clv_pct IS NOT NULL), 0) AS clv
-    FROM paper_bets pb
+    FROM paper_bets_current pb
     JOIN matches m ON pb.match_id = m.id
     WHERE pb.status IN ('won', 'lost')
     GROUP BY m.league, pb.market_type
@@ -150,7 +150,7 @@ async function computeCalibration(): Promise<{ buckets: CalibrationBucket[]; sco
     SELECT
       model_probability,
       status
-    FROM paper_bets
+    FROM paper_bets_current
     WHERE status IN ('won', 'lost')
     AND model_probability IS NOT NULL
   `);

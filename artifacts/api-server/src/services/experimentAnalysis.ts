@@ -1,4 +1,4 @@
-import { db, experimentRegistryTable, experimentLearningJournalTable, paperBetsTable } from "@workspace/db";
+import { db, experimentRegistryTable, experimentLearningJournalTable, paperBetsCurrentView } from "@workspace/db";
 import { sql, eq } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import crypto from "crypto";
@@ -19,7 +19,7 @@ export async function runWeeklyExperimentAnalysis(): Promise<void> {
         COALESCE(SUM(settlement_pnl::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as pnl,
         COALESCE(SUM(stake::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as staked,
         COALESCE(AVG(clv_pct::numeric) FILTER (WHERE status IN ('won', 'lost') AND clv_pct IS NOT NULL), 0) as clv
-      FROM paper_bets
+      FROM paper_bets_current
       WHERE experiment_tag = ${exp.experimentTag}
         AND placed_at > NOW() - INTERVAL '7 days'
     `);
@@ -31,7 +31,7 @@ export async function runWeeklyExperimentAnalysis(): Promise<void> {
         COALESCE(SUM(settlement_pnl::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as pnl,
         COALESCE(SUM(stake::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as staked,
         COALESCE(AVG(clv_pct::numeric) FILTER (WHERE status IN ('won', 'lost') AND clv_pct IS NOT NULL), 0) as clv
-      FROM paper_bets
+      FROM paper_bets_current
       WHERE experiment_tag = ${exp.experimentTag}
         AND placed_at > NOW() - INTERVAL '30 days'
     `);
@@ -42,13 +42,13 @@ export async function runWeeklyExperimentAnalysis(): Promise<void> {
         COUNT(*) FILTER (WHERE status IN ('won', 'lost')) as settled,
         COALESCE(SUM(settlement_pnl::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as pnl,
         COALESCE(SUM(stake::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as staked
-      FROM paper_bets
+      FROM paper_bets_current
       WHERE experiment_tag = ${exp.experimentTag}
       GROUP BY opportunity_boosted
     `);
 
     const latestBet = await db.execute(sql`
-      SELECT placed_at FROM paper_bets
+      SELECT placed_at FROM paper_bets_current
       WHERE experiment_tag = ${exp.experimentTag}
       ORDER BY placed_at DESC LIMIT 1
     `);

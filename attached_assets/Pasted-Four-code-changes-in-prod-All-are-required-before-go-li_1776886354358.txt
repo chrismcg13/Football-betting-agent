@@ -1,0 +1,134 @@
+Four code changes in prod. All are required before go-live. Do not touch dev. Do not flip TRADING_MODE, paper_mode, or agent_status yet — go-live is a separate prompt.
+
+CHANGE A — Fix the TOCTOU duplicate-bet bug in scheduler.ts
+
+Two parts, one small, one slightly larger, belt-and-braces to catch both paths to intra-cycle duplicates.
+
+A1 (one line): After preCorrelation.push(...) on scheduler.ts around line 871, add:
+  pendingKeys.add(dupKey);
+
+This prevents the second-through-Nth bet on the same (match, market, selection) from slipping through when the picker emits duplicates.
+
+A2 (upstream dedup): Before the main candidate loop begins at scheduler.ts around line 800, dedupe allEntries (or whatever the pre-loop candidate list is named) by (matchId, marketType, selectionName), keeping the entry with the highest effectiveScore. This prevents the picker from ever emitting the same line twice in a single cycle regardless of what the scheduler loop does.
+
+Implementation for A2:
+  - Walk allEntries, build a Map keyed by `${matchId}|${marketType}|${selectionName}`
+  - For each key, store the entry with the highest effectiveScore
+  - Replace allEntries with Array.from(map.values()) before the loop begins
+  - Log: "Deduplicated N intra-cycle candidates to M unique (match, market, selection) entries" if N > M
+
+Verify by inspection: after A1 and A2, trace through the dedup logic once more and confirm no path exists for an exact-duplicate intra-cycle bet to reach placePaperBet.
+
+CHANGE B — Update agent_config thresholds for post-Prompt-5 regime
+
+Two UPDATE queries:
+
+UPDATE agent_config SET value = '0.005' WHERE key = 'min_edge_threshold';
+-- Was 0.03 (3pp, bookmaker-shopping units). Now 0.005 (0.5pp, CLV-style units).
+-- Required because Prompt 5 changed the edge formula from modelProb - (1/actionable)
+-- to (1/fairValue) - (1/actionable). Current candidate pool shows edges in 0.33-3.02pp range;
+-- a 3pp floor would reject ~94% of real candidates.
+
+UPDATE agent_config SET value = '60' WHERE key = 'min_opportunity_score';
+-- Was 48. Raised to 60 based on historical data: pre-fix paper_bets show the 60-69 opp_score
+-- bucket was the only profitable one (+£663 raw P&L vs -£614 for 50-59). 
+-- Below 60 lost money at similar win rates.
+
+Also update live_opp_score_threshold to match:
+UPDATE agent_config SET value = '60' WHERE key = 'live_opp_score_threshold';
+
+Confirm after each UPDATE by SELECT.
+
+CHANGE C — Legacy data tagging via view-based approach
+
+Ship the view-based legacy tagging that the prior investigation recommended.
+
+C1 — Schema addition (migrate.ts):
+
+Add to the existing migration block:
+  ALTER TABLE paper_bets ADD COLUMN IF NOT EXISTS legacy_regime BOOLEAN NOT NULL DEFAULT false;
+
+C2 — Create view (migrate.ts, after the ALTER):
+
+After any column addition to paper_bets, the migration should drop and recreate the view:
+  DROP VIEW IF EXISTS paper_bets_current;
+  CREATE VIEW paper_bets_current AS SELECT * FROM paper_bets WHERE legacy_regime = false;
+
+C3 — Partial index (migrate.ts):
+
+  CREATE INDEX IF NOT EXISTS idx_paper_bets_current_placed_at 
+    ON paper_bets (placed_at) WHERE legacy_regime = false;
+
+C4 — Drizzle view definition (lib/db/src/schema/paperBets.ts):
+
+Define paperBetsCurrentView using pgView, mirroring the paper_bets table shape. Export alongside paperBetsTable. Pattern per Drizzle docs.
+
+C5 — Switch the Class A endpoints and services you identified in the prior investigation to read from paperBetsCurrentView instead of paperBetsTable:
+
+Endpoints (api.ts):
+  /dashboard/summary, /dashboard/performance, /dashboard/bets/by-league, 
+  /dashboard/bets/by-market, /dashboard/viability, /trading/corrected-stats, 
+  /dashboard/clv-stats, /dashboard/scan-stats, /admin/experiment-analysis, 
+  /dashboard/edge-segments, /dashboard/model-health, /dashboard/edge-decay, 
+  /dashboard/execution-metrics, /dashboard/live-summary
+
+Services (by file):
+  experimentAnalysis.ts, modelHealthReport.ts, edgeDecay.ts, edgeConcentration.ts, 
+  liveThresholdReview.ts, agentRecommendations.ts, marketRegime.ts, dataRichness.ts, 
+  thresholdAssessment.ts, launchActivation.ts, promotionEngine.ts, commissionService.ts
+
+C6 — Class B (keep reading from paperBetsTable directly):
+  All settlement/reconciliation/audit/ops endpoints and services as you identified.
+  riskManager.ts weekly-loss check stays on paperBetsTable — full history, not legacy-filtered.
+  learningLoop.ts stays on paperBetsTable — training on full history.
+
+C7 — Class C toggle endpoints:
+  /dashboard/bets and /dashboard/filtered-bets get an optional includeLegacy query param.
+  When false (default): use paperBetsCurrentView. When true: use paperBetsTable.
+
+Do NOT execute the legacy backfill yet. That happens in the go-live prompt when we know the exact cutover timestamp.
+
+CHANGE D — Confirm BANNED_MARKETS contents
+
+Open paperTrading.ts line 382 area, paste the full BANNED_MARKETS Set definition showing all entries. Confirm OVER_UNDER_25, OVER_UNDER_35, FIRST_HALF_RESULT, DOUBLE_CHANCE are all present. No code change in this step — verification only.
+
+VERIFICATION AFTER APPLYING ALL CHANGES:
+
+1. Show the consolidated diff for Changes A and C before applying. B is SQL. D is inspection only.
+
+2. Apply migrations. Restart workflow. Confirm clean boot:
+   - ENVIRONMENT=production, DB host contains rough-flower
+   - ENVIRONMENT=production, TRADING_MODE=LIVE
+   - Migrations complete
+
+3. Confirm new schema state:
+   - SELECT column_name FROM information_schema.columns WHERE table_name = 'paper_bets' AND column_name = 'legacy_regime'; → 1 row
+   - SELECT 1 FROM pg_views WHERE viewname = 'paper_bets_current'; → 1 row
+   - SELECT indexname FROM pg_indexes WHERE tablename = 'paper_bets' AND indexname = 'idx_paper_bets_current_placed_at'; → 1 row
+
+4. Confirm updated agent_config:
+   - SELECT key, value FROM agent_config WHERE key IN ('min_edge_threshold', 'min_opportunity_score', 'live_opp_score_threshold');
+   - All three should show the new values.
+
+5. Confirm BANNED_MARKETS contents. Paste the relevant lines.
+
+6. Confirm dedup fix by code inspection. Walk through the scheduler candidate loop mentally and confirm no path allows duplicate (matchId, marketType, selectionName) entries to reach placePaperBet.
+
+7. Confirm guardrails unchanged:
+   - agent_status still paused_weekly
+   - paper_mode still false
+   - live_breaker_paused_until still 2026-04-23T00:00:00Z
+   - Zero live bets placed during this prompt's work
+
+8. Wait for one trading cycle. Even though it will trip the weekly-loss breaker and skip placement, the value-detection portion runs and will exercise the new min_edge and min_opportunity_score thresholds. Paste the funnel report showing candidates entering and what stage they survive/die at.
+
+9. Sample check: in the cycle report, does stage 07_post_correlation show a smaller number than before? (It should, because higher opp_score threshold filters more aggressively.)
+
+10. Confirm the view works. Run:
+    - SELECT COUNT(*) FROM paper_bets;
+    - SELECT COUNT(*) FROM paper_bets_current;
+    Both should be 799 since no rows have been flagged legacy_regime=true yet. The view is wired but not yet filtering.
+
+Report everything. If any step fails, stop and report. Do not auto-fix.
+
+Once all verifications are clean, this is the last code-change prompt before go-live. The next prompt after this one will be the go-live script: backfill legacy_regime on all existing rows, set dashboard_reset_at, flip paper_mode and TRADING_MODE, clear agent_status, and monitor.

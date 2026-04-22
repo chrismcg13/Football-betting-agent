@@ -632,6 +632,15 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS fair_value_source TEXT,
         ADD COLUMN IF NOT EXISTS validator_best_odds NUMERIC(10,4)
     `);
+    // Change C (2026-04-22): add legacy_regime column. The matching view
+    // (paper_bets_current) and partial index are created at the END of the
+    // migrate() function, AFTER every other `ALTER TABLE paper_bets` runs,
+    // because Postgres freezes a view's column list at CREATE time and any
+    // later ALTER would leave the view out of sync.
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS legacy_regime BOOLEAN NOT NULL DEFAULT false
+    `);
     await db.execute(sql`
       ALTER TABLE compliance_logs
         ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
@@ -904,6 +913,22 @@ export async function runMigrations() {
     await db.execute(sql`
       ALTER TABLE paper_bets
         ADD COLUMN IF NOT EXISTS qualification_path TEXT
+    `);
+
+    // Change C (2026-04-22): create paper_bets_current view + partial index.
+    // MUST run AFTER every `ALTER TABLE paper_bets` in this migrate() —
+    // Postgres freezes a view's column list at CREATE time. If a new column
+    // is added to paper_bets in a future migrate, that ALTER must be placed
+    // BEFORE this block (or the block must be re-executed afterward).
+    await db.execute(sql`DROP VIEW IF EXISTS paper_bets_current`);
+    await db.execute(sql`
+      CREATE VIEW paper_bets_current AS
+        SELECT * FROM paper_bets WHERE legacy_regime = false
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_current_placed_at
+        ON paper_bets (placed_at)
+        WHERE legacy_regime = false
     `);
 
     logger.info("Migrations complete");

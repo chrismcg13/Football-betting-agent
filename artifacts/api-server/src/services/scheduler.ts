@@ -780,6 +780,32 @@ export async function runTradingCycle(options?: {
       .where(and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`));
     const pendingKeys = new Set(existingPending.map((b) => `${b.matchId}|${b.marketType}|${b.selectionName}`));
 
+    // ── Change A2 (intra-cycle upstream dedup) ───────────────────────────────
+    // Belt-and-braces against the picker emitting the same (match, market,
+    // selection) more than once in a single cycle. Without this, the pre-loop
+    // pendingKeys snapshot is blind to duplicates introduced WITHIN this loop
+    // (the original triple-bet bug on Once Caldas vs Inter Bogota, 2026-04-19).
+    // Keep the entry with the highest effectiveScore; first-seen wins on ties.
+    {
+      const beforeCount = allEntries.length;
+      const seenByKey = new Map<string, typeof allEntries[number]>();
+      for (const e of allEntries) {
+        const k = `${e.bet.matchId}|${e.bet.marketType}|${e.bet.selectionName}`;
+        const existing = seenByKey.get(k);
+        if (!existing || e.effectiveScore > existing.effectiveScore) {
+          seenByKey.set(k, e);
+        }
+      }
+      const afterCount = seenByKey.size;
+      if (beforeCount > afterCount) {
+        logger.info(
+          { beforeCount, afterCount, removed: beforeCount - afterCount },
+          `Deduplicated ${beforeCount} intra-cycle candidates to ${afterCount} unique (match, market, selection) entries`,
+        );
+        allEntries = Array.from(seenByKey.values());
+      }
+    }
+
     let funnelDupSkip = 0, funnelScoreSkip = 0, funnelLeagueSkip = 0, funnelMarketSkip = 0, funnelCycleCapHit = 0;
 
     for (const entry of allEntries) {
@@ -865,6 +891,12 @@ export async function runTradingCycle(options?: {
         _effectiveScore: effectiveScore,
         _isContrarian: isContrarian,
       } as BetCandidate & Record<string, unknown>);
+
+      // ── Change A1 (intra-cycle TOCTOU close) ────────────────────────────
+      // Mark this (match, market, selection) as taken so any further loop
+      // iterations queueing the same key are rejected at the dupKey check
+      // above. Belt-and-braces alongside A2 upstream dedup.
+      pendingKeys.add(dupKey);
 
       leagueCounts[bet.league] = leagueCount + 1;
       marketCounts[bet.marketType] = marketCount + 1;

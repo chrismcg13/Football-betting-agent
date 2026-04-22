@@ -3,6 +3,7 @@ import {
   db,
   pool,
   paperBetsTable,
+  paperBetsCurrentView,
   matchesTable,
   complianceLogsTable,
   learningNarrativesTable,
@@ -95,24 +96,27 @@ function paginate(page: unknown, limit: unknown, max = 200) {
 //   appear in dashboard totals, PnL, ROI, CLV, upcoming/live/settled views.
 //   This is applied to every dashboard endpoint below.
 const REAL_MONEY = isNotNull(paperBetsTable.betfairBetId);
+const REAL_MONEY_CURRENT = isNotNull(paperBetsCurrentView.betfairBetId);
 
 async function getSettledBetsStats() {
+  // Class A helper used by /dashboard/summary — reads paper_bets_current
+  // (legacy_regime=false) so the dashboard summary excludes pre-cutover bets.
   const rows = await db
     .select({
-      status: paperBetsTable.status,
-      stake: paperBetsTable.stake,
-      settlementPnl: paperBetsTable.settlementPnl,
-      settledAt: paperBetsTable.settledAt,
-      opportunityScore: paperBetsTable.opportunityScore,
-      grossPnl: paperBetsTable.grossPnl,
-      commissionAmount: paperBetsTable.commissionAmount,
-      netPnl: paperBetsTable.netPnl,
+      status: paperBetsCurrentView.status,
+      stake: paperBetsCurrentView.stake,
+      settlementPnl: paperBetsCurrentView.settlementPnl,
+      settledAt: paperBetsCurrentView.settledAt,
+      opportunityScore: paperBetsCurrentView.opportunityScore,
+      grossPnl: paperBetsCurrentView.grossPnl,
+      commissionAmount: paperBetsCurrentView.commissionAmount,
+      netPnl: paperBetsCurrentView.netPnl,
     })
-    .from(paperBetsTable)
+    .from(paperBetsCurrentView)
     .where(
       and(
-        inArray(paperBetsTable.status, ["won", "lost", "void"]),
-        REAL_MONEY,
+        inArray(paperBetsCurrentView.status, ["won", "lost", "void"]),
+        REAL_MONEY_CURRENT,
       ),
     );
   return rows;
@@ -125,9 +129,9 @@ router.get("/dashboard/summary", async (_req, res) => {
   const todayStartUtc = new Date();
   todayStartUtc.setUTCHours(0, 0, 0, 0);
 
-  // Dashboard is real-money only — see REAL_MONEY constant at top of file.
-  const pendingWhere = and(eq(paperBetsTable.status, "pending"), REAL_MONEY);
-  const betsTodayWhere = and(gte(paperBetsTable.placedAt, todayStartUtc), REAL_MONEY);
+  // Dashboard is real-money only — see REAL_MONEY_CURRENT constant at top of file.
+  const pendingWhere = and(eq(paperBetsCurrentView.status, "pending"), REAL_MONEY_CURRENT);
+  const betsTodayWhere = and(gte(paperBetsCurrentView.placedAt, todayStartUtc), REAL_MONEY_CURRENT);
 
   const [bankroll, agentStatus, allSettled, allPending, betsTodayRows, tierSplitRows, paperModeRow, maxExposurePctRow, exposureRuleSinceRow] = await Promise.all([
     getBankroll(),
@@ -135,16 +139,16 @@ router.get("/dashboard/summary", async (_req, res) => {
     getSettledBetsStats(),
     db
       .select({
-        id: paperBetsTable.id,
-        stake: paperBetsTable.stake,
-        opportunityScore: paperBetsTable.opportunityScore,
-        placedAt: paperBetsTable.placedAt,
+        id: paperBetsCurrentView.id,
+        stake: paperBetsCurrentView.stake,
+        opportunityScore: paperBetsCurrentView.opportunityScore,
+        placedAt: paperBetsCurrentView.placedAt,
       })
-      .from(paperBetsTable)
+      .from(paperBetsCurrentView)
       .where(pendingWhere),
     db
       .select({ count: sql<number>`count(*)::int` })
-      .from(paperBetsTable)
+      .from(paperBetsCurrentView)
       .where(betsTodayWhere),
     db.execute(sql`
       SELECT
@@ -318,50 +322,50 @@ router.get("/dashboard/performance", async (_req, res) => {
   since.setUTCDate(since.getUTCDate() - 30);
   since.setUTCHours(0, 0, 0, 0);
 
-  // Dashboard is real-money only — see REAL_MONEY constant at top of file.
+  // Dashboard is real-money only — see REAL_MONEY_CURRENT constant at top of file.
   const settledWhere = and(
-    inArray(paperBetsTable.status, ["won", "lost"]),
-    gte(paperBetsTable.settledAt, since),
-    REAL_MONEY,
+    inArray(paperBetsCurrentView.status, ["won", "lost"]),
+    gte(paperBetsCurrentView.settledAt, since),
+    REAL_MONEY_CURRENT,
   );
 
   const settled = await db
     .select({
-      settledAt: paperBetsTable.settledAt,
-      settlementPnl: paperBetsTable.settlementPnl,
-      status: paperBetsTable.status,
-      stake: paperBetsTable.stake,
+      settledAt: paperBetsCurrentView.settledAt,
+      settlementPnl: paperBetsCurrentView.settlementPnl,
+      status: paperBetsCurrentView.status,
+      stake: paperBetsCurrentView.stake,
     })
-    .from(paperBetsTable)
+    .from(paperBetsCurrentView)
     .where(settledWhere)
-    .orderBy(asc(paperBetsTable.settledAt));
+    .orderBy(asc(paperBetsCurrentView.settledAt));
 
   // Overview "Recent Results" shows wins/losses only — voids are tracked on the
   // Bets History page so they don't clutter the at-a-glance settled view.
   const recentSettledWhere = and(
-    inArray(paperBetsTable.status, ["won", "lost"]),
-    REAL_MONEY,
+    inArray(paperBetsCurrentView.status, ["won", "lost"]),
+    REAL_MONEY_CURRENT,
   );
   const recentBets = await db
     .select({
-      id: paperBetsTable.id,
-      matchId: paperBetsTable.matchId,
+      id: paperBetsCurrentView.id,
+      matchId: paperBetsCurrentView.matchId,
       homeTeam: matchesTable.homeTeam,
       awayTeam: matchesTable.awayTeam,
       league: matchesTable.league,
-      marketType: paperBetsTable.marketType,
-      selectionName: paperBetsTable.selectionName,
-      oddsAtPlacement: paperBetsTable.oddsAtPlacement,
-      stake: paperBetsTable.stake,
-      status: paperBetsTable.status,
-      settlementPnl: paperBetsTable.settlementPnl,
-      settledAt: paperBetsTable.settledAt,
-      placedAt: paperBetsTable.placedAt,
+      marketType: paperBetsCurrentView.marketType,
+      selectionName: paperBetsCurrentView.selectionName,
+      oddsAtPlacement: paperBetsCurrentView.oddsAtPlacement,
+      stake: paperBetsCurrentView.stake,
+      status: paperBetsCurrentView.status,
+      settlementPnl: paperBetsCurrentView.settlementPnl,
+      settledAt: paperBetsCurrentView.settledAt,
+      placedAt: paperBetsCurrentView.placedAt,
     })
-    .from(paperBetsTable)
-    .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .from(paperBetsCurrentView)
+    .leftJoin(matchesTable, eq(paperBetsCurrentView.matchId, matchesTable.id))
     .where(recentSettledWhere)
-    .orderBy(desc(paperBetsTable.settledAt))
+    .orderBy(desc(paperBetsCurrentView.settledAt))
     .limit(15);
 
   // Daily P&L
@@ -460,13 +464,13 @@ router.get("/dashboard/bets/by-league", async (_req, res) => {
   const settled = await db
     .select({
       league: matchesTable.league,
-      status: paperBetsTable.status,
-      stake: paperBetsTable.stake,
-      settlementPnl: paperBetsTable.settlementPnl,
+      status: paperBetsCurrentView.status,
+      stake: paperBetsCurrentView.stake,
+      settlementPnl: paperBetsCurrentView.settlementPnl,
     })
-    .from(paperBetsTable)
-    .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
-    .where(and(inArray(paperBetsTable.status, ["won", "lost"]), REAL_MONEY));
+    .from(paperBetsCurrentView)
+    .leftJoin(matchesTable, eq(paperBetsCurrentView.matchId, matchesTable.id))
+    .where(and(inArray(paperBetsCurrentView.status, ["won", "lost"]), REAL_MONEY_CURRENT));
 
   const groups = new Map<
     string,
@@ -654,13 +658,13 @@ router.post("/admin/capture-pinnacle-snapshots", async (_req, res) => {
 router.get("/dashboard/bets/by-market", async (_req, res) => {
   const settled = await db
     .select({
-      marketType: paperBetsTable.marketType,
-      status: paperBetsTable.status,
-      stake: paperBetsTable.stake,
-      settlementPnl: paperBetsTable.settlementPnl,
+      marketType: paperBetsCurrentView.marketType,
+      status: paperBetsCurrentView.status,
+      stake: paperBetsCurrentView.stake,
+      settlementPnl: paperBetsCurrentView.settlementPnl,
     })
-    .from(paperBetsTable)
-    .where(and(inArray(paperBetsTable.status, ["won", "lost"]), REAL_MONEY));
+    .from(paperBetsCurrentView)
+    .where(and(inArray(paperBetsCurrentView.status, ["won", "lost"]), REAL_MONEY_CURRENT));
 
   const groups = new Map<
     string,
@@ -711,63 +715,69 @@ router.get("/dashboard/bets", async (req, res) => {
     500,
   );
   const statusFilter = String(req.query["status"] ?? "all");
+  // Class C toggle (Change C7): default reads paper_bets_current (legacy
+  // bets hidden from dashboard); ?includeLegacy=true reads the raw table
+  // (full history, for audit / drill-down).
+  const includeLegacy = String(req.query["includeLegacy"] ?? "false") === "true";
+  const t = (includeLegacy ? paperBetsTable : paperBetsCurrentView) as typeof paperBetsTable;
+  const realMoney = isNotNull(t.betfairBetId);
 
   // Dashboard is real-money only — bets list never includes never-placed shadow
   // rows, regardless of status filter.
   const baseConditions =
     statusFilter === "all" || !statusFilter
-      ? REAL_MONEY
-      : and(eq(paperBetsTable.status, statusFilter), REAL_MONEY);
+      ? realMoney
+      : and(eq(t.status, statusFilter), realMoney);
 
   const [bets, countResult] = await Promise.all([
     db
       .select({
-        id: paperBetsTable.id,
-        matchId: paperBetsTable.matchId,
+        id: t.id,
+        matchId: t.matchId,
         homeTeam: matchesTable.homeTeam,
         awayTeam: matchesTable.awayTeam,
         league: matchesTable.league,
         kickoffTime: matchesTable.kickoffTime,
         homeScore: matchesTable.homeScore,
         awayScore: matchesTable.awayScore,
-        marketType: paperBetsTable.marketType,
-        selectionName: paperBetsTable.selectionName,
-        betType: paperBetsTable.betType,
-        oddsAtPlacement: paperBetsTable.oddsAtPlacement,
-        stake: paperBetsTable.stake,
-        potentialProfit: paperBetsTable.potentialProfit,
-        modelProbability: paperBetsTable.modelProbability,
-        betfairImpliedProbability: paperBetsTable.betfairImpliedProbability,
-        calculatedEdge: paperBetsTable.calculatedEdge,
-        opportunityScore: paperBetsTable.opportunityScore,
-        modelVersion: paperBetsTable.modelVersion,
-        status: paperBetsTable.status,
-        settlementPnl: paperBetsTable.settlementPnl,
-        placedAt: paperBetsTable.placedAt,
-        settledAt: paperBetsTable.settledAt,
-        oddsSource: paperBetsTable.oddsSource,
-        liveTier: paperBetsTable.liveTier,
-        betfairBetId: paperBetsTable.betfairBetId,
-        betfairStatus: paperBetsTable.betfairStatus,
-        betfairSizeMatched: paperBetsTable.betfairSizeMatched,
-        betfairAvgPriceMatched: paperBetsTable.betfairAvgPriceMatched,
-        betfairPnl: paperBetsTable.betfairPnl,
-        dataTier: paperBetsTable.dataTier,
-        experimentTag: paperBetsTable.experimentTag,
-        clvPct: paperBetsTable.clvPct,
-        pinnacleOdds: paperBetsTable.pinnacleOdds,
-        isContrarian: paperBetsTable.isContrarian,
-        betThesis: paperBetsTable.betThesis,
+        marketType: t.marketType,
+        selectionName: t.selectionName,
+        betType: t.betType,
+        oddsAtPlacement: t.oddsAtPlacement,
+        stake: t.stake,
+        potentialProfit: t.potentialProfit,
+        modelProbability: t.modelProbability,
+        betfairImpliedProbability: t.betfairImpliedProbability,
+        calculatedEdge: t.calculatedEdge,
+        opportunityScore: t.opportunityScore,
+        modelVersion: t.modelVersion,
+        status: t.status,
+        settlementPnl: t.settlementPnl,
+        placedAt: t.placedAt,
+        settledAt: t.settledAt,
+        oddsSource: t.oddsSource,
+        liveTier: t.liveTier,
+        betfairBetId: t.betfairBetId,
+        betfairStatus: t.betfairStatus,
+        betfairSizeMatched: t.betfairSizeMatched,
+        betfairAvgPriceMatched: t.betfairAvgPriceMatched,
+        betfairPnl: t.betfairPnl,
+        dataTier: t.dataTier,
+        experimentTag: t.experimentTag,
+        clvPct: t.clvPct,
+        pinnacleOdds: t.pinnacleOdds,
+        isContrarian: t.isContrarian,
+        betThesis: t.betThesis,
       })
-      .from(paperBetsTable)
-      .leftJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+      .from(t)
+      .leftJoin(matchesTable, eq(t.matchId, matchesTable.id))
       .where(baseConditions)
-      .orderBy(desc(paperBetsTable.placedAt))
+      .orderBy(desc(t.placedAt))
       .limit(limit)
       .offset(offset),
     db
       .select({ count: sql<number>`count(*)::int` })
-      .from(paperBetsTable)
+      .from(t)
       .where(baseConditions),
   ]);
 
@@ -805,15 +815,15 @@ router.get("/dashboard/bets", async (req, res) => {
 router.get("/dashboard/viability", async (_req, res) => {
   const allSettled = await db
     .select({
-      stake: paperBetsTable.stake,
-      settlementPnl: paperBetsTable.settlementPnl,
-      calculatedEdge: paperBetsTable.calculatedEdge,
-      placedAt: paperBetsTable.placedAt,
-      settledAt: paperBetsTable.settledAt,
+      stake: paperBetsCurrentView.stake,
+      settlementPnl: paperBetsCurrentView.settlementPnl,
+      calculatedEdge: paperBetsCurrentView.calculatedEdge,
+      placedAt: paperBetsCurrentView.placedAt,
+      settledAt: paperBetsCurrentView.settledAt,
     })
-    .from(paperBetsTable)
-    .where(and(inArray(paperBetsTable.status, ["won", "lost"]), REAL_MONEY))
-    .orderBy(asc(paperBetsTable.placedAt));
+    .from(paperBetsCurrentView)
+    .where(and(inArray(paperBetsCurrentView.status, ["won", "lost"]), REAL_MONEY_CURRENT))
+    .orderBy(asc(paperBetsCurrentView.placedAt));
 
   const totalSettledBets = allSettled.length;
 
@@ -1356,18 +1366,18 @@ router.get("/trading/corrected-stats", async (_req, res) => {
     // Get all settled bets (won/lost) with opportunity scores
     const rows = await db
       .select({
-        id: paperBetsTable.id,
-        matchId: paperBetsTable.matchId,
-        marketType: paperBetsTable.marketType,
-        selectionName: paperBetsTable.selectionName,
-        stake: paperBetsTable.stake,
-        settlementPnl: paperBetsTable.settlementPnl,
-        status: paperBetsTable.status,
-        opportunityScore: paperBetsTable.opportunityScore,
-        oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+        id: paperBetsCurrentView.id,
+        matchId: paperBetsCurrentView.matchId,
+        marketType: paperBetsCurrentView.marketType,
+        selectionName: paperBetsCurrentView.selectionName,
+        stake: paperBetsCurrentView.stake,
+        settlementPnl: paperBetsCurrentView.settlementPnl,
+        status: paperBetsCurrentView.status,
+        opportunityScore: paperBetsCurrentView.opportunityScore,
+        oddsAtPlacement: paperBetsCurrentView.oddsAtPlacement,
       })
-      .from(paperBetsTable)
-      .where(inArray(paperBetsTable.status, ["won", "lost"]));
+      .from(paperBetsCurrentView)
+      .where(inArray(paperBetsCurrentView.status, ["won", "lost"]));
 
     // Group by match+category, keep highest-scored
     const keptBetIds = new Set<number>();
@@ -1487,25 +1497,25 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
     // All settled bets with CLV data (proxy or Pinnacle closing line)
     const rows = await db
       .select({
-        clvPct: paperBetsTable.clvPct,
-        placedAt: paperBetsTable.placedAt,
-        marketType: paperBetsTable.marketType,
-        status: paperBetsTable.status,
-        pinnacleOdds: paperBetsTable.pinnacleOdds,
-        closingPinnacleOdds: (paperBetsTable as any).closingPinnacleOdds,
-        isContrarian: paperBetsTable.isContrarian,
-        stake: paperBetsTable.stake,
-        settlementPnl: paperBetsTable.settlementPnl,
+        clvPct: paperBetsCurrentView.clvPct,
+        placedAt: paperBetsCurrentView.placedAt,
+        marketType: paperBetsCurrentView.marketType,
+        status: paperBetsCurrentView.status,
+        pinnacleOdds: paperBetsCurrentView.pinnacleOdds,
+        closingPinnacleOdds: (paperBetsCurrentView as any).closingPinnacleOdds,
+        isContrarian: paperBetsCurrentView.isContrarian,
+        stake: paperBetsCurrentView.stake,
+        settlementPnl: paperBetsCurrentView.settlementPnl,
       })
-      .from(paperBetsTable)
+      .from(paperBetsCurrentView)
       .where(
         and(
-          sql`${paperBetsTable.clvPct} IS NOT NULL`,
-          sql`${paperBetsTable.status} IN ('won','lost')`,
-          REAL_MONEY,
+          sql`${paperBetsCurrentView.clvPct} IS NOT NULL`,
+          sql`${paperBetsCurrentView.status} IN ('won','lost')`,
+          REAL_MONEY_CURRENT,
         ),
       )
-      .orderBy(asc(paperBetsTable.placedAt))
+      .orderBy(asc(paperBetsCurrentView.placedAt))
       .limit(500);
 
     if (rows.length === 0) {
@@ -1523,8 +1533,8 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
     // Total settled (won + lost) for coverage % — real-money only
     const totalSettledRows = await db
       .select({ count: sql<number>`count(*)` })
-      .from(paperBetsTable)
-      .where(and(sql`${paperBetsTable.status} IN ('won','lost')`, REAL_MONEY));
+      .from(paperBetsCurrentView)
+      .where(and(sql`${paperBetsCurrentView.status} IN ('won','lost')`, REAL_MONEY_CURRENT));
     const totalSettled = Number(totalSettledRows[0]?.count ?? rows.length);
     const pinnacleClosingCoveragePct = totalSettled > 0 ? Math.round((pinnacleClosingCount / totalSettled) * 100) : 0;
 

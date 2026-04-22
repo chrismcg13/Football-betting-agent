@@ -1,4 +1,4 @@
-import { db, paperBetsTable, learningNarrativesTable } from "@workspace/db";
+import { db, paperBetsCurrentView, learningNarrativesTable } from "@workspace/db";
 import { sql, and, inArray, isNotNull, gte } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { getMarketFamily } from "./edgeConcentration";
@@ -33,7 +33,7 @@ export async function analyzeEdgeDecay(): Promise<EdgeDecaySummary> {
       closing_pinnacle_odds::float AS pinnacle_at_close,
       placed_at,
       settled_at
-    FROM paper_bets
+    FROM paper_bets_current
     WHERE status IN ('won', 'lost')
     AND calculated_edge IS NOT NULL
     AND clv_pct IS NOT NULL

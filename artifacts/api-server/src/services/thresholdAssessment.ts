@@ -1,4 +1,4 @@
-import { db, paperBetsTable, matchesTable } from "@workspace/db";
+import { db, paperBetsCurrentView, matchesTable } from "@workspace/db";
 import { eq, and, gte, lte, desc, isNull, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
@@ -86,18 +86,18 @@ export async function runThresholdAssessment(low: number, high: number): Promise
 
   const rows = await db
     .select({
-      betId: paperBetsTable.id,
-      matchId: paperBetsTable.matchId,
-      marketType: paperBetsTable.marketType,
-      selectionName: paperBetsTable.selectionName,
-      oddsAtPlacement: paperBetsTable.oddsAtPlacement,
-      stake: paperBetsTable.stake,
-      opportunityScore: paperBetsTable.opportunityScore,
-      modelProbability: paperBetsTable.modelProbability,
-      dataTier: paperBetsTable.dataTier,
-      pinnacleOdds: paperBetsTable.pinnacleOdds,
-      pinnacleImplied: paperBetsTable.pinnacleImplied,
-      clvPct: paperBetsTable.clvPct,
+      betId: paperBetsCurrentView.id,
+      matchId: paperBetsCurrentView.matchId,
+      marketType: paperBetsCurrentView.marketType,
+      selectionName: paperBetsCurrentView.selectionName,
+      oddsAtPlacement: paperBetsCurrentView.oddsAtPlacement,
+      stake: paperBetsCurrentView.stake,
+      opportunityScore: paperBetsCurrentView.opportunityScore,
+      modelProbability: paperBetsCurrentView.modelProbability,
+      dataTier: paperBetsCurrentView.dataTier,
+      pinnacleOdds: paperBetsCurrentView.pinnacleOdds,
+      pinnacleImplied: paperBetsCurrentView.pinnacleImplied,
+      clvPct: paperBetsCurrentView.clvPct,
       homeTeam: matchesTable.homeTeam,
       awayTeam: matchesTable.awayTeam,
       league: matchesTable.league,
@@ -105,17 +105,17 @@ export async function runThresholdAssessment(low: number, high: number): Promise
       kickoffTime: matchesTable.kickoffTime,
       betfairEventId: matchesTable.betfairEventId,
     })
-    .from(paperBetsTable)
-    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .from(paperBetsCurrentView)
+    .innerJoin(matchesTable, eq(paperBetsCurrentView.matchId, matchesTable.id))
     .where(
       and(
-        eq(paperBetsTable.status, "pending"),
-        isNull(paperBetsTable.deletedAt),
+        eq(paperBetsCurrentView.status, "pending"),
+        isNull(paperBetsCurrentView.deletedAt),
         gte(matchesTable.kickoffTime, minKickoff),
         lte(matchesTable.kickoffTime, maxKickoff),
       ),
     )
-    .orderBy(desc(paperBetsTable.opportunityScore));
+    .orderBy(desc(paperBetsCurrentView.opportunityScore));
 
   const enriched: {
     row: typeof rows[0];
