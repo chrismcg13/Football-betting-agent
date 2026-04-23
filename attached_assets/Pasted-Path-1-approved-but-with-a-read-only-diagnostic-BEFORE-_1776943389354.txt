@@ -1,0 +1,51 @@
+Path 1 approved, but with a read-only diagnostic BEFORE A3.
+
+PRE-A3 DIAGNOSTIC (read-only, no writes):
+
+1. Paste the API server log from 11:11 startup to now. I want to see
+   every cron that fired, every bankroll_updated compliance entry,
+   every paper_bets mutation, every error. If the log is large, summarise
+   but paste verbatim any line mentioning: bankroll, paper_bets UPDATE,
+   settlement, compliance_log write, agent_status, risk_event.
+
+2. Current DB state vs the pre-migration snapshot captured at Step 0:
+   SELECT key, value, updated_at FROM agent_config
+   WHERE key IN ('bankroll','high_water_mark','hwm_updated_at','agent_status',
+                 'live_breaker_paused_until','pause_reason','paused_at',
+                 'starting_deposit','daily_bets_used_offset',
+                 'daily_bets_used_offset_date')
+   ORDER BY key;
+   
+   Compare to the snapshot in 04_tool-action-log.txt. Flag any drift.
+
+3. Any paper_bets rows written or updated since 09:17 UTC:
+   SELECT id, status, placed_at, settled_at, settlement_pnl, betfair_bet_id
+   FROM paper_bets
+   WHERE (placed_at > '2026-04-23 09:17:00+00'
+          OR settled_at > '2026-04-23 09:17:00+00')
+     AND deleted_at IS NULL
+   ORDER BY COALESCE(settled_at, placed_at) DESC;
+
+4. Compliance log entries since 09:17 with action_type in
+   ('bankroll_updated','risk_event','void_banned_market_bets',
+    'settlement','agent_paused','agent_resumed'):
+   SELECT timestamp, action_type, details
+   FROM compliance_logs
+   WHERE timestamp > '2026-04-23 09:17:00+00'
+     AND action_type IN ('bankroll_updated','risk_event',
+                         'void_banned_market_bets','settlement',
+                         'agent_paused','agent_resumed')
+   ORDER BY timestamp;
+
+Post all four. Hold for my review.
+
+IF the diagnostic shows:
+- No bankroll drift, no new bets, no settlements, no risk events:
+  proceed directly to A3+A4 as planned.
+- Any drift or writes: STOP and report. We need to decide whether
+  to update the pre-migration snapshot (so Step 6 rollback still
+  works) before continuing.
+
+If a cron fires during the diagnostic, let it — don't interrupt.
+Just include any resulting log lines in your next message so we can
+see what happened.
