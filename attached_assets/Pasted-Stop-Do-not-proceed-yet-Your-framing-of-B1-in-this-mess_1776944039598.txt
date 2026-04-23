@@ -1,0 +1,50 @@
+Stop. Do not proceed yet.
+
+Your framing of B1 in this message is wrong. B1 is NOT about tagging
+new inserts with legacy_regime=false. B1 is about the bankroll writer
+bug:
+
+- Three new helpers in paperTrading.ts: getConfigBankroll(),
+  applyBatchPnl(delta, reason, extraDetails), setBankrollAbsolute(value, reason)
+- Four writer sites currently call getBankroll() + setConfigValue('bankroll', ...)
+  and compute newBankroll from Betfair available. Those sites get swapped
+  to applyBatchPnl(delta, reason, extraDetails).
+- Sites: paperTrading.ts:1957 (settle), paperTrading.ts:2157 (backfill),
+  paperTrading.ts:2360 (voidBetsOnBannedMarkets), api.ts:2218 (mismatch
+  repair).
+
+B1b is the SELECT-source filter to legacy_regime=false on the writer
+SOURCE queries, so legacy bets never enter a batch that writes to new-era
+bankroll. Sites: paperTrading.ts:1685 (pending bet selector),
+paperTrading.ts:2010 (voided bet selector in backfillCornersCardsStats),
+paperTrading.ts:2326 (banned market selector), api.ts:2115 (mismatch repair
+raw SQL, add AND legacy_regime = false).
+
+B2 is alertDetection.ts — add paperBetsCurrentView import, swap queries at
+L215-222 (void rate) and L256-269 (slippage) from paperBetsTable to
+paperBetsCurrentView including the inner ORDER BY paper_bets references
+inside the sql`` template.
+
+B2b is riskManager.ts — add paperBetsCurrentView import, swap 5 queries at
+L107-117 (getTodaysSettledLoss), L119-132 (getWeeklySettledLoss),
+L134-144 (getTodaysNetPnl), L146-159 (getWeeklyNetPnl), L305-314
+(checkConsecutiveLosses last 5).
+
+Plus: the lazy import at api.ts:2112 changes from
+  const { getBankroll, setConfigValue } = await import("../services/paperTrading");
+to
+  const { applyBatchPnl } = await import("../services/paperTrading");
+
+Before writing any files:
+
+1. Re-read the four target files at the specified line ranges. Post the
+   current content of each affected block so we both have ground truth.
+
+2. Re-derive the full unified diff for B1 + B1b + B1-writer-4 + B1b-writer-4
+   + B2 + B2b based on the spec above, and post it verbatim in one block
+   for my line-by-line review.
+
+3. Do NOT write anything to disk yet. Hold for my approval of the derived
+   diff before any file edit.
+
+State is frozen — no clock pressure. Take the time to get this right.
