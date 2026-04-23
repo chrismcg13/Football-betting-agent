@@ -1,0 +1,46 @@
+A2 approved. Proceed directly to A3 AND A4 in a single pass — do not
+stop between them unless something goes wrong. Clock is ~7 min.
+
+A3 — Propose payload. Suggested:
+
+  run = "bash -c 'while true; do echo \"[$(date -u +%FT%TZ)] MAINTENANCE_WINDOW_OPEN pid=$$\"; sleep 30; done'"
+
+If TOML escape rules make this awkward, use any functionally
+equivalent variant — the only hard requirements are:
+- Long-running (no exit)
+- Timestamped heartbeat at least every 60s so we can see it's alive
+- Short sleep intervals so Step 5 SIGTERM returns quickly
+- No network calls, no file writes outside /tmp, no DB touches
+
+Post the final TOML payload string you'll write. Then proceed
+IMMEDIATELY to A4 without waiting for my approval — the clock
+matters more than the aesthetic of the payload.
+
+A4 — Execute + verify:
+1. Write temp file /home/runner/workspace/artifacts/api-server/.replit-artifact/artifact.edit.toml
+   with full TOML (all blocks preserved, only [services.development]
+   run line changed).
+2. Call verifyAndReplaceArtifactToml. Post the response.
+3. Call restart_workflow. Post the response.
+4. Wait 30 seconds. Call getWorkflowStatus. Confirm:
+   - state = running
+   - maintenance marker appearing with current timestamp
+   - ps check: no pnpm/node/api-server process
+   - port 8080: no listener
+5. Wait 90 more seconds. Re-check all four. Confirm marker timestamp
+   has advanced (proving loop is alive) and no API server process has
+   spawned.
+6. Post the full before/after snapshot + both verification passes.
+
+STOP CONDITIONS (do not continue, report immediately):
+- verifyAndReplaceArtifactToml validation fails
+- restart_workflow errors
+- After restart, state != running OR an api-server process appears
+- Auto-restart fires during A3/A4 with the old command
+
+If auto-restart fires with the old command before A4 completes:
+DO NOT reflexively kill. Report and wait for instruction. We need
+to think about whether to proceed (now with contaminated state) or
+restart the sequence from A1.
+
+Go.
