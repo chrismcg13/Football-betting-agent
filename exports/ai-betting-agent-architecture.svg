@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1700" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6b7280"/>
+    </marker>
+    <style>
+      .title  { font-size: 32px; font-weight: 700; fill: #111827; }
+      .sub    { font-size: 16px; font-weight: 400; fill: #6b7280; }
+      .num    { font-size: 22px; font-weight: 700; fill: #374151; }
+      .head   { font-size: 20px; font-weight: 600; fill: #111827; }
+      .desc   { font-size: 15px; fill: #374151; }
+      .foot   { font-size: 12px; fill: #9ca3af; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="1700" fill="#ffffff"/>
+
+  <text x="600" y="55" text-anchor="middle" class="title">How the AI Betting Agent Works</text>
+  <text x="600" y="82" text-anchor="middle" class="sub">Live Betfair Trading — End to End</text>
+
+  <!-- Step template: number circle (left) + rounded box (right). y starts at 130, gap 165. -->
+  <circle cx="80" cy="185" r="32" fill="#1d4ed8"/>
+  <text x="80" y="193" text-anchor="middle" font-size="26" font-weight="700" fill="white">1</text>
+  <rect x="150" y="130" width="1000" height="110" rx="14" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.5"/>
+  <text x="180" y="168" class="head">Find the games</text>
+  <text x="180" y="202" class="desc">Pull every upcoming football match worldwide — ~90 leagues, ~1,200 fixtures.</text>
+  <line x1="80" y1="225" x2="80" y2="280" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="350" r="32" fill="#1d4ed8"/>
+  <text x="80" y="358" text-anchor="middle" font-size="26" font-weight="700" fill="white">2</text>
+  <rect x="150" y="295" width="1000" height="110" rx="14" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.5"/>
+  <text x="180" y="333" class="head">Collect the prices</text>
+  <text x="180" y="367" class="desc">Stream live prices from Pinnacle (the sharpest book) and Betfair Exchange.</text>
+  <line x1="80" y1="390" x2="80" y2="445" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="515" r="32" fill="#6d28d9"/>
+  <text x="80" y="523" text-anchor="middle" font-size="26" font-weight="700" fill="white">3</text>
+  <rect x="150" y="460" width="1000" height="110" rx="14" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.5"/>
+  <text x="180" y="498" class="head">Understand each match</text>
+  <text x="180" y="532" class="desc">Build a profile per match: form, scoring patterns, head-to-head, context.</text>
+  <line x1="80" y1="555" x2="80" y2="610" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="680" r="32" fill="#6d28d9"/>
+  <text x="80" y="688" text-anchor="middle" font-size="26" font-weight="700" fill="white">4</text>
+  <rect x="150" y="625" width="1000" height="110" rx="14" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.5"/>
+  <text x="180" y="663" class="head">Predict the outcome</text>
+  <text x="180" y="697" class="desc">A trained model produces probabilities for match result, goals, and BTTS.</text>
+  <line x1="80" y1="720" x2="80" y2="775" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="845" r="32" fill="#7e22ce"/>
+  <text x="80" y="853" text-anchor="middle" font-size="26" font-weight="700" fill="white">5</text>
+  <rect x="150" y="790" width="1000" height="110" rx="14" fill="#f3e8ff" stroke="#7e22ce" stroke-width="1.5"/>
+  <text x="180" y="828" class="head">Find the value</text>
+  <text x="180" y="862" class="desc">Where our probability beats Pinnacle’s price, an edge exists.</text>
+  <line x1="80" y1="885" x2="80" y2="940" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="1010" r="32" fill="#7e22ce"/>
+  <text x="80" y="1018" text-anchor="middle" font-size="26" font-weight="700" fill="white">6</text>
+  <rect x="150" y="955" width="1000" height="110" rx="14" fill="#f3e8ff" stroke="#7e22ce" stroke-width="1.5"/>
+  <text x="180" y="993" class="head">Filter for quality & safety</text>
+  <text x="180" y="1027" class="desc">Drop correlated, illiquid, low-edge, or otherwise risky bets.</text>
+  <line x1="80" y1="1050" x2="80" y2="1105" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="1175" r="32" fill="#b45309"/>
+  <text x="80" y="1183" text-anchor="middle" font-size="26" font-weight="700" fill="white">7</text>
+  <rect x="150" y="1120" width="1000" height="110" rx="14" fill="#fef3c7" stroke="#b45309" stroke-width="1.5"/>
+  <text x="180" y="1158" class="head">Schedule the bets</text>
+  <text x="180" y="1192" class="desc">Pick the best surviving opportunities for this cycle, within daily caps.</text>
+  <line x1="80" y1="1215" x2="80" y2="1270" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="1340" r="32" fill="#b91c1c"/>
+  <text x="80" y="1348" text-anchor="middle" font-size="26" font-weight="700" fill="white">8</text>
+  <rect x="150" y="1285" width="1000" height="110" rx="14" fill="#fee2e2" stroke="#b91c1c" stroke-width="1.5"/>
+  <text x="180" y="1323" class="head">Place on Betfair</text>
+  <text x="180" y="1357" class="desc">Refresh balance, size the stake, place the bet on the live exchange.</text>
+  <line x1="80" y1="1380" x2="80" y2="1435" stroke="#6b7280" stroke-width="2.5" marker-end="url(#arr)"/>
+  <circle cx="80" cy="1505" r="32" fill="#15803d"/>
+  <text x="80" y="1513" text-anchor="middle" font-size="26" font-weight="700" fill="white">9</text>
+  <rect x="150" y="1450" width="1000" height="110" rx="14" fill="#dcfce7" stroke="#15803d" stroke-width="1.5"/>
+  <text x="180" y="1488" class="head">Settlement</text>
+  <text x="180" y="1522" class="desc">When the match ends, fetch the result and resolve every open bet.</text>
+  <text x="600" y="1670" text-anchor="middle" class="foot">Cycle repeats every few minutes · Settlement runs every 5 minutes</text>
+</svg>

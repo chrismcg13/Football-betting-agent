@@ -6,3 +6,9 @@ id = "TDlkpwK7ObiI4NDHvVLUE"
 uri = "file://.local/pre-launch-audit.md"
 type = "text"
 title = "Pre-Launch Audit Report"
+
+[[outputs]]
+id = "TD6Pe8MByLiWUTfQKihCF"
+uri = "file://exports/ai-betting-agent-architecture.svg"
+type = "image"
+title = "AI Betting Agent — How It Works"
