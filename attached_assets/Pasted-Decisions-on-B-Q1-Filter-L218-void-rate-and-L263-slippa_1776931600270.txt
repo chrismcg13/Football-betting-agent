@@ -1,0 +1,40 @@
+Decisions on B:
+
+Q1: Filter L218 (void rate) and L263 (slippage) in addition to the five
+    risk-loop queries. Operational queries (watchdog/volume/distribution)
+    remain raw. Update the B2 diff to include these two.
+
+Q2: Add high_water_mark = 100.00 to B3. Before finalising B3, grep for
+    any other ratcheting or peak-tracking config values that would cause
+    fictional drawdown on a bankroll reset. Candidates: peak_bankroll,
+    max_total_wealth, session_high, drawdown_from_peak, any config key
+    with "high", "peak", "max", or "ceiling" semantics. Report findings
+    before I approve B3.
+
+Q3: BEFORE executing B3, audit the actual breaker-trip logic. Specifically:
+    - grep every write to agent_status in the codebase
+    - grep every read of high_water_mark and every drawdown calculation
+    - list every distinct pause_reason string literal
+    - identify the function that flipped agent_status to paused_weekly on
+      2026-04-19 — that's the real risk engine, and its read dependencies
+      must all either (a) use paper_bets_current or (b) be documented as
+      intentionally raw with reasoning
+    This audit is blocking. B3 does not execute until I see the output.
+
+Additional diagnostic (not blocking B but needs answering before unpause):
+
+D4: Bankroll drifted £51.67 -> £90.67 between 22:00 and 06:08 despite A1
+    reporting zero pending live bets. What settled or re-settled in that
+    window and which writer fired? Paste the relevant paper_bets rows
+    (filter settled_at or updated_at in that range) and the compliance
+    log entries. If it's backfill re-settling legacy voids, fine — but
+    I need to see the evidence.
+
+D5: The one "fully matched but cancelled" bet from the cancellation
+    analysis — what is it, when did it happen, why was it cancelled
+    after matching? One-paragraph answer.
+
+Do not execute B3-B5 until Q2 findings, Q3 audit, and D4/D5 are posted
+and I approve. B1, B2 fixes can be implemented as code changes ready to
+deploy, but do not deploy until the migration is approved — they go
+live together.
