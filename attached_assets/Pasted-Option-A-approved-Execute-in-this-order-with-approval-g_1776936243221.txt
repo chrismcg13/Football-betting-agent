@@ -1,0 +1,70 @@
+Option A approved. Execute in this order, with approval gates between
+each sub-step.
+
+SUB-STEP A1 — Log preservation
+Before any workflow config change:
+- Create persistent directory: /home/runner/migration-logs/ (or
+  equivalent path outside /tmp and outside any auto-rotation zone).
+  Confirm the path is persistent across workflow restarts.
+- Copy in:
+  - Your in-memory snapshot of the last 20 lines from the pre-rotation
+    API server log (the one that showed the 08:56:26 odds_snapshots
+    write).
+  - All getWorkflowStatus outputs captured in this session.
+  - A plain-text log of every SQL output and tool action from Step 0
+    onwards.
+- Post the directory listing + file sizes so I can confirm the
+  evidence is saved.
+- Hold for my approval before A2.
+
+SUB-STEP A2 — Skill read
+- Read the artifacts skill. Post the sections relevant to:
+  - Modifying a workflow's run command
+  - Any constraints on command format, length, or escape rules
+  - Whether the change is reversible and how
+- Do not execute any change yet. Post the relevant skill content
+  verbatim.
+- Hold for my approval before A3.
+
+SUB-STEP A3 — Proposed command payload
+Propose the exact no-op command as a specific string. Requirements:
+- Logs a clear maintenance marker on every iteration (for
+  getWorkflowStatus visibility).
+- Sleep loop rather than one long sleep (so Step 5 SIGTERM interrupts
+  quickly).
+- Timestamped output so we can see the loop is alive.
+- Suggested shape:
+  bash -c 'while true; do echo "[$(date -u +%FT%TZ)] MAINTENANCE_WINDOW_OPEN pid=$$"; sleep 30; done'
+- Confirm this exact string (or your revision) will work with the
+  workflow command format from the skill read.
+- Post the proposed payload. Hold for my approval before A4.
+
+SUB-STEP A4 — Execute swap + verify
+Only after I approve A3:
+- Swap the artifact command.
+- Confirm via getWorkflowStatus that:
+  - Workflow state = running
+  - Maintenance marker is appearing in fresh logs
+  - No pnpm/node process is running (ps check)
+  - Port 8080 has no listener
+- Wait 2 minutes.
+- Re-check all four conditions. Confirm the marker timestamp has
+  advanced (proving the loop is alive) and nothing else has changed.
+- Post the before/after getWorkflowStatus + ps + port checks.
+- Hold for my approval before Step 1 (code deploy).
+
+ONE QUESTION TO ANSWER IN A2 OR A3:
+What is the minimum auto-restart backoff for this workflow type? The
+18-minute delay was observed once; is that the floor or could a second
+failure restart faster? If you can't determine from documentation,
+note it as a known unknown and flag that Option A's no-op loop is our
+insurance against it.
+
+At Step 5 (post-migration):
+- Swap command back to: pnpm --filter @workspace/api-server run dev
+- restart_workflow
+- Verify API server boots with new code, agent_status=running,
+  paper_bets_current returns 0 rows, no breaker trips on first
+  settlement cycle.
+
+Proceed with A1. Post output and hold.
