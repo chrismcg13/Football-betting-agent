@@ -1,0 +1,46 @@
+A2 approved — proceed with migration. Reasoning: the old API command
+is no longer in the TOML. River cycling a no-op that does nothing is
+harmless to DB state. That's what matters.
+
+Before Step 1, two final confirmations (fast, read-only):
+
+C1: Re-run Q3 and Q4 from the pre-A3 diagnostic. I want zero drift
+    confirmed one more time since pid 232 lived from 11:11 to
+    ~11:27. A single settlement or bankroll write during that
+    14-minute window changes our rollback baseline. Post results.
+
+C2: Current workflow state + process check. Is anything running
+    right now? River cycling or stable-failed? Post:
+    - getWorkflowStatus
+    - ps -ef | grep -E 'pnpm|node|bash|api-server' | grep -v grep
+    - netstat or ss on port 8080
+
+IF C1 shows zero drift AND C2 shows no API server process:
+  proceed directly to Step 1 (code deploy). All four files:
+  - paperTrading.ts (B1 helpers + B1.2/3/4 writer swaps + B1b.1/2/3
+    SELECT filters)
+  - api.ts (B1 writer #4 + B1b writer #4 raw SQL filter)
+  - alertDetection.ts (B2: view import + L215-222 + L256-269)
+  - riskManager.ts (B2b: view import + 5 query swaps)
+
+  After writing, run TypeScript check (tsc --noEmit or equivalent)
+  BEFORE reporting done. Post:
+  - Full diff of what was actually written (not a summary)
+  - tsc output
+  - Confirmation that no workflow restart was triggered
+  - Note: we do NOT restart anything between Step 1 and Step 2 —
+    code sits dormant in the file tree, river keeps cycling the
+    no-op, migration SQL runs directly against DB.
+
+IF C1 shows drift OR C2 shows an API server process:
+  STOP. Report. Do not proceed.
+
+FALLBACK OPTION IN POCKET (do not execute unless I say):
+If river cycling interferes with anything during Steps 1-4, A1 is
+available: swap TOML to a dummy port listener. Design it now (don't
+write it) so it's ready if needed:
+  node -e 'require("http").createServer((q,s)=>s.end("MAINTENANCE")).listen(8080,()=>setInterval(()=>console.log("[" + new Date().toISOString() + "] MAINTENANCE pid=" + process.pid), 30000))'
+Post the exact TOML line you'd use if A1 becomes needed. Keep it
+handy, don't execute.
+
+Go.
