@@ -1,0 +1,48 @@
+HOLD Step 2. Migration design change per user direction.
+
+The bankroll value should NOT be hardcoded to 100. It should equal
+the current live Betfair balance at the moment of reset.
+
+Before we execute, answer these questions:
+
+Q1: What reading should "bankroll" use?
+    (a) availableToBetBalance only
+    (b) totalWealth = available + |exposure|
+    (c) other
+    
+    User previously confirmed zero pending live bets, so these should
+    currently be equal. Recommend (b) for consistency with HWM and
+    drawdown math, which already use totalWealth. Confirm or push back.
+
+Q2: Can you fetch the current Betfair balance right now WITHOUT
+    bringing the API server back up?
+    
+    Options:
+    (a) Run a one-shot node script using LIVE_BETFAIR_KEY against
+        the VPS proxy at 209.38.164.154:3001. If this is feasible,
+        post the exact script you'd run for my review before executing.
+    (b) Tell me it's not feasible from the current no-op state.
+    
+    Do NOT swap the TOML back to the real API command to do this.
+    That reintroduces the exact risk we spent this whole session
+    neutralising.
+
+Q3: Once we have the real number, the migration changes in three
+    places:
+    - ('bankroll', <real>, NOW())
+    - ('high_water_mark', <real>, NOW())
+    - ('starting_deposit', <real>, NOW())
+    - ('go_live_starting_bankroll', <real>, NOW())
+    
+    Plus the reset rationale note in the audit entry. Confirm this
+    is a straight substitution in the existing SQL block, nothing
+    else changes.
+
+Q4: Edge case — if live balance reads as 0 or errors, we do NOT
+    proceed. A failed balance read means we don't know ground truth,
+    and writing a fallback value (100, last-known, zero) is worse
+    than waiting. Confirm you'll STOP rather than fallback.
+
+Answer Q1-Q4. If Q2 is (a), post the script and hold for approval.
+If Q2 is (b), I'll get the balance manually and paste the number.
+Do NOT execute any SQL until I confirm the number.
