@@ -307,6 +307,69 @@ export async function getBankroll(): Promise<number> {
   return Number(v ?? "500");
 }
 
+// ─── Bankroll writer helpers (B1) ────────────────────────────────────────────
+// Writers MUST read the persisted bankroll from agent_config (NOT the live
+// Betfair balance via getBankroll()) before applying a delta and writing back.
+// Reading the live Betfair value and writing it to agent_config is the bug
+// these helpers exist to prevent — it overwrites the persisted ledger with a
+// transient exchange-balance snapshot.
+
+/** Read raw persisted bankroll from agent_config. Never falls through to live Betfair. */
+export async function getConfigBankroll(): Promise<number> {
+  const v = await getConfigValue("bankroll");
+  return Number(v ?? "500");
+}
+
+/**
+ * Atomic bankroll mutation: read persisted value, add delta, write back, log.
+ * Returns { before, after, delta } so callers can embed in their own audit logs.
+ */
+export async function applyBatchPnl(
+  delta: number,
+  reason: string,
+  extraDetails?: Record<string, unknown>,
+): Promise<{ before: number; after: number; delta: number }> {
+  const before = await getConfigBankroll();
+  const after = Math.round((before + delta) * 100) / 100;
+  await setConfigValue("bankroll", String(after));
+  await db.insert(complianceLogsTable).values({
+    actionType: "bankroll_updated",
+    details: {
+      bankrollBefore: before,
+      bankrollAfter: after,
+      delta,
+      reason,
+      ...(extraDetails ?? {}),
+    },
+    timestamp: new Date(),
+  });
+  logger.info(
+    { previous: before, delta, updated: after, reason },
+    "Bankroll updated via applyBatchPnl",
+  );
+  return { before, after, delta };
+}
+
+/**
+ * Set bankroll to an absolute value (used for explicit resets, e.g. £100 baseline).
+ * Logs compliance with previous value for audit.
+ */
+export async function setBankrollAbsolute(
+  value: number,
+  reason: string,
+): Promise<{ before: number; after: number }> {
+  const before = await getConfigBankroll();
+  const after = Math.round(value * 100) / 100;
+  await setConfigValue("bankroll", String(after));
+  await db.insert(complianceLogsTable).values({
+    actionType: "bankroll_updated",
+    details: { bankrollBefore: before, bankrollAfter: after, delta: after - before, reason, source: "setBankrollAbsolute" },
+    timestamp: new Date(),
+  });
+  logger.warn({ previous: before, updated: after, reason }, "Bankroll set to absolute value");
+  return { before, after };
+}
+
 // ===================== Bet placement pre-checks =====================
 
 // Read a stake-multiplier from config; clamp to (0, 1] to prevent
@@ -1684,7 +1747,11 @@ async function _settleBetsInner(): Promise<SettlementResult> {
   const pendingBets = await db
     .select()
     .from(paperBetsTable)
-    .where(and(eq(paperBetsTable.status, "pending"), sql`deleted_at IS NULL`));
+    .where(and(
+      eq(paperBetsTable.status, "pending"),
+      sql`deleted_at IS NULL`,
+      eq(paperBetsTable.legacyRegime, false),
+    ));
 
   if (pendingBets.length === 0) {
     return {
@@ -1955,29 +2022,11 @@ async function _settleBetsInner(): Promise<SettlementResult> {
   }
 
   if (settled > 0) {
-    const currentBankroll = await getBankroll();
-    const newBankroll =
-      Math.round((currentBankroll + totalPnl) * 100) / 100;
-    await setConfigValue("bankroll", String(newBankroll));
-
-    await db.insert(complianceLogsTable).values({
-      actionType: "bankroll_updated",
-      details: {
-        bankrollBefore: currentBankroll,
-        bankrollAfter: newBankroll,
-        delta: totalPnl,
-        betsSettled: settled,
-        won,
-        lost,
-        reason: "settlement",
-      },
-      timestamp: new Date(),
+    await applyBatchPnl(totalPnl, "settlement", {
+      betsSettled: settled,
+      won,
+      lost,
     });
-
-    logger.info(
-      { previous: currentBankroll, delta: totalPnl, updated: newBankroll },
-      "Bankroll updated after settlement",
-    );
 
     const totalSettledResult = await db
       .select({ count: sql<number>`count(*)::int` })
@@ -2010,7 +2059,10 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
   const allVoidedBets = await db
     .select()
     .from(paperBetsTable)
-    .where(eq(paperBetsTable.status, "void"));
+    .where(and(
+      eq(paperBetsTable.status, "void"),
+      eq(paperBetsTable.legacyRegime, false),
+    ));
 
   if (allVoidedBets.length === 0) {
     return { matchesUpdated: 0, betsResettled: 0 };
@@ -2155,14 +2207,9 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
   }
 
   if (betsResettled > 0) {
-    const bankrollStr = await getConfigValue("bankroll");
-    const bankroll = parseFloat(bankrollStr ?? "500");
-    const newBankroll = Math.round((bankroll + pnlDelta) * 100) / 100;
-    await setConfigValue("bankroll", String(newBankroll));
-    logger.info(
-      { betsResettled, pnlDelta, bankroll, newBankroll },
-      "backfill: bankroll updated after re-settlement",
-    );
+    await applyBatchPnl(pnlDelta, "backfill_corners_cards_resettle", {
+      betsResettled,
+    });
   }
 
   return { matchesUpdated, betsResettled };
@@ -2333,6 +2380,7 @@ export async function voidBetsOnBannedMarkets(): Promise<{
         eq(paperBetsTable.status, "pending"),
         sql`deleted_at IS NULL`,
         inArray(paperBetsTable.marketType, bannedList),
+        eq(paperBetsTable.legacyRegime, false),
       ),
     );
 
@@ -2355,10 +2403,13 @@ export async function voidBetsOnBannedMarkets(): Promise<{
       .where(eq(paperBetsTable.id, bet.id));
   }
 
-  // Refund total stake to bankroll
-  const currentBankroll = await getBankroll();
-  const newBankroll = currentBankroll + totalStakeRefunded;
-  await setConfigValue("bankroll", String(newBankroll.toFixed(2)));
+  // Refund total stake to bankroll (writes via applyBatchPnl, then a separate
+  // void_banned_market_bets audit entry that references the before/after values).
+  const { before: bankrollBefore, after: bankrollAfter } = await applyBatchPnl(
+    totalStakeRefunded,
+    "void_banned_market_bets_refund",
+    { voided: pendingBanned.length, byMarket, bannedMarkets: BANNED_MARKETS },
+  );
 
   await db.insert(complianceLogsTable).values({
     actionType: "void_banned_market_bets",
@@ -2367,8 +2418,8 @@ export async function voidBetsOnBannedMarkets(): Promise<{
       totalStakeRefunded: totalStakeRefunded.toFixed(2),
       byMarket,
       bannedMarkets: BANNED_MARKETS,
-      bankrollBefore: currentBankroll,
-      bankrollAfter: newBankroll,
+      bankrollBefore,
+      bankrollAfter,
     },
     timestamp: new Date(),
   });

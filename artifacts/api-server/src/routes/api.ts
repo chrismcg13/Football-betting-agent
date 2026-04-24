@@ -2109,14 +2109,14 @@ router.post("/admin/remediate-settlement-errors", async (_req, res) => {
     const { listClearedOrders } = await import("../services/betfairLive");
     const { paperBetsTable, complianceLogsTable, db } = await import("@workspace/db");
     const { sql, eq } = await import("drizzle-orm");
-    const { getBankroll, setConfigValue } = await import("../services/paperTrading");
+    const { applyBatchPnl } = await import("../services/paperTrading");
 
     // ─── (A) Mismatch repair ─────────────────────────────────────
     const mismatchRows = (
       await db.execute(sql`
         SELECT id, betfair_bet_id, stake::text AS stake, settlement_pnl::text AS settlement_pnl, status
         FROM paper_bets
-        WHERE status='void' AND betfair_status='won' AND betfair_bet_id IS NOT NULL
+        WHERE status='void' AND betfair_status='won' AND betfair_bet_id IS NOT NULL AND legacy_regime = false
       `)
     ).rows as Array<{
       id: number;
@@ -2213,20 +2213,11 @@ router.post("/admin/remediate-settlement-errors", async (_req, res) => {
     let bankrollBefore: number | null = null;
     let bankrollAfter: number | null = null;
     if (Math.abs(cumulativePnlDelta) > 0.01) {
-      bankrollBefore = await getBankroll();
-      bankrollAfter = Math.round((bankrollBefore + cumulativePnlDelta) * 100) / 100;
-      await setConfigValue("bankroll", String(bankrollAfter));
-      await db.insert(complianceLogsTable).values({
-        actionType: "bankroll_updated",
-        details: {
-          bankrollBefore,
-          bankrollAfter,
-          delta: cumulativePnlDelta,
-          source: "settlement_mismatch_remediation",
-          rowsRepaired: mismatchResults.filter((r) => r.status === "repaired").length,
-        },
-        timestamp: new Date(),
+      const result = await applyBatchPnl(cumulativePnlDelta, "settlement_mismatch_remediation", {
+        rowsRepaired: mismatchResults.filter((r) => r.status === "repaired").length,
       });
+      bankrollBefore = result.before;
+      bankrollAfter = result.after;
     }
 
     // ─── (B) NaN backfill ─────────────────────────────────────────

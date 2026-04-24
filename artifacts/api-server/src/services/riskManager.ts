@@ -1,6 +1,6 @@
 import {
   db,
-  paperBetsTable,
+  paperBetsCurrentView,
   complianceLogsTable,
   learningNarrativesTable,
   agentConfigTable,
@@ -109,10 +109,10 @@ async function getTodaysSettledLoss(): Promise<number> {
   todayStart.setUTCHours(0, 0, 0, 0);
   const result = await db
     .select({
-      total: sql<number>`COALESCE(ABS(SUM(${paperBetsTable.settlementPnl}::numeric) FILTER (WHERE ${paperBetsTable.settlementPnl}::numeric < 0)), 0)`,
+      total: sql<number>`COALESCE(ABS(SUM(${paperBetsCurrentView.settlementPnl}::numeric) FILTER (WHERE ${paperBetsCurrentView.settlementPnl}::numeric < 0)), 0)`,
     })
-    .from(paperBetsTable)
-    .where(gte(paperBetsTable.settledAt, todayStart));
+    .from(paperBetsCurrentView)
+    .where(gte(paperBetsCurrentView.settledAt, todayStart));
   return result[0]?.total ?? 0;
 }
 
@@ -124,10 +124,10 @@ async function getWeeklySettledLoss(): Promise<number> {
   weekStart.setUTCHours(0, 0, 0, 0);
   const result = await db
     .select({
-      total: sql<number>`COALESCE(ABS(SUM(${paperBetsTable.settlementPnl}::numeric) FILTER (WHERE ${paperBetsTable.settlementPnl}::numeric < 0)), 0)`,
+      total: sql<number>`COALESCE(ABS(SUM(${paperBetsCurrentView.settlementPnl}::numeric) FILTER (WHERE ${paperBetsCurrentView.settlementPnl}::numeric < 0)), 0)`,
     })
-    .from(paperBetsTable)
-    .where(gte(paperBetsTable.settledAt, weekStart));
+    .from(paperBetsCurrentView)
+    .where(gte(paperBetsCurrentView.settledAt, weekStart));
   return result[0]?.total ?? 0;
 }
 
@@ -136,10 +136,10 @@ async function getTodaysNetPnl(): Promise<number> {
   todayStart.setUTCHours(0, 0, 0, 0);
   const result = await db
     .select({
-      total: sql<number>`COALESCE(SUM(${paperBetsTable.settlementPnl}::numeric), 0)`,
+      total: sql<number>`COALESCE(SUM(${paperBetsCurrentView.settlementPnl}::numeric), 0)`,
     })
-    .from(paperBetsTable)
-    .where(gte(paperBetsTable.settledAt, todayStart));
+    .from(paperBetsCurrentView)
+    .where(gte(paperBetsCurrentView.settledAt, todayStart));
   return Number(result[0]?.total ?? 0);
 }
 
@@ -151,10 +151,10 @@ async function getWeeklyNetPnl(): Promise<number> {
   weekStart.setUTCHours(0, 0, 0, 0);
   const result = await db
     .select({
-      total: sql<number>`COALESCE(SUM(${paperBetsTable.settlementPnl}::numeric), 0)`,
+      total: sql<number>`COALESCE(SUM(${paperBetsCurrentView.settlementPnl}::numeric), 0)`,
     })
-    .from(paperBetsTable)
-    .where(gte(paperBetsTable.settledAt, weekStart));
+    .from(paperBetsCurrentView)
+    .where(gte(paperBetsCurrentView.settledAt, weekStart));
   return Number(result[0]?.total ?? 0);
 }
 
@@ -305,12 +305,12 @@ export async function checkBankrollFloor(): Promise<boolean> {
 export async function checkConsecutiveLosses(): Promise<boolean> {
   const lastFive = await db
     .select({
-      settlementPnl: paperBetsTable.settlementPnl,
-      status: paperBetsTable.status,
+      settlementPnl: paperBetsCurrentView.settlementPnl,
+      status: paperBetsCurrentView.status,
     })
-    .from(paperBetsTable)
-    .where(inArray(paperBetsTable.status, ["won", "lost"]))
-    .orderBy(desc(paperBetsTable.settledAt))
+    .from(paperBetsCurrentView)
+    .where(inArray(paperBetsCurrentView.status, ["won", "lost"]))
+    .orderBy(desc(paperBetsCurrentView.settledAt))
     .limit(5);
 
   if (lastFive.length < 5) return false;

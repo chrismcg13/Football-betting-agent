@@ -1,4 +1,4 @@
-import { db, paperBetsTable, matchesTable, alertsTable } from "@workspace/db";
+import { db, paperBetsTable, paperBetsCurrentView, matchesTable, alertsTable } from "@workspace/db";
 import { eq, and, gte, desc, sql, lte, count } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { createAlert, type AlertSeverity, type AlertCategory } from "./alerting";
@@ -102,10 +102,10 @@ async function checkRiskLimits(): Promise<void> {
 
   const [dailyResult] = await db.select({
     loss: sql<string>`COALESCE(SUM(CASE WHEN settlement_pnl < 0 THEN ABS(settlement_pnl) ELSE 0 END), 0)`,
-  }).from(paperBetsTable).where(
+  }).from(paperBetsCurrentView).where(
     and(
-      gte(paperBetsTable.settledAt, dayAgo),
-      sql`${paperBetsTable.status} IN ('won', 'lost')`,
+      gte(paperBetsCurrentView.settledAt, dayAgo),
+      sql`${paperBetsCurrentView.status} IN ('won', 'lost')`,
     ),
   );
 
@@ -122,10 +122,10 @@ async function checkRiskLimits(): Promise<void> {
 
   const [weeklyResult] = await db.select({
     loss: sql<string>`COALESCE(SUM(CASE WHEN settlement_pnl < 0 THEN ABS(settlement_pnl) ELSE 0 END), 0)`,
-  }).from(paperBetsTable).where(
+  }).from(paperBetsCurrentView).where(
     and(
-      gte(paperBetsTable.settledAt, weekAgo),
-      sql`${paperBetsTable.status} IN ('won', 'lost')`,
+      gte(paperBetsCurrentView.settledAt, weekAgo),
+      sql`${paperBetsCurrentView.status} IN ('won', 'lost')`,
     ),
   );
 
@@ -143,10 +143,10 @@ async function checkRiskLimits(): Promise<void> {
 
 async function checkConsecutiveLosses(): Promise<void> {
   const recentBets = await db
-    .select({ status: paperBetsTable.status })
-    .from(paperBetsTable)
-    .where(sql`${paperBetsTable.status} IN ('won', 'lost')`)
-    .orderBy(desc(paperBetsTable.settledAt))
+    .select({ status: paperBetsCurrentView.status })
+    .from(paperBetsCurrentView)
+    .where(sql`${paperBetsCurrentView.status} IN ('won', 'lost')`)
+    .orderBy(desc(paperBetsCurrentView.settledAt))
     .limit(8);
 
   if (recentBets.length < 5) return;
@@ -174,9 +174,9 @@ async function checkPerformanceMetrics(): Promise<void> {
   const [clv7d] = await db.select({
     avg: sql<string>`AVG(clv_pct)`,
     count: count(),
-  }).from(paperBetsTable).where(
+  }).from(paperBetsCurrentView).where(
     and(
-      gte(paperBetsTable.settledAt, sevenDaysAgo),
+      gte(paperBetsCurrentView.settledAt, sevenDaysAgo),
       sql`clv_pct IS NOT NULL`,
     ),
   );
@@ -194,10 +194,10 @@ async function checkPerformanceMetrics(): Promise<void> {
   const [roi14d] = await db.select({
     pnl: sql<string>`COALESCE(SUM(settlement_pnl), 0)`,
     staked: sql<string>`COALESCE(SUM(stake), 0)`,
-  }).from(paperBetsTable).where(
+  }).from(paperBetsCurrentView).where(
     and(
-      gte(paperBetsTable.settledAt, fourteenDaysAgo),
-      sql`${paperBetsTable.status} IN ('won', 'lost')`,
+      gte(paperBetsCurrentView.settledAt, fourteenDaysAgo),
+      sql`${paperBetsCurrentView.status} IN ('won', 'lost')`,
     ),
   );
 
@@ -215,9 +215,9 @@ async function checkPerformanceMetrics(): Promise<void> {
   const [voidStats] = await db.select({
     total: count(),
     voids: sql<string>`COUNT(*) FILTER (WHERE status = 'void')`,
-  }).from(paperBetsTable).where(
-    sql`${paperBetsTable.id} IN (
-      SELECT id FROM paper_bets ORDER BY placed_at DESC LIMIT 50
+  }).from(paperBetsCurrentView).where(
+    sql`${paperBetsCurrentView.id} IN (
+      SELECT id FROM paper_bets_current ORDER BY placed_at DESC LIMIT 50
     )`,
   );
 
@@ -260,10 +260,10 @@ async function checkExecutionQuality(): Promise<void> {
       ELSE NULL END
     ))`,
     count: count(),
-  }).from(paperBetsTable).where(
+  }).from(paperBetsCurrentView).where(
     sql`betfair_avg_price_matched IS NOT NULL
-    AND ${paperBetsTable.id} IN (
-      SELECT id FROM paper_bets WHERE betfair_avg_price_matched IS NOT NULL
+    AND ${paperBetsCurrentView.id} IN (
+      SELECT id FROM paper_bets_current WHERE betfair_avg_price_matched IS NOT NULL
       ORDER BY placed_at DESC LIMIT 50
     )`,
   );
