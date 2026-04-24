@@ -1,0 +1,48 @@
+Diff approved with the following decisions:
+
+D1 (Hunk 1G dual compliance): Keep both entries as written.
+D2 (setBankrollAbsolute signature): (value, reason) approved.
+D3 (drop totalStakeRefunded.toFixed(2) from inner details): approved.
+D4 (complianceLogsTable import at api.ts L2110): leave in place.
+D5 (B1b uses legacyRegime predicate, not view swap): approved —
+    reasoning is correct.
+
+Before writing files, one last verification:
+
+V1: In riskManager.ts, you kept the paperBetsTable import because it's
+    "still used elsewhere in the file." Post the full list of remaining
+    paperBetsTable references in riskManager.ts after your planned
+    changes (grep + line numbers + one-line purpose for each). I need to
+    confirm none of them are risk gates we should have filtered. If any
+    of them read paper_bets for PnL, settlement, or risk logic, flag
+    before writing.
+
+V2: Same check for alertDetection.ts — post remaining paperBetsTable
+    references after B2 changes. You already noted L105/125/146 as
+    "PnL/ROI metrics that may want migrating later" — confirm those are
+    the only ones and confirm they are NOT read by any risk gate
+    (i.e. their output doesn't feed setAgentStatus or similar).
+
+IF V1 and V2 come back clean (no unexpected risk gates left on raw
+paper_bets):
+
+  Proceed to Step 1 execution:
+  
+  a. Write all four files with the approved diff.
+  b. Run TypeScript check: tsc --noEmit for the workspace or the
+     specific package. Post full output.
+  c. If tsc is clean, post:
+     - Actual diff of what was written (from git diff or equivalent,
+       not a summary)
+     - Confirmation no workflow restart was triggered
+     - Current workflow state (should still be failed, no river cycling)
+     - Current process list (should show no api-server)
+  d. Hold for my approval of the deployed state before Step 2
+     (migration SQL).
+  
+  If tsc fails: STOP, post errors, do NOT attempt to fix without my
+  review. Some "fixes" to tsc errors could silently change semantics.
+
+IF V1 or V2 surface a risk gate we missed:
+  STOP and report. We add a B2c hunk before execution rather than
+  discovering it post-unpause.
