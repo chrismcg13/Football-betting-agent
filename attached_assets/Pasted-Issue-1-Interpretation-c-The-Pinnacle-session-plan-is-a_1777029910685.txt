@@ -1,0 +1,56 @@
+Issue 1: Interpretation (c). The Pinnacle session plan is appearing
+in context via some mechanism we don't need to fix right now. It's
+noise from parallel work. You've correctly filtered it three times
+this session — keep doing that. Proceed with the migration.
+
+Issue 2: Option C — targeted verification, but expanded to ALL 22
+errors in the 4 files I touched, not just 4 sites.
+
+For each of the 22 error lines in paperTrading.ts, api.ts,
+alertDetection.ts, riskManager.ts:
+
+1. Read the file at that line number (with ~10 lines of context).
+2. Classify the error into one of:
+   (i)   Clearly pre-existing: error line is outside any edit range
+         AND the surrounding code is textually unchanged AND the
+         error type is about unrelated symbols/shapes (not about the
+         new helpers, view, or legacyRegime column).
+   (ii)  Possibly caused by my edits: error line is close to an edit,
+         OR references any of {applyBatchPnl, getConfigBankroll,
+         setBankrollAbsolute, paperBetsCurrentView, legacyRegime}.
+   (iii) Ambiguous: worth a closer look.
+
+Specific sites to pay extra attention to:
+
+- riskManager.ts:480 (distanceToDailyLimit missing). Hunk 4A replaced
+  paperBetsTable with paperBetsCurrentView in the import. Confirm the
+  error is about an unrelated return type shape, not a downstream
+  effect of the import swap. Post the surrounding function and the
+  exact type it's returning.
+
+- alertDetection.ts:428, 430 (paperBetsTable.league missing). This is
+  in checkConcentrationAnomaly — one of the 8 sites we consciously
+  left on raw paperBetsTable. If Drizzle says paper_bets has no
+  league column, confirm whether this is pre-existing schema drift
+  (likely from Pinnacle work) or caused by our session. Post the
+  relevant Drizzle schema definition for paper_bets around the
+  league column.
+
+Also note for my records:
+- Zero errors reference new symbols (applyBatchPnl, paperBetsCurrentView,
+  etc.). This is strong evidence our edits compile.
+- All edited line ranges fall outside error lines per your initial
+  cross-check.
+
+Post the full classification table (22 rows), plus the two deep-dive
+findings on riskManager.ts:480 and alertDetection.ts:428. Hold for my
+review.
+
+If all 22 classify as (i) pre-existing, I'll approve Option B
+(proceed to Step 2 with baseline tsc breakage acknowledged).
+
+If any classify as (ii) or (iii), STOP and report. We fix before
+Step 2.
+
+On the .git/index.lock — leave it. Harmless for read operations.
+We'll clean it up later.
