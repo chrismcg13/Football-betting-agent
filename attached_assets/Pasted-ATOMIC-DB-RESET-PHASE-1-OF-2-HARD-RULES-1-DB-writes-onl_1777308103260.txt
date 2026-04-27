@@ -1,0 +1,122 @@
+ATOMIC DB RESET — PHASE 1 OF 2
+
+HARD RULES
+1. DB writes only. No file edits. No code patches. No deploy. No scheduler change.
+2. All writes inside ONE transaction. ROLLBACK on any verify mismatch.
+3. After the final report, STOP. Do not proceed to code patches or any "while I'm here" work.
+4. If any pre-flight gate fails, abort cleanly. No auto-recovery.
+
+CONTEXT
+Phase 1 = DB reset only, against Neon prod via this container's DATABASE_URL. Code patches (HWM unification, kill switch, dup/void parity) and redeploy + scheduler enable are PHASE 2, in a separate prompt I will send next. Do not touch code, .replit-artifact, or build artifacts in this task.
+
+User-supplied truth:
+LIVE_BANKROLL = 100.00 (GBP, confirmed by user against Betfair web UI on 2026-04-27)
+
+═══════════════════════════════════════
+STEP 0 — PRE-FLIGHT GATES
+═══════════════════════════════════════
+0a. DATABASE_URL host contains "rough-flower" → must PASS.
+0b. ENVIRONMENT=production AND TRADING_MODE=LIVE → must PASS.
+0c. Port 8080 unbound in this container → must PASS.
+0d. SELECT current_database(), current_user → must return neondb / neondb_owner.
+
+Any FAIL → abort, no writes attempted.
+
+═══════════════════════════════════════
+STEP 1 — BACKUP
+═══════════════════════════════════════
+Outside the main transaction (so it persists if main txn rolls back):
+
+CREATE SCHEMA prod_cutover_backup_2026_04_27;
+CREATE TABLE prod_cutover_backup_2026_04_27.paper_bets AS TABLE public.paper_bets;
+CREATE TABLE prod_cutover_backup_2026_04_27.agent_config AS TABLE public.agent_config;
+CREATE TABLE prod_cutover_backup_2026_04_27.experiment_registry AS TABLE public.experiment_registry;
+CREATE TABLE prod_cutover_backup_2026_04_27.drawdown_events AS TABLE public.drawdown_events;
+CREATE TABLE prod_cutover_backup_2026_04_27.experiment_learning_journal AS TABLE public.experiment_learning_journal;
+CREATE TABLE prod_cutover_backup_2026_04_27.promotion_audit_log AS TABLE public.promotion_audit_log;
+
+Verify each backup row count matches source. Mismatch → abort, do not enter main transaction.
+
+═══════════════════════════════════════
+STEP 2 — DISCOVERY (read-only, before main txn)
+═══════════════════════════════════════
+2a. List columns of experiment_registry. Identify which of these performance columns actually exist:
+    settled_count, won_count, lost_count, void_count, roi, clv, win_rate, p_value, sample_p_value, edge_realised, last_settled_at, last_updated, tier
+    Only existing columns get reset in Step 4. Report the actual column list before continuing.
+
+2b. List any materialised views or cached aggregate tables that derive from paper_bets. Report names. Do NOT truncate yet — list only.
+
+═══════════════════════════════════════
+STEP 3 — MAIN TRANSACTION
+═══════════════════════════════════════
+BEGIN;
+
+3a. Soft-archive history.
+    UPDATE paper_bets SET legacy_regime = true WHERE legacy_regime = false;
+    Report rows affected (expected ~799).
+
+3b. Reset agent_config (UPSERT each key, updated_at=now()):
+    bankroll                = 100.00
+    high_water_mark         = 100.00
+    starting_deposit        = 100.00
+    agent_status            = 'active'
+    pause_reason            = ''
+    last_pause_at           = NULL
+    Leave untouched: paper_mode, data_source, and every other key not listed.
+    Flag in report (do NOT change): data_source='football_data_fallback'.
+
+3c. Reset experiment_registry performance columns.
+    For every column identified as existing in Step 2a from this list:
+      settled_count, won_count, lost_count, void_count → 0
+      roi, clv, win_rate, p_value, sample_p_value, edge_realised → NULL
+      last_settled_at → NULL
+      last_updated → now()
+    Set tier = 'experiment' for ALL rows (including the 8 currently 'abandoned' — they re-enter experiment pool).
+    Do NOT delete rows. Do NOT touch identity columns (league, market, id, created_at, etc.).
+
+3d. TRUNCATE drawdown_events.
+
+3e. For each materialised view / cached aggregate table identified in Step 2b: REFRESH or TRUNCATE as appropriate so it reflects the post-reset state. State explicitly which action was taken per object.
+
+3f. Do NOT truncate promotion_audit_log. Do NOT truncate experiment_learning_journal.
+
+3g. INSERT one row into experiment_learning_journal:
+    analysis_date = now()
+    summary = 'Production DB cutover phase 1 — 2026-04-27. Bankroll reset to live Betfair balance £100.00 (user-confirmed). All 799 prior paper_bets soft-archived via legacy_regime=true. agent_config bankroll/HWM/starting_deposit unified at £100. experiment_registry performance metrics zeroed, all rows back to experiment tier. drawdown_events truncated. agent_status set to active. Code patches (HWM unification, kill switch, dup/void parity verification) and redeploy pending as phase 2.'
+
+3h. POST-COMMIT VERIFY (still inside transaction, before COMMIT):
+    • SELECT COUNT(*) FROM paper_bets_current → must be 0
+    • SELECT COUNT(*) FROM paper_bets WHERE legacy_regime=true → must equal pre-reset paper_bets total
+    • SELECT value FROM agent_config WHERE key='bankroll' → must equal '100' or '100.00'
+    • SELECT value FROM agent_config WHERE key='high_water_mark' → must equal '100' or '100.00'
+    • SELECT value FROM agent_config WHERE key='starting_deposit' → must equal '100' or '100.00'
+    • SELECT value FROM agent_config WHERE key='agent_status' → must equal 'active'
+    • SELECT COUNT(*) FROM experiment_registry WHERE tier='promoted' → must be 0
+    • SELECT COUNT(*) FROM experiment_registry WHERE tier='experiment' → must equal pre-reset (1143 + 8) = 1151
+    • SELECT COUNT(*) FROM drawdown_events → must be 0
+    • SELECT COUNT(*) FROM promotion_audit_log → must equal pre-reset value (preserved)
+    • SELECT COUNT(*) FROM experiment_learning_journal → must equal pre-reset + 1
+
+    Any mismatch → ROLLBACK and abort. Report which check failed.
+
+COMMIT.
+
+═══════════════════════════════════════
+FINAL REPORT (single message, then STOP)
+═══════════════════════════════════════
+Required:
+- Pass/fail per gate (0a–0d)
+- Backup schema name + per-table row counts
+- Existing columns of experiment_registry (from Step 2a)
+- Materialised views / cached aggregates handled (from Step 2b/3e)
+- Rows affected per UPDATE/TRUNCATE/INSERT in Step 3
+- Every verify check from 3h with actual value
+- Final agent_config snapshot (all keys, values, updated_at)
+- Closing line, exact text: "Phase 1 complete. DB reset committed. Awaiting phase 2 prompt for code patches and redeploy. No further actions queued."
+
+If aborted at any point:
+- State exactly which step
+- State whether main transaction was opened (it shouldn't have been, if abort happened in Step 0/1/2)
+- State whether ROLLBACK or COMMIT was executed
+- DO NOT attempt recovery or re-run
+- Wait for my next prompt
