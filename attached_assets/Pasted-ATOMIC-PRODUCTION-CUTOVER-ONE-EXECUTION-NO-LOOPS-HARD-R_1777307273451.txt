@@ -1,0 +1,136 @@
+ATOMIC PRODUCTION CUTOVER — ONE EXECUTION, NO LOOPS
+
+HARD RULES
+1. This is a single atomic execution. After the final report, STOP. No iteration, no "while I'm here" refactors, no self-improvement loops.
+2. Every step is a gate. If a gate fails, abort cleanly, report state, do NOT auto-recover.
+3. All DB writes for the metric reset run inside ONE transaction. Roll back on any error.
+4. Zero bet placement during this task. Scheduler enable is the LAST step.
+5. Where the spec says "verify" — read actual code/data, not memory or assumption.
+6. Show file paths + line numbers for every code reference and patch.
+
+CRITICAL CONTAINER CLARIFICATION
+Earlier read-only analysis confirmed: this dev container's DATABASE_URL points at Neon prod. The deployed prod artifact is a separate runtime. For this task:
+- DB writes go to Neon prod via DATABASE_URL — that is correct.
+- Code/config changes that need to take effect at runtime must land in the DEPLOYED PROD artifact, not in this dev container's files. The dev container's TOML stays as the no-op bash loop. Do not touch it.
+- If at any point you cannot distinguish "editing deployed prod" from "editing this dev container", ABORT and tell me. Do not guess.
+
+═══════════════════════════════════════
+STEP 0 — PRE-FLIGHT GATES (no writes)
+═══════════════════════════════════════
+Verify and report each. Any FAIL → abort, no rollback needed (no writes yet).
+
+0a. DATABASE_URL host contains "rough-flower". 
+0b. ENVIRONMENT=production AND TRADING_MODE=LIVE.
+0c. LIVE_BETFAIR_KEY present in prod env.
+0d. ONE read-only Betfair getAccountFunds call from the prod runtime path. Report:
+    • availableToBetBalance
+    • exposure
+    • totalWealth = availableToBetBalance + |exposure|
+    • response timestamp
+    • exit IP (must be the DigitalOcean UK/EU VPS, not a Replit US IP)
+    Non-200, timeout, or US exit IP → ABORT.
+0e. Confirm port 8080 unbound in this container (no rogue API server). If bound, ABORT.
+
+Define: LIVE_BANKROLL = totalWealth from 0d (use this exact number for all writes below — do NOT hardcode £100).
+
+═══════════════════════════════════════
+STEP 1 — DUPLICATE + VOID PREVENTION PARITY
+═══════════════════════════════════════
+For each of the two below: locate the code, confirm it is active on the prod runtime path (not just present in the repo), patch ONLY if missing or broken. Minimal diff. No refactor. Show file:line.
+
+1a. DUPLICATE PREVENTION
+    Required: an idempotency check at bet submission that rejects a second submission with the same (marketId, selectionId, side, kickoffTimestamp) within a 24h window. DB unique constraint OR pre-submission lookup OR both. Verify; patch if missing.
+
+1b. VOID PREVENTION
+    Required: skip any candidate bet where the market has ANY of:
+      - market suspended in the last 60 minutes
+      - fixture postponement flag in the last 24h
+      - competition flagged as abandonment-prone
+      - Asian handicap or dead-heat ruleset on a market type where we don't model it
+    Verify; patch if missing.
+
+If patches are required they go in the deployed prod artifact, not just this container. Confirm explicitly.
+
+═══════════════════════════════════════
+STEP 2 — METRIC RESET (single transaction)
+═══════════════════════════════════════
+BEGIN;
+
+2a. Backup. Create prod_cutover_backup_2026_04_27 schema and full COPY of: paper_bets, agent_config, experiment_registry, drawdown_events, experiment_learning_journal, promotion_audit_log. Read-only safety net.
+
+2b. Soft-archive history. UPDATE paper_bets SET legacy_regime = true WHERE legacy_regime = false. Do NOT delete rows. The paper_bets_current view (legacy_regime=false) now returns 0 rows — dashboards see a clean slate.
+
+2c. Reset agent_config keys (UPSERT):
+    • bankroll = LIVE_BANKROLL
+    • high_water_mark = LIVE_BANKROLL
+    • starting_deposit = LIVE_BANKROLL
+    • agent_status = 'active'
+    • pause_reason = ''
+    • last_pause_at = NULL
+    Leave untouched: paper_mode, data_source (flag if data_source='football_data_fallback' but do not change), and any keys not listed.
+
+2d. Reset experiment_registry performance fields. Keep identity columns (league, market, tier_history audit). Zero out: settled_count, won_count, lost_count, void_count, roi, clv, win_rate, p_value, sample_p_value, edge_realised, last_settled_at. Set tier='experiment' for all rows. Set last_updated=now().
+
+2e. TRUNCATE drawdown_events. TRUNCATE any materialised view / cached aggregate that backs the dashboard performance pages (list them explicitly in the report). Do NOT truncate promotion_audit_log. Do NOT truncate experiment_learning_journal.
+
+2f. INSERT one row into experiment_learning_journal:
+    analysis_date=now(), summary='Production cutover 2026-04-27. Bankroll reset to live Betfair balance £{LIVE_BANKROLL}. All prior bets soft-archived via legacy_regime=true. Metrics reset. HWM unified.'
+
+2g. Verify post-commit, INSIDE the transaction before COMMIT:
+    • SELECT COUNT(*) FROM paper_bets_current → must be 0
+    • SELECT value FROM agent_config WHERE key='bankroll' → must equal LIVE_BANKROLL
+    • SELECT COUNT(*) FROM experiment_registry WHERE tier='promoted' → must be 0
+    Mismatch → ROLLBACK and abort.
+
+COMMIT.
+
+═══════════════════════════════════════
+STEP 3 — HWM UNIFICATION + KILL SWITCH
+═══════════════════════════════════════
+3a. Fix HWM drift. ONE source of truth = agent_config.high_water_mark. Patch the drawdown evaluator to read from and write to agent_config only. Remove any per-event HWM snapshotting in drawdown_events. File:line in report. Lands in deployed prod artifact.
+
+3b. Add hard kill switch (in addition to existing 5%/10% daily/weekly limits and £200 floor):
+    IF current_bankroll < 0.80 * agent_config.starting_deposit
+    THEN set agent_status='paused_killswitch', pause_reason='hard 20% drawdown kill switch', and refuse all bet placement until manually cleared.
+    File:line in report.
+
+3c. Confirm production quarantine still rejects data_tier='experiment' and opportunity_boosted=true. With 0 promoted markets, this means the scheduler will place ZERO bets until the normal promotion pipeline graduates a market. State this explicitly in the report — it is the intended behaviour.
+
+═══════════════════════════════════════
+STEP 4 — PLACEMENT FAILURE DIAGNOSTIC (info only)
+═══════════════════════════════════════
+ONE diagnostic pass over the soft-archived paper_bets (legacy_regime=true) data:
+    • Top 5 reasons for status='placement_failed' (group by error_reason or equivalent)
+    • Top 5 reasons for status='cancelled'
+Report only. Do NOT patch. Do NOT investigate further. If a reason looks like it would recur in live trading, flag it in the final report under "RISK".
+
+═══════════════════════════════════════
+STEP 5 — SCHEDULER ENABLE (last step)
+═══════════════════════════════════════
+ONLY if Steps 0–4 completed without abort.
+
+5a. Switch the deployed prod artifact from the maintenance no-op entrypoint to the real API server entrypoint. Confirm explicitly: this change lands in deployed prod, NOT in this dev container's TOML.
+
+5b. Hit deployed prod /healthz. Confirm response shows:
+    • ENVIRONMENT=production
+    • TRADING_MODE=LIVE
+    • DB host contains rough-flower
+    • agent_status='active'
+    • bankroll = LIVE_BANKROLL
+
+5c. Do NOT manually trigger any cron. Let the next scheduled tick be the first live action.
+
+═══════════════════════════════════════
+FINAL REPORT (single message, then STOP)
+═══════════════════════════════════════
+Required contents:
+- Pass/fail per gate (0a–0e, 1a, 1b, 2g, 5b)
+- LIVE_BANKROLL value
+- Files patched, with file:line and minimal-diff confirmation
+- Tables truncated (named explicitly), tables soft-archived, tables backed up
+- Top 5 placement_failed + top 5 cancelled reasons
+- Healthz response body from deployed prod
+- Final agent_config snapshot
+- Closing line, exact text: "Cutover complete. Infrastructure live. Awaiting first promoted market for live trading. No further actions queued."
+
+If any step aborted: stop where you are, report (i) what completed, (ii) what did not, (iii) current DB state, (iv) what I need to do manually. Do NOT attempt recovery.
