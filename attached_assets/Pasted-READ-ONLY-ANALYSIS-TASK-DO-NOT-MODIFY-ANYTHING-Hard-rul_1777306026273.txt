@@ -1,0 +1,96 @@
+READ-ONLY ANALYSIS TASK — DO NOT MODIFY ANYTHING
+
+Hard rules for this task:
+1. Make zero code, config, schema, or data changes.
+2. Do not commit. Do not deploy. Do not "fix" issues you spot — just report them.
+3. If you make any change at all, even unintentionally, declare it loudly at the top of your response.
+4. Do not start follow-up work after this report. I will send a separate implementation prompt.
+5. No self-directed improvement loops. Answer exactly what is asked, then stop.
+
+CONTEXT
+I am bringing the prod environment live to trade with my real £100 Betfair balance. I need verified facts before I flip the scheduler. Production is currently in passive mode (dashboard + sync only). Dev is on Replit Postgres (helium); prod is on Neon. Live Betfair key is stored as LIVE_BETFAIR_KEY in Replit secrets. A DigitalOcean UK/EU VPS exists to bypass Betfair IP-blocking from Replit US servers.
+
+I need a single comprehensive report covering the six sections below. Use file paths and line numbers for every code reference. No prose padding. No "should be" — only verified state.
+
+────────────────────────────────────────
+1. DATABASE STATE
+────────────────────────────────────────
+- Print the host portion (only) of DATABASE_URL for dev and prod. Confirm they differ.
+- Show the startup safety check that blocks prod if DATABASE_URL points to known dev hosts. Quote the code with file path and line numbers. Confirm it is active.
+- For BOTH databases, report:
+  • bets table: total rows, settled count, void count, SUM(pnl), win count, loss count
+  • experiment_registry: total rows, count by tier (experiment / candidate / promoted)
+  • promotion_audit_log: total rows, most recent 5 entries (timestamp + tier change)
+  • experiment_learning_journal: total rows, most recent entry timestamp
+  • Current stored bankroll value in prod (table + column + value)
+
+────────────────────────────────────────
+2. DEV → PROD FEATURE PARITY AUDIT
+────────────────────────────────────────
+List every code change merged or deployed in dev in the last 30 days. For each, state explicitly whether the same change is present in prod, verified by reading prod files (not by memory or assumption). Use this format per change:
+
+  • Change: [one-line summary]
+  • Dev location: [file path:lines]
+  • Prod status: PRESENT / MISSING / PARTIALLY PRESENT
+  • Prod location (if present): [file path:lines]
+  • Evidence: [what you actually checked]
+
+Mandatory items to address explicitly even if nothing surfaced in the diff:
+  a) Duplicate bet prevention — what is the mechanism (DB unique constraint, idempotency key, in-memory lock, dedupe-before-placement, all of the above)? Is it in prod? Show the code in both environments.
+  b) Void bet handling — what changed, why, and is it in prod? Show the code path that decides whether to place a bet on a market that could void (e.g. postponements, abandonment risk, Asian handicap voids, dead-heat rules, market suspension).
+  c) Any model changes, threshold tweaks, stake-sizing changes, circuit-breaker changes.
+  d) Any sync pipeline changes.
+
+If anything is in dev but missing or different in prod, flag it loudly with a "⚠ DRIFT" tag at the start of the line.
+
+────────────────────────────────────────
+3. BETFAIR LIVE INTEGRATION STATE (PROD)
+────────────────────────────────────────
+- Confirm LIVE_BETFAIR_KEY exists in prod secrets (do not print the value).
+- Confirm prod is configured against the live Betfair API, not sandbox or paper-trade. Show the config and the code branch that selects it.
+- Confirm outbound traffic to Betfair routes through the DigitalOcean UK/EU VPS, not directly from Replit US. Show the proxy/forwarder config and the actual exit IP if you can verify it.
+- Run ONE read-only Betfair API call from prod (getAccountFunds or equivalent) and report the live account balance. Do NOT place, cancel, or modify any bet. Do NOT call any market-data endpoint that costs request budget if avoidable.
+
+────────────────────────────────────────
+4. SCHEDULER + TRADING PIPELINE STATE (PROD)
+────────────────────────────────────────
+- Is the prod scheduler currently disabled or enabled? Show the exact mechanism (env var name, config file, feature flag, code branch) with file path and line numbers.
+- List every cron/scheduled job that would run in prod once the scheduler is enabled: name, cron expression, file path, what it does in one line.
+- Show the production quarantine logic that blocks experiment-tier and opportunity-boosted bets. File path + lines.
+- Show the sync double-gate (sync_eligible=true AND data_tier='promoted'). File path + lines.
+- Critical question: given that NO markets are currently promoted (confirm this against experiment_registry), what would actually happen if I enabled the prod scheduler right now? Walk through the code path. Would it place zero bets, or are there paths that allow candidate-tier or experiment-tier bets into prod? List every gate a bet must pass to be placed in prod, in order, with file:line for each gate.
+
+────────────────────────────────────────
+5. METRIC RESET SURFACE AREA
+────────────────────────────────────────
+I want to preserve raw bet history but reset everything derived from it: PnL, wins, losses, ROI, bankroll, go-live readiness counters, and any cached or materialised performance values. Bankroll should be reset to the live Betfair balance reported in section 3.
+
+Produce a complete inventory table:
+
+  Table | Column | Current value | Proposed reset value | Notes
+
+Cover at minimum:
+  • bets table — any column that flags "counts toward live PnL" or similar
+  • experiment_registry — performance fields (settled count, ROI, CLV, WR, p-value, etc.)
+  • Any bankroll table
+  • Any dashboard snapshot / materialised view / cached aggregate table
+  • Any go-live readiness counter table
+  • promotion_audit_log and experiment_learning_journal — should these be preserved untouched or reset? Recommend.
+
+For each row, also state: does any code path read this column in a way that would break if it were zeroed? (e.g. a divide-by-bets-count that would now hit zero.)
+
+────────────────────────────────────────
+6. RISKS, GOTCHAS, BLOCKERS
+────────────────────────────────────────
+List concrete risks for each of these actions. Be specific — reference file:line where relevant.
+  a) Resetting PnL/wins/losses while keeping raw bet rows.
+  b) Setting prod bankroll to live Betfair balance (£100) and detaching from the current stored value.
+  c) Enabling the prod scheduler.
+  d) Any change to the promotion threshold to allow candidate-tier or earlier bets to flow into prod with real money.
+
+Specifically flag: any SUM(pnl) FROM bets queries that would double-count or under-count after a reset, any caches that need explicit invalidation, any dashboard pages that will display broken/empty states until the first new prod bet settles, any cron job whose first run after reset could behave unexpectedly.
+
+────────────────────────────────────────
+OUTPUT FORMAT
+────────────────────────────────────────
+Plain text under the six section headings. File paths and line numbers for every code reference. No "I'll go ahead and fix this." No follow-up work. After producing the report, stop and wait for my next prompt.
