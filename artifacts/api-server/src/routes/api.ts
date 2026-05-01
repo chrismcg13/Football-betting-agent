@@ -1568,7 +1568,7 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
       pinnacleClosing: (r as any).closingPinnacleOdds != null,
     }));
 
-    res.json({
+    return res.json({
       count: rows.length,
       avgClv: Math.round(avgClv * 1000) / 1000,
       pinnacleCount,
@@ -1582,7 +1582,7 @@ router.get("/dashboard/clv-stats", async (_req, res) => {
     });
   } catch (err) {
     logger.error({ err }, "CLV stats query failed");
-    res.status(500).json({ error: "Failed to compute CLV stats" });
+    return res.status(500).json({ error: "Failed to compute CLV stats" });
   }
 });
 
@@ -2071,9 +2071,9 @@ router.post("/admin/cancel-bet", async (req, res) => {
     const b = rows[0];
     if (!b.betfair_bet_id || !b.betfair_market_id) return res.status(400).json({ error: "no betfair ids" });
     const result = await cancelOrders(b.betfair_market_id, [{ betId: b.betfair_bet_id }]);
-    res.json({ success: true, internalBetId, betfair: b, cancelResult: result });
+    return res.json({ success: true, internalBetId, betfair: b, cancelResult: result });
   } catch (err) {
-    res.status(500).json({ success: false, message: String(err) });
+    return res.status(500).json({ success: false, message: String(err) });
   }
 });
 
@@ -2085,9 +2085,9 @@ router.post("/admin/set-config", async (req, res) => {
     }
     await setConfigValue(key, String(value));
     const verify = await getConfigValue(key);
-    res.json({ success: true, key, value: verify });
+    return res.json({ success: true, key, value: verify });
   } catch (err) {
-    res.status(500).json({ success: false, message: String(err) });
+    return res.status(500).json({ success: false, message: String(err) });
   }
 });
 
@@ -3269,7 +3269,7 @@ router.post("/admin/starting-deposit", async (req, res) => {
     await setConfigValue("starting_deposit", String(newTotal));
 
     const newFloor = await getBankrollFloorFromDeposit();
-    res.json({
+    return res.json({
       previousDeposit: currentDeposit,
       added: amount,
       newTotalDeposit: newTotal,
@@ -3278,7 +3278,7 @@ router.post("/admin/starting-deposit", async (req, res) => {
     });
   } catch (err) {
     logger.warn({ err }, "Starting deposit update failed");
-    res.status(500).json({ error: String(err) });
+    return res.status(500).json({ error: String(err) });
   }
 });
 
@@ -3326,10 +3326,10 @@ router.get("/dashboard/vps-relay", async (_req, res) => {
       return res.json({ ...status, message: "VPS relay not configured — set VPS_RELAY_URL" });
     }
     const health = await checkRelayHealth();
-    res.json({ ...status, ...health });
+    return res.json({ ...status, ...health });
   } catch (err) {
     logger.warn({ err }, "VPS relay status check failed");
-    res.status(500).json({ error: String(err) });
+    return res.status(500).json({ error: String(err) });
   }
 });
 
