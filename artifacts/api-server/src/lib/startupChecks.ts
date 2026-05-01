@@ -1,8 +1,30 @@
 const KNOWN_LOCAL_DEV_HOSTS = ["helium", "localhost", "127.0.0.1"];
 
+/**
+ * Decision matrix:
+ *
+ * | ENVIRONMENT | Hostname pattern               | allowDevOnProd | Result          |
+ * |-------------|--------------------------------|----------------|-----------------|
+ * | development | rough-flower (prod Neon)       | false (default)| FATAL — refuse  |
+ * | development | rough-flower (prod Neon)       | true           | WARN — allow    |
+ * | development | billowing-lab (dev Neon)       | any            | INFO — pass     |
+ * | development | other                          | any            | WARN — pass     |
+ * | production  | helium / localhost / 127.0.0.1 | any            | FATAL — refuse  |
+ * | production  | billowing-lab (dev Neon)       | any            | FATAL — refuse  |
+ * | production  | rough-flower (prod Neon)       | any            | INFO — pass     |
+ * | production  | other                          | any            | WARN — pass     |
+ *
+ * The `allowDevOnProd` flag is the explicit opt-in for paper-trading-on-prod
+ * (Phase 6 amended in migration-plan-v2.md): ENVIRONMENT=development +
+ * DATABASE_URL=prod Neon, so paper bets land in the canonical DB without a
+ * dev branch. The flag only affects the dev+prod-host branch — it does NOT
+ * relax any production-side check. The companion verifyTradingModeForEnvironment
+ * still refuses dev+LIVE, so this override cannot be combined with live betting.
+ */
 export function verifyDbHostForEnvironment(
   environment: string,
   dbUrl: string,
+  allowDevOnProd: boolean = false,
 ): { fatal: boolean; level: "info" | "warn" | "error"; message: string } {
   let hostname: string;
   try {
@@ -17,6 +39,10 @@ export function verifyDbHostForEnvironment(
 
   if (environment === "development") {
     if (hostname.includes("rough-flower")) {
+      if (allowDevOnProd) {
+        return { fatal: false, level: "warn",
+          message: `ALLOW_DEV_ON_PROD=true — dev workspace explicitly running against prod DB (paper-on-prod mode). This bypasses the dev/prod isolation rail.` };
+      }
       return { fatal: true, level: "error",
         message: `Dev workspace is pointed at prod DB — refusing to start` };
     }

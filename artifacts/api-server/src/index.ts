@@ -11,9 +11,10 @@ import { sql, count } from "drizzle-orm";
 import { verifyDbHostForEnvironment, verifyTradingModeForEnvironment } from "./lib/startupChecks";
 
 const ENVIRONMENT = process.env["ENVIRONMENT"] ?? "development";
+const ALLOW_DEV_ON_PROD = process.env["ALLOW_DEV_ON_PROD"] === "true";
 
 if (process.env["DATABASE_URL"]) {
-  const result = verifyDbHostForEnvironment(ENVIRONMENT, process.env["DATABASE_URL"]);
+  const result = verifyDbHostForEnvironment(ENVIRONMENT, process.env["DATABASE_URL"], ALLOW_DEV_ON_PROD);
   if (result.fatal) {
     console.error(`FATAL: ${result.message}`);
     process.exit(1);

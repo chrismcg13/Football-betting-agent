@@ -1002,6 +1002,10 @@ export async function runStartupHealthCheck(): Promise<{
     }
 
     const { verifyDbHostForEnvironment, verifyTradingModeForEnvironment } = await import("../lib/startupChecks");
+    // ALLOW_DEV_ON_PROD is intentionally NOT threaded through here. This
+    // health check only runs when TRADING_MODE=LIVE, and LIVE-mode pre-flight
+    // must always engage all rails — the override is meaningless (and unsafe)
+    // once real money is on the line.
     const dbCheck = verifyDbHostForEnvironment(
       process.env["ENVIRONMENT"] ?? "development",
       process.env["DATABASE_URL"] ?? "",
