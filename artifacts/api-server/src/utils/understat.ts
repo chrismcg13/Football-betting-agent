@@ -68,18 +68,33 @@ export async function fetchUnderstatLeagueData(
     }
 
     const decoded = decodeUnderstatJson(match[1]);
-    const parsed = JSON.parse(decoded) as Array<Record<string, unknown>>;
+    type UnderstatRawMatch = {
+      id?: unknown;
+      h?: { title?: unknown };
+      a?: { title?: unknown };
+      home_team?: unknown;
+      away_team?: unknown;
+      xG?: { h?: unknown; a?: unknown };
+      home_xG?: unknown;
+      away_xG?: unknown;
+      goals?: { h?: unknown; a?: unknown };
+      home_goals?: unknown;
+      away_goals?: unknown;
+      datetime?: unknown;
+      isResult?: unknown;
+    };
+    const parsed = JSON.parse(decoded) as UnderstatRawMatch[];
 
     return parsed.map((m) => ({
-      id: String(m["id"] ?? ""),
-      home_team: String(m["h"]?.["title"] ?? m["home_team"] ?? ""),
-      away_team: String(m["a"]?.["title"] ?? m["away_team"] ?? ""),
-      home_xG: parseFloat(String(m["xG"]?.["h"] ?? m["home_xG"] ?? 0)),
-      away_xG: parseFloat(String(m["xG"]?.["a"] ?? m["away_xG"] ?? 0)),
-      home_goals: parseInt(String(m["goals"]?.["h"] ?? m["home_goals"] ?? 0), 10),
-      away_goals: parseInt(String(m["goals"]?.["a"] ?? m["away_goals"] ?? 0), 10),
-      datetime: String(m["datetime"] ?? ""),
-      isResult: Boolean(m["isResult"]),
+      id: String(m.id ?? ""),
+      home_team: String(m.h?.title ?? m.home_team ?? ""),
+      away_team: String(m.a?.title ?? m.away_team ?? ""),
+      home_xG: parseFloat(String(m.xG?.h ?? m.home_xG ?? 0)),
+      away_xG: parseFloat(String(m.xG?.a ?? m.away_xG ?? 0)),
+      home_goals: parseInt(String(m.goals?.h ?? m.home_goals ?? 0), 10),
+      away_goals: parseInt(String(m.goals?.a ?? m.away_goals ?? 0), 10),
+      datetime: String(m.datetime ?? ""),
+      isResult: Boolean(m.isResult),
     }));
   } catch (err) {
     logger.warn({ err, league, year }, "Understat fetch failed — skipping");
