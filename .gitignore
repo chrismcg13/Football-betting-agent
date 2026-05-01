@@ -51,3 +51,4 @@ Thumbs.db
 # Local-only files (secrets and planning context — never commit)
 replit-secrets.txt
 migration-plan-v2.md
+.claude/
