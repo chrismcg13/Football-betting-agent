@@ -178,9 +178,9 @@ router.get("/launch-activation/betfair-markets", async (req, res) => {
       startTime: m.marketStartTime,
       runners: m.runners?.map((r: any) => ({ id: r.selectionId, name: r.runnerName, priority: r.sortPriority })),
     }));
-    res.json({ count: summary.length, markets: summary });
+    return res.json({ count: summary.length, markets: summary });
   } catch (err) {
-    res.status(500).json({ error: String(err) });
+    return res.status(500).json({ error: String(err) });
   }
 });
 

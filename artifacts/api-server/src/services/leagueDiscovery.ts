@@ -665,7 +665,6 @@ const LEAGUE_ID_NAMES: Record<number, { name: string; country: string; type: str
   307: { name: "Saudi Pro League", country: "Saudi Arabia", type: "league", gender: "male" },
   318: { name: "Premier League", country: "Ghana", type: "league", gender: "male" },
   320: { name: "Premier League", country: "Kenya", type: "league", gender: "male" },
-  321: { name: "NPFL (old)", country: "Nigeria", type: "league", gender: "male" },
   399: { name: "NPFL", country: "Nigeria", type: "league", gender: "male" },
   323: { name: "Indian Super League", country: "India", type: "league", gender: "male" },
   332: { name: "Liga Nacional", country: "Honduras", type: "league", gender: "male" },

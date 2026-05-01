@@ -42,14 +42,14 @@ import {
   captureAllPendingSnapshots,
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
-import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, getLeaguesWithPendingBets, fetchAndStoreOddsForAllUpcoming, backfillPinnacleSnapshotsFromAf } from "./apiFootball";
+import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, backfillPinnacleSnapshotsFromAf } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
 import { runPromotionEngine } from "./promotionEngine";
 import { runWeeklyExperimentAnalysis } from "./experimentAnalysis";
 import { syncDevToProd } from "./syncDevToProd";
-import { reconcileSettlements, isLiveMode, getAccountFunds } from "./betfairLive";
+import { reconcileSettlements, getAccountFunds } from "./betfairLive";
 import { recalculateAllDataRichness } from "./dataRichness";
 import { reviewLiveThreshold } from "./liveThresholdReview";
 import { checkRelayHealth, isRelayConfigured, relayGetLiquidity, relayGetMarket } from "./vpsRelay";
