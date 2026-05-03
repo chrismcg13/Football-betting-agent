@@ -664,7 +664,7 @@ export async function bootstrapModels(): Promise<string> {
     stds,
   );
 
-  const version = `v1.0.0-bootstrap-${season}-${Date.now()}`;
+  const version = `v1.0.0-bootstrap-${currentYear}-${Date.now()}`;
   const modelSet: ModelSet = {
     outcomeModel,
     bttsModel,
