@@ -63,37 +63,11 @@ async function testBetfair(): Promise<boolean> {
     !!process.env["BETFAIR_USERNAME"] &&
     !!process.env["BETFAIR_PASSWORD"];
   if (!hasCreds) {
-    logger.warn("Betfair credentials not set — will use football-data.org fallback");
+    logger.warn("Betfair credentials not set — ingestion will skip cycles until configured");
     return false;
   }
   logger.info("Betfair credentials present — session will be established on first use");
   return true;
-}
-
-async function testFootballData(): Promise<boolean> {
-  const apiKey = process.env["FOOTBALL_DATA_API_KEY"];
-  if (!apiKey) {
-    logger.warn("FOOTBALL_DATA_API_KEY not set — data ingestion may fail");
-    return false;
-  }
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const resp = await fetch("https://api.football-data.org/v4/competitions", {
-      signal: controller.signal,
-      headers: { "X-Auth-Token": apiKey },
-    });
-    clearTimeout(timeout);
-    if (resp.ok) {
-      logger.info("football-data.org connection OK");
-      return true;
-    }
-    logger.warn({ status: resp.status }, "football-data.org returned non-OK status");
-    return false;
-  } catch (err) {
-    logger.warn({ err }, "football-data.org connection test failed — will retry on first scheduled run");
-    return false;
-  }
 }
 
 // ─── Initial data bootstrap ───────────────────────────────────────────────────
@@ -226,10 +200,9 @@ async function main() {
   await runMigrations();
 
   // 2. Connection checks — non-fatal (warn + continue)
-  const [dbOk, betfairOk, footballDataOk] = await Promise.all([
+  const [dbOk, betfairOk] = await Promise.all([
     testDatabase(),
     testBetfair(),
-    testFootballData(),
   ]);
 
   if (!dbOk) {
@@ -334,7 +307,6 @@ async function main() {
     port,
     dbConnected: dbOk,
     betfairConfigured: betfairOk,
-    footballDataConfigured: footballDataOk,
     modelLoaded,
     startedAt: new Date().toISOString(),
   });
@@ -347,7 +319,6 @@ async function main() {
         environment: ENVIRONMENT,
         dbConnected: dbOk,
         betfairConfigured: betfairOk,
-        footballDataConfigured: footballDataOk,
         modelLoaded,
       },
       "=== BET_AGENT_OS ready ===",

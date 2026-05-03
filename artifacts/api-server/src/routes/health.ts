@@ -2,12 +2,11 @@ import { Router, type IRouter } from "express";
 import { db, paperBetsTable, oddsSnapshotsTable, complianceLogsTable } from "@workspace/db";
 import { sql, desc } from "drizzle-orm";
 import { getSchedulerStatus } from "../services/scheduler";
-import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
 
 // ─── GET /api/health ──────────────────────────────────────────────────────────
-// Comprehensive health check: DB, Betfair session, football-data, cron statuses
+// Comprehensive health check: DB, Betfair session, cron statuses
 
 router.get("/health", async (_req, res) => {
   const checks: Record<string, unknown> = {};
@@ -30,33 +29,9 @@ router.get("/health", async (_req, res) => {
     !!process.env["BETFAIR_PASSWORD"];
   checks["betfair"] = hasBetfairCreds
     ? { status: "configured", note: "Credentials present — session established on first use" }
-    : { status: "unconfigured", note: "BETFAIR_APP_KEY / USERNAME / PASSWORD not set — using football-data fallback" };
+    : { status: "unconfigured", note: "BETFAIR_APP_KEY / USERNAME / PASSWORD not set" };
 
-  // 3. Football-data.org connectivity
-  const hasFootballDataKey = !!process.env["FOOTBALL_DATA_API_KEY"];
-  if (hasFootballDataKey) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 4000);
-      const resp = await fetch("https://api.football-data.org/v4/competitions", {
-        signal: controller.signal,
-        headers: { "X-Auth-Token": process.env["FOOTBALL_DATA_API_KEY"]! },
-      });
-      clearTimeout(timeout);
-      checks["footballData"] = {
-        status: resp.ok ? "ok" : "degraded",
-        httpStatus: resp.status,
-      };
-      if (!resp.ok) overallOk = false;
-    } catch (err) {
-      // Network error or timeout — don't mark overall as failed, data may be cached
-      checks["footballData"] = { status: "unreachable", message: (err as Error).message };
-    }
-  } else {
-    checks["footballData"] = { status: "unconfigured", note: "FOOTBALL_DATA_API_KEY not set" };
-  }
-
-  // 4. Last odds fetch time (most recent odds snapshot)
+  // 3. Last odds fetch time (most recent odds snapshot)
   try {
     const [latestOdds] = await db
       .select({ snapshotTime: oddsSnapshotsTable.snapshotTime })
@@ -68,7 +43,7 @@ router.get("/health", async (_req, res) => {
     checks["lastOddsFetch"] = null;
   }
 
-  // 5. Last bet placed time
+  // 4. Last bet placed time
   try {
     const [latestBet] = await db
       .select({ placedAt: paperBetsTable.placedAt })
@@ -80,10 +55,10 @@ router.get("/health", async (_req, res) => {
     checks["lastBetPlaced"] = null;
   }
 
-  // 6. Cron job statuses
+  // 5. Cron job statuses
   checks["cronJobs"] = getSchedulerStatus();
 
-  // 7. Process uptime
+  // 6. Process uptime
   checks["uptimeSeconds"] = Math.floor(process.uptime());
   checks["nodeVersion"] = process.version;
   checks["timestamp"] = new Date().toISOString();
