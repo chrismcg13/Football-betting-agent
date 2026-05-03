@@ -960,39 +960,152 @@ export async function updatePinnacleOddsFromActualMappings(): Promise<{
   return { updated, leaguesWithPinnacle: leagueNames };
 }
 
-// ─── Betfair Exchange coverage sync (Phase 1.C) ──────────────────────────────
-// Calls Betfair listCompetitions("1") (eventTypeId=1 = football) and fuzzy-
-// matches each Betfair competition to a competition_config row using the
-// token-set ratio at oddsPapiDiscovery.leagueNameSimilarity (threshold 0.85,
-// country as secondary tie-breaker via combined score 0.7×name + 0.3×country).
-// Ratchets has_betfair_exchange=true on match. Runs weekly Sunday 02:30 UTC.
+// ─── Betfair Exchange coverage sync (Phase 1.C + 1.D.1 aggressive matcher) ───
+// Calls Betfair listCompetitions("1") (eventTypeId=1 = football) and matches
+// each Betfair competition to a competition_config row using a 4-pass matcher:
 //
-// Per plan v3 1.C: this gives us the Betfair-side coverage flag that Phase 1.D
-// (deferred to commit B) uses to gate the trading cycle on BOTH Pinnacle AND
-// Betfair availability.
+//   Pass 1: strict token-set ratio ≥ 0.85 with country tie-breaker
+//           (combined = 0.7×nameSim + 0.3×countrySim)
+//   Pass 2: relaxed token-set ratio ≥ 0.70, country tolerance
+//   Pass 3: slug-strict equality (alphanum-only normalised)
+//   Pass 4: substring containment (≥ 8 char overlap), country tolerance
+//
+// Each pass tries all unmatched Betfair competitions. Each Betfair competition
+// matches at most once (first pass to land it wins). The match-method is
+// logged so we can audit aggressiveness and false-positive rate.
+//
+// Ratchets has_betfair_exchange=true on match (one-way). Logs unmatched with
+// nearest-neighbour for manual curation. Runs weekly Sunday 02:30 UTC; can
+// also be triggered manually via POST /api/admin/sync-betfair-coverage.
 
-const BETFAIR_SIM_THRESHOLD = 0.85;
+const BETFAIR_SIM_THRESHOLD_STRICT = 0.85;
+const BETFAIR_SIM_THRESHOLD_LOOSE = 0.70;
+const BETFAIR_COUNTRY_TOLERANCE = 0.5;
+const BETFAIR_SUBSTRING_MIN_CHARS = 8;
+
+function slugifyAlnum(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function normaliseForSubstring(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+interface CcRow {
+  id: number;
+  name: string;
+  country: string;
+  hasBetfairExchange: boolean;
+}
+
+interface MatchResult {
+  cc: CcRow;
+  method: "strict" | "loose" | "slug" | "substring";
+  nameSim: number;
+  countrySim: number;
+  combined: number;
+}
+
+function findBestMatch(
+  bcName: string,
+  bcRegion: string,
+  ccRows: CcRow[],
+  excludedIds: Set<number>,
+): MatchResult | null {
+  // Pass 1: strict token-set ≥ 0.85 with country tie-breaker
+  let best: MatchResult | null = null;
+  for (const cc of ccRows) {
+    if (excludedIds.has(cc.id)) continue;
+    const nameSim = leagueNameSimilarity(bcName, cc.name);
+    if (nameSim < BETFAIR_SIM_THRESHOLD_STRICT) continue;
+    const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
+    const combined = nameSim * 0.7 + countrySim * 0.3;
+    if (!best || combined > best.combined) {
+      best = { cc, method: "strict", nameSim, countrySim, combined };
+    }
+  }
+  if (best) return best;
+
+  // Pass 2: loose token-set ≥ 0.70 with country tolerance — require country
+  // signal when cc.country is populated (avoids cross-country same-name false
+  // positives for "Premier League", "Primera División", etc.)
+  for (const cc of ccRows) {
+    if (excludedIds.has(cc.id)) continue;
+    const nameSim = leagueNameSimilarity(bcName, cc.name);
+    if (nameSim < BETFAIR_SIM_THRESHOLD_LOOSE) continue;
+    const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
+    if ((cc.country ?? "") !== "" && countrySim < BETFAIR_COUNTRY_TOLERANCE) continue;
+    const combined = nameSim * 0.7 + countrySim * 0.3;
+    if (!best || combined > best.combined) {
+      best = { cc, method: "loose", nameSim, countrySim, combined };
+    }
+  }
+  if (best) return best;
+
+  // Pass 3: slug-strict equality (alphanum-only)
+  const bSlug = slugifyAlnum(bcName);
+  if (bSlug.length >= 4) {
+    for (const cc of ccRows) {
+      if (excludedIds.has(cc.id)) continue;
+      const ccSlug = slugifyAlnum(cc.name);
+      if (ccSlug === bSlug && ccSlug.length >= 4) {
+        return { cc, method: "slug", nameSim: 1.0, countrySim: 0, combined: 1.0 };
+      }
+    }
+  }
+
+  // Pass 4: substring containment with country tolerance — Betfair name fully
+  // contains a competition_config row's name (or vice versa), at least 8
+  // matching characters. Catches cases like "England Premier League" vs
+  // "Premier League" where token-set still scores below threshold.
+  const bNorm = normaliseForSubstring(bcName);
+  for (const cc of ccRows) {
+    if (excludedIds.has(cc.id)) continue;
+    const ccNorm = normaliseForSubstring(cc.name);
+    if (!ccNorm || !bNorm) continue;
+    const longer = bNorm.length >= ccNorm.length ? bNorm : ccNorm;
+    const shorter = bNorm.length >= ccNorm.length ? ccNorm : bNorm;
+    if (shorter.length < BETFAIR_SUBSTRING_MIN_CHARS) continue;
+    if (!longer.includes(shorter)) continue;
+    const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
+    if ((cc.country ?? "") !== "" && countrySim < BETFAIR_COUNTRY_TOLERANCE) continue;
+    return { cc, method: "substring", nameSim: 0.75, countrySim, combined: 0.75 };
+  }
+
+  return null;
+}
 
 export async function syncBetfairCompetitionCoverage(): Promise<{
   betfairCompetitions: number;
   matched: number;
   promoted: number;
   unmatched: number;
+  matchMethodBreakdown: Record<string, number>;
 }> {
   const startedAt = new Date();
-  logger.info("Starting Betfair Exchange coverage sync (weekly)");
+  logger.info("Starting Betfair Exchange coverage sync (4-pass matcher)");
 
   let betfairCompetitions: Array<{ competition: { id: string; name: string }; competitionRegion: string }>;
   try {
     betfairCompetitions = await listCompetitions("1");
   } catch (err) {
     logger.warn({ err }, "Betfair listCompetitions failed — skipping coverage sync");
-    return { betfairCompetitions: 0, matched: 0, promoted: 0, unmatched: 0 };
+    return { betfairCompetitions: 0, matched: 0, promoted: 0, unmatched: 0, matchMethodBreakdown: {} };
   }
 
   if (!Array.isArray(betfairCompetitions) || betfairCompetitions.length === 0) {
     logger.warn("Betfair listCompetitions returned empty — skipping coverage sync");
-    return { betfairCompetitions: 0, matched: 0, promoted: 0, unmatched: 0 };
+    return { betfairCompetitions: 0, matched: 0, promoted: 0, unmatched: 0, matchMethodBreakdown: {} };
   }
 
   const ccRows = await db
@@ -1006,64 +1119,67 @@ export async function syncBetfairCompetitionCoverage(): Promise<{
 
   let matched = 0;
   let promoted = 0;
-  const unmatched: Array<{ name: string; region: string; bestSim: number; bestCandidate: string }> = [];
+  const matchMethodBreakdown: Record<string, number> = {
+    strict: 0,
+    loose: 0,
+    slug: 0,
+    substring: 0,
+  };
+  const unmatched: Array<{
+    name: string;
+    region: string;
+    bestSim: number;
+    bestCandidate: string;
+    bestCandidateCountry: string;
+  }> = [];
+  const excludedIds = new Set<number>();
 
   for (const bc of betfairCompetitions) {
     const bcName = bc.competition?.name ?? "";
     const bcRegion = bc.competitionRegion ?? "";
     if (!bcName) continue;
 
-    let bestMatch: typeof ccRows[number] | null = null;
-    let bestCombined = 0;
-    let bestNameSim = 0;
-    let bestCountrySim = 0;
-    for (const cc of ccRows) {
-      const nameSim = leagueNameSimilarity(bcName, cc.name);
-      if (nameSim < BETFAIR_SIM_THRESHOLD) continue;
-      const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
-      const combined = nameSim * 0.7 + countrySim * 0.3;
-      if (!bestMatch || combined > bestCombined) {
-        bestMatch = cc;
-        bestCombined = combined;
-        bestNameSim = nameSim;
-        bestCountrySim = countrySim;
-      }
-    }
+    const result = findBestMatch(bcName, bcRegion, ccRows, excludedIds);
 
-    if (!bestMatch) {
-      // Track top near-miss for compliance review
-      let nearMiss = { name: "", sim: 0 };
+    if (!result) {
+      // Log unmatched with nearest-neighbour for manual review
+      let nearMiss = { name: "", country: "", sim: 0 };
       for (const cc of ccRows) {
         const s = leagueNameSimilarity(bcName, cc.name);
-        if (s > nearMiss.sim) nearMiss = { name: cc.name, sim: s };
+        if (s > nearMiss.sim) nearMiss = { name: cc.name, country: cc.country ?? "", sim: s };
       }
       unmatched.push({
         name: bcName,
         region: bcRegion,
         bestSim: nearMiss.sim,
         bestCandidate: nearMiss.name,
+        bestCandidateCountry: nearMiss.country,
       });
       continue;
     }
-    matched++;
 
-    if (!bestMatch.hasBetfairExchange) {
+    matched++;
+    matchMethodBreakdown[result.method]++;
+    excludedIds.add(result.cc.id);
+
+    if (!result.cc.hasBetfairExchange) {
       await db
         .update(competitionConfigTable)
         .set({ hasBetfairExchange: true })
-        .where(eq(competitionConfigTable.id, bestMatch.id));
+        .where(eq(competitionConfigTable.id, result.cc.id));
       promoted++;
       logger.info(
         {
           betfairName: bcName,
           betfairRegion: bcRegion,
-          matchedTo: bestMatch.name,
-          matchedCountry: bestMatch.country,
-          nameSim: bestNameSim.toFixed(3),
-          countrySim: bestCountrySim.toFixed(3),
-          combined: bestCombined.toFixed(3),
+          matchedTo: result.cc.name,
+          matchedCountry: result.cc.country,
+          method: result.method,
+          nameSim: result.nameSim.toFixed(3),
+          countrySim: result.countrySim.toFixed(3),
+          combined: result.combined.toFixed(3),
         },
-        "Promoted competition_config to has_betfair_exchange=true via Betfair listCompetitions sync",
+        "Promoted competition_config.has_betfair_exchange=true via Betfair sync",
       );
     }
   }
@@ -1075,8 +1191,9 @@ export async function syncBetfairCompetitionCoverage(): Promise<{
       betfairCompetitions: betfairCompetitions.length,
       matched,
       promoted,
+      matchMethodBreakdown,
       unmatchedCount: unmatched.length,
-      unmatchedSample: unmatched.slice(0, 30),
+      unmatchedSample: unmatched.slice(0, 50),
       durationMs: Date.now() - startedAt.getTime(),
     },
     timestamp: new Date(),
@@ -1087,6 +1204,7 @@ export async function syncBetfairCompetitionCoverage(): Promise<{
       betfairCompetitions: betfairCompetitions.length,
       matched,
       promoted,
+      matchMethodBreakdown,
       unmatched: unmatched.length,
       durationMs: Date.now() - startedAt.getTime(),
     },
@@ -1098,5 +1216,6 @@ export async function syncBetfairCompetitionCoverage(): Promise<{
     matched,
     promoted,
     unmatched: unmatched.length,
+    matchMethodBreakdown,
   };
 }

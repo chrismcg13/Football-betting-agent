@@ -653,6 +653,41 @@ router.post("/admin/capture-pinnacle-snapshots", async (_req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// POST /api/admin/sync-betfair-coverage
+// Manual trigger for the Betfair Exchange coverage sync (4-pass matcher).
+// Normally runs Sunday 02:30 UTC weekly; use this to trigger immediately
+// after Commit A/B deploy or after adding new leagues to competition_config.
+// ─────────────────────────────────────────────
+router.post("/admin/sync-betfair-coverage", async (_req, res) => {
+  try {
+    const { syncBetfairCompetitionCoverage } = await import("../services/leagueDiscovery");
+    const result = await syncBetfairCompetitionCoverage();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual sync-betfair-coverage failed");
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/discover-pinnacle-leagues
+// Manual trigger for the OddsPapi /v4/tournaments tournament discovery sweep.
+// Normally runs Sunday 02:00 UTC weekly. Probes ~200-400 OddsPapi tournaments
+// for Pinnacle pricing and ratchets competition_config.has_pinnacle_odds=true
+// on positive matches.
+// ─────────────────────────────────────────────
+router.post("/admin/discover-pinnacle-leagues", async (_req, res) => {
+  try {
+    const { discoverPinnacleLeagues } = await import("../services/oddsPapiDiscovery");
+    const result = await discoverPinnacleLeagues();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual discover-pinnacle-leagues failed");
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
 // GET /api/dashboard/bets/by-market
 // ─────────────────────────────────────────────
 router.get("/dashboard/bets/by-market", async (_req, res) => {
