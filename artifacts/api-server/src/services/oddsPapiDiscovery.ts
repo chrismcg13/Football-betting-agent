@@ -32,25 +32,39 @@ interface OddsPapiOddsResponse {
   odds?: OddsPapiBookmaker[];
 }
 
-// Token-set similarity with diacritic stripping + degenerate-set guard.
+// Generic football-league tokens that, when shared as the ONLY common token,
+// don't constitute a meaningful match. Used by the degenerate-set guard
+// below: if the singleton intersection token is generic, fall back to
+// Jaccard scoring (which penalises size disparity); if specific, trust the
+// subset match.
 //
-// Pre-2026-05-04 bug: pure intersection/min(|A|,|B|) returned 1.0 in degenerate
-// cases like "V-League" {league} matching "South Korean K1 League"
-// {south,korean,k1,league} — because the smaller set was fully contained.
-// Common-token bleed produced false 1.0 scores any time the smaller name was
-// a generic suffix like "League".
+// Without this distinction, "V-League" {league} matched "South Korean K1
+// League" {south,korean,k1,league} at 1.0 (false), but ALSO "Norwegian
+// Eliteserien" failed to match "Eliteserien" because both were treated
+// the same way.
+const GENERIC_LEAGUE_TOKENS = new Set([
+  "league", "cup", "liga", "serie", "primera", "segunda", "premier",
+  "championship", "division", "conference", "professional", "pro",
+  "national", "ligue", "copa", "federation", "federacion", "supercup",
+  "playoff", "playoffs", "qualifying", "qualifier", "qualifiers",
+  "first", "second", "third", "tier", "men", "women", "men_s", "women_s",
+]);
+
+// Token-set similarity with diacritic stripping + selective degenerate-set
+// guard. When min(|A|,|B|) == 1 and the singleton intersection token is
+// GENERIC (e.g., "league", "cup"), fall back to Jaccard. When the singleton
+// is SPECIFIC (e.g., "eliteserien", "allsvenskan"), trust the subset match.
 //
-// Fix: when min(|A|,|B|) == 1, fall back to Jaccard (intersection / union),
-// which penalises the size-disparity. Larger sets continue to use the more
-// permissive intersection/min, which correctly handles "Premier League" vs
-// "Premier League England" subset matches.
-//
-// Test cases (post-fix):
+// Test cases:
 //   "Premier League" vs "Premier League England": min=2, score=2/2=1.0 ✓
-//   "V-League" vs "South Korean K1 League": min=1, jaccard=1/4=0.25 ✓ rejects
-//   "Brazilian Serie A" vs "Serie A": min=1, jaccard=1/2=0.5 ✓ rejects
+//   "V-League" vs "South Korean K1 League": min=1, singleton=league GENERIC,
+//     Jaccard=1/4=0.25 ✓ rejects
+//   "Norwegian Eliteserien" vs "Eliteserien": min=1, singleton=eliteserien
+//     SPECIFIC, score=1/1=1.0 ✓ matches (was rejected pre-fix)
+//   "Brazilian Serie A" vs "Serie A": min=1, singleton=serie GENERIC,
+//     Jaccard=1/2=0.5 ✓ rejects (cross-country bleed prevented)
 //   "Brazil Serie A" vs "Brasileirão Série A": min=2, score=1/2=0.5 ✓ rejects
-//   (the latter correctly rejected — needs alias dictionary, not fuzzy match)
+//     (still needs alias dictionary, not fuzzy match)
 export function leagueNameSimilarity(a: string, b: string): number {
   const norm = (s: string) =>
     s
@@ -66,12 +80,19 @@ export function leagueNameSimilarity(a: string, b: string): number {
   const aTokens = new Set(aN.split(" ").filter((t) => t.length >= 2));
   const bTokens = new Set(bN.split(" ").filter((t) => t.length >= 2));
   if (aTokens.size === 0 || bTokens.size === 0) return 0;
-  let intersection = 0;
-  for (const t of aTokens) if (bTokens.has(t)) intersection++;
+  const sharedTokens: string[] = [];
+  for (const t of aTokens) if (bTokens.has(t)) sharedTokens.push(t);
+  const intersection = sharedTokens.length;
+  if (intersection === 0) return 0;
   const minSize = Math.min(aTokens.size, bTokens.size);
   if (minSize === 1) {
-    // Degenerate-set guard: Jaccard penalises size disparity
-    return intersection / (aTokens.size + bTokens.size - intersection);
+    // Singleton — generic tokens trigger Jaccard fallback to avoid generic-
+    // suffix bleed; specific tokens trust the subset match.
+    const allSharedGeneric = sharedTokens.every((t) => GENERIC_LEAGUE_TOKENS.has(t));
+    if (allSharedGeneric) {
+      return intersection / (aTokens.size + bTokens.size - intersection);
+    }
+    return intersection / minSize;
   }
   return intersection / minSize;
 }
