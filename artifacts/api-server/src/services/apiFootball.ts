@@ -648,7 +648,7 @@ async function fetchApiFootball<T = unknown>(
 
 // ─── Fixture discovery ────────────────────────────────────────────────────────
 
-interface ApiFixture {
+export interface ApiFixture {
   fixture: { id: number; date: string; status: { short: string; long: string } };
   league: { id: number; name: string; country: string };
   teams: {
@@ -2143,4 +2143,20 @@ export function getTeamPositionFromStandings(
   apiTeamId: number,
 ): number | null {
   return standings.find((s) => s.team.id === apiTeamId)?.rank ?? null;
+}
+
+// ─── Historical fixtures (Stage 4 Phase E) ───────────────────────────────────
+// Replaces footballData.getHistoricalCompetitionMatches as the bootstrap source.
+// One call returns the entire league-season's finished fixtures (~380 for top-5
+// European, ~125 for CL/EL group+knockout). Used by predictionEngine.bootstrapModels.
+
+export async function fetchHistoricalFixtures(
+  leagueId: number,
+  season: number,
+): Promise<ApiFixture[]> {
+  const result = await fetchApiFootball<ApiFixture[]>(
+    "/fixtures",
+    { league: leagueId, season, status: "FT-AET-PEN" },
+  );
+  return result ?? [];
 }

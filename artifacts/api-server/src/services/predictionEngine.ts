@@ -11,10 +11,80 @@ import {
 import { eq, inArray, desc, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
-  getHistoricalCompetitionMatches,
-  FEATURE_COMPETITIONS,
   type FDMatch,
 } from "./footballData";
+import {
+  fetchHistoricalFixtures,
+  getCurrentSeasonForLeague,
+  type ApiFixture,
+} from "./apiFootball";
+
+// API-Football league IDs to bootstrap on. Maps the original FEATURE_COMPETITIONS
+// (football-data.org codes PL, BL1, SA, PD, FL1, CL, EL, PPL, BSA, ELC, DED) to
+// API-Football's numeric league IDs. Domestic top divisions plus continental
+// cups plus Tier-2 (Championship + Eredivisie) — same scope as the prior
+// bootstrap, just sourced from API-Football.
+const BOOTSTRAP_LEAGUE_IDS: number[] = [
+  39,   // Premier League (PL)
+  78,   // Bundesliga (BL1)
+  135,  // Serie A (SA)
+  140,  // Primera División / La Liga (PD)
+  61,   // Ligue 1 (FL1)
+  2,    // UEFA Champions League (CL)
+  3,    // UEFA Europa League (EL)
+  94,   // Primeira Liga (PPL)
+  71,   // Brasileirão (BSA)
+  40,   // Championship (ELC)
+  88,   // Eredivisie (DED)
+];
+
+// Number of prior seasons to pull. Three gives ~6,000-10,000 finished fixtures
+// across the 11 leagues — well above the 30-sample minimum and rich enough for
+// per-team match histories of 5-10 home + 5-10 away games.
+const BOOTSTRAP_SEASON_COUNT = 3;
+
+function apiFixtureToFdMatchShape(fix: ApiFixture): FDMatch {
+  const ftHome = fix.score.fulltime.home;
+  const ftAway = fix.score.fulltime.away;
+  let winner: "HOME_TEAM" | "DRAW" | "AWAY_TEAM" | null = null;
+  if (ftHome !== null && ftAway !== null) {
+    if (ftHome > ftAway) winner = "HOME_TEAM";
+    else if (ftHome < ftAway) winner = "AWAY_TEAM";
+    else winner = "DRAW";
+  }
+  return {
+    id: fix.fixture.id,
+    utcDate: fix.fixture.date,
+    status: fix.fixture.status?.short ?? "",
+    matchday: null,
+    homeTeam: {
+      id: fix.teams.home.id,
+      name: fix.teams.home.name,
+      shortName: fix.teams.home.name,
+      tla: "",
+    },
+    awayTeam: {
+      id: fix.teams.away.id,
+      name: fix.teams.away.name,
+      shortName: fix.teams.away.name,
+      tla: "",
+    },
+    competition: {
+      id: fix.league.id,
+      name: fix.league.name,
+      code: String(fix.league.id),
+      area: { name: fix.league.country, code: "" },
+    },
+    score: {
+      winner,
+      fullTime: { home: ftHome, away: ftAway },
+      halfTime: {
+        home: fix.score.halftime?.home ?? null,
+        away: fix.score.halftime?.away ?? null,
+      },
+    },
+  };
+}
 
 // ===================== Feature ordering =====================
 // This order MUST be consistent across training and prediction.
@@ -466,36 +536,53 @@ export async function loadLatestModel(): Promise<boolean> {
 
 // ===================== Bootstrap training =====================
 export async function bootstrapModels(): Promise<string> {
-  const season = new Date().getFullYear() - 1;
+  // Latest season to fetch is whatever the league's current "season" is per
+  // API-Football's convention (Aug-May leagues use the start year). We then
+  // walk back BOOTSTRAP_SEASON_COUNT seasons to build a multi-year corpus.
+  const now = new Date();
+  const currentYear = now.getUTCFullYear();
   logger.info(
-    { season, competitions: FEATURE_COMPETITIONS },
-    "Starting bootstrap model training from historical data",
+    {
+      currentYear,
+      seasons: BOOTSTRAP_SEASON_COUNT,
+      leagueIds: BOOTSTRAP_LEAGUE_IDS,
+    },
+    "Starting bootstrap model training from API-Football historical data",
   );
 
   const allSamples: TrainingSample[] = [];
 
-  for (const code of FEATURE_COMPETITIONS) {
-    logger.info({ code, season }, "Fetching historical matches for training");
-    const matches = await getHistoricalCompetitionMatches(
-      code,
-      season,
-    ).catch((err) => {
-      logger.warn({ err, code }, "Failed to fetch historical matches");
-      return [] as FDMatch[];
-    });
+  for (const leagueId of BOOTSTRAP_LEAGUE_IDS) {
+    const latestSeason = getCurrentSeasonForLeague(leagueId);
+    const seasons: number[] = [];
+    for (let i = 0; i < BOOTSTRAP_SEASON_COUNT; i++) {
+      seasons.push(latestSeason - i);
+    }
 
+    const fixtures: ApiFixture[] = [];
+    for (const season of seasons) {
+      logger.info({ leagueId, season }, "Fetching historical fixtures for training");
+      try {
+        const fetched = await fetchHistoricalFixtures(leagueId, season);
+        fixtures.push(...fetched);
+      } catch (err) {
+        logger.warn({ err, leagueId, season }, "Failed to fetch historical fixtures");
+      }
+    }
+
+    const matches = fixtures.map(apiFixtureToFdMatchShape);
     const finished = matches.filter(
       (m) => m.score.winner !== null && m.score.fullTime.home !== null,
     );
     if (finished.length === 0) {
-      logger.debug({ code }, "No finished historical matches available");
+      logger.debug({ leagueId }, "No finished historical matches available");
       continue;
     }
 
     const samples = buildTrainingSamples(finished);
     logger.info(
-      { code, total: finished.length, samples: samples.length },
-      "Training samples built from competition",
+      { leagueId, seasons, total: finished.length, samples: samples.length },
+      "Training samples built from league",
     );
     allSamples.push(...samples);
   }
