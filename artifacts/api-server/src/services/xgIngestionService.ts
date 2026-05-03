@@ -6,7 +6,7 @@ import {
   LEAGUE_MAP,
   type MatchXGData,
 } from "../utils/understat";
-import { resolveAlias, teamSimilarity } from "./oddsPapi";
+import { transliterate } from "./oddsPapi";
 
 interface TeamXGLatest {
   teamName: string;
@@ -23,15 +23,14 @@ interface TeamXGLatest {
 interface PerLeagueIngestStats {
   league: string;
   scraped: number;
-  matched: number;
-  unmatched: number;
   inserted: number;
   updated: number;
-  sampleUnmatched: string[];
+  withResults: number;
+  skipped: number;
+  sampleSkipped: string[];
 }
 
-const TEAM_SIMILARITY_THRESHOLD = 0.85;
-const MAX_SAMPLE_UNMATCHED = 10;
+const MAX_SAMPLE_SKIPPED = 10;
 
 function avg(arr: number[]): number {
   if (arr.length === 0) return 0;
@@ -45,81 +44,18 @@ function activeUnderstatYear(): number {
   return now.getUTCFullYear() - (now.getUTCMonth() < 6 ? 1 : 0);
 }
 
-// Match an Understat record to a row in the matches table.
-// Returns matchId on a high-confidence match, null otherwise.
-// Conservative: ≥0.85 similarity on BOTH home and away. Bind by league + ±24h window.
-async function findMatchingDbRow(
-  understatLeague: string,
-  understatHome: string,
-  understatAway: string,
-  understatKickoffMs: number,
-): Promise<number | null> {
-  const winLow = new Date(understatKickoffMs - 24 * 60 * 60 * 1000);
-  const winHigh = new Date(understatKickoffMs + 24 * 60 * 60 * 1000);
-
-  // Pull candidate matches from DB. Bind to league + ±24h window.
-  // We compare on the LEAGUE column; Understat's slug ("Serie_A") may differ
-  // from our display string ("Serie A"). Try both forms.
-  const understatLeagueDisplayMap: Record<string, string[]> = {
-    EPL: ["Premier League", "EPL"],
-    Bundesliga: ["Bundesliga"],
-    La_liga: ["La Liga", "La_liga"],
-    Serie_A: ["Serie A", "Serie_A"],
-    Ligue_1: ["Ligue 1", "Ligue_1"],
-    "La Liga": ["La Liga", "La_liga"],
-    "Serie A": ["Serie A", "Serie_A"],
-    "Ligue 1": ["Ligue 1", "Ligue_1"],
-  };
-  const candidateLeagues = understatLeagueDisplayMap[understatLeague] ?? [understatLeague];
-
-  // Build a parameterised IN-list. Drizzle spreads `${array}` directly inside
-  // `ANY(...)` as `($1,$2)`, which Postgres parses as a row constructor, not an
-  // array — `ANY(($1,$2))` errors. `sql.join` joins per-value SQL fragments
-  // into `$1, $2, ...` so `IN (${...})` becomes a real value list.
-  const leagueInList = sql.join(
-    candidateLeagues.map((l) => sql`${l}`),
-    sql`, `,
-  );
-  const candidatesResult = await db.execute(sql`
-    SELECT id, home_team, away_team, league, kickoff_time
-    FROM matches
-    WHERE league IN (${leagueInList})
-      AND kickoff_time >= ${winLow}
-      AND kickoff_time <= ${winHigh}
-  `);
-  const candidates = ((candidatesResult as any).rows ?? []) as Array<{
-    id: number;
-    home_team: string;
-    away_team: string;
-    league: string;
-    kickoff_time: Date;
-  }>;
-
-  if (candidates.length === 0) return null;
-
-  // Resolve aliases up-front for the Understat names.
-  const understatHomeResolved = resolveAlias(understatHome);
-  const understatAwayResolved = resolveAlias(understatAway);
-
-  let best: { id: number; homeSim: number; awaySim: number; dtMs: number } | null = null;
-  for (const c of candidates) {
-    const dbHomeResolved = resolveAlias(c.home_team);
-    const dbAwayResolved = resolveAlias(c.away_team);
-    const homeSim = teamSimilarity(understatHomeResolved, dbHomeResolved);
-    const awaySim = teamSimilarity(understatAwayResolved, dbAwayResolved);
-    if (homeSim < TEAM_SIMILARITY_THRESHOLD || awaySim < TEAM_SIMILARITY_THRESHOLD) continue;
-    const dtMs = Math.abs(new Date(c.kickoff_time).getTime() - understatKickoffMs);
-    // Pick closest kickoff among tying-quality matches
-    if (
-      !best ||
-      homeSim + awaySim > best.homeSim + best.awaySim ||
-      (homeSim + awaySim === best.homeSim + best.awaySim && dtMs < best.dtMs)
-    ) {
-      best = { id: c.id, homeSim, awaySim, dtMs };
-    }
-  }
-
-  return best?.id ?? null;
+// Conservative team-name canonicalization. Lowercases, transliterates diacritics,
+// strips punctuation, collapses whitespace. Deliberately does NOT strip prefix
+// words (fc/ac/sc/inter/real/...) — that would conflate distinct teams (e.g.
+// "AC Milan" and "Inter Milan" both reduce to "milan" via resolveAlias's
+// normalizeTeam fallback at oddsPapi.ts:984). Producer and consumer must apply
+// the SAME canonicalization for exact-match lookups to work.
+function canonicalTeamName(raw: string): string {
+  return transliterate(raw)
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function ingestLeague(
@@ -129,42 +65,52 @@ async function ingestLeague(
   const stats: PerLeagueIngestStats = {
     league,
     scraped: matches.length,
-    matched: 0,
-    unmatched: 0,
     inserted: 0,
     updated: 0,
-    sampleUnmatched: [],
+    withResults: 0,
+    skipped: 0,
+    sampleSkipped: [],
   };
 
+  const seasonStart = activeUnderstatYear();
+  const seasonLabel = `${seasonStart}-${(seasonStart + 1).toString().slice(-2)}`;
+
   for (const m of matches) {
+    if (!m.id) {
+      stats.skipped++;
+      if (stats.sampleSkipped.length < MAX_SAMPLE_SKIPPED) {
+        stats.sampleSkipped.push(`${m.home_team} vs ${m.away_team} (missing id)`);
+      }
+      continue;
+    }
     const understatKickoffMs = new Date(m.datetime).getTime();
     if (Number.isNaN(understatKickoffMs)) {
-      stats.unmatched++;
-      if (stats.sampleUnmatched.length < MAX_SAMPLE_UNMATCHED) {
-        stats.sampleUnmatched.push(`${m.home_team} vs ${m.away_team} (bad datetime)`);
+      stats.skipped++;
+      if (stats.sampleSkipped.length < MAX_SAMPLE_SKIPPED) {
+        stats.sampleSkipped.push(`${m.home_team} vs ${m.away_team} (bad datetime)`);
       }
       continue;
     }
 
-    const matchId = await findMatchingDbRow(
-      league,
-      m.home_team,
-      m.away_team,
-      understatKickoffMs,
-    );
+    // Canonicalize team names so producer and consumer (getTeamXGStats) agree
+    // on a single string representation per team.
+    const homeTeamCanonical = canonicalTeamName(m.home_team);
+    const awayTeamCanonical = canonicalTeamName(m.away_team);
 
-    if (matchId === null) {
-      stats.unmatched++;
-      if (stats.sampleUnmatched.length < MAX_SAMPLE_UNMATCHED) {
-        stats.sampleUnmatched.push(`${m.home_team} vs ${m.away_team}`);
+    if (!homeTeamCanonical || !awayTeamCanonical) {
+      stats.skipped++;
+      if (stats.sampleSkipped.length < MAX_SAMPLE_SKIPPED) {
+        stats.sampleSkipped.push(
+          `${m.home_team} vs ${m.away_team} (empty canonical name)`,
+        );
       }
       continue;
     }
-
-    stats.matched++;
 
     // Use the Understat numeric match id as the primary key for xg_match_data.
-    // ON CONFLICT (id) DO UPDATE handles re-scrapes idempotently.
+    // ON CONFLICT (id) DO UPDATE handles re-scrapes idempotently. We no longer
+    // depend on a row existing in `matches` — Understat's full season is
+    // ingested independently.
     const matchDate = m.datetime.slice(0, 10);
     const homeXg = (m.home_xG as number | null) ?? null;
     const awayXg = (m.away_xG as number | null) ?? null;
@@ -187,18 +133,20 @@ async function ingestLeague(
           (id, home_team, away_team, league, season, match_date,
            home_xg, away_xg, home_goals, away_goals, is_result, source, created_at)
         VALUES
-          (${m.id}, ${m.home_team}, ${m.away_team}, ${league},
-           ${`${activeUnderstatYear()}-${(activeUnderstatYear() + 1).toString().slice(-2)}`},
-           ${matchDate},
+          (${m.id}, ${homeTeamCanonical}, ${awayTeamCanonical}, ${league},
+           ${seasonLabel}, ${matchDate},
            ${homeXg}, ${awayXg}, ${homeGoals}, ${awayGoals},
            ${isResult}, 'understat', NOW())
         ON CONFLICT (id) DO NOTHING
       `);
       stats.inserted++;
+      if (isResult) stats.withResults++;
     } else if (!existing[0].is_result && isResult) {
       // Result newly arrived
       await db.execute(sql`
         UPDATE xg_match_data SET
+          home_team  = ${homeTeamCanonical},
+          away_team  = ${awayTeamCanonical},
           home_goals = ${homeGoals},
           away_goals = ${awayGoals},
           home_xg    = ${homeXg},
@@ -208,13 +156,16 @@ async function ingestLeague(
         WHERE id = ${m.id}
       `);
       stats.updated++;
+      stats.withResults++;
     } else if (!existing[0].is_result) {
       // Pre-match xG refresh
       await db.execute(sql`
         UPDATE xg_match_data SET
-          home_xg = ${homeXg},
-          away_xg = ${awayXg},
-          source  = 'understat'
+          home_team = ${homeTeamCanonical},
+          away_team = ${awayTeamCanonical},
+          home_xg   = ${homeXg},
+          away_xg   = ${awayXg},
+          source    = 'understat'
         WHERE id = ${m.id}
       `);
       stats.updated++;
@@ -229,20 +180,14 @@ async function logComplianceXgIngestion(
   durationMs: number,
 ): Promise<void> {
   const totalScraped = leagueStats.reduce((s, l) => s + l.scraped, 0);
-  const totalMatched = leagueStats.reduce((s, l) => s + l.matched, 0);
-  const matchRate = totalScraped > 0 ? totalMatched / totalScraped : 0;
-
-  // Aggregate top unmatched names across leagues for alias-table grooming.
-  const unmatchedFreq = new Map<string, number>();
-  for (const ls of leagueStats) {
-    for (const name of ls.sampleUnmatched) {
-      unmatchedFreq.set(name, (unmatchedFreq.get(name) ?? 0) + 1);
-    }
-  }
-  const topUnmatchedTeams = Array.from(unmatchedFreq.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
-    .map(([name, count]) => ({ name, count }));
+  const totalInserted = leagueStats.reduce((s, l) => s + l.inserted, 0);
+  const totalUpdated = leagueStats.reduce((s, l) => s + l.updated, 0);
+  const totalWithResults = leagueStats.reduce((s, l) => s + l.withResults, 0);
+  const totalSkipped = leagueStats.reduce((s, l) => s + l.skipped, 0);
+  const ingestRate =
+    totalScraped > 0
+      ? (totalInserted + totalUpdated) / totalScraped
+      : 0;
 
   try {
     await db.insert(complianceLogsTable).values({
@@ -250,9 +195,11 @@ async function logComplianceXgIngestion(
       details: {
         leagueStats,
         totalScraped,
-        totalMatched,
-        matchRate: Math.round(matchRate * 10000) / 10000,
-        topUnmatchedTeams,
+        totalInserted,
+        totalUpdated,
+        totalWithResults,
+        totalSkipped,
+        ingestRate: Math.round(ingestRate * 10000) / 10000,
         durationMs,
       },
       timestamp: new Date(),
@@ -296,11 +243,11 @@ export async function runXGIngestion(): Promise<{ inserted: number; updated: num
       leagueStats.push({
         league,
         scraped: 0,
-        matched: 0,
-        unmatched: 0,
         inserted: 0,
         updated: 0,
-        sampleUnmatched: [],
+        withResults: 0,
+        skipped: 0,
+        sampleSkipped: [],
       });
       continue;
     }
@@ -394,13 +341,25 @@ export async function computeTeamXGRolling(): Promise<void> {
   logger.info({ count: teams.length }, "Team xG rolling stats computed");
 }
 
-export async function getTeamXGStats(teamName: string): Promise<TeamXGLatest | null> {
+export async function getTeamXGStats(
+  teamName: string,
+  league?: string,
+): Promise<TeamXGLatest | null> {
+  // Producer canonicalises before INSERT; consumer must apply the same
+  // canonicalisation. Exact-match-only — the previous LIKE %% pattern caused
+  // form-dependent behaviour and a wrong-team risk if cross-league data ever
+  // landed in this table (e.g. Italian "Inter" colliding with "Inter Miami").
+  // Misses fall through to the existing proxy formula in featureEngine.
+  const canonical = canonicalTeamName(teamName);
+  if (!canonical) return null;
+
   const result = await db.execute(sql`
     SELECT DISTINCT ON (team_name)
       team_name, league, xg_for_5, xg_against_5, xg_diff_5,
       goals_vs_xg_diff, xg_momentum, matches_counted, computed_at
     FROM team_xg_rolling
-    WHERE LOWER(team_name) LIKE ${`%${teamName.toLowerCase()}%`}
+    WHERE team_name = ${canonical}
+      ${league ? sql`AND league = ${league}` : sql``}
     ORDER BY team_name, computed_at DESC
     LIMIT 1
   `);
