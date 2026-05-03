@@ -935,9 +935,17 @@ export async function runTradingCycle(options?: {
         );
         funnel["07a_pinnacle_league_filter"] = "disabled" as unknown as number;
       } else if (selectedBets.length > 0) {
+        // Phase 1.D (2026-05-04): dual-flag gate — both Pinnacle pricing AND
+        // Betfair Exchange coverage required. Pre-Phase-1, this filter was
+        // single-flag (has_pinnacle_odds only). The Betfair flag closes the
+        // silent-rejection path where a Pinnacle-priced league had no Betfair
+        // execution venue. Backfill ran 2026-05-04 with healthy 113/131
+        // dual-flag/pinnacle ratio.
         const ccRows = await db.execute(sql`
           SELECT LOWER(name) AS name, LOWER(country) AS country
-          FROM competition_config WHERE has_pinnacle_odds = true
+          FROM competition_config
+          WHERE has_pinnacle_odds = true
+            AND has_betfair_exchange = true
         `);
         const ccData = ((ccRows as unknown as { rows?: Array<{ name: string; country: string }> }).rows
           ?? (ccRows as unknown as Array<{ name: string; country: string }>));
@@ -1001,20 +1009,20 @@ export async function runTradingCycle(options?: {
               before,
               after: selectedBets.length,
               rejected,
-              pinLeaguesLoaded: pinName.size,
+              dualFlagLeaguesLoaded: pinName.size,
               sampleRejections: rejectionDetails.slice(0, 25),
               totalRejections: rejectionDetails.length,
               scope: "v3_section6_step1_audit",
             },
-            "Pinnacle-league selection filter rejected non-Pinnacle-league candidates",
+            "Dual-flag (Pinnacle+Betfair) league filter rejected candidates without both flags",
           );
         } else {
           logger.info(
-            { tier, kept: selectedBets.length, pinLeaguesLoaded: pinName.size },
-            "Pinnacle-league filter: all candidates in Pinnacle leagues",
+            { tier, kept: selectedBets.length, dualFlagLeaguesLoaded: pinName.size },
+            "Dual-flag filter: all candidates pass Pinnacle+Betfair gates",
           );
         }
-        funnel["07a_rejected_non_pinnacle_league"] = rejected;
+        funnel["07a_rejected_non_pinnacle_or_betfair_league"] = rejected;
       }
     }
 
