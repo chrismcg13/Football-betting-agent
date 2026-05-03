@@ -21,6 +21,7 @@ export const LEAGUE_MAP: Record<string, string> = {
   La_liga: "La_liga",
   Serie_A: "Serie_A",
   Ligue_1: "Ligue_1",
+  RFPL: "RFPL",
 };
 
 export async function fetchUnderstatLeagueData(
