@@ -15,7 +15,6 @@ import {
   getCurrentSeasonForLeague,
   getTeamPositionFromStandings,
 } from "./apiFootball";
-import { getTeamXGStats } from "./xgIngestionService";
 
 type StandingsCache = Map<string, FDStandingEntry[]>;
 
@@ -29,49 +28,6 @@ const LEAGUE_CODE_MAP: Record<string, string> = {
   "Eredivisie": "DED",
   "Primeira Liga": "PPL",
 };
-
-// Top-5 European leagues covered by Understat. Both display-name and slug
-// variants accepted. Stage 2 of F2.e wires team_xg_rolling reads ONLY for these
-// leagues; non-top-5 fixtures fall through to the existing computeXgProxy
-// formula.
-const UNDERSTAT_COVERED_LEAGUES = new Set<string>([
-  "Premier League",
-  "EPL",
-  "Bundesliga",
-  "La Liga",
-  "La_liga",
-  "Serie A",
-  "Serie_A",
-  "Ligue 1",
-  "Ligue_1",
-]);
-
-const UNDERSTAT_FRESHNESS_MAX_AGE_DAYS = 14;
-
-// Try to retrieve real Understat xG rolling stats for a team in a top-5 league.
-// Returns null on:
-//   - non-top-5 league
-//   - team not found in team_xg_rolling
-//   - rolling stats older than UNDERSTAT_FRESHNESS_MAX_AGE_DAYS (defends
-//     against bygone-season data being silently used)
-async function getRollingXgIfFresh(
-  teamName: string,
-  league: string,
-): Promise<{ xgFor5: number; xgAgainst5: number } | null> {
-  if (!UNDERSTAT_COVERED_LEAGUES.has(league)) return null;
-
-  const stats = await getTeamXGStats(teamName).catch(() => null);
-  if (!stats) return null;
-
-  const ageMs = Date.now() - new Date(stats.computedAt).getTime();
-  const ageDays = ageMs / (1000 * 60 * 60 * 24);
-  if (ageDays > UNDERSTAT_FRESHNESS_MAX_AGE_DAYS) return null;
-
-  return {
-    xgFor5: Number(stats.xgFor5),
-    xgAgainst5: Number(stats.xgAgainst5),
-  };
-}
 
 function getTeamPosition(
   standings: FDStandingEntry[],
@@ -452,45 +408,9 @@ export async function computeFeaturesForMatch(
   const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
   const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
 
-  const homeXgProxy = computeXgProxy(homeMatches, homeTeamId, "home", 10);
-  const awayXgProxy = computeXgProxy(awayMatches, awayTeamId, "away", 10);
-
-  // F2.e Stage 2: try real Understat xG (top-5 leagues only, ≤14d fresh).
-  // Fall through to the proxy formula on miss / staleness / non-top-5.
-  // Need the team-name strings for team_xg_rolling lookup since we only have
-  // numeric IDs in this code path.
-  const matchRow = await db
-    .select({
-      homeTeam: matchesTable.homeTeam,
-      awayTeam: matchesTable.awayTeam,
-    })
-    .from(matchesTable)
-    .where(eq(matchesTable.id, matchId))
-    .limit(1);
-  const homeTeamName = matchRow[0]?.homeTeam ?? "";
-  const awayTeamName = matchRow[0]?.awayTeam ?? "";
-  const homeRolling = homeTeamName
-    ? await getRollingXgIfFresh(homeTeamName, league)
-    : null;
-  const awayRolling = awayTeamName
-    ? await getRollingXgIfFresh(awayTeamName, league)
-    : null;
-  const homeXg = homeRolling ? homeRolling.xgFor5 : homeXgProxy;
-  const awayXg = awayRolling ? awayRolling.xgFor5 : awayXgProxy;
+  const homeXg = computeXgProxy(homeMatches, homeTeamId, "home", 10);
+  const awayXg = computeXgProxy(awayMatches, awayTeamId, "away", 10);
   const xgDiff = homeXg - awayXg;
-  if (homeRolling || awayRolling) {
-    logger.info(
-      {
-        matchId,
-        league,
-        homeRollingUsed: !!homeRolling,
-        awayRollingUsed: !!awayRolling,
-        homeXg,
-        awayXg,
-      },
-      "F2.e: real Understat xG used for fixture",
-    );
-  }
 
   // ─── Read any API-Football enriched features already stored ─────────────────
   const storedFeatures = await db
@@ -696,29 +616,9 @@ async function computeFeaturesFromDb(
 
   const homeXgDb = computeXgProxy(homeMatches, homeTeamId, "home", 10);
   const awayXgDb = computeXgProxy(awayMatches, awayTeamId, "away", 10);
-  const homeXgFallback = hasDbHistory ? homeXgDb : homeGoalsScored;
-  const awayXgFallback = hasDbHistory ? awayXgDb : awayGoalsScored;
-
-  // F2.e Stage 2: try real Understat xG (top-5 leagues only, ≤14d fresh).
-  // Fall through to the proxy/fallback on miss.
-  const homeRolling = await getRollingXgIfFresh(homeTeam, league);
-  const awayRolling = await getRollingXgIfFresh(awayTeam, league);
-  const homeXg = homeRolling ? homeRolling.xgFor5 : homeXgFallback;
-  const awayXg = awayRolling ? awayRolling.xgFor5 : awayXgFallback;
+  const homeXg = hasDbHistory ? homeXgDb : homeGoalsScored;
+  const awayXg = hasDbHistory ? awayXgDb : awayGoalsScored;
   const xgDiff = homeXg - awayXg;
-  if (homeRolling || awayRolling) {
-    logger.info(
-      {
-        matchId,
-        league,
-        homeRollingUsed: !!homeRolling,
-        awayRollingUsed: !!awayRolling,
-        homeXg,
-        awayXg,
-      },
-      "F2.e: real Understat xG used for DB-path fixture",
-    );
-  }
 
   const homeYellowCards = stored["home_yellow_cards_avg"] ?? 1.8;
   const awayYellowCards = stored["away_yellow_cards_avg"] ?? 1.6;
