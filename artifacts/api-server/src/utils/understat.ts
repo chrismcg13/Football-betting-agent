@@ -12,7 +12,7 @@ export interface MatchXGData {
   isResult: boolean;
 }
 
-const LEAGUE_MAP: Record<string, string> = {
+export const LEAGUE_MAP: Record<string, string> = {
   EPL: "EPL",
   Bundesliga: "Bundesliga",
   "La Liga": "La_liga",

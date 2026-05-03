@@ -21,6 +21,7 @@ export const xgMatchDataTable = pgTable("xg_match_data", {
   homeGoals: integer("home_goals"),
   awayGoals: integer("away_goals"),
   isResult: boolean("is_result").default(false),
+  source: text("source").notNull().default("understat"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
 });
 
