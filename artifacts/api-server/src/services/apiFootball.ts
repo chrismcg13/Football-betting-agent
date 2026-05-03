@@ -2030,3 +2030,117 @@ export async function capturePreKickoffLineups(): Promise<{
   logger.info({ checked: matchesWithBets.rows.length, captured, keyPlayerMissing }, "Pre-kickoff lineup capture complete");
   return { checked: matchesWithBets.rows.length, captured, keyPlayerMissing };
 }
+
+// ─── Standings + H2H (Stage 4 Phase D) ───────────────────────────────────────
+// These replace the football-data.org getStandings + getHeadToHead helpers in
+// featureEngine.ts. Standings drive `league_position_diff`; h2h drives
+// `h2h_home_win_rate`. Cached aggressively (standings 12h, h2h none — h2h is
+// per-fixture-pair so cache hits are rare).
+
+interface ApiStandingEntry {
+  rank: number;
+  team: { id: number; name: string };
+  points: number;
+  goalsDiff: number;
+}
+
+interface ApiStandingsResponse {
+  league: {
+    id: number;
+    name: string;
+    standings: ApiStandingEntry[][];
+  };
+}
+
+const STANDINGS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const standingsCacheStore: Map<string, { data: ApiStandingEntry[]; cachedAt: number }> = new Map();
+
+const AUG_MAY_LEAGUES_GLOBAL = new Set<number>([
+  39, 40, 41, 42, 78, 79, 80, 140, 141, 135, 136, 137, 61, 62, 63, 88, 94, 144,
+  179, 207, 218, 119, 103, 113, 197, 203, 286, 372,
+]);
+
+export function getCurrentSeasonForLeague(leagueId: number): number {
+  const now = new Date();
+  const currentYear = now.getUTCFullYear();
+  const currentMonth = now.getUTCMonth() + 1;
+  if (AUG_MAY_LEAGUES_GLOBAL.has(leagueId)) {
+    return currentMonth >= 7 ? currentYear : currentYear - 1;
+  }
+  return currentYear;
+}
+
+export async function fetchStandingsFromApiFootball(
+  leagueId: number,
+  season?: number,
+): Promise<ApiStandingEntry[]> {
+  const seasonResolved = season ?? getCurrentSeasonForLeague(leagueId);
+  const cacheKey = `${leagueId}:${seasonResolved}`;
+  const cached = standingsCacheStore.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < STANDINGS_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const result = await fetchApiFootball<ApiStandingsResponse[]>(
+    "/standings",
+    { league: leagueId, season: seasonResolved },
+  );
+
+  if (!result || result.length === 0) {
+    standingsCacheStore.set(cacheKey, { data: [], cachedAt: Date.now() });
+    return [];
+  }
+
+  const flat = (result[0]?.league.standings ?? []).flat();
+  standingsCacheStore.set(cacheKey, { data: flat, cachedAt: Date.now() });
+  return flat;
+}
+
+export interface ApiH2HSummary {
+  numberOfMatches: number;
+  homeWins: number;
+  draws: number;
+  awayWins: number;
+}
+
+export async function fetchH2HFromApiFootball(
+  homeApiTeamId: number,
+  awayApiTeamId: number,
+  last = 20,
+): Promise<ApiH2HSummary | null> {
+  const result = await fetchApiFootball<ApiFixture[]>(
+    "/fixtures/headtohead",
+    { h2h: `${homeApiTeamId}-${awayApiTeamId}`, last },
+  );
+  if (!result || result.length === 0) return null;
+
+  let homeWins = 0;
+  let draws = 0;
+  let awayWins = 0;
+
+  for (const fix of result) {
+    const ft = fix.score?.fulltime;
+    const h = ft?.home;
+    const a = ft?.away;
+    if (h === null || a === null || h === undefined || a === undefined) continue;
+    const fixtureHomeId = fix.teams?.home?.id;
+    if (h === a) {
+      draws++;
+    } else if (h > a) {
+      if (fixtureHomeId === homeApiTeamId) homeWins++;
+      else awayWins++;
+    } else {
+      if (fixtureHomeId === homeApiTeamId) awayWins++;
+      else homeWins++;
+    }
+  }
+
+  return { numberOfMatches: homeWins + draws + awayWins, homeWins, draws, awayWins };
+}
+
+export function getTeamPositionFromStandings(
+  standings: ApiStandingEntry[],
+  apiTeamId: number,
+): number | null {
+  return standings.find((s) => s.team.id === apiTeamId)?.rank ?? null;
+}

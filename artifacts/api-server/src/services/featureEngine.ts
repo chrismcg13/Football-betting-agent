@@ -8,6 +8,13 @@ import {
   type FDMatch,
   type FDStandingEntry,
 } from "./footballData";
+import {
+  LEAGUE_IDS,
+  fetchStandingsFromApiFootball,
+  fetchH2HFromApiFootball,
+  getCurrentSeasonForLeague,
+  getTeamPositionFromStandings,
+} from "./apiFootball";
 
 type StandingsCache = Map<string, FDStandingEntry[]>;
 
@@ -318,6 +325,26 @@ async function getStoredTeamId(
   return isNaN(id) ? null : id;
 }
 
+async function getStoredAfTeamId(
+  matchId: number,
+  featureName: "_af_home_team_id" | "_af_away_team_id",
+): Promise<number | null> {
+  const rows = await db
+    .select({ featureValue: featuresTable.featureValue })
+    .from(featuresTable)
+    .where(
+      and(
+        eq(featuresTable.matchId, matchId),
+        eq(featuresTable.featureName, featureName),
+      ),
+    )
+    .limit(1);
+
+  if (!rows[0]?.featureValue) return null;
+  const id = parseInt(rows[0].featureValue, 10);
+  return isNaN(id) ? null : id;
+}
+
 export async function computeFeaturesForMatch(
   matchId: number,
   homeTeamId: number,
@@ -559,7 +586,22 @@ async function computeFeaturesFromDb(
   const awayOver25 = hasDbHistory ? awayOver25Db :
     Math.min(0.9, Math.max(0.1, (totalGoalsAvg - 2.0) * 0.35 + 0.5));
 
-  const h2hHomeWinRate = 0.4;
+  // ─── h2h_home_win_rate via API-Football /fixtures/headtohead ─────────────────
+  // Fallback 0.4 (slight home advantage prior) if either team's API-Football ID
+  // isn't stored, the league isn't in our LEAGUE_IDS map, or the call returns null.
+  const homeAfId = await getStoredAfTeamId(matchId, "_af_home_team_id");
+  const awayAfId = await getStoredAfTeamId(matchId, "_af_away_team_id");
+  let h2hHomeWinRate = 0.4;
+  if (homeAfId && awayAfId) {
+    try {
+      const h2h = await fetchH2HFromApiFootball(homeAfId, awayAfId, 20);
+      if (h2h && h2h.numberOfMatches > 0) {
+        h2hHomeWinRate = h2h.homeWins / h2h.numberOfMatches;
+      }
+    } catch (err) {
+      logger.warn({ err, matchId, homeAfId, awayAfId }, "H2H lookup failed — using neutral fallback");
+    }
+  }
 
   const homeCleanSheets = hasDbHistory ? computeCleanSheetRate(homeMatches, homeTeamId, "home", 5) :
     Math.max(0.05, 1 - (awayGoalsScored / 1.5));
@@ -591,7 +633,26 @@ async function computeFeaturesFromDb(
   const homeGoalMomentum = 0.5 + homePointsTraj * 2;
   const awayGoalMomentum = 0.5 + awayPointsTraj * 2;
 
-  const leaguePositionDiff = 0;
+  // ─── league_position_diff via API-Football /standings ────────────────────────
+  // Fallback 0 (treat as equal-position) if league isn't in LEAGUE_IDS map,
+  // either team's API-Football ID isn't stored, or standings call returns empty.
+  let leaguePositionDiff = 0;
+  const apiLeagueId = LEAGUE_IDS[league];
+  if (apiLeagueId && homeAfId && awayAfId) {
+    try {
+      const season = getCurrentSeasonForLeague(apiLeagueId);
+      const standings = await fetchStandingsFromApiFootball(apiLeagueId, season);
+      if (standings.length > 0) {
+        const homePos = getTeamPositionFromStandings(standings, homeAfId);
+        const awayPos = getTeamPositionFromStandings(standings, awayAfId);
+        if (homePos !== null && awayPos !== null) {
+          leaguePositionDiff = (awayPos - homePos) / standings.length;
+        }
+      }
+    } catch (err) {
+      logger.warn({ err, matchId, apiLeagueId }, "Standings lookup failed — using neutral fallback");
+    }
+  }
 
   const features: Array<[string, number]> = [
     ["home_form_last5", homeForm5],
