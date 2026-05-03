@@ -197,7 +197,7 @@ async function getOddspapiUsageByPriority(priority: string): Promise<number> {
   return Number(rows[0]?.total ?? 0);
 }
 
-async function canMakeOddspapiRequest(needed = 1, priority = "P1"): Promise<boolean> {
+export async function canMakeOddspapiRequest(needed = 1, priority = "P1"): Promise<boolean> {
   const key = process.env.ODDSPAPI_KEY;
   if (!key) return false;
   const [daily, monthly, effectiveCap] = await Promise.all([
@@ -277,7 +277,7 @@ export function isOddsPapiCircuitOpen(): boolean {
   return isCircuitOpen(ODDSPAPI_SERVICE);
 }
 
-async function fetchOddsPapi<T = unknown>(
+export async function fetchOddsPapi<T = unknown>(
   path: string,
   params: Record<string, string | number> = {},
   trackAs = "request",

@@ -43,7 +43,8 @@ import {
 } from "./oddsPapi";
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, backfillPinnacleSnapshotsFromAf } from "./apiFootball";
-import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
+import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig, syncBetfairCompetitionCoverage } from "./leagueDiscovery";
+import { discoverPinnacleLeagues } from "./oddsPapiDiscovery";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
 import { runPromotionEngine } from "./promotionEngine";
@@ -2087,6 +2088,24 @@ export function startScheduler(): void {
     });
   }, { timezone: "UTC" });
   logger.info("Weekly experiment analysis scheduler active — Sunday 04:00 UTC");
+
+  // Phase 1.B: weekly OddsPapi /v4/tournaments discovery + Pinnacle probe
+  cron.schedule("0 2 * * 0", () => {
+    logger.info("OddsPapi tournament discovery triggered (Sunday 02:00 UTC)");
+    void discoverPinnacleLeagues()
+      .then((r) => logger.info(r, "OddsPapi tournament discovery complete"))
+      .catch((err) => logger.error({ err }, "OddsPapi tournament discovery failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("OddsPapi tournament discovery scheduler active — Sunday 02:00 UTC");
+
+  // Phase 1.C: weekly Betfair Exchange coverage sync
+  cron.schedule("30 2 * * 0", () => {
+    logger.info("Betfair competition coverage sync triggered (Sunday 02:30 UTC)");
+    void syncBetfairCompetitionCoverage()
+      .then((r) => logger.info(r, "Betfair coverage sync complete"))
+      .catch((err) => logger.error({ err }, "Betfair coverage sync failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Betfair Exchange coverage sync scheduler active — Sunday 02:30 UTC");
 
   cron.schedule("30 4 * * 0", () => {
     logger.info("Data richness recalculation triggered (Sunday 04:30 UTC)");

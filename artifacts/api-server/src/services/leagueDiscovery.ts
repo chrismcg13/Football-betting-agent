@@ -13,6 +13,8 @@ import { db, discoveredLeaguesTable, leagueEdgeScoresTable, learningNarrativesTa
 import { eq, inArray, sql, and, like } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { ALL_LEAGUE_IDS, TIER1_LEAGUE_IDS, TIER2_LEAGUE_IDS, TIER3_LEAGUE_IDS } from "./apiFootball";
+import { listCompetitions } from "./betfair";
+import { leagueNameSimilarity } from "./oddsPapiDiscovery";
 
 // ─── Pre-known leagues to ALWAYS include (hardcoded IDs from apiFootball.ts) ──
 const BASELINE_LEAGUE_IDS = new Set(ALL_LEAGUE_IDS);
@@ -65,6 +67,40 @@ const KNOWN_PINNACLE_LEAGUE_IDS = new Set([
   42,   // EFL League Two
   307,  // Saudi Pro League
   288,  // South Africa PSL
+  // ─── Phase 1.F additions (2026-05-04) — obvious-Pinnacle internationals,
+  //     domestic cups, women's leagues, and friendlies. Static fallback floor;
+  //     the weekly /v4/tournaments probe in oddsPapiDiscovery.ts is the
+  //     authoritative source for the long tail. See plan v3 1.F.
+  // International tournaments (men's)
+  1,    // FIFA World Cup
+  5,    // UEFA Nations League
+  6,    // Africa Cup of Nations
+  7,    // AFC Asian Cup
+  9,    // Copa America
+  10,   // International Friendlies (men's)
+  11,   // Gold Cup (CONCACAF)
+  848,  // UEFA Nations League (alt ID)
+  // International tournaments (women's)
+  8,    // FIFA Women's World Cup
+  22,   // Women's International Friendlies
+  666,  // Women's International Friendlies (alt)
+  960,  // UEFA Women's Euro
+  // Domestic cups (Europe top-5 + Scotland + Netherlands)
+  45,   // FA Cup (England)
+  46,   // EFL Cup / Carabao
+  66,   // Coupe de France
+  81,   // DFB-Pokal (Germany)
+  137,  // Coppa Italia
+  143,  // Copa del Rey (Spain)
+  156,  // KNVB Beker (Netherlands)
+  180,  // Scottish Cup
+  // Women's domestic leagues
+  254,  // NWSL (USA)
+  524,  // Serie A Femminile (Italy)
+  770,  // Frauen-Bundesliga (Germany)
+  771,  // WSL (England)
+  773,  // Division 1 Féminine (France)
+  775,  // Liga F (Spain)
 ]);
 
 // ─── Tier classification ──────────────────────────────────────────────────────
@@ -883,6 +919,7 @@ export async function updatePinnacleOddsFromActualMappings(): Promise<{
 
   // Update discovered_leagues for these leagues
   let updated = 0;
+  let ccUpdated = 0;
   for (const name of leagueNames) {
     const result = await db
       .update(discoveredLeaguesTable)
@@ -893,11 +930,173 @@ export async function updatePinnacleOddsFromActualMappings(): Promise<{
       updated++;
       logger.info({ league: name }, "Updated hasPinnacleOdds=true from Pinnacle data (API-Football or OddsPapi)");
     }
+
+    // Phase 1.E (2026-05-04): also propagate to competition_config so the
+    // trading-cycle gate at scheduler.ts:937-948 (which reads competition_config,
+    // not discovered_leagues) sees the promotion. Case-insensitive name match
+    // because the gate lowercases on read.
+    const ccResult = await db.execute(sql`
+      UPDATE competition_config
+      SET has_pinnacle_odds = true
+      WHERE LOWER(name) = LOWER(${name})
+        AND has_pinnacle_odds = false
+    `);
+    const ccRowCount = (ccResult as { rowCount?: number }).rowCount ?? 0;
+    if (ccRowCount > 0) {
+      ccUpdated++;
+      logger.info({ league: name }, "Promoted competition_config.has_pinnacle_odds=true (bidirectional sync)");
+    }
   }
 
   logger.info(
-    { afPinnacle: leaguesWithAfPinnacle.length, oddsPapiMapped: leaguesWithOddsPapiMapping.length, newlyUpdated: updated },
+    {
+      afPinnacle: leaguesWithAfPinnacle.length,
+      oddsPapiMapped: leaguesWithOddsPapiMapping.length,
+      discoveredLeaguesUpdated: updated,
+      competitionConfigUpdated: ccUpdated,
+    },
     "Pinnacle coverage sync complete",
   );
   return { updated, leaguesWithPinnacle: leagueNames };
+}
+
+// ─── Betfair Exchange coverage sync (Phase 1.C) ──────────────────────────────
+// Calls Betfair listCompetitions("1") (eventTypeId=1 = football) and fuzzy-
+// matches each Betfair competition to a competition_config row using the
+// token-set ratio at oddsPapiDiscovery.leagueNameSimilarity (threshold 0.85,
+// country as secondary tie-breaker via combined score 0.7×name + 0.3×country).
+// Ratchets has_betfair_exchange=true on match. Runs weekly Sunday 02:30 UTC.
+//
+// Per plan v3 1.C: this gives us the Betfair-side coverage flag that Phase 1.D
+// (deferred to commit B) uses to gate the trading cycle on BOTH Pinnacle AND
+// Betfair availability.
+
+const BETFAIR_SIM_THRESHOLD = 0.85;
+
+export async function syncBetfairCompetitionCoverage(): Promise<{
+  betfairCompetitions: number;
+  matched: number;
+  promoted: number;
+  unmatched: number;
+}> {
+  const startedAt = new Date();
+  logger.info("Starting Betfair Exchange coverage sync (weekly)");
+
+  let betfairCompetitions: Array<{ competition: { id: string; name: string }; competitionRegion: string }>;
+  try {
+    betfairCompetitions = await listCompetitions("1");
+  } catch (err) {
+    logger.warn({ err }, "Betfair listCompetitions failed — skipping coverage sync");
+    return { betfairCompetitions: 0, matched: 0, promoted: 0, unmatched: 0 };
+  }
+
+  if (!Array.isArray(betfairCompetitions) || betfairCompetitions.length === 0) {
+    logger.warn("Betfair listCompetitions returned empty — skipping coverage sync");
+    return { betfairCompetitions: 0, matched: 0, promoted: 0, unmatched: 0 };
+  }
+
+  const ccRows = await db
+    .select({
+      id: competitionConfigTable.id,
+      name: competitionConfigTable.name,
+      country: competitionConfigTable.country,
+      hasBetfairExchange: competitionConfigTable.hasBetfairExchange,
+    })
+    .from(competitionConfigTable);
+
+  let matched = 0;
+  let promoted = 0;
+  const unmatched: Array<{ name: string; region: string; bestSim: number; bestCandidate: string }> = [];
+
+  for (const bc of betfairCompetitions) {
+    const bcName = bc.competition?.name ?? "";
+    const bcRegion = bc.competitionRegion ?? "";
+    if (!bcName) continue;
+
+    let bestMatch: typeof ccRows[number] | null = null;
+    let bestCombined = 0;
+    let bestNameSim = 0;
+    let bestCountrySim = 0;
+    for (const cc of ccRows) {
+      const nameSim = leagueNameSimilarity(bcName, cc.name);
+      if (nameSim < BETFAIR_SIM_THRESHOLD) continue;
+      const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
+      const combined = nameSim * 0.7 + countrySim * 0.3;
+      if (!bestMatch || combined > bestCombined) {
+        bestMatch = cc;
+        bestCombined = combined;
+        bestNameSim = nameSim;
+        bestCountrySim = countrySim;
+      }
+    }
+
+    if (!bestMatch) {
+      // Track top near-miss for compliance review
+      let nearMiss = { name: "", sim: 0 };
+      for (const cc of ccRows) {
+        const s = leagueNameSimilarity(bcName, cc.name);
+        if (s > nearMiss.sim) nearMiss = { name: cc.name, sim: s };
+      }
+      unmatched.push({
+        name: bcName,
+        region: bcRegion,
+        bestSim: nearMiss.sim,
+        bestCandidate: nearMiss.name,
+      });
+      continue;
+    }
+    matched++;
+
+    if (!bestMatch.hasBetfairExchange) {
+      await db
+        .update(competitionConfigTable)
+        .set({ hasBetfairExchange: true })
+        .where(eq(competitionConfigTable.id, bestMatch.id));
+      promoted++;
+      logger.info(
+        {
+          betfairName: bcName,
+          betfairRegion: bcRegion,
+          matchedTo: bestMatch.name,
+          matchedCountry: bestMatch.country,
+          nameSim: bestNameSim.toFixed(3),
+          countrySim: bestCountrySim.toFixed(3),
+          combined: bestCombined.toFixed(3),
+        },
+        "Promoted competition_config to has_betfair_exchange=true via Betfair listCompetitions sync",
+      );
+    }
+  }
+
+  await db.insert(complianceLogsTable).values({
+    actionType: "decision",
+    details: {
+      action: "betfair_competition_coverage_sync",
+      betfairCompetitions: betfairCompetitions.length,
+      matched,
+      promoted,
+      unmatchedCount: unmatched.length,
+      unmatchedSample: unmatched.slice(0, 30),
+      durationMs: Date.now() - startedAt.getTime(),
+    },
+    timestamp: new Date(),
+  });
+
+  logger.info(
+    {
+      betfairCompetitions: betfairCompetitions.length,
+      matched,
+      promoted,
+      unmatched: unmatched.length,
+      durationMs: Date.now() - startedAt.getTime(),
+    },
+    "Betfair Exchange coverage sync complete",
+  );
+
+  return {
+    betfairCompetitions: betfairCompetitions.length,
+    matched,
+    promoted,
+    unmatched: unmatched.length,
+  };
 }

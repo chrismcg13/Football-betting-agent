@@ -23,6 +23,7 @@ export const competitionConfigTable = pgTable("competition_config", {
   hasOdds: boolean("has_odds").notNull().default(false),
   hasEvents: boolean("has_events").notNull().default(false),
   hasPinnacleOdds: boolean("has_pinnacle_odds").notNull().default(false),
+  hasBetfairExchange: boolean("has_betfair_exchange").notNull().default(false),
   seasonalStart: text("seasonal_start"),
   seasonalEnd: text("seasonal_end"),
   currentSeason: integer("current_season"),
