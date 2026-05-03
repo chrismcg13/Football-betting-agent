@@ -981,7 +981,47 @@ export async function updatePinnacleOddsFromActualMappings(): Promise<{
 const BETFAIR_SIM_THRESHOLD_STRICT = 0.85;
 const BETFAIR_SIM_THRESHOLD_LOOSE = 0.70;
 const BETFAIR_COUNTRY_TOLERANCE = 0.5;
-const BETFAIR_SUBSTRING_MIN_CHARS = 8;
+const BETFAIR_SUBSTRING_MIN_CHARS = 6;
+const BETFAIR_PASS1_COMBINED_FLOOR = 0.85;
+
+// Betfair returns competitionRegion as ISO 3-letter codes (BRA, GBR, USA, KOR,
+// etc.) but our competition_config.country uses full English names. Without
+// translation, country fuzzy-match always near-zero. This map normalises ISO
+// codes → country names before comparison. GBR is ambiguous (England /
+// Scotland / Wales / NI separately in cc) — handled in normaliseRegion below.
+const ISO_TO_COUNTRY: Record<string, string> = {
+  ARG: "Argentina", AUS: "Australia", AUT: "Austria", BEL: "Belgium",
+  BHR: "Bahrain", BLR: "Belarus", BIH: "Bosnia and Herzegovina",
+  BRA: "Brazil", BGR: "Bulgaria", CAN: "Canada", CHE: "Switzerland",
+  CHL: "Chile", CHN: "China", COL: "Colombia", CRO: "Croatia", HRV: "Croatia",
+  CZE: "Czech Republic", DEU: "Germany", DNK: "Denmark", ECU: "Ecuador",
+  EGY: "Egypt", ENG: "England", ESP: "Spain", FIN: "Finland", FRA: "France",
+  GRC: "Greece", HKG: "Hong Kong", HUN: "Hungary", IDN: "Indonesia",
+  IND: "India", IRL: "Ireland", IRN: "Iran", ISL: "Iceland", ISR: "Israel",
+  ITA: "Italy", JPN: "Japan", KOR: "South Korea", LUX: "Luxembourg",
+  MEX: "Mexico", MKD: "North Macedonia", NGA: "Nigeria", NLD: "Netherlands",
+  NOR: "Norway", NZL: "New Zealand", PAK: "Pakistan", PER: "Peru",
+  PHL: "Philippines", POL: "Poland", PRT: "Portugal", PRY: "Paraguay",
+  QAT: "Qatar", ROU: "Romania", RUS: "Russia", SAU: "Saudi Arabia",
+  SCO: "Scotland", SRB: "Serbia", SVK: "Slovakia", SVN: "Slovenia",
+  SWE: "Sweden", THA: "Thailand", TUR: "Turkey", UKR: "Ukraine",
+  URY: "Uruguay", USA: "USA", VEN: "Venezuela", VNM: "Vietnam",
+  ZAF: "South Africa", WAL: "Wales",
+};
+
+function normaliseRegion(region: string, bcName: string): string {
+  const upper = region.toUpperCase();
+  if (upper === "GBR") {
+    // GBR is ambiguous — try to disambiguate from name hints
+    const lower = bcName.toLowerCase();
+    if (lower.includes("scottish") || lower.includes("scotland")) return "Scotland";
+    if (lower.includes("welsh") || lower.includes("wales")) return "Wales";
+    if (lower.includes("northern irish") || lower.includes("northern ireland")) return "Northern Ireland";
+    return "England"; // default — most common GBR football market
+  }
+  if (upper === "INTERNATIONAL") return "World";
+  return ISO_TO_COUNTRY[upper] ?? region;
+}
 
 function slugifyAlnum(s: string): string {
   return s
@@ -1022,14 +1062,21 @@ function findBestMatch(
   ccRows: CcRow[],
   excludedIds: Set<number>,
 ): MatchResult | null {
-  // Pass 1: strict token-set ≥ 0.85 with country tie-breaker
+  // Normalise ISO country code → country name for fuzzy comparison
+  const bcRegionNormalised = normaliseRegion(bcRegion, bcName);
+
+  // Pass 1: strict token-set ≥ 0.85 AND combined ≥ 0.85 (country must agree).
+  // Pre-2026-05-04 bug: only nameSim was thresholded; this allowed
+  // "Brazilian Serie C" (BRA) to match Italian Serie C at nameSim=1.0
+  // countrySim≈0 combined=0.7, winning Pass 1. Now requires combined ≥ 0.85.
   let best: MatchResult | null = null;
   for (const cc of ccRows) {
     if (excludedIds.has(cc.id)) continue;
     const nameSim = leagueNameSimilarity(bcName, cc.name);
     if (nameSim < BETFAIR_SIM_THRESHOLD_STRICT) continue;
-    const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
+    const countrySim = leagueNameSimilarity(bcRegionNormalised, cc.country ?? "");
     const combined = nameSim * 0.7 + countrySim * 0.3;
+    if (combined < BETFAIR_PASS1_COMBINED_FLOOR) continue;
     if (!best || combined > best.combined) {
       best = { cc, method: "strict", nameSim, countrySim, combined };
     }
@@ -1043,7 +1090,7 @@ function findBestMatch(
     if (excludedIds.has(cc.id)) continue;
     const nameSim = leagueNameSimilarity(bcName, cc.name);
     if (nameSim < BETFAIR_SIM_THRESHOLD_LOOSE) continue;
-    const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
+    const countrySim = leagueNameSimilarity(bcRegionNormalised, cc.country ?? "");
     if ((cc.country ?? "") !== "" && countrySim < BETFAIR_COUNTRY_TOLERANCE) continue;
     const combined = nameSim * 0.7 + countrySim * 0.3;
     if (!best || combined > best.combined) {
@@ -1065,9 +1112,9 @@ function findBestMatch(
   }
 
   // Pass 4: substring containment with country tolerance — Betfair name fully
-  // contains a competition_config row's name (or vice versa), at least 8
-  // matching characters. Catches cases like "England Premier League" vs
-  // "Premier League" where token-set still scores below threshold.
+  // contains a competition_config row's name (or vice versa), at least 6
+  // matching characters (down from 8 to catch "Serie A" 7 chars and "FA Cup"
+  // 6 chars). Country tolerance still required when cc.country populated.
   const bNorm = normaliseForSubstring(bcName);
   for (const cc of ccRows) {
     if (excludedIds.has(cc.id)) continue;
@@ -1077,7 +1124,7 @@ function findBestMatch(
     const shorter = bNorm.length >= ccNorm.length ? ccNorm : bNorm;
     if (shorter.length < BETFAIR_SUBSTRING_MIN_CHARS) continue;
     if (!longer.includes(shorter)) continue;
-    const countrySim = leagueNameSimilarity(bcRegion, cc.country ?? "");
+    const countrySim = leagueNameSimilarity(bcRegionNormalised, cc.country ?? "");
     if ((cc.country ?? "") !== "" && countrySim < BETFAIR_COUNTRY_TOLERANCE) continue;
     return { cc, method: "substring", nameSim: 0.75, countrySim, combined: 0.75 };
   }

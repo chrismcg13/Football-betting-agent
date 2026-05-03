@@ -32,11 +32,25 @@ interface OddsPapiOddsResponse {
   odds?: OddsPapiBookmaker[];
 }
 
-// Token-set ratio with diacritic stripping. Returns 1.0 when smaller token
-// set is fully contained in the larger; partial scores reflect fractional
-// inclusion. Chosen over Levenshtein/Jaro-Winkler because league names
-// commonly differ by word reordering and extra qualifiers ("Premier League"
-// vs "England Premier League"); set-based matching is robust to those.
+// Token-set similarity with diacritic stripping + degenerate-set guard.
+//
+// Pre-2026-05-04 bug: pure intersection/min(|A|,|B|) returned 1.0 in degenerate
+// cases like "V-League" {league} matching "South Korean K1 League"
+// {south,korean,k1,league} — because the smaller set was fully contained.
+// Common-token bleed produced false 1.0 scores any time the smaller name was
+// a generic suffix like "League".
+//
+// Fix: when min(|A|,|B|) == 1, fall back to Jaccard (intersection / union),
+// which penalises the size-disparity. Larger sets continue to use the more
+// permissive intersection/min, which correctly handles "Premier League" vs
+// "Premier League England" subset matches.
+//
+// Test cases (post-fix):
+//   "Premier League" vs "Premier League England": min=2, score=2/2=1.0 ✓
+//   "V-League" vs "South Korean K1 League": min=1, jaccard=1/4=0.25 ✓ rejects
+//   "Brazilian Serie A" vs "Serie A": min=1, jaccard=1/2=0.5 ✓ rejects
+//   "Brazil Serie A" vs "Brasileirão Série A": min=2, score=1/2=0.5 ✓ rejects
+//   (the latter correctly rejected — needs alias dictionary, not fuzzy match)
 export function leagueNameSimilarity(a: string, b: string): number {
   const norm = (s: string) =>
     s
@@ -54,7 +68,12 @@ export function leagueNameSimilarity(a: string, b: string): number {
   if (aTokens.size === 0 || bTokens.size === 0) return 0;
   let intersection = 0;
   for (const t of aTokens) if (bTokens.has(t)) intersection++;
-  return intersection / Math.min(aTokens.size, bTokens.size);
+  const minSize = Math.min(aTokens.size, bTokens.size);
+  if (minSize === 1) {
+    // Degenerate-set guard: Jaccard penalises size disparity
+    return intersection / (aTokens.size + bTokens.size - intersection);
+  }
+  return intersection / minSize;
 }
 
 function extractBookmakerSlugs(raw: OddsPapiOddsResponse): string[] {
@@ -111,11 +130,12 @@ export async function discoverPinnacleLeagues(): Promise<{
   const startedAt = new Date();
   logger.info("Starting OddsPapi tournament discovery (weekly)");
 
-  if (!(await canMakeOddspapiRequest(3000, "P4"))) {
-    logger.warn("OddsPapi budget too low for tournament discovery — skipping");
-    return { tournamentsScanned: 0, pinnaclePriced: 0, matched: 0, promoted: 0, unmatched: 0 };
-  }
-
+  // Pre-2026-05-04: required upfront 3000-call budget reservation, which
+  // P4 priority (10% of 100k/month = 10k/month allocation) almost always
+  // failed because we were near monthly cap. Result: function returned
+  // all-zeros immediately. New approach: drop the upfront reservation,
+  // check budget per-tournament inside the loop. Greedy consumption,
+  // partial results > zero results.
   const tournaments = await fetchOddsPapi<OddsPapiTournament[]>(
     "/tournaments",
     { sportId: 10 },
@@ -148,7 +168,20 @@ export async function discoverPinnacleLeagues(): Promise<{
   let promoted = 0;
   const unmatched: Array<{ tournamentName: string; categoryName: string }> = [];
 
-  for (const tour of active) {
+  let budgetExhaustedAt: number | null = null;
+  for (let i = 0; i < active.length; i++) {
+    const tour = active[i];
+    if (!tour) continue;
+    // Per-tournament budget check (need 2 calls: fixture + odds probe)
+    if (!(await canMakeOddspapiRequest(2, "P4"))) {
+      budgetExhaustedAt = i;
+      logger.warn(
+        { tournamentsScanned: i, remainingTournaments: active.length - i },
+        "OddsPapi budget exhausted mid-discovery — partial results",
+      );
+      break;
+    }
+
     const fixtures = await fetchOddsPapi<OddsPapiFixtureProbe[]>(
       "/fixtures",
       { tournamentId: tour.tournamentId, hasOdds: "true", limit: 1 },
@@ -216,16 +249,20 @@ export async function discoverPinnacleLeagues(): Promise<{
     }
   }
 
+  const tournamentsScanned = budgetExhaustedAt ?? active.length;
+
   await db.insert(complianceLogsTable).values({
     actionType: "decision",
     details: {
       action: "oddspapi_tournament_discovery",
-      tournamentsScanned: active.length,
+      tournamentsScanned,
+      tournamentsTotal: active.length,
       pinnaclePriced,
       matched,
       promoted,
       unmatchedCount: unmatched.length,
       unmatchedSample: unmatched.slice(0, 20),
+      budgetExhausted: budgetExhaustedAt !== null,
       durationMs: Date.now() - startedAt.getTime(),
     },
     timestamp: new Date(),
@@ -233,18 +270,20 @@ export async function discoverPinnacleLeagues(): Promise<{
 
   logger.info(
     {
-      tournamentsScanned: active.length,
+      tournamentsScanned,
+      tournamentsTotal: active.length,
       pinnaclePriced,
       matched,
       promoted,
       unmatched: unmatched.length,
+      budgetExhausted: budgetExhaustedAt !== null,
       durationMs: Date.now() - startedAt.getTime(),
     },
     "OddsPapi tournament discovery complete",
   );
 
   return {
-    tournamentsScanned: active.length,
+    tournamentsScanned,
     pinnaclePriced,
     matched,
     promoted,
