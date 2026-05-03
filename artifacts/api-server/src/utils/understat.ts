@@ -23,21 +23,15 @@ export const LEAGUE_MAP: Record<string, string> = {
   Ligue_1: "Ligue_1",
 };
 
-function decodeUnderstatJson(raw: string): string {
-  return raw
-    .replace(/\\x([0-9A-Fa-f]{2})/g, (_, hex) =>
-      String.fromCharCode(parseInt(hex, 16)),
-    )
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, "\\");
-}
-
 export async function fetchUnderstatLeagueData(
   league: string,
   year: number,
 ): Promise<MatchXGData[]> {
   const slug = LEAGUE_MAP[league] ?? league;
-  const url = `https://understat.com/league/${slug}/${year}`;
+  // Understat moved match data from inline `var datesData = JSON.parse(...)`
+  // (rendered server-side in the league HTML page) to an AJAX endpoint that
+  // league.min.js calls client-side. The HTML page no longer contains the data.
+  const url = `https://understat.com/main/getLeagueData/${slug}/${year}`;
 
   try {
     logger.info({ league, year, url }, "Fetching Understat league data");
@@ -46,7 +40,9 @@ export async function fetchUnderstatLeagueData(
       headers: {
         "User-Agent":
           "Mozilla/5.0 (compatible; BettingAgent/1.0; research purposes)",
-        Accept: "text/html,application/xhtml+xml",
+        Accept: "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        Referer: `https://understat.com/league/${slug}/${year}`,
       },
       signal: AbortSignal.timeout(20000),
     });
@@ -59,15 +55,6 @@ export async function fetchUnderstatLeagueData(
       return [];
     }
 
-    const html = await resp.text();
-
-    const match = html.match(/var datesData\s*=\s*JSON\.parse\('(.+?)'\)/);
-    if (!match) {
-      logger.warn({ league, year }, "Could not find datesData variable in Understat HTML");
-      return [];
-    }
-
-    const decoded = decodeUnderstatJson(match[1]);
     type UnderstatRawMatch = {
       id?: unknown;
       h?: { title?: unknown };
@@ -83,7 +70,13 @@ export async function fetchUnderstatLeagueData(
       datetime?: unknown;
       isResult?: unknown;
     };
-    const parsed = JSON.parse(decoded) as UnderstatRawMatch[];
+    const payload = (await resp.json()) as { dates?: UnderstatRawMatch[] };
+    const parsed = payload.dates ?? [];
+
+    if (parsed.length === 0) {
+      logger.warn({ league, year }, "Understat response had no dates array");
+      return [];
+    }
 
     return parsed.map((m) => ({
       id: String(m.id ?? ""),
