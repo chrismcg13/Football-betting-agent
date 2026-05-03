@@ -88,27 +88,44 @@ function apiFixtureToFdMatchShape(fix: ApiFixture): FDMatch {
 
 // ===================== Feature ordering =====================
 // This order MUST be consistent across training and prediction.
+//
+// F2.e Stage 3 (2026-05-03): xG features promoted to FEATURE_NAMES. Indices
+// [12] [13] [14] are populated by featureEngine.ts using real Understat
+// rolling stats (top-5 European leagues, ≤14d fresh) OR the existing
+// computeXgProxy fallback formula for non-Understat fixtures. The model sees
+// a single shape; data quality differs by league.
+//
+// Adding features changes the model input dimension. loadLatestModel()
+// validates featureMeans.length === FEATURE_NAMES.length to refuse loading
+// a stale 12-dim model into the new 15-dim code path.
 export const FEATURE_NAMES = [
-  "home_form_last5",
-  "away_form_last5",
-  "home_goals_scored_avg",
-  "home_goals_conceded_avg",
-  "away_goals_scored_avg",
-  "away_goals_conceded_avg",
-  "h2h_home_win_rate",
-  "league_position_diff",
-  "home_btts_rate",
-  "away_btts_rate",
-  "home_over25_rate",
-  "away_over25_rate",
+  "home_form_last5",          // [0]
+  "away_form_last5",          // [1]
+  "home_goals_scored_avg",    // [2]
+  "home_goals_conceded_avg",  // [3]
+  "away_goals_scored_avg",    // [4]
+  "away_goals_conceded_avg",  // [5]
+  "h2h_home_win_rate",        // [6]
+  "league_position_diff",     // [7]
+  "home_btts_rate",           // [8]
+  "away_btts_rate",           // [9]
+  "home_over25_rate",         // [10]
+  "away_over25_rate",         // [11]
+  "home_xg_proxy",            // [12] — real Understat xG for top-5, proxy elsewhere
+  "away_xg_proxy",            // [13] — same as above
+  "xg_diff",                  // [14] — homeXg − awayXg
 ] as const;
 
 type FeatureName = (typeof FEATURE_NAMES)[number];
 
-// Feature index subsets for each model
-const OUTCOME_IDX = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] as const;
-const BTTS_IDX = [0, 1, 2, 3, 4, 5, 8, 9] as const;
-const OVER_UNDER_IDX = [0, 1, 2, 3, 4, 5, 10, 11] as const;
+// Feature index subsets for each model.
+// xG features added to OUTCOME_IDX (most signal) and OVER_UNDER_IDX (xg_diff
+// is highly predictive of total-goals markets). BTTS_IDX gets the diff only —
+// BTTS is more about per-team scoring rates which are already covered by
+// btts_rate features.
+const OUTCOME_IDX = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] as const;
+const BTTS_IDX = [0, 1, 2, 3, 4, 5, 8, 9, 14] as const;
+const OVER_UNDER_IDX = [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14] as const;
 
 // Outcome class labels
 const OUTCOME_HOME = 0;
@@ -513,6 +530,29 @@ export async function loadLatestModel(): Promise<boolean> {
     trainingSize: number;
   };
 
+  // F2.e Stage 3 (2026-05-03): refuse to load a model whose normalisation
+  // vector length disagrees with FEATURE_NAMES. Loading a 12-dim model into
+  // the new 15-dim code path would silently corrupt predictions
+  // (out-of-bounds means/stds → NaN normalised features). Bootstrap is
+  // required when this triggers.
+  if (
+    !Array.isArray(w.featureMeans) ||
+    !Array.isArray(w.featureStds) ||
+    w.featureMeans.length !== FEATURE_NAMES.length ||
+    w.featureStds.length !== FEATURE_NAMES.length
+  ) {
+    logger.error(
+      {
+        version: row.modelVersion,
+        expectedLength: FEATURE_NAMES.length,
+        actualMeansLength: Array.isArray(w.featureMeans) ? w.featureMeans.length : null,
+        actualStdsLength: Array.isArray(w.featureStds) ? w.featureStds.length : null,
+      },
+      "Model feature-count mismatch — refusing to load. Bootstrap or retrain required.",
+    );
+    return false;
+  }
+
   try {
     currentModel = {
       outcomeModel: LogisticRegression.load(w.outcomeModel),
@@ -524,7 +564,7 @@ export async function loadLatestModel(): Promise<boolean> {
       trainingSize: w.trainingSize,
     };
     logger.info(
-      { version: row.modelVersion, trainingSize: w.trainingSize },
+      { version: row.modelVersion, trainingSize: w.trainingSize, featureDim: FEATURE_NAMES.length },
       "Prediction model loaded from database",
     );
     return true;
