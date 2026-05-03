@@ -1065,18 +1065,30 @@ function findBestMatch(
   // Normalise ISO country code → country name for fuzzy comparison
   const bcRegionNormalised = normaliseRegion(bcRegion, bcName);
 
-  // Pass 1: strict token-set ≥ 0.85 AND combined ≥ 0.85 (country must agree).
-  // Pre-2026-05-04 bug: only nameSim was thresholded; this allowed
-  // "Brazilian Serie C" (BRA) to match Italian Serie C at nameSim=1.0
-  // countrySim≈0 combined=0.7, winning Pass 1. Now requires combined ≥ 0.85.
+  // Pass 1: strict token-set ≥ 0.85. Combined floor only enforced when BOTH
+  // country fields are meaningful (non-blank, non-"World", non-"International").
+  // Pre-2026-05-04 commit ca28646 bug: only nameSim thresholded → allowed
+  // "Brazilian Serie C" (BRA) to match Italian Serie C cross-country.
+  // Commit 7fa1519 over-corrected: combined-floor enforcement when country
+  // fields blank rejected 56 legitimate matches (CL/EL/internationals where
+  // categoryName=="International" or cc.country=="" gives countrySim=0).
+  // This commit: combined floor only kicks in when both countries are
+  // present and disagree — i.e., catches actual cross-country bleed without
+  // rejecting "country signal unavailable" cases.
   let best: MatchResult | null = null;
+  const bcCountryMeaningful =
+    bcRegionNormalised.trim() !== "" && bcRegionNormalised.toLowerCase() !== "world";
   for (const cc of ccRows) {
     if (excludedIds.has(cc.id)) continue;
     const nameSim = leagueNameSimilarity(bcName, cc.name);
     if (nameSim < BETFAIR_SIM_THRESHOLD_STRICT) continue;
     const countrySim = leagueNameSimilarity(bcRegionNormalised, cc.country ?? "");
     const combined = nameSim * 0.7 + countrySim * 0.3;
-    if (combined < BETFAIR_PASS1_COMBINED_FLOOR) continue;
+    const ccCountryMeaningful =
+      (cc.country ?? "").trim() !== "" && (cc.country ?? "").toLowerCase() !== "world";
+    if (ccCountryMeaningful && bcCountryMeaningful && combined < BETFAIR_PASS1_COMBINED_FLOOR) {
+      continue;
+    }
     if (!best || combined > best.combined) {
       best = { cc, method: "strict", nameSim, countrySim, combined };
     }

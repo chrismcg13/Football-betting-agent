@@ -205,20 +205,35 @@ export async function discoverPinnacleLeagues(): Promise<{
 
     pinnaclePriced++;
 
+    // 2026-05-04 fix: tie-breaker by name-length proximity. When multiple cc
+    // rows score the same combined (common when countrySim=0 because both
+    // use international/world), prefer the cc.name with length closest to the
+    // tournamentName. This fixes "World Cup" matching "FIFA Women's World Cup"
+    // (length 21) instead of "FIFA World Cup" (length 14): both score
+    // nameSim=1.0 via subset matching, but FIFA World Cup is the closer-
+    // length match to "World Cup" (length 9), so |14-9|=5 < |21-9|=12.
+    const bcLen = tour.tournamentName.length;
     let bestMatch: typeof ccRows[number] | null = null;
     let bestCombined = 0;
     let bestNameSim = 0;
     let bestCountrySim = 0;
+    let bestLenDelta = Number.POSITIVE_INFINITY;
     for (const cc of ccRows) {
       const nameSim = leagueNameSimilarity(tour.tournamentName, cc.name);
       if (nameSim < SIM_THRESHOLD) continue;
       const countrySim = leagueNameSimilarity(tour.categoryName, cc.country ?? "");
       const combined = nameSim * 0.7 + countrySim * 0.3;
-      if (!bestMatch || combined > bestCombined) {
+      const lenDelta = Math.abs(cc.name.length - bcLen);
+      // Prefer higher combined; on combined-tie, prefer smaller name-length delta
+      const isBetter = !bestMatch
+        || combined > bestCombined
+        || (combined === bestCombined && lenDelta < bestLenDelta);
+      if (isBetter) {
         bestMatch = cc;
         bestCombined = combined;
         bestNameSim = nameSim;
         bestCountrySim = countrySim;
+        bestLenDelta = lenDelta;
       }
     }
 
