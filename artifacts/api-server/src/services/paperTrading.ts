@@ -1053,8 +1053,9 @@ export async function placePaperBet(
     }
   }
 
-  if (stake < 2) {
-    return logReject(`Calculated stake £${stake} is below minimum £2`);
+  const minStake = liveLimits ? 2 : 0.10;
+  if (stake < minStake) {
+    return logReject(`Calculated stake £${stake} is below minimum £${minStake}`);
   }
 
   if (isLiveMode()) {

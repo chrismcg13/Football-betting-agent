@@ -3730,9 +3730,9 @@ export async function pinnaclePreBetFilter(params: {
 
   const edgePct = (params.modelProbability - pinnacleImplied) * 100;
 
-  let minEdge = 2;
+  let minEdge = 1;
   if (lineDir === "away") {
-    minEdge = 3;
+    minEdge = 2;
   }
 
   if (edgePct < minEdge) {

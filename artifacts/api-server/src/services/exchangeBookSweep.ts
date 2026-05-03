@@ -24,6 +24,7 @@ const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   "OVER_UNDER_25",
   "OVER_UNDER_35",
   "BOTH_TEAMS_TO_SCORE",
+  "FIRST_HALF_RESULT",
 ]);
 
 function toInternalMarketType(bfMarketType: string): string {
