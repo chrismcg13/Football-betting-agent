@@ -2,7 +2,6 @@ import { db, agentConfigTable, complianceLogsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { runBetfairIngestion } from "./dataIngestionBetfair";
-import { runFallbackIngestion } from "./dataIngestionFallback";
 
 async function getDataSource(): Promise<string> {
   const rows = await db
@@ -39,18 +38,15 @@ export async function runDataIngestion(): Promise<void> {
     } catch (err) {
       logger.warn(
         { err },
-        "Betfair ingestion failed — switching to football-data fallback",
+        "Betfair ingestion failed — football-data fallback retired (Stage 4); skipping this cycle",
       );
       await logCompliance("risk_adjustment", {
-        action: "betfair_geo_fallback",
-        reason:
-          err instanceof Error ? err.message : String(err),
-        fallback_source: "football_data_fallback",
+        action: "betfair_failed_no_fallback",
+        reason: err instanceof Error ? err.message : String(err),
         timestamp: new Date().toISOString(),
       });
-      await runFallbackIngestion();
     }
   } else {
-    await runFallbackIngestion();
+    logger.info({}, "data_ingestion: no-op (football-data path retired in Stage 4)");
   }
 }
