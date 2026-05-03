@@ -72,10 +72,18 @@ async function findMatchingDbRow(
   };
   const candidateLeagues = understatLeagueDisplayMap[understatLeague] ?? [understatLeague];
 
+  // Build a parameterised IN-list. Drizzle spreads `${array}` directly inside
+  // `ANY(...)` as `($1,$2)`, which Postgres parses as a row constructor, not an
+  // array — `ANY(($1,$2))` errors. `sql.join` joins per-value SQL fragments
+  // into `$1, $2, ...` so `IN (${...})` becomes a real value list.
+  const leagueInList = sql.join(
+    candidateLeagues.map((l) => sql`${l}`),
+    sql`, `,
+  );
   const candidatesResult = await db.execute(sql`
     SELECT id, home_team, away_team, league, kickoff_time
     FROM matches
-    WHERE league = ANY(${candidateLeagues})
+    WHERE league IN (${leagueInList})
       AND kickoff_time >= ${winLow}
       AND kickoff_time <= ${winHigh}
   `);
