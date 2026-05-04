@@ -377,6 +377,30 @@ export async function runTradingCycle(options?: {
       "Settlement complete",
     );
 
+    // 1b. Paper-bet hygiene breaker. If any non-legacy paper bet has been
+    // pending for more than 48h after this cycle's settlement pass, then
+    // settlement is silently failing — refuse to add new bets on top.
+    // The five Replit-era IDs (793,794,802,804,807) are excluded explicitly
+    // because they pre-date the current settlement pipeline.
+    const stale = await db.execute(sql`
+      SELECT id FROM public.paper_bets
+      WHERE deleted_at IS NULL
+        AND status = 'pending'
+        AND legacy_regime = false
+        AND placed_at < NOW() - INTERVAL '48 hours'
+        AND id NOT IN (793, 794, 802, 804, 807)
+      ORDER BY id
+    `);
+    if (stale.rows.length > 0) {
+      const staleIds = (stale.rows as Record<string, unknown>[]).map((r) => Number(r.id));
+      logger.error(
+        { stuckCount: staleIds.length, staleIds, tier },
+        "PAPER HYGIENE BREAKER: pending bets >48h unsettled — refusing to place new bets this cycle. Investigate syncMatchResults / settleBets.",
+      );
+      markRun("trading", "skipped");
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
+    }
+
     // 2. Run risk checks
     const riskResult = await runAllRiskChecks();
     if (riskResult.anyTriggered) {
