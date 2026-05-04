@@ -127,6 +127,25 @@ In-match events (goals, cards, subs). Useful for live trading; not applicable to
 
 ---
 
+## P11 — Surfaced 2026-05-04 (paper-mode hygiene session)
+
+### P11.1 — Live-flip blocker: Betfair placement bypasses the VPS relay
+- **Description:** `BETFAIR_PROXY_URL` is unset in production env (verified via `/proc/<pid>/environ`). `placeOrders` (`betfairLive.ts:571`) therefore POSTs directly to `https://api.betfair.com/exchange/betting/rest/v1.0/placeOrders/` (default at `betfairLive.ts:20-21`). Meanwhile `betfair-relay` (pm2 id 0) listens on `127.0.0.1:3001` with a `/bet/place` endpoint, callable via `relayPlaceBet` (`vpsRelay.ts:160`) — but `relayPlaceBet` has zero callers in the api-server. The intended architecture (placement via relay for session caching / rate-limiting / decoupled deploys / audit) is not actually wired.
+- **Lift:** zero functional lift in paper mode. Pre-live-flip prerequisite — placement currently bypasses the relay entirely.
+- **Confidence:** EVIDENCE-BASED on the misconfiguration. ANALYTICAL on which fix to pick.
+- **Cost:** ~2 hours for option (a) — set `BETFAIR_PROXY_URL=http://127.0.0.1:3001` and have the relay transparently proxy `/exchange/...`. ~4 hours for option (b) — swap `placeOrders` callers in `betfairLive.ts` to `relayPlaceBet` and adapt response-shape mapping.
+- **Why deferred:** paper mode only; live placement code explicitly out-of-scope this session.
+
+### P11.2 — `fix/typecheck-debt-bucket-c` branch has 45 outstanding tsc errors
+- **Description:** `pnpm -C artifacts/api-server typecheck` reports 45 errors across 9 files (`alertDetection.ts`, `betfairLive.ts`, `launchActivation.ts`, `leagueDiscovery.ts`, `oddsPapi.ts`, `paperTrading.ts`, `predictionEngine.ts`, `riskManager.ts`, `scheduler.ts`). esbuild bypasses tsc so the build ships; branch name indicates active cleanup track.
+- **Live-impacting subset:** `betfairLive.ts:1412` returns `unavailableOnExchange: true` but the declared return type does not include the property. `paperTrading.ts:1410` reads `liveResult.unavailableOnExchange` — at type level the check is `undefined`. When live mode is on, the hard-suppression branch silently skips and the market gets a placement-failure counter increment instead of being banned. Latent real-money-correctness bug.
+- **Lift:** type-correctness parity with runtime. The two `unavailableOnExchange` sites are the live-impacting ones; remainder is mostly drizzle schema drift and inferred-never patterns.
+- **Confidence:** EVIDENCE-BASED on error list. ANALYTICAL on live-impact ranking.
+- **Cost:** Bucket-level fix is the branch's existing goal. Standalone live-blocker subset (just the two `unavailableOnExchange` sites) is ~1 hour.
+- **Why deferred:** branch was already in progress; tracked here so the live-blocker subset isn't lost if the branch is abandoned.
+
+---
+
 ## Out-of-scope notes
 
 - WhoScored / Opta scraping: ToS-forbidden. Skip.
