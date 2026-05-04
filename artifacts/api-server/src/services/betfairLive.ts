@@ -2,7 +2,7 @@ import axios, { type AxiosInstance } from "axios";
 import { logger } from "../lib/logger";
 import { db } from "@workspace/db";
 import { paperBetsTable, complianceLogsTable, oddsSnapshotsTable } from "@workspace/db";
-import { eq, and, isNotNull, isNull, sql, desc } from "drizzle-orm";
+import { eq, and, isNotNull, isNull, sql, desc, inArray } from "drizzle-orm";
 import { BETFAIR_TICKS } from "./orderManager";
 
 function roundDownToTick(price: number): number {
@@ -834,16 +834,19 @@ export async function reconcileSettlements(): Promise<{
     const internalPnl = Number(bet.settlementPnl ?? 0);
     const pnlDiff = Math.abs(betfairPnl - internalPnl);
 
-    // ── CLV: compare placement odds vs latest market snapshot (proxy) ──
-    // Ported from paperTrading.settleBets which used to compute this for all
-    // bets. Now that settleBets defers all matched real-money bets to this
-    // function, we must compute CLV here or every future real-money bet
-    // would have null CLV/closingOddsProxy. Best-effort — failure does not
-    // block settlement.
+    // ── CLV: Pinnacle-source-only at reconciliation (R6 hotfix, 2026-05-04) ──
+    // Mirror of the post-R6 paperTrading.settleBets logic:
+    //   (1) closing_odds_proxy — latest snapshot of ANY source. Diagnostic only.
+    //   (2) clv_pct — latest snapshot of Pinnacle sources ONLY. Promotion-
+    //       engine threshold (1.5%) is Pinnacle-shaped; do not write market-
+    //       proxy values into this column. If no Pinnacle snapshot exists,
+    //       leave clv_pct alone via conditional spread (already in place
+    //       below). Pre-R6, this writer was non-destructive but source-
+    //       agnostic, which still contaminated clv_pct for Tier B/C bets.
     let closingOddsProxy: number | null = null;
     let clvPct: number | null = null;
     try {
-      const latestSnapshot = await db
+      const latestAnySource = await db
         .select({ backOdds: oddsSnapshotsTable.backOdds })
         .from(oddsSnapshotsTable)
         .where(
@@ -855,12 +858,29 @@ export async function reconcileSettlements(): Promise<{
         )
         .orderBy(desc(oddsSnapshotsTable.snapshotTime))
         .limit(1);
-      if (latestSnapshot[0]?.backOdds) {
-        closingOddsProxy = Number(latestSnapshot[0].backOdds);
-        if (closingOddsProxy > 1) {
+      if (latestAnySource[0]?.backOdds) {
+        closingOddsProxy = Number(latestAnySource[0].backOdds);
+      }
+
+      const latestPinnacle = await db
+        .select({ backOdds: oddsSnapshotsTable.backOdds })
+        .from(oddsSnapshotsTable)
+        .where(
+          and(
+            eq(oddsSnapshotsTable.matchId, bet.matchId),
+            eq(oddsSnapshotsTable.marketType, bet.marketType),
+            eq(oddsSnapshotsTable.selectionName, bet.selectionName),
+            inArray(oddsSnapshotsTable.source, ["oddspapi_pinnacle", "api_football_real:Pinnacle"]),
+          ),
+        )
+        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+        .limit(1);
+      if (latestPinnacle[0]?.backOdds) {
+        const pinnacleClose = Number(latestPinnacle[0].backOdds);
+        if (pinnacleClose > 1) {
           const placementOdds = Number(bet.oddsAtPlacement ?? 0);
           if (placementOdds > 1) {
-            clvPct = ((placementOdds - closingOddsProxy) / closingOddsProxy) * 100;
+            clvPct = ((placementOdds - pinnacleClose) / pinnacleClose) * 100;
             clvPct = Math.round(clvPct * 1000) / 1000;
           }
         }

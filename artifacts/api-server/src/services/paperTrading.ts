@@ -1927,17 +1927,21 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     const newStatus = isVoid ? "void" : betWon ? "won" : "lost";
     const now = new Date();
 
-    // ── CLV: compare placement odds vs closing odds proxy ──────────────
-    // NOTE: True CLV should use Pinnacle closing odds. The odds_snapshots table
-    // does not have a separate Pinnacle source — it stores API-Football real odds
-    // (1xBet / Bet365). We use the latest snapshot as the best available proxy.
-    // Pinnacle odds at placement time are stored in bet.pinnacleOdds but those
-    // are opening prices, not closing prices. Until a Pinnacle closing-odds fetch
-    // is added to the settlement flow, this remains a market-proxy CLV.
+    // ── CLV: Pinnacle-source-only at settlement (R6 hotfix, 2026-05-04) ──
+    // Two separate snapshot lookups:
+    //   (1) closing_odds_proxy — latest snapshot of ANY source. Diagnostic
+    //       column; preserves the historical "did any closing data exist?"
+    //       semantics. Not used by the promotion-engine threshold gate.
+    //   (2) clv_pct — latest snapshot of Pinnacle sources ONLY. The promotion
+    //       engine's minClv ≥ 1.5 gate is Pinnacle-shaped; market-proxy values
+    //       must not flow into this column at settlement. If no Pinnacle
+    //       snapshot exists, leave clv_pct alone via conditional spread on
+    //       the UPDATE (do not null-clobber a prior Writer-A pre-kickoff
+    //       Pinnacle write).
     let closingOddsProxy: number | null = null;
     let clvPct: number | null = null;
     try {
-      const latestSnapshot = await db
+      const latestAnySource = await db
         .select({ backOdds: oddsSnapshotsTable.backOdds })
         .from(oddsSnapshotsTable)
         .where(
@@ -1949,14 +1953,31 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         )
         .orderBy(desc(oddsSnapshotsTable.snapshotTime))
         .limit(1);
-      if (latestSnapshot[0]?.backOdds) {
-        closingOddsProxy = Number(latestSnapshot[0].backOdds);
-        if (closingOddsProxy > 1) {
-          clvPct = ((odds - closingOddsProxy) / closingOddsProxy) * 100;
+      if (latestAnySource[0]?.backOdds) {
+        closingOddsProxy = Number(latestAnySource[0].backOdds);
+      }
+
+      const latestPinnacle = await db
+        .select({ backOdds: oddsSnapshotsTable.backOdds })
+        .from(oddsSnapshotsTable)
+        .where(
+          and(
+            eq(oddsSnapshotsTable.matchId, bet.matchId),
+            eq(oddsSnapshotsTable.marketType, bet.marketType),
+            eq(oddsSnapshotsTable.selectionName, bet.selectionName),
+            inArray(oddsSnapshotsTable.source, ["oddspapi_pinnacle", "api_football_real:Pinnacle"]),
+          ),
+        )
+        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+        .limit(1);
+      if (latestPinnacle[0]?.backOdds) {
+        const pinnacleClose = Number(latestPinnacle[0].backOdds);
+        if (pinnacleClose > 1) {
+          clvPct = ((odds - pinnacleClose) / pinnacleClose) * 100;
           clvPct = Math.round(clvPct * 1000) / 1000;
           logger.info(
-            { betId: bet.id, placementOdds: odds, closingOddsProxy, clvPct },
-            "CLV calculated (proxy: latest API-Football snapshot — not Pinnacle closing odds)",
+            { betId: bet.id, placementOdds: odds, pinnacleClose, clvPct },
+            "CLV calculated from Pinnacle snapshot (oddspapi_pinnacle | api_football_real:Pinnacle)",
           );
         }
       }
@@ -1971,7 +1992,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         settlementPnl: String(settlementPnl),
         settledAt: now,
         closingOddsProxy: closingOddsProxy != null ? String(closingOddsProxy) : null,
-        clvPct: clvPct != null ? String(clvPct) : null,
+        ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
         exchangeId,
         grossPnl: String(commResult.grossPnl),
         commissionRate: String(commResult.commissionRate),
