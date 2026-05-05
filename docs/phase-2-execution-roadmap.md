@@ -55,7 +55,26 @@ Both fixes were tight-scope, single-purpose commits.
 
 ---
 
-## Wave 2 — R6.1 verify, decision-audit infrastructure, banned-market reactivation
+## Wave 2 — R6.1 verify, decision-audit infrastructure, banned-market reactivation ✅ CLOSED 2026-05-05
+
+**Closed:** 2026-05-05 ~20:15 UTC. First Tier B shadow bet on a previously-banned market (`OVER_UNDER_15`) placed at 2026-05-05 20:10:29 UTC — banned-market reactivation verified flowing.
+
+**Wave 2 commit shape:**
+- `8958578` — Wave 2 #1: model_decision_audit_log + pending_threshold_revisions schema (4 verification SQLs passed)
+- `6dd8d8c` — Wave 2 #5: DOUBLE_CHANCE investigation closed (settlement correct, no code fix; +15% CLV / −40% ROI was R6 ghost on Replit-era data)
+- `cb6f03c` — Wave 2 #4: gate BANNED_MARKETS filter on universe_tier (experiment-track bypass, Tier A byte-identical)
+- `58e71e3` — Wave 2 #4.1: dispatcher tier-lookup fix (broken `country === ""` fallback + hyphenation normalization)
+
+**Latent bugs surfaced & fixed in Wave 2:**
+- `country === ""` fallback in scheduler.ts:1002 was unreachable inside `if (country)` branch — dispatcher silently mis-routed ~half of Tier A/B candidates to no_tier_match.
+- competition_config inconsistent hyphenation ("South-Africa" vs "South Africa") — fixed via SQL-level `REPLACE(*, '-', ' ')` normalization.
+
+**Cosmetic follow-up flagged (not blocking):**
+- Funnel field `07a_tier_b_candidates_rejected` is misleadingly named — actually tracks `tierCounts.B` (kept + rejected). Legacy from Phase 2.B.1. Rename to `07a_tier_b_candidates_seen` or similar in a future cleanup.
+
+---
+
+## Wave 2 — original spec (kept for context)
 
 **Goal:** verify R6.1 holding clean post-firehose-on, ship the autonomous-decision plumbing, investigate DOUBLE_CHANCE, then open banned markets on the experiment track.
 
