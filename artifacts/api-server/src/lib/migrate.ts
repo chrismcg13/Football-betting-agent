@@ -909,6 +909,145 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS qualification_path TEXT
     `);
 
+    // ── Phase 2.A schema migrations (2026-05-05) ─────────────────────────
+    // Adds the universe-tier classification, archetype labels, shadow-stake
+    // tracking, and graduation evaluation log. All ALTER statements are
+    // idempotent (IF NOT EXISTS); CHECK constraints are added separately
+    // via DO blocks so re-runs don't fail on existing constraint names.
+    //
+    // No behaviour change in this commit — the gate dispatcher, reverse-
+    // mapping cron, event-driven graduation, and shadow-stake placement
+    // path all land in subsequent commits per the v2 §6 Phase 2.A
+    // schema-then-behaviour-flip discipline.
+
+    // 1. competition_config — universe tier columns + nullable api_football_id
+    await db.execute(sql`
+      ALTER TABLE competition_config
+        ALTER COLUMN api_football_id DROP NOT NULL
+    `);
+    await db.execute(sql`
+      ALTER TABLE competition_config
+        ADD COLUMN IF NOT EXISTS universe_tier TEXT NOT NULL DEFAULT 'unmapped',
+        ADD COLUMN IF NOT EXISTS archetype TEXT,
+        ADD COLUMN IF NOT EXISTS betfair_competition_id TEXT,
+        ADD COLUMN IF NOT EXISTS warmup_started_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS warmup_completed_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS universe_tier_decided_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS settlement_bias_index NUMERIC(6,4)
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'competition_config_universe_tier_check'
+        ) THEN
+          ALTER TABLE competition_config
+            ADD CONSTRAINT competition_config_universe_tier_check
+            CHECK (universe_tier IN ('A','B','C','D','E','unmapped'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS competition_config_universe_tier_idx
+        ON competition_config(universe_tier)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS competition_config_betfair_competition_id_idx
+        ON competition_config(betfair_competition_id)
+        WHERE betfair_competition_id IS NOT NULL
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS competition_config_betfair_only_uniq
+        ON competition_config(betfair_competition_id)
+        WHERE api_football_id IS NULL AND betfair_competition_id IS NOT NULL
+    `);
+
+    // 2. experiment_registry — calibration + cooldown + edge-survival columns
+    await db.execute(sql`
+      ALTER TABLE experiment_registry
+        ADD COLUMN IF NOT EXISTS archetype TEXT,
+        ADD COLUMN IF NOT EXISTS clv_source TEXT NOT NULL DEFAULT 'none',
+        ADD COLUMN IF NOT EXISTS warmup_completed_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS kelly_fraction REAL NOT NULL DEFAULT 1.0,
+        ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS cooldown_eligible_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS model_version_at_abandon TEXT,
+        ADD COLUMN IF NOT EXISTS experiment_phase_roi REAL,
+        ADD COLUMN IF NOT EXISTS candidate_phase_roi REAL
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'experiment_registry_clv_source_check'
+        ) THEN
+          ALTER TABLE experiment_registry
+            ADD CONSTRAINT experiment_registry_clv_source_check
+            CHECK (clv_source IN ('pinnacle','market_proxy','none'));
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'experiment_registry_kelly_fraction_check'
+        ) THEN
+          ALTER TABLE experiment_registry
+            ADD CONSTRAINT experiment_registry_kelly_fraction_check
+            CHECK (kelly_fraction >= 0 AND kelly_fraction <= 1.0);
+        END IF;
+      END $$
+    `);
+
+    // 3. paper_bets — shadow-stake + universe-tier + clv-source capture
+    // (must be ABOVE the view-rebuild block so SELECT * picks up new columns)
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS shadow_stake NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS shadow_stake_kelly_fraction REAL,
+        ADD COLUMN IF NOT EXISTS shadow_pnl NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS universe_tier_at_placement TEXT,
+        ADD COLUMN IF NOT EXISTS clv_source TEXT
+    `);
+
+    // 4. graduation_evaluation_log — new table for event-driven evaluator
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS graduation_evaluation_log (
+        id TEXT PRIMARY KEY,
+        experiment_tag TEXT NOT NULL,
+        triggered_by TEXT NOT NULL,
+        trigger_bet_id INTEGER REFERENCES paper_bets(id),
+        metrics_snapshot JSONB NOT NULL,
+        threshold_outcome TEXT NOT NULL,
+        evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'graduation_evaluation_log_triggered_by_check'
+        ) THEN
+          ALTER TABLE graduation_evaluation_log
+            ADD CONSTRAINT graduation_evaluation_log_triggered_by_check
+            CHECK (triggered_by IN ('settlement','cron','manual'));
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'graduation_evaluation_log_outcome_check'
+        ) THEN
+          ALTER TABLE graduation_evaluation_log
+            ADD CONSTRAINT graduation_evaluation_log_outcome_check
+            CHECK (threshold_outcome IN ('promote','demote','hold','warmup','insufficient_data'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS gel_tag_evaluated_idx
+        ON graduation_evaluation_log(experiment_tag, evaluated_at DESC)
+    `);
+
     // Change C (2026-04-22): create paper_bets_current view + partial index.
     // MUST run AFTER every `ALTER TABLE paper_bets` in this migrate() —
     // Postgres freezes a view's column list at CREATE time. If a new column

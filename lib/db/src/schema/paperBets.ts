@@ -115,6 +115,25 @@ export const paperBetsTable = pgTable("paper_bets", {
   // the paper_bets_current view (legacy_regime=false). Settlement, audit,
   // reconciliation, and risk paths read directly from this table.
   legacyRegime: boolean("legacy_regime").notNull().default(false),
+  // ── Phase 2.A: shadow-stake + universe-tier capture ────────────────────
+  // shadow_stake = full_Kelly × shadow_stake_kelly_fraction (Phase 2.A
+  // shadow-stake mechanic for Tier B/C bets that go to Betfair at £0 actual
+  // stake but record what 0.25× Kelly would have recommended).
+  // shadow_pnl = what P&L would have been if the bet had been placed at
+  // shadow_stake instead of stake=0; computed at settlement time from the
+  // outcome and the recorded shadow_stake. Enables apples-to-apples
+  // comparison between experiment-phase shadow ROI and candidate-phase
+  // real ROI for the edge-survival graduation gate.
+  // universe_tier_at_placement = denormalized snapshot of competition_config.
+  // universe_tier at the moment of placement, for retrospective queries
+  // that don't have to reconstruct historical tier state.
+  // clv_source ∈ {'pinnacle','market_proxy','none'} — tagged at write time
+  // so the promotion engine can gate threshold semantics by source.
+  shadowStake: numeric("shadow_stake", { precision: 12, scale: 2 }),
+  shadowStakeKellyFraction: real("shadow_stake_kelly_fraction"),
+  shadowPnl: numeric("shadow_pnl", { precision: 12, scale: 2 }),
+  universeTierAtPlacement: text("universe_tier_at_placement"),
+  clvSource: text("clv_source"),
 }, (table) => ({
   uniquePendingBet: uniqueIndex("paper_bets_unique_pending_canonical_idx")
     .on(table.matchId, table.marketType, table.selectionCanonical)
