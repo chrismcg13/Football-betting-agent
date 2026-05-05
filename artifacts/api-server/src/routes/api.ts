@@ -1933,7 +1933,7 @@ router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
 // Experiment Pipeline API
 // ─────────────────────────────────────────────
 
-import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags } from "../services/promotionEngine";
+import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runRetrospectiveAnalysis } from "../services/promotionEngine";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 
 router.get("/admin/experiments", async (_req, res) => {
@@ -2941,6 +2941,32 @@ router.post("/admin/run-promotion-engine", async (_req, res) => {
   try {
     const result = await runPromotionEngine();
     res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Sub-phase 6.2: read-only retrospective analysis. No writes.
+// Body: { scope: 'global' | 'per_archetype:X' | 'per_league:Y',
+//         thresholdName: 'experiment_to_candidate.min_sample_size' (etc),
+//         lookbackDays?: number (default 90, hard-floored at 2026-05-03),
+//         alternatives?: number[] (default ±10/25/50% + 2x of current value) }
+router.post("/admin/run-retrospective-analysis", async (req, res) => {
+  try {
+    const { scope, thresholdName, lookbackDays, alternatives } = req.body ?? {};
+    if (typeof scope !== "string" || typeof thresholdName !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "scope (string) and thresholdName (string) required",
+      });
+    }
+    const result = await runRetrospectiveAnalysis({
+      scope,
+      thresholdName,
+      lookbackDays: typeof lookbackDays === "number" ? lookbackDays : undefined,
+      alternatives: Array.isArray(alternatives) ? alternatives.filter((v: any) => typeof v === "number") : undefined,
+    });
+    res.json({ success: true, result });
   } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
   }

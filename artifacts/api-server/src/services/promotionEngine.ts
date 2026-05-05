@@ -805,6 +805,318 @@ export async function runPromotionEngine(): Promise<{
   return { promoted, demoted, abandoned, evaluated };
 }
 
+// ─── Sub-phase 6.2: retrospective analysis (read-only) ──────────────────────
+// Per docs/phase-2-wave-3-subphase-6-plan.md §5 sub-commit 6.2.
+//
+// Walks graduation_evaluation_log rows in scope/window, re-evaluates the
+// gate condition under alternative threshold values, and reports per-
+// alternative how many evaluations would have flipped outcome and the
+// kelly_fraction-weighted impact magnitude.
+//
+// First-order analysis only: does NOT model cascading transitions
+// (a tag promoted earlier would have placed bets at higher kelly_fraction,
+// which compounds into the realised Kelly-growth). Full counterfactual
+// replay ships in sub-commit 6.3. This deliverable validates the data
+// plumbing + threshold-name parsing under read-only scope discipline.
+
+// Hard floor on lookback. Pre-2026-05-03 data is Replit-era buggy and must
+// not influence threshold proposals. Per plan §6 R6.
+const THRESHOLD_RETROSPECTIVE_MIN_DATE = new Date("2026-05-03T00:00:00Z");
+
+export type RetrospectiveScope = string; // 'global' | 'per_archetype:X' | 'per_league:Y'
+
+export interface RetrospectiveAnalysisOpts {
+  scope: RetrospectiveScope;
+  thresholdName: string;
+  lookbackDays?: number;
+  alternatives?: number[];
+}
+
+export interface RetrospectiveAlternative {
+  value: number;
+  direction: "looser" | "tighter" | "current";
+  wouldChangeNEvaluations: number;
+  wouldChangeNTags: number;
+  kellyFractionImpactSum: number;
+}
+
+export interface RetrospectiveAnalysisResult {
+  scope: RetrospectiveScope;
+  thresholdName: string;
+  lookbackDays: number;
+  lookbackStartDate: string;
+  baselineMetrics: {
+    nEvaluationsInScope: number;
+    nTagsInScope: number;
+    nSettledBetsInScope: number;
+    realisedKellyGrowthRate: number;
+  };
+  currentValue: number;
+  alternatives: RetrospectiveAlternative[];
+  notes: string;
+}
+
+function parseThresholdName(name: string): { gateKey: keyof ResolvedThresholds; fieldKey: string } | null {
+  const m = name.match(/^([a-z_]+)\.([a-z_]+)$/);
+  if (!m) return null;
+  const snakeToCamel = (s: string) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  const gateKey = snakeToCamel(m[1]) as keyof ResolvedThresholds;
+  const fieldKey = snakeToCamel(m[2]);
+  return { gateKey, fieldKey };
+}
+
+function makeAlternativeThresholds(base: ResolvedThresholds, thresholdName: string, altValue: number): ResolvedThresholds {
+  const parsed = parseThresholdName(thresholdName);
+  if (!parsed) throw new Error(`Invalid thresholdName: ${thresholdName}`);
+  const copy: any = JSON.parse(JSON.stringify(base));
+  if (!(parsed.gateKey in copy)) throw new Error(`Unknown gate: ${String(parsed.gateKey)}`);
+  if (!(parsed.fieldKey in copy[parsed.gateKey])) {
+    throw new Error(`Unknown field ${parsed.fieldKey} in gate ${String(parsed.gateKey)}`);
+  }
+  copy[parsed.gateKey][parsed.fieldKey] = altValue;
+  return copy as ResolvedThresholds;
+}
+
+function getCurrentValue(t: ResolvedThresholds, thresholdName: string): number {
+  const parsed = parseThresholdName(thresholdName);
+  if (!parsed) throw new Error(`Invalid thresholdName: ${thresholdName}`);
+  const gate = (t as any)[parsed.gateKey];
+  if (!gate || typeof gate[parsed.fieldKey] !== "number") {
+    throw new Error(`No numeric value at ${String(parsed.gateKey)}.${parsed.fieldKey}`);
+  }
+  return gate[parsed.fieldKey] as number;
+}
+
+// Pure gate evaluator. Mirrors the gate conditions in evaluateExperimentTag.
+// Does NOT cover the promoted→candidate gate fully (that requires rolling
+// metrics + consecutive_negative_weeks computed at evaluation time, which we
+// don't have in the snapshot). Returns "hold" for promoted-tier rows;
+// sub-commit 6.3 will model this fully.
+function evaluateGateForRetrospective(
+  metrics: ExperimentMetrics,
+  currentTier: string,
+  t: ResolvedThresholds,
+): "promote" | "demote" | "hold" {
+  if (currentTier === "experiment") {
+    const ec = t.experimentToCandidate;
+    if (
+      metrics.sampleSize >= ec.minSampleSize &&
+      metrics.roi >= ec.minRoi &&
+      metrics.clv >= ec.minClv &&
+      metrics.winRate >= ec.minWinRate &&
+      metrics.pValue <= ec.maxPValue &&
+      metrics.weeksActive >= ec.minWeeksActive &&
+      metrics.edge >= ec.minEdge
+    ) return "promote";
+    if (
+      metrics.sampleSize >= t.abandonThreshold.minSample &&
+      metrics.roi <= t.abandonThreshold.maxRoi &&
+      metrics.pValue <= t.abandonThreshold.maxPValue
+    ) return "promote"; // direction-agnostic transition (to abandoned)
+    return "hold";
+  }
+  if (currentTier === "candidate") {
+    const cp = t.candidateToPromoted;
+    if (
+      metrics.sampleSize >= cp.minSampleSize &&
+      metrics.roi >= cp.minRoi &&
+      metrics.clv >= cp.minClv &&
+      metrics.pValue <= cp.maxPValue &&
+      metrics.weeksActive >= cp.minWeeksActive
+    ) return "promote";
+    if (
+      metrics.roi < t.demotionCandidateToExperiment.minRoi ||
+      metrics.clv < t.demotionCandidateToExperiment.minClv
+    ) return "demote";
+    return "hold";
+  }
+  return "hold"; // promoted/abandoned: not modelled in 6.2
+}
+
+async function resolveThresholdsForScope(scope: string): Promise<ResolvedThresholds> {
+  if (scope === "global") return resolveAllThresholds(null, null);
+  if (scope.startsWith("per_archetype:")) {
+    const archetype = scope.slice("per_archetype:".length);
+    return resolveAllThresholds(null, archetype);
+  }
+  if (scope.startsWith("per_league:")) {
+    const leagueCode = scope.slice("per_league:".length);
+    const archetype = await getArchetypeForLeague(leagueCode);
+    return resolveAllThresholds(leagueCode, archetype);
+  }
+  throw new Error(`Invalid scope: ${scope} (expected 'global' | 'per_archetype:X' | 'per_league:Y')`);
+}
+
+export async function runRetrospectiveAnalysis(
+  opts: RetrospectiveAnalysisOpts,
+): Promise<RetrospectiveAnalysisResult> {
+  const { scope, thresholdName } = opts;
+  const lookbackDays = opts.lookbackDays ?? 90;
+
+  // Validate threshold name early.
+  const parsed = parseThresholdName(thresholdName);
+  if (!parsed) throw new Error(`Invalid thresholdName: ${thresholdName}`);
+
+  // Resolve current thresholds for this scope.
+  const currentThresholds = await resolveThresholdsForScope(scope);
+  const currentValue = getCurrentValue(currentThresholds, thresholdName);
+
+  // Default alternatives: ±10/25/50% perturbations + 2x. Excludes current.
+  const alternatives = (opts.alternatives ?? [0.5, 0.75, 0.9, 1.1, 1.25, 1.5, 2.0].map((m) => currentValue * m))
+    .filter((v) => Number.isFinite(v) && v !== currentValue);
+
+  // Compute lookback window with hard floor at 2026-05-03.
+  const requestedStart = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
+  const lookbackStart = requestedStart > THRESHOLD_RETROSPECTIVE_MIN_DATE
+    ? requestedStart
+    : THRESHOLD_RETROSPECTIVE_MIN_DATE;
+
+  // Build scope SQL filter on the JOINED experiment_registry → competition_config
+  // pipeline. We use the same hyphen-normalisation used elsewhere (Wave 2 #4.1).
+  let scopeFilter = sql``;
+  if (scope.startsWith("per_archetype:")) {
+    const archetype = scope.slice("per_archetype:".length);
+    scopeFilter = sql`
+      AND er.league_code IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM competition_config cc
+        WHERE LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(er.league_code, '-', ' '))
+          AND cc.archetype = ${archetype}
+      )
+    `;
+  } else if (scope.startsWith("per_league:")) {
+    const leagueCode = scope.slice("per_league:".length);
+    scopeFilter = sql`
+      AND LOWER(REPLACE(er.league_code, '-', ' ')) = LOWER(REPLACE(${leagueCode}, '-', ' '))
+    `;
+  }
+
+  // Pull evaluations + reconstruct tier-at-eval-time from promotion_audit_log.
+  const evalRows = await db.execute(sql`
+    SELECT
+      gel.experiment_tag,
+      gel.evaluated_at,
+      gel.metrics_snapshot,
+      gel.threshold_outcome,
+      COALESCE(
+        (SELECT pal.new_tier
+         FROM promotion_audit_log pal
+         WHERE pal.experiment_tag = gel.experiment_tag
+           AND pal.decided_at <= gel.evaluated_at
+         ORDER BY pal.decided_at DESC
+         LIMIT 1),
+        'experiment'
+      ) AS tier_at_eval
+    FROM graduation_evaluation_log gel
+    JOIN experiment_registry er ON er.experiment_tag = gel.experiment_tag
+    WHERE gel.evaluated_at >= ${lookbackStart}
+      ${scopeFilter}
+  `);
+  const rows = ((evalRows as any).rows ?? []) as Array<{
+    experiment_tag: string;
+    evaluated_at: Date;
+    metrics_snapshot: ExperimentMetrics;
+    threshold_outcome: string;
+    tier_at_eval: string;
+  }>;
+
+  // Baseline aggregates across the in-scope settled bets + tag count.
+  const baselineRows = await db.execute(sql`
+    SELECT
+      COUNT(*) FILTER (WHERE pb.status IN ('won','lost')) AS n_settled,
+      COUNT(DISTINCT pb.experiment_tag) FILTER (WHERE pb.status IN ('won','lost')) AS n_tags,
+      COALESCE(SUM(
+        LN(GREATEST(0.001,
+          (COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1) +
+           COALESCE(NULLIF(pb.settlement_pnl::numeric, 0), pb.shadow_pnl::numeric, 0)) /
+          COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1)
+        ))
+      ) FILTER (WHERE pb.status IN ('won','lost')), 0) AS sum_log_growth
+    FROM paper_bets pb
+    JOIN experiment_registry er ON er.experiment_tag = pb.experiment_tag
+    WHERE pb.placed_at >= ${lookbackStart}
+      AND pb.deleted_at IS NULL
+      AND pb.legacy_regime = false
+      ${scopeFilter}
+  `);
+  const b = (baselineRows as any).rows?.[0] ?? {};
+  const nSettledBets = parseInt(b.n_settled ?? "0");
+  const nTagsInScope = parseInt(b.n_tags ?? "0");
+  const sumLogGrowth = parseFloat(b.sum_log_growth ?? "0");
+  const realisedKellyGrowthRate = nSettledBets > 0 ? sumLogGrowth / nSettledBets : 0;
+
+  // Per-alternative: re-evaluate each row with modified thresholds, count flips.
+  const altResults: RetrospectiveAlternative[] = [];
+  for (const altValue of alternatives) {
+    const altThresholds = makeAlternativeThresholds(currentThresholds, thresholdName, altValue);
+    let changedN = 0;
+    const changedTags = new Set<string>();
+    let kellyImpactSum = 0;
+
+    for (const row of rows) {
+      const tier = row.tier_at_eval ?? "experiment";
+      // metrics_snapshot is JSONB — Postgres returns it as a parsed object.
+      const metrics = row.metrics_snapshot;
+      if (!metrics || typeof metrics !== "object") continue;
+
+      const origOut = evaluateGateForRetrospective(metrics, tier, currentThresholds);
+      const altOut = evaluateGateForRetrospective(metrics, tier, altThresholds);
+      if (origOut === altOut) continue;
+
+      changedN++;
+      changedTags.add(row.experiment_tag);
+
+      const origKelly = inferKellyFractionForOutcome(tier, origOut);
+      const altKelly = inferKellyFractionForOutcome(tier, altOut);
+      kellyImpactSum += Math.abs(altKelly - origKelly);
+    }
+
+    const direction: "looser" | "tighter" | "current" =
+      altValue > currentValue ? "looser" :
+      altValue < currentValue ? "tighter" :
+      "current";
+
+    altResults.push({
+      value: altValue,
+      direction,
+      wouldChangeNEvaluations: changedN,
+      wouldChangeNTags: changedTags.size,
+      kellyFractionImpactSum: kellyImpactSum,
+    });
+  }
+
+  return {
+    scope,
+    thresholdName,
+    lookbackDays,
+    lookbackStartDate: lookbackStart.toISOString(),
+    baselineMetrics: {
+      nEvaluationsInScope: rows.length,
+      nTagsInScope,
+      nSettledBetsInScope: nSettledBets,
+      realisedKellyGrowthRate,
+    },
+    currentValue,
+    alternatives: altResults,
+    notes: "First-order analysis: counts evaluations where the alternative threshold flips the gate outcome under each evaluation's stored metrics_snapshot. kellyFractionImpactSum is sum of |Δkelly_fraction| across changed evaluations — a magnitude signal, not a Kelly-growth-rate delta. Does NOT model cascading transitions (a tag promoted earlier would have placed bets at higher kelly_fraction, which compounds). Full counterfactual replay ships in sub-commit 6.3. Promoted-tier evaluations are treated as 'hold' (rolling metrics + consecutive_negative_weeks not in snapshot). Lookback hard-floored at 2026-05-03 (pre-Claude-Code-era data excluded).",
+  };
+}
+
+// Heuristic mapping from gate outcome to resulting tier's kelly_fraction.
+// "promote" from candidate → promoted (full Kelly); "promote" from experiment
+// → candidate (0.25); "demote" from candidate → experiment (0). Used only
+// for the impact magnitude signal in the read-only retrospective.
+function inferKellyFractionForOutcome(currentTier: string, outcome: "promote" | "demote" | "hold"): number {
+  if (outcome === "hold") return TIER_TO_KELLY_FRACTION[currentTier] ?? 0;
+  if (currentTier === "experiment") {
+    return outcome === "promote" ? TIER_TO_KELLY_FRACTION.candidate : TIER_TO_KELLY_FRACTION.experiment;
+  }
+  if (currentTier === "candidate") {
+    return outcome === "promote" ? TIER_TO_KELLY_FRACTION.promoted : TIER_TO_KELLY_FRACTION.experiment;
+  }
+  return TIER_TO_KELLY_FRACTION[currentTier] ?? 0;
+}
+
 async function computeRollingMetrics(tag: string, window: number): Promise<{ roi: number; clv: number }> {
   const rows = await db.execute(sql`
     SELECT 
