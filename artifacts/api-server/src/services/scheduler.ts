@@ -952,16 +952,27 @@ export async function runTradingCycle(options?: {
         );
         funnel["07a_universe_tier_filter"] = "disabled" as unknown as number;
       } else if (selectedBets.length > 0) {
+        // Wave 2 #4.1 (2026-05-05): normalize hyphens → spaces in both
+        // competition_config and matches for tuple lookup. Hyphenation is
+        // inconsistent in competition_config (some rows "South-Africa", others
+        // "South Africa") but matches.country is space-separated. Without
+        // normalization, the strict tuple lookup misses for ~half of Tier
+        // A/B leagues, sending their candidates to no_tier_match.
         const ccRows = await db.execute(sql`
-          SELECT LOWER(name) AS name, LOWER(country) AS country, universe_tier
+          SELECT LOWER(REPLACE(name, '-', ' ')) AS name,
+                 LOWER(REPLACE(COALESCE(country, ''), '-', ' ')) AS country,
+                 universe_tier
           FROM competition_config
           WHERE universe_tier IN ('A','B','C')
         `);
         const ccData = ((ccRows as unknown as { rows?: Array<{ name: string; country: string; universe_tier: string }> }).rows
           ?? (ccRows as unknown as Array<{ name: string; country: string; universe_tier: string }>));
-        // Build (key→tier) and (name→tier) maps so the strict-tuple lookup
-        // can fall back to name-only when matches.country is empty (same
-        // semantics as the prior pinKey/pinName pair).
+        // Build (key→tier) and (name→tier) maps. tierByName uses last-wins
+        // for duplicate league names (e.g., 32 "cup" rows across countries);
+        // this is acceptable when same name maps to same tier (95%+ of cases
+        // per D-WV2-7). Mixed-tier names ("fa cup", "2. liga") are bounded
+        // and surface as edge-case mis-routing — addressed by the
+        // tierByKey-first lookup which catches them when country matches.
         const tierByKey = new Map<string, string>();
         const tierByName = new Map<string, string>();
         for (const r of ccData) {
@@ -975,8 +986,8 @@ export async function runTradingCycle(options?: {
           const matchRows = await db
             .select({
               id: matchesTable.id,
-              league: sql<string>`LOWER(${matchesTable.league})`.as("league"),
-              country: sql<string>`LOWER(COALESCE(${matchesTable.country}, ''))`.as("country"),
+              league: sql<string>`LOWER(REPLACE(${matchesTable.league}, '-', ' '))`.as("league"),
+              country: sql<string>`LOWER(REPLACE(COALESCE(${matchesTable.country}, ''), '-', ' '))`.as("country"),
             })
             .from(matchesTable)
             .where(inArray(matchesTable.id, matchIds));
@@ -994,15 +1005,18 @@ export async function runTradingCycle(options?: {
           const meta = matchMeta.get(c.matchId);
           const league = meta?.league ?? "";
           const country = meta?.country ?? "";
-          // Same lookup semantics as pre-2.B: strict tuple, fall back to name-
-          // only when matches.country is empty.
+          // Wave 2 #4.1 (2026-05-05): tier lookup with name-only fallback
+          // when tuple misses. Prior code's `country === ""` guard was
+          // unreachable inside the `if (country)` branch, so the fallback
+          // never fired when the tuple lookup failed due to country format
+          // mismatch. Result: ~half of Tier B candidates routed to
+          // no_tier_match. Fixed: tuple-first, name-fallback unconditional
+          // on tuple miss.
           let candidateTier: string | null = null;
           if (country) {
             candidateTier = tierByKey.get(`${league}|${country}`) ?? null;
-            if (!candidateTier && tierByName.has(league) && country === "") {
-              candidateTier = tierByName.get(league) ?? null;
-            }
-          } else {
+          }
+          if (!candidateTier) {
             candidateTier = tierByName.get(league) ?? null;
           }
 
