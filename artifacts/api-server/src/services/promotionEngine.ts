@@ -87,6 +87,140 @@ interface ExperimentMetrics {
   kellyGrowth30dRolling: number;
 }
 
+// ─── Sub-phase 6.1: dynamic threshold lookup chain ──────────────────────────
+// Per docs/phase-2-wave-3-subphase-6-plan.md §3.1.
+// Active per-scope threshold values come from the most-recently-approved row
+// in pending_threshold_revisions per (threshold_name, scope) tuple. Lookup
+// chain: per-league > per-archetype > global > compile-time default. Cached
+// in-memory for 5 minutes; refreshed on TTL expiry.
+
+const THRESHOLD_OVERRIDE_CACHE_TTL_MS = 5 * 60 * 1000;
+let thresholdOverrideCache: {
+  computedAt: number;
+  // Map<scope, Map<threshold_name, numeric value>>
+  byScope: Map<string, Map<string, number>>;
+} | null = null;
+
+async function getThresholdOverrideMap(): Promise<Map<string, Map<string, number>>> {
+  const now = Date.now();
+  if (thresholdOverrideCache && now - thresholdOverrideCache.computedAt < THRESHOLD_OVERRIDE_CACHE_TTL_MS) {
+    return thresholdOverrideCache.byScope;
+  }
+
+  // DISTINCT ON returns the most-recently-approved row per (threshold_name, scope).
+  const rows = await db.execute(sql`
+    SELECT DISTINCT ON (threshold_name, scope)
+      threshold_name, scope, proposed_value
+    FROM pending_threshold_revisions
+    WHERE status = 'approved'
+    ORDER BY threshold_name, scope, reviewed_at DESC NULLS LAST, proposed_at DESC
+  `);
+
+  const byScope = new Map<string, Map<string, number>>();
+  for (const r of (rows as any).rows ?? []) {
+    const scope = r.scope as string;
+    const thresholdName = r.threshold_name as string;
+    // proposed_value is JSONB; accept either a numeric or { "value": numeric } shape.
+    const raw = r.proposed_value;
+    let value: number | null = null;
+    if (typeof raw === "number") value = raw;
+    else if (raw && typeof raw === "object" && typeof (raw as any).value === "number") {
+      value = (raw as any).value;
+    }
+    if (value == null) continue;
+    if (!byScope.has(scope)) byScope.set(scope, new Map());
+    byScope.get(scope)!.set(thresholdName, value);
+  }
+
+  thresholdOverrideCache = { computedAt: now, byScope };
+  return byScope;
+}
+
+// Look up archetype for a league. Best-effort; returns null if not in
+// competition_config or league_code not normalisable.
+async function getArchetypeForLeague(leagueCode: string | null): Promise<string | null> {
+  if (!leagueCode) return null;
+  try {
+    const rows = await db.execute(sql`
+      SELECT archetype FROM competition_config
+      WHERE LOWER(REPLACE(name, '-', ' ')) = LOWER(REPLACE(${leagueCode}, '-', ' '))
+      LIMIT 1
+    `);
+    const arch = (rows as any).rows?.[0]?.archetype;
+    return typeof arch === "string" ? arch : null;
+  } catch {
+    return null;
+  }
+}
+
+interface ResolvedThresholds {
+  experimentToCandidate: typeof THRESHOLDS.experimentToCandidate;
+  candidateToPromoted: typeof THRESHOLDS.candidateToPromoted;
+  demotionPromotedToCandidate: typeof THRESHOLDS.demotionPromotedToCandidate;
+  demotionCandidateToExperiment: typeof THRESHOLDS.demotionCandidateToExperiment;
+  abandonThreshold: typeof THRESHOLDS.abandonThreshold;
+}
+
+// Resolve all gate thresholds for a (league, archetype) scope. Lookup chain:
+// per-league > per-archetype > global > compile-time default.
+// Empty pending_threshold_revisions table = all calls fall through to
+// compile-time defaults = zero behaviour change. Sub-phases 6.3+ start
+// writing approved overrides.
+async function resolveAllThresholds(
+  leagueCode: string | null,
+  archetype: string | null,
+): Promise<ResolvedThresholds> {
+  const byScope = await getThresholdOverrideMap();
+
+  const get = (name: string, def: number): number => {
+    if (leagueCode) {
+      const v = byScope.get(`per_league:${leagueCode}`)?.get(name);
+      if (v != null) return v;
+    }
+    if (archetype) {
+      const v = byScope.get(`per_archetype:${archetype}`)?.get(name);
+      if (v != null) return v;
+    }
+    const g = byScope.get("global")?.get(name);
+    if (g != null) return g;
+    return def;
+  };
+
+  return {
+    experimentToCandidate: {
+      minSampleSize: get("experiment_to_candidate.min_sample_size", THRESHOLDS.experimentToCandidate.minSampleSize),
+      minRoi:        get("experiment_to_candidate.min_roi",         THRESHOLDS.experimentToCandidate.minRoi),
+      minClv:        get("experiment_to_candidate.min_clv",         THRESHOLDS.experimentToCandidate.minClv),
+      minWinRate:    get("experiment_to_candidate.min_win_rate",    THRESHOLDS.experimentToCandidate.minWinRate),
+      maxPValue:     get("experiment_to_candidate.max_p_value",     THRESHOLDS.experimentToCandidate.maxPValue),
+      minWeeksActive:get("experiment_to_candidate.min_weeks_active",THRESHOLDS.experimentToCandidate.minWeeksActive),
+      minEdge:       get("experiment_to_candidate.min_edge",        THRESHOLDS.experimentToCandidate.minEdge),
+    },
+    candidateToPromoted: {
+      minSampleSize: get("candidate_to_promoted.min_sample_size", THRESHOLDS.candidateToPromoted.minSampleSize),
+      minRoi:        get("candidate_to_promoted.min_roi",         THRESHOLDS.candidateToPromoted.minRoi),
+      minClv:        get("candidate_to_promoted.min_clv",         THRESHOLDS.candidateToPromoted.minClv),
+      maxPValue:     get("candidate_to_promoted.max_p_value",     THRESHOLDS.candidateToPromoted.maxPValue),
+      minWeeksActive:get("candidate_to_promoted.min_weeks_active",THRESHOLDS.candidateToPromoted.minWeeksActive),
+    },
+    demotionPromotedToCandidate: {
+      rollingWindow:               get("demotion_promoted_to_candidate.rolling_window",                  THRESHOLDS.demotionPromotedToCandidate.rollingWindow),
+      minRoi:                      get("demotion_promoted_to_candidate.min_roi",                         THRESHOLDS.demotionPromotedToCandidate.minRoi),
+      minClv:                      get("demotion_promoted_to_candidate.min_clv",                         THRESHOLDS.demotionPromotedToCandidate.minClv),
+      maxConsecutiveNegativeWeeks: get("demotion_promoted_to_candidate.max_consecutive_negative_weeks", THRESHOLDS.demotionPromotedToCandidate.maxConsecutiveNegativeWeeks),
+    },
+    demotionCandidateToExperiment: {
+      minRoi: get("demotion_candidate_to_experiment.min_roi", THRESHOLDS.demotionCandidateToExperiment.minRoi),
+      minClv: get("demotion_candidate_to_experiment.min_clv", THRESHOLDS.demotionCandidateToExperiment.minClv),
+    },
+    abandonThreshold: {
+      minSample: get("abandon_threshold.min_sample",  THRESHOLDS.abandonThreshold.minSample),
+      maxRoi:    get("abandon_threshold.max_roi",     THRESHOLDS.abandonThreshold.maxRoi),
+      maxPValue: get("abandon_threshold.max_p_value", THRESHOLDS.abandonThreshold.maxPValue),
+    },
+  };
+}
+
 function computePValue(wins: number, total: number, impliedWinRate: number): number {
   if (total === 0 || impliedWinRate <= 0 || impliedWinRate >= 1) return 1;
   const observed = wins / total;
@@ -354,7 +488,13 @@ export async function evaluateExperimentTag(
   }
 
   const metrics = await computeMetricsForExperiment(tag);
-  const t = THRESHOLDS;
+
+  // Sub-phase 6.1: resolve thresholds via lookup chain (per-league >
+  // per-archetype > global > default). Empty pending_threshold_revisions
+  // table = all calls fall through to compile-time defaults = zero
+  // behaviour change. Sub-phases 6.3+ start writing approved overrides.
+  const archetype = await getArchetypeForLeague(exp.league_code);
+  const t = await resolveAllThresholds(exp.league_code, archetype);
 
   // Update registry with current metrics (same behaviour as legacy cron).
   await db.update(experimentRegistryTable).set({

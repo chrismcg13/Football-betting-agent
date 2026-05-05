@@ -1149,6 +1149,15 @@ export async function runMigrations() {
       CREATE INDEX IF NOT EXISTS pending_threshold_revisions_scope_idx
         ON pending_threshold_revisions(threshold_name, scope)
     `);
+    // Sub-phase 6.1 (2026-05-05): partial index for the resolveThreshold
+    // lookup chain. Sorts by (threshold_name, scope, reviewed_at DESC) so
+    // the per-call SQL `SELECT DISTINCT ON (threshold_name, scope) ... ORDER
+    // BY threshold_name, scope, reviewed_at DESC` is index-only.
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS pending_threshold_revisions_approved_idx
+        ON pending_threshold_revisions(threshold_name, scope, reviewed_at DESC NULLS LAST)
+        WHERE status = 'approved'
+    `);
 
     // Change C (2026-04-22): create paper_bets_current view + partial index.
     // MUST run AFTER every `ALTER TABLE paper_bets` in this migrate() —
