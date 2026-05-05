@@ -44,6 +44,7 @@ import {
 import { applyCorrelationDetection, type BetCandidate } from "./correlationDetector";
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, backfillPinnacleSnapshotsFromAf } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
+import { runBetfairReverseMapping } from "./betfairFirstUniverse";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
 import { runPromotionEngine } from "./promotionEngine";
@@ -2141,6 +2142,19 @@ export function startScheduler(): void {
       .catch((err) => logger.warn({ err }, "Discovered-league fixture ingestion failed — non-fatal"));
   }, { timezone: "UTC" });
   logger.info("Discovered-league fixture ingestion scheduler active — twice daily 06:30 & 18:30 UTC");
+
+  // Betfair-first reverse-mapping: daily at 07:00 UTC (sub-phase 2 plan §3.8).
+  // Reverse-maps Betfair's soccer competition list against API-Football,
+  // populates Tier D for unmatched, archetype-labels every row.
+  // Dry-run by default — flip BETFAIR_REVERSE_MAPPING_DRY_RUN=false to enable
+  // writes after reviewing 1-3 dry-run reports.
+  cron.schedule("0 7 * * *", () => {
+    logger.info("Betfair-first reverse-mapping triggered by scheduler");
+    void runBetfairReverseMapping()
+      .then((r) => logger.info({ runId: r.runId, durationMs: r.durationMs, dryRun: r.dryRun, writesApplied: r.writesApplied }, "Betfair reverse-mapping complete"))
+      .catch((err) => logger.warn({ err }, "Betfair reverse-mapping failed — non-fatal"));
+  }, { timezone: "UTC" });
+  logger.info("Betfair reverse-mapping scheduler active — daily at 07:00 UTC");
 
   cron.schedule("0 4 * * *", () => {
     logger.info("Promotion engine triggered (daily 04:00 UTC)");

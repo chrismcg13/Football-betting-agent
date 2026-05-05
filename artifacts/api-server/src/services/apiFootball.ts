@@ -609,7 +609,7 @@ export function isApiFootballCircuitOpen(): boolean {
   return isCircuitOpen(API_FOOTBALL_SERVICE);
 }
 
-async function fetchApiFootball<T = unknown>(
+export async function fetchApiFootball<T = unknown>(
   path: string,
   params: Record<string, string | number> = {},
   options?: { priority?: boolean },

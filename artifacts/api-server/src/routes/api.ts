@@ -51,6 +51,7 @@ import {
   runSettlementNow,
 } from "../services/scheduler";
 import { getDiscoveredLeagues, getDiscoveryStats, getCompetitionCoverageStats } from "../services/leagueDiscovery";
+import { manualTriggerBetfairReverseMapping } from "../services/betfairFirstUniverse";
 import { getAllTeamXGStats } from "../services/xgIngestionService";
 import { getCircuitBreakerStatus, resumeAgent } from "../services/riskManager";
 import { getCachedBalance, isLiveMode, getAccountFunds, cancelOrders, type ClearedOrder } from "../services/betfairLive";
@@ -1910,6 +1911,20 @@ router.post("/leagues/ingest-fixtures", async (_req, res) => {
     res.json({ success: true, result });
   } catch (err) {
     logger.error({ err }, "Manual fixture ingestion failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/leagues/betfair-reverse-mapping/run — sub-phase 2 cron (manual trigger).
+// Honours BETFAIR_REVERSE_MAPPING_DRY_RUN env (default 'true' — log diff, no writes).
+// ─────────────────────────────────────────────
+router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
+  try {
+    const result = await manualTriggerBetfairReverseMapping();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual Betfair reverse-mapping failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });
