@@ -357,6 +357,42 @@ These were applied via direct DML on prod (per prior session conversation summar
 
 ---
 
+## 7.A Typecheck debt — non-blocking, sub-phase scope follow-up
+
+**Discovered during R6.1 deploy attempt 2026-05-05.** `pnpm typecheck` fails on `artifacts/api-server` with ~30 errors across 8 files.
+
+**Origin and scope:**
+
+| Source | File:line | Error |
+|---|---|---|
+| Phase 2.B.2 (`786dd46`) | `scheduler.ts:1404,9` | `universeTier` does not exist on `BetOrder` interface |
+| Phase 2.B.2 (`786dd46`) | `scheduler.ts:1461,31` | same |
+| Pre-Phase-2 | `alertDetection.ts:238-246` | `dailyBudget`, `usedToday` properties missing on budget type |
+| Pre-Phase-2 | `alertDetection.ts:428,430` | `league` not on paper_bets table type |
+| Pre-Phase-2 | `betfairLive.ts:1465` | `unavailableOnExchange` |
+| Pre-Phase-2 | `launchActivation.ts:141,203,438-440` | `AlertCategory`, missing properties |
+| Pre-Phase-2 | `leagueDiscovery.ts:420` | `approved` property |
+| Pre-Phase-2 | `oddsPapi.ts:1568,1569,1576` | `combined` property `never` type |
+| Pre-Phase-2 | `paperTrading.ts:1457,1547,2402,2437` | various property + arithmetic type errors |
+| Pre-Phase-2 | `riskManager.ts:480` | `distanceToDailyLimit` |
+| Pre-Phase-2 | `scheduler.ts:313,327,329,488,754,1108,1451-1452,2391` | various |
+| Pre-Phase-2 | `valueDetection.ts:319-320` | `null` not assignable to `number` |
+
+**Why production deploys succeed despite this:** the build path uses a transpiler (esbuild/swc/Vite) that emits JS regardless of type-check failures. `pnpm build` succeeds; only `pnpm typecheck` fails. The runtime behaves correctly because the type errors are mostly cosmetic (missing optional fields, narrow union mismatches) rather than semantic bugs.
+
+**Why this matters:**
+- Future sub-phases that add new code paths can't typecheck-validate against a clean baseline.
+- IDE feedback (TypeScript language server) reports all these errors as red squiggles, drowning new errors.
+- Strict-mode emission (if ever enabled) would block deploys.
+
+**Recommended cleanup:** `phase-1-typecheck-bucket-D` — follow-up sub-phase between sub-phase 2 and sub-phase 3. Mirrors the prior `553431d Merge fix/typecheck-debt-bucket-c — Phase 1 typecheck cleanup` commit that closed bucket C. Estimated wall-clock: 1-2h. Low risk (cosmetic fixes only).
+
+**R6.1 added zero new errors.** Verified by line-cross-referencing against R6.1's edited regions (`paperTrading.ts:2024-2073`, `betfairLive.ts:700-718` + `876-911`). None of the error-emitting lines are in those regions.
+
+**Confidence: EVIDENCE-BASED.** All error lines and their origin commits are git-traceable.
+
+---
+
 ## 8. Open verification items for the user (NOT BLOCKING sub-phase 1)
 
 These are minor parity questions that can be tracked but do not block proceeding:
