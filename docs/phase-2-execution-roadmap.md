@@ -99,6 +99,18 @@ Items ordered per user's adjustment: **schema first, investigation next, volume-
 
 ---
 
+## Wave 3 #1 ✅ CLOSED 2026-05-05
+
+**Closed:** 2026-05-05 ~21:00 UTC. Cron-path manual trigger evaluated 1,145 experiments; 946 wrote graduation_evaluation_log rows; distribution-shift detector produced structured JSONB findings for 3 archetypes (lower_division n=2242, top_flight_men n=165, cup n=2). All A scores < |1.5| → no model-bug alert. Settlement hook in place; fires on fixture completion (no settled bets in deploy window so settlement-path verification deferred to natural fixture flow).
+
+**Wave 3 #1 commit:** `516a4d4` — single tight commit with three user refinements baked in (per-league granularity, Kelly-growth-rate first-class, structured distribution-shift JSONB).
+
+**Follow-ups flagged (NOT blocking):**
+- 199-row gap between `evaluated: 1145` and graduation_evaluation_log rows (946) — likely errors swallowed by cron's per-tag try/catch. Bug-hunt territory; architecture validated.
+- Distribution-shift 30-day window includes pre-May-3 Replit-era data (per user guidance: "buggy and wasn't a good judge"). Sub-phase 6 should restrict to ≥2026-05-03 data when it consumes these findings for autonomous threshold proposals.
+
+---
+
 ## Wave 3 — Event-driven learning + feature expansion
 
 **Goal:** close the 24h cron-driven learning latency to event-driven; begin API-Football data expansion with the highest-value endpoint first.
