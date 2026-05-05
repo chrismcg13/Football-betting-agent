@@ -60,7 +60,48 @@ const NO_REGION_FUZZY_THRESHOLD = 0.95;
 const ODDS_PAPI_STALENESS_DAYS = 14;
 const FUZZY_FAILURE_SAMPLE_SIZE = 30;
 
-// ─── Token-set ratio fuzzy match (plan §3.1, locked) ─────────────────────────
+// ─── Token-set ratio fuzzy match (plan §3.1) + country-adjective strip ──────
+
+// Country-adjective tokens stripped from BOTH sides during tokenisation
+// (Commit A.3, 2026-05-05). Empirically catches "Belgian Pro League" →
+// AF "Jupiler Pro League" (ratio 1.0 after strip), "Argentinian Primera
+// Division" → "Primera División" (ratio 1.0), "French Premiere Ligue" →
+// "Ligue 1" (ratio 1.0 after also stripping "premiere"), etc.
+//
+// Synonym handling (Pro↔Professional, Liga↔League) is NOT in this set —
+// that's deferred to a v3 follow-up. ~22 of 30 fuzzy failures from
+// Commit A.2 remain as legitimate Tier D after this strip.
+const COUNTRY_ADJECTIVES: Set<string> = new Set([
+  // Europe
+  "english", "scottish", "welsh", "irish", "british", "northern",
+  "french", "german", "italian", "spanish", "portuguese", "dutch", "belgian",
+  "swiss", "austrian", "luxembourgish",
+  "swedish", "norwegian", "danish", "finnish", "icelandic", "faroese",
+  "polish", "czech", "slovak", "slovakian", "hungarian", "romanian",
+  "bulgarian", "serbian", "croatian", "slovenian", "bosnian", "montenegrin",
+  "macedonian", "albanian", "greek", "turkish", "cypriot", "maltese",
+  "russian", "ukrainian", "belarusian", "estonian", "latvian", "lithuanian",
+  "georgian", "armenian", "azerbaijani", "moldovan", "kazakh", "uzbek",
+  // Americas
+  "american", "canadian", "mexican",
+  "brazilian", "argentinian", "argentine", "chilean", "colombian", "peruvian",
+  "uruguayan", "ecuadorian", "paraguayan", "bolivian", "venezuelan",
+  "panamanian", "honduran", "jamaican", "guatemalan", "costa", "rican",
+  // Asia / Oceania
+  "japanese", "korean", "chinese", "australian", "indonesian",
+  "thai", "vietnamese", "malaysian", "philippine", "indian",
+  "saudi", "qatari", "bahraini", "omani", "emirati", "uae",
+  "iranian", "iraqi", "israeli", "jordanian", "lebanese", "kuwaiti", "uzbekistani",
+  // Africa
+  "egyptian", "moroccan", "tunisian", "algerian",
+  "nigerian", "ghanaian", "kenyan", "ugandan", "tanzanian", "ethiopian",
+  "senegalese", "ivorian", "cameroonian", "rwandan", "zimbabwean", "botswanan",
+  "south", "african",  // for "South African"
+  // Generic abbreviations
+  "us", "gb", "uk",
+  // French equivalents that work like country-adjective noise
+  "premiere",  // Betfair "French Premiere Ligue" → strip "premiere" lets "Ligue" match
+]);
 
 function normaliseLeagueName(s: string): string {
   return s
@@ -74,7 +115,11 @@ function normaliseLeagueName(s: string): string {
 
 function tokenSetRatio(a: string, b: string): number {
   const tokenize = (s: string) =>
-    new Set(normaliseLeagueName(s).split(" ").filter((t) => t.length > 0));
+    new Set(
+      normaliseLeagueName(s)
+        .split(" ")
+        .filter((t) => t.length > 0 && !COUNTRY_ADJECTIVES.has(t)),
+    );
   const A = tokenize(a);
   const B = tokenize(b);
   if (A.size === 0 || B.size === 0) return 0;
@@ -262,7 +307,7 @@ const BETFAIR_REGION_TO_AF_COUNTRIES: Record<string, string[]> = {
   "LATVIA": ["Latvia"], "LITHUANIA": ["Lithuania"], "GEORGIA": ["Georgia"],
   "ARMENIA": ["Armenia"], "AZERBAIJAN": ["Azerbaijan"], "MOLDOVA": ["Moldova"],
   "KAZAKHSTAN": ["Kazakhstan"],
-  "USA": ["USA"], "CANADA": ["Canada"], "MEXICO": ["Mexico"],
+  "CANADA": ["Canada"], "MEXICO": ["Mexico"],
   "BRAZIL": ["Brazil"], "ARGENTINA": ["Argentina"], "CHILE": ["Chile"],
   "COLOMBIA": ["Colombia"], "PERU": ["Peru"], "URUGUAY": ["Uruguay"],
   "ECUADOR": ["Ecuador"], "PARAGUAY": ["Paraguay"], "BOLIVIA": ["Bolivia"],
