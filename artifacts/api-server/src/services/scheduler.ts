@@ -186,7 +186,7 @@ async function safeRunFeatures(): Promise<void> {
 // unconditionally whenever Betfair credentials are configured — NOT gated on
 // agent_config.data_source.
 
-async function safeRunExchangeBookSweep(): Promise<void> {
+async function safeRunExchangeBookSweep(opts?: { hoursAhead?: number }): Promise<void> {
   if (exchangeBookSweepRunning) {
     logger.warn("Exchange book sweep already in progress — skipping this run");
     markRun("exchange_book_sweep", "skipped");
@@ -196,7 +196,7 @@ async function safeRunExchangeBookSweep(): Promise<void> {
   markStart("exchange_book_sweep");
   try {
     await trackCronExecution("exchange_book_sweep", async () => {
-      const r = await runExchangeBookSweep();
+      const r = await runExchangeBookSweep(opts);
       return r.snapshotsWritten;
     });
     markRun("exchange_book_sweep", "success");
@@ -1834,14 +1834,20 @@ export function startScheduler(): void {
   // Exchange book sweep: every 10 minutes, populates odds_snapshots with
   // source='betfair_exchange' for the venue-anchored pricing picker. Runs
   // unconditionally, independent of data_source config flag.
-  cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep(); }, { timezone: "UTC" });
-  logger.info("Exchange book sweep scheduler active — every 10 minutes (24h NEAR window)");
+  // Wave 1.5 (2026-05-05): extended window from 24h to 48h to match
+  // valueDetection's 1-48h evaluation window. Without this, ~half the
+  // matches valueDetection looks at have no betfair_exchange snapshot
+  // and get rejected at 02a_rej_no_betfair_exchange. Tier B firehose
+  // benefits especially since Tier B has fewer matches, so coverage
+  // gaps are proportionally more impactful.
+  cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep({ hoursAhead: 48 }); }, { timezone: "UTC" });
+  logger.info("Exchange book sweep scheduler active — every 10 minutes (48h window — Wave 1.5)");
 
   // Startup warmup: run one sweep ~30s after boot so the first population
   // doesn't have to wait the full 10-minute cron interval.
   setTimeout(() => {
-    logger.info("Exchange book sweep startup warmup triggered (T+30s)");
-    void safeRunExchangeBookSweep();
+    logger.info("Exchange book sweep startup warmup triggered (T+30s, 48h window)");
+    void safeRunExchangeBookSweep({ hoursAhead: 48 });
   }, 30_000);
 
   // Feature computation: every 6 hours
