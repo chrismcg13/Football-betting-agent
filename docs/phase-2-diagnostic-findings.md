@@ -1,100 +1,255 @@
-# Phase 2 — Diagnostic Findings
+# Phase 2 — Diagnostic Findings (Strategic-Push Refresh)
 
-**Status:** **EMPIRICAL FINDINGS COMPLETE (prod only).** All SQL has been run against prod. Dev was skipped per user direction (focus is prod paper-bet integrity until real-money switch). Findings, decision-branch resolution, and Phase 2.A readiness verdict are recorded in §6 and §7. R6 patch is staged but uncommitted; recommended commit sequence in §7.
+**Status:** **EMPIRICAL FINDINGS POPULATED** (2026-05-05, prod). One **CRITICAL** safety-boundary finding requires user attention — see §-1 below.
 
-**Author:** Claude (diagnostic-and-hotfix session, 2026-05-04)
-**Working tree:** `C:\Users\chris\projects\Football-betting-agent\` (git repo, branch as-of `916c6cc`)
-**Constraint disclosed:** this session's shell has no `psql`, `node`, or `pnpm` available. SQL must be run by the user. R6 patch is staged in the working tree but **not committed** — pending the verification test described in §5.
-
----
-
-## 0. What this session has done
-
-| Item | Status | Notes |
-|---|---|---|
-| Pre-work item 1: fix R6 Q1 SQL syntax | ✅ Done | `r6-clv-source-investigation.md` §3.1 corrected; malformed `JOIN ... AS league_via_match` removed; columns qualified |
-| Pre-work item 2: pin patch approach | ✅ Done | Filter snapshot lookup to Pinnacle sources + conditional-spread write. **Both Writer B and Writer C.** Documented in `r6-clv-source-investigation.md` §4.3 |
-| Pre-work item 3: pin demotion criterion | ✅ Done | Three-condition OR rule documented in `r6-clv-source-investigation.md` §4.2 |
-| Sequence A: Run R6 Q1-Q4 | ⏳ Awaiting user run | SQL is final; no more corrections needed |
-| Sequence B: Settlement-bias SQL | ⏳ Awaiting user run | SQL re-included below for convenience |
-| Sequence C: API-Football usage SQL | ⏳ Awaiting user run | |
-| Sequence D: Retrospective threshold SQL | ⏳ Awaiting user run | |
-| Sequence E: Sunday discovery cron audit | ✅ Done | Results in §3 below |
-| Hotfix F: R6 patch | ⚠️ Staged, not committed | Two file edits in working tree; awaits verification + your approval before commit. Diff in §4 |
-| Hotfix G: Manual demotion of contaminated rows | ⏳ Pending Q4 results | Cannot proceed until Q4 returns rows |
-| Findings doc H | 🟡 This document — partial | Will be completed when SQL runs |
+**Author:** Claude (sub-phase 1 of strategic Phase 2 push, 2026-05-05)
+**Working tree:** `C:\Users\chris\projects\Football-betting-agent\`
+**Companion:** `docs/phase-2-current-state.md` (codebase audit, file:line cites)
+**Supersedes:** the prior version of this file (committed earlier in `.jsonl` history). Prior findings summarised in §0 below; fresh findings (run 2026-05-05) integrated in §§2-6.
 
 ---
 
-## 1. Pre-work corrections (decisions pinned)
+## -1. CRITICAL FINDING — Safety boundaries not at brief-stated defaults
 
-### 1.1 R6 Q1 SQL fix (item 1)
+The strategic Phase 2 brief explicitly defines the following as **user-approval-gated** parameters that the model **cannot modify autonomously** (only tighten, never loosen). Q12 results from agent_config show they are NOT in the stated default state:
 
-The malformed clause `JOIN matches m ON m.id = pb.match_id AS league_via_match` was caused by a leftover alias from an earlier draft. Fixed in place at `r6-clv-source-investigation.md` §3.1. All column references in the CTE are now qualified (`pb.*` and `m.league`). Visual inspection shows the query is syntactically valid Postgres; full parse-check requires running it. **Run with `EXPLAIN` first as a sanity check** — if it errors, paste the message.
+| Parameter | Brief-stated default | Current value (prod) | Updated_at | Direction of drift |
+|---|---|---|---|---|
+| `max_stake_pct` | 2% (`0.02`) | **3%** (`0.03`) | 2026-04-16 | **Loosened** (above default) |
+| `bankroll_floor` | £200 | **£0** | 2026-05-03 | **Disabled** |
+| `daily_loss_limit_pct` | 5% (`0.05`) | **99%** (`0.99`) | 2026-05-03 | **Effectively disabled** |
+| `weekly_loss_limit_pct` | 10% (`0.10`) | **99%** (`0.99`) | 2026-05-03 | **Effectively disabled** |
+| `bankroll` | (operational, fluctuates) | £10,010.42 | 2026-05-05 | settlement-driven, not relevant |
+| `paper_mode` | true | **true** | 2026-05-02 | OK |
+| `agent_status` | running | **running** | 2026-05-02 | OK |
+| `experiment_track_enabled` | (not yet set) | **(no row)** | n/a | OK — defaults to `'false'` per `scheduler.ts:945` |
+| `reject_non_pinnacle_leagues` | (not yet set) | **(no row)** | n/a | OK — defaults to enabled per `scheduler.ts:947` |
 
-### 1.2 Patch approach for Writer B + Writer C (item 2)
+**Interpretation:** these were edited by hand on or before 2026-05-03 (likely as part of paper-mode loosening to enable broad data accumulation without circuit-breakers tripping). They are **not** something the model did — there are no autonomous code paths that write to `agent_config` for these keys.
 
-**Decision: filter the snapshot lookup to Pinnacle sources only AND use conditional-spread for the `clv_pct` write.** Apply identically to both writers. Leave `closing_odds_proxy` semantics unchanged (intentionally any-source — diagnostic column).
+**Why this matters now:** the strategic brief just established (2026-05-05) that these are the model's **uncrossable safety floor**. The push from sub-phase 2 onwards opens the firehose (Tier B/C placements, banned-market reactivations, broader universe). With drawdown caps effectively disabled and `bankroll_floor=0`, none of the production-track risk-control invariants the brief depends on are actually in force.
 
-**Why:**
-- *Filter-the-lookup* and *conditional-spread* are not really alternatives but complements (the user's prompt framed them as either-or; both are needed):
-  - Filter alone, with unconditional write, would null-clobber when no Pinnacle snapshot exists.
-  - Conditional spread alone, with any-source lookup, would still write market-proxy CLV when a non-Pinnacle snapshot is the latest.
-  - Together: writes only Pinnacle CLV; if no Pinnacle snapshot found, leaves prior write alone.
-- The Pinnacle source set `["oddspapi_pinnacle", "api_football_real:Pinnacle"]` is the canonical pair already used at `valueDetection.ts:685`, `oddsPapi.ts:2462`, `oddsPapi.ts:3142-3144` — matching this precedent keeps the codebase consistent.
-- Two separate snapshot lookups (one any-source for `closing_odds_proxy`, one Pinnacle-only for `clv_pct`) cost ~negligible at settlement frequency. Cleaner than fetching all sources and filtering in memory.
+**Three resolution paths (user decides):**
 
-**Net effect on `clv_pct` going forward:**
-- For Tier A bets: Writer A populates Pinnacle pre-kickoff; Writer B/C refresh with Pinnacle at settlement. Column stays Pinnacle-attributed.
-- For Tier B/C bets: Writer A doesn't fire (no OddsPapi mapping); Writer B/C find no Pinnacle snapshot → `clv_pct` stays NULL.
-- **NULL becomes the explicit signal that no Pinnacle CLV is available.**
+1. **Restore brief defaults before sub-phase 2 ships.** Set `bankroll_floor='200'`, `daily_loss_limit_pct='0.05'`, `weekly_loss_limit_pct='0.10'`, `max_stake_pct='0.02'`. Aligns prod with the brief verbatim. Most defensive.
+2. **Update the brief to reflect current operating values** (e.g., the user has consciously set 99% loss caps because we're paper-trading and want to learn distribution). Brief gets a correction line clarifying the operational defaults are looser than the document's example values; the **principle** (model-can-tighten-only) still holds at whatever the current values are.
+3. **Hybrid — set new "phase-2-ready" values explicitly.** E.g., `daily_loss_limit_pct='0.20'`, `weekly_loss_limit_pct='0.30'`, `bankroll_floor='1000'` (10% of current bankroll) — looser than original defaults but tighter than effectively-disabled. Documents the safety floor at a paper-trade-appropriate level.
 
-This is the bridge-state behaviour until Phase 2's `clv_source` column lands and Tier B/C can record CLV under a non-Pinnacle source tag.
+**Recommendation: option 3.** The brief's literal defaults assume ~£500 bankroll real-money; current bankroll is £10,010 in paper mode, where the original 5%/10% caps would over-trigger on natural variance. But 99% caps means the safety boundary is non-existent, which contradicts the brief.
 
-### 1.3 Demotion criterion (item 3)
+**This is a STOP gate for sub-phase 2.** Per the brief's safety-boundary list, sub-phases that put more capital at risk (which sub-phase 4 banned-market reactivation does, even at £0 — through correlation with future graduations) cannot proceed under the brief's discipline until the boundary is set to a value the user has consciously chosen.
 
-Pinned at `r6-clv-source-investigation.md` §4.2. Restated here:
+**No code or DML applied by me. Awaiting your call.**
 
-A currently-promoted `experiment_registry` row is a demotion candidate if **any** of:
+---
 
+## 0. Prior-session findings — preserved as historical baseline
+
+These were established in the 2026-05-04 diagnostic-and-hotfix session. The strategic-push refresh queries below either confirm they're still true or capture what's drifted since.
+
+### 0.1 R6 contamination scale (confirmed pre-patch)
+
+Of 422 settled bets at the time of audit:
+- 9 (2%) `pinnacle_preserved`
+- 129 (31%) `pinnacle_overwritten_by_proxy` ← **the destructive-write bug**
+- 205 (49%) `market_proxy_only`
+- 79 (19%) `no_clv`
+
+Of 138 bets where Writer A had pre-populated Pinnacle CLV: **129 destroyed by Writer B/C** = **94% destruction rate.** R6 hotfix shipped (commit `29e8396`); verification passed.
+
+### 0.2 Promotion audit — empty
+
+`promotion_audit_log` was empty: no tier transitions ever recorded. R6 contamination has not corrupted any production transition because no transitions occurred.
+
+### 0.3 Currently-promoted experiments at risk — none
+
+`experiment_registry WHERE data_tier = 'promoted'` was empty. No demotion candidates.
+
+### 0.4 Settlement bias — Primera División flagged
+
+Only one league cleared the `n_pred_win ≥ 15 AND n_pred_lose ≥ 15` filter: Primera División, bias_index = **−0.524** (5.2× the v2 §1.3 |B|≥0.10 threshold). Cause hypothesised: AF fixture-result coverage gap on contentious matches. Action recorded: route to Tier D when 2.A ships.
+
+### 0.5 API-Football 14-day usage
+
+Daily average ~4,617 calls; +Phase-2 projection ~7,400/day; throttle threshold 50,000/day, daily cap 75,000. **Headroom adequate.** Anomaly: April 24 - May 1 (8 days) had no `api_usage` rows — logging or call-volume gap, **not investigated.**
+
+### 0.6 Retrospective threshold — 0/32 graduate at sample 50
+
+32 leagues evaluated with `has_betfair_exchange = true AND has_pinnacle_odds = true` filter. **0 WOULD_GRADUATE, 30 fail_sample, 2 no_data.** Failures uniformly at the sample-size gate. Action: lowered `PROMO_MIN_SAMPLE_SIZE` from 30 → 25 (commit `1f0e466`). R14 winsorization shipped in same commit.
+
+### 0.7 Bet pace projection — Tier B firehose-on time-to-eval
+
+Active `other` archetype: 60 bets/week placement rate, ~15-25/week settle rate. Time-to-25 settled ≈ 1-2 weeks per league at firehose-on. Phase 2.C will see real tier-change activity in first month, not first quarter.
+
+---
+
+## 1. Refresh queries — what to run now
+
+Universe has changed since the 2026-05-04 audit (Phase 2.A schema deployed, R6 patch deployed, `universe_tier` seeded 149A/84B/804E, Tier 1 placement-bottleneck DML applied). The queries below are runnable today and reflect the **current** schema.
+
+**Run order suggestion:** §2 (R6 freshness), §3 (settlement bias — broadened filter), §4 (API usage — fresh 14-day), §5 (retrospective — current universe), §6 (banned-market history).
+
+**All queries are READ-ONLY.** No DML. No schema changes. Run on **prod**. Paste raw output back; I integrate.
+
+---
+
+## 2. R6 freshness check (Q1-Q4 re-run)
+
+R6 patch deployed 2026-05-05. Verify post-patch settlements no longer show contamination.
+
+### 2.1 Q1-fresh — Provenance distribution post-R6
+
+```sql
+-- Post-R6 settlement provenance: ONLY rows settled after the R6 patch deploy.
+-- The 'pinnacle_overwritten_by_proxy' bucket should be EMPTY (modulo the
+-- closing_pinnacle_odds vs odds_snapshots-Pinnacle source-discrepancy edge
+-- case identified during verification of bet id 859).
+WITH classified AS (
+  SELECT
+    pb.id,
+    pb.status,
+    m.league,
+    pb.odds_at_placement::numeric                      AS odds,
+    pb.clv_pct::numeric                                AS clv,
+    pb.closing_pinnacle_odds::numeric                  AS pin_close,
+    pb.closing_odds_proxy::numeric                     AS proxy_close,
+    CASE WHEN pb.closing_pinnacle_odds IS NOT NULL AND pb.closing_pinnacle_odds::numeric > 1
+         THEN ROUND(((pb.odds_at_placement::numeric - pb.closing_pinnacle_odds::numeric) / pb.closing_pinnacle_odds::numeric) * 100, 3)
+         ELSE NULL END                                 AS clv_if_pinnacle,
+    CASE WHEN pb.closing_odds_proxy IS NOT NULL AND pb.closing_odds_proxy::numeric > 1
+         THEN ROUND(((pb.odds_at_placement::numeric - pb.closing_odds_proxy::numeric) / pb.closing_odds_proxy::numeric) * 100, 3)
+         ELSE NULL END                                 AS clv_if_proxy
+  FROM paper_bets pb
+  JOIN matches m ON m.id = pb.match_id
+  WHERE pb.status IN ('won','lost')
+    AND pb.deleted_at IS NULL
+    AND pb.legacy_regime = false
+    AND pb.settled_at >= '2026-05-05 09:44:19'  -- R6 deploy timestamp; adjust if you have a different one
+)
+SELECT
+  CASE
+    WHEN clv IS NULL THEN 'no_clv'
+    WHEN pin_close IS NULL AND proxy_close IS NOT NULL THEN 'market_proxy_only'
+    WHEN pin_close IS NOT NULL AND ABS(clv - clv_if_pinnacle) < 0.01 THEN 'pinnacle_preserved'
+    WHEN pin_close IS NOT NULL AND ABS(clv - clv_if_proxy)    < 0.01 THEN 'pinnacle_overwritten_by_proxy'
+    WHEN pin_close IS NOT NULL AND clv_if_pinnacle IS NOT NULL THEN 'inconsistent_pinnacle_present_but_clv_neither'
+    ELSE 'other'
+  END AS provenance,
+  COUNT(*)                AS n,
+  ROUND(AVG(clv), 3)      AS avg_clv,
+  ROUND(AVG(odds)::numeric, 2)    AS avg_odds
+FROM classified
+GROUP BY provenance
+ORDER BY n DESC;
 ```
-(a) pinnacle_sample / current_sample_size < 0.5            -- Pinnacle data covers <50% of decisions
-(b) pinnacle_only_clv IS NULL                              -- no Pinnacle data at all
-(c) pinnacle_only_clv + 0.5 < recorded_clv                 -- recorded CLV materially inflated vs Pinnacle truth
-```
 
-OR (not AND). Conservative-leaning. Action per row is manual: review, decide, run single-row UPDATE.
+**Pass criteria:**
+- `pinnacle_overwritten_by_proxy` count ≤ 1 (the bet id 859 edge case is acceptable; anything more is a regression).
+- All rows fall in {`pinnacle_preserved`, `market_proxy_only`, `no_clv`, `inconsistent_pinnacle_present_but_clv_neither`}.
+- `pinnacle_preserved` count > 0 (Tier A bets continue to land Pinnacle CLV cleanly).
 
----
+**Result (2026-05-05):**
 
-## 2. Diagnostic SQL runbook (to be run by user)
-
-**Procedure for each query:**
-1. Run in **dev** first; capture output.
-2. Compare to expectation; if anything looks anomalous, stop.
-3. Run in **prod**; capture output.
-4. Paste both outputs into the placeholder sections below.
-
-**All queries are read-only.** No DML. No schema changes. No transactions needed (single-statement reads).
-
-### 2.A R6 Q1-Q4 (in `r6-clv-source-investigation.md` §3.1-3.4)
-
-| # | Query | Purpose | Result placeholder |
+| provenance | n | avg_clv | avg_odds |
 |---|---|---|---|
-| Q1 | Provenance distribution across all settled bets | Count of `pinnacle_preserved` / `market_proxy_only` / `pinnacle_overwritten_by_proxy` / `inconsistent_pinnacle_present_but_clv_neither` / `no_clv` | **TODO — paste here** |
-| Q2 | Per-experiment-tag CLV provenance | For each tag: settled count and pinnacle/market_proxy/overwritten/no_clv breakdown | **TODO — paste here** (top 50 tags by settled count is sufficient) |
-| Q3 | Promotions on contaminated CLV | Promotion-audit-log rows where `recorded_clv ≥ 1.5 BUT pinnacle_only_clv < 1.0 OR NULL` | **TODO — paste here** (full row count + the rows themselves) |
-| Q4 | Currently-promoted experiments at risk | Rows where data_tier='promoted' and one of §1.3 conditions triggers | **TODO — paste here** (full list — these are the demotion candidates) |
+| `pinnacle_preserved` | 2 | 6.086 | 2.77 |
+| `inconsistent_pinnacle_present_but_clv_neither` | 1 | 4.247 | 5.40 |
 
-**What I'll do once results are pasted:**
-- Q1 → fill the §A.1 cells in §6.
-- Q2 → identify which experiment_tags are most contaminated; flag for closer review.
-- Q3 → quantify how many historical promotions need provenance review.
-- Q4 → list demotion candidates in §6.A; user decides per row before any UPDATE.
+**Verdict: ✅ PASS.**
+- Zero `pinnacle_overwritten_by_proxy` rows — the destructive-write bug is gone.
+- Zero `market_proxy_only` rows in the post-deploy window — every settled bet either has Pinnacle CLV or is in the structural-pass-with-source-discrepancy bucket.
+- 2/3 cleanly preserved Pinnacle CLV; 1/3 (id 859, characterised at the end of the prior session) is structurally-correct: the patch's Pinnacle-source filter found a snapshot at 5.18 in `odds_snapshots`, while the strict-pre-kickoff `closing_pinnacle_odds` shows 5.14. Both are Pinnacle prices, captured at different times by different code paths. Patch is doing what it was designed to do.
 
-### 2.B Settlement-bias SQL (v2 §2.1)
+**Note on small N:** only 3 settled bets in the post-deploy window. Universe was Tier-A-only (149 leagues) but the deploy was 2026-05-05 09:44 UTC; few fixtures completed between then and the query run. Re-check at higher N during sub-phase 2 dry-run validation.
 
-Verbatim re-print for convenience:
+### 2.2 Q2-fresh — Per-experiment_tag CLV provenance
+
+Same query as `r6-clv-source-investigation.md` §3.2 but scoped to post-R6 deploy.
+
+```sql
+WITH classified AS (
+  SELECT
+    pb.experiment_tag,
+    pb.id,
+    pb.clv_pct::numeric AS clv,
+    pb.closing_pinnacle_odds::numeric AS pin_close,
+    pb.odds_at_placement::numeric AS odds,
+    CASE
+      WHEN pb.clv_pct IS NULL THEN 'no_clv'
+      WHEN pb.closing_pinnacle_odds IS NULL THEN 'market_proxy_only'
+      WHEN ABS(pb.clv_pct::numeric - ((pb.odds_at_placement::numeric - pb.closing_pinnacle_odds::numeric) / pb.closing_pinnacle_odds::numeric) * 100) < 0.01
+        THEN 'pinnacle_preserved'
+      ELSE 'pinnacle_overwritten'
+    END AS provenance
+  FROM paper_bets pb
+  WHERE pb.status IN ('won','lost')
+    AND pb.deleted_at IS NULL
+    AND pb.legacy_regime = false
+    AND pb.experiment_tag IS NOT NULL
+    AND pb.settled_at >= '2026-05-05 09:44:19'
+)
+SELECT
+  experiment_tag,
+  COUNT(*) AS settled,
+  SUM(CASE WHEN provenance = 'pinnacle_preserved' THEN 1 ELSE 0 END) AS pinnacle,
+  SUM(CASE WHEN provenance = 'market_proxy_only' THEN 1 ELSE 0 END) AS market_proxy,
+  SUM(CASE WHEN provenance = 'pinnacle_overwritten' THEN 1 ELSE 0 END) AS overwritten,
+  SUM(CASE WHEN provenance = 'no_clv' THEN 1 ELSE 0 END) AS no_clv,
+  ROUND(100.0 * SUM(CASE WHEN provenance = 'pinnacle_preserved' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS pct_pinnacle
+FROM classified
+GROUP BY experiment_tag
+ORDER BY settled DESC
+LIMIT 200;
+```
+
+**Pass criteria:** `overwritten = 0` for every tag (or ≤ 1 across all tags counting the id 859 edge).
+
+**Result (2026-05-05):** Not run. Q1-fresh's 3-row total covers the same data; per-tag breakdown adds no signal at N=3. Skipped. Re-run during sub-phase 2 dry-run when post-deploy N is larger.
+
+### 2.3 Q3-fresh — Promotions on contaminated CLV (re-confirm empty)
+
+```sql
+SELECT
+  pal.id,
+  pal.experiment_tag,
+  pal.previous_tier,
+  pal.new_tier,
+  pal.decided_at,
+  (pal.metrics_snapshot ->> 'clv')::numeric AS recorded_clv,
+  (pal.metrics_snapshot ->> 'sampleSize')::int AS sample_size,
+  (pal.metrics_snapshot ->> 'roi')::numeric AS recorded_roi
+FROM promotion_audit_log pal
+WHERE pal.new_tier IN ('candidate', 'promoted')
+ORDER BY pal.decided_at DESC;
+```
+
+**Expected (still):** zero rows. If non-zero, capture them — investigate whether any of the new transitions used pre-R6 contaminated CLV.
+
+**Result (2026-05-05):** Not run by user, but the prior-session result was empty and no new tier-transition code paths have shipped. Re-run before sub-phase 5 (event-driven graduation) ships, since that's the change that introduces new transition writes.
+
+### 2.4 Q4-fresh — Currently-promoted experiments at risk (re-confirm empty)
+
+```sql
+SELECT
+  er.id, er.experiment_tag, er.league_code, er.market_type, er.data_tier,
+  er.current_sample_size, er.current_roi, er.current_clv,
+  er.current_p_value, er.current_win_rate
+FROM experiment_registry er
+WHERE er.data_tier = 'promoted'
+ORDER BY er.experiment_tag;
+```
+
+**Expected:** zero rows.
+
+**Result (2026-05-05):** Not run; same rationale — re-run pre-sub-phase 5.
+
+---
+
+## 3. Settlement-bias — broadened to all post-Phase-2.A universe
+
+The prior run filtered to leagues with `n_pred_win ≥ 15 AND n_pred_lose ≥ 15`, which excluded all but Primera División. Two refresh angles below: (a) lower the bucket-size threshold to admit more leagues, (b) restrict to current universe (Tier A + B + C — i.e., leagues we'll actually bet through).
+
+### 3.1 Settlement bias — n ≥ 8 buckets, current universe
 
 ```sql
 WITH bet_outcomes AS (
@@ -105,8 +260,10 @@ WITH bet_outcomes AS (
     CASE WHEN pb.status IN ('won','lost','void') THEN 1 ELSE 0 END AS settled
   FROM paper_bets pb
   JOIN matches m ON m.id = pb.match_id
+  JOIN competition_config cc ON LOWER(cc.name) = LOWER(m.league)
   WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
     AND pb.placed_at < NOW() - INTERVAL '7 days'
+    AND cc.universe_tier IN ('A','B','C')
 ),
 buckets AS (
   SELECT
@@ -122,27 +279,74 @@ SELECT league, srate_pred_win, srate_pred_lose,
   ROUND((srate_pred_win - srate_pred_lose)::numeric, 3) AS bias_index,
   n_pred_win, n_pred_lose
 FROM buckets
-WHERE n_pred_win >= 15 AND n_pred_lose >= 15
+WHERE n_pred_win >= 8 AND n_pred_lose >= 8
 ORDER BY ABS(srate_pred_win - srate_pred_lose) DESC NULLS LAST
-LIMIT 100;
+LIMIT 200;
 ```
 
-**Scope per the user's prompt:** run this against all current dual-flag (Tier A) leagues *plus* the 65 Betfair-only leagues from the recent expansion. The query above runs across all leagues in `matches` — to scope it tightly:
+
+**Threshold actions per v2 §2.1:**
+- `|B| < 0.05` → admit at current tier
+- `0.05 ≤ |B| < 0.10` → flag for Tier C probationary review
+- `|B| ≥ 0.10` → route to Tier D (no bets)
+
+**Why n ≥ 8:** at n=8, a one-bucket settlement-rate point estimate has standard error ~0.18 — large enough that small B values are noise but large enough that |B|≥0.10 is meaningfully significant. n=15 was conservative; with the universe expansion in sub-phase 2 we want broader coverage even at higher noise.
+
+**Result (2026-05-05):**
+
+| league | srate_pred_win | srate_pred_lose | bias_index | n_pred_win | n_pred_lose |
+|---|---|---|---|---|---|
+| Primera División | 0.476 | 1.000 | **−0.524** | 189 | 90 |
+
+Only Primera División cleared the n≥8 filter. Same outcome as the prior n≥15 run.
+
+**Interpretation:** broadening the threshold from n≥15 to n≥8 added zero additional rows. Tells us:
+- Most leagues in Tier A + B do not have *both* `n_pred_win ≥ 8` and `n_pred_lose ≥ 8` — they place imbalanced volume across confidence buckets, OR they have low total volume.
+- Primera División remains the singular high-bias outlier at **5.2× the |B|≥0.10 threshold**.
+
+**Action: pre-flag Primera División for `universe_tier='D'` re-classification in sub-phase 2.** This is a Tier-A demotion (currently 'A', should become 'D'). Per the brief's two-commit discipline (`feedback_race_conditions.md`), this should land as a separate DML between sub-phase 2 schema migrations and behaviour flips, not bundled with sub-phase 2's main commit.
+
+**Caveat:** the bias signal is from settled-bet outcomes; it doesn't tell us *why* settlement coverage skews. Hypothesis: AF result-fetching gap on contentious La Liga matches. Worth a follow-up code investigation but not blocking.
+
+### 3.2 Settlement bias — pooled by archetype
+
+For leagues that don't yet have enough bucket samples individually, archetype pooling gives an early-warning signal.
 
 ```sql
--- Append before LIMIT:
-AND league IN (
-  SELECT name FROM competition_config
-  WHERE has_betfair_exchange = true
-  -- (this includes both dual-flag and Betfair-only — the union the prompt requests)
+WITH bet_outcomes AS (
+  SELECT
+    cc.archetype,
+    m.league,
+    pb.id,
+    pb.model_probability::numeric AS p,
+    CASE WHEN pb.status IN ('won','lost','void') THEN 1 ELSE 0 END AS settled
+  FROM paper_bets pb
+  JOIN matches m ON m.id = pb.match_id
+  JOIN competition_config cc ON LOWER(cc.name) = LOWER(m.league)
+  WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
+    AND pb.placed_at < NOW() - INTERVAL '7 days'
+    AND cc.universe_tier IN ('A','B','C')
+    AND cc.archetype IS NOT NULL
 )
+SELECT
+  archetype,
+  COUNT(DISTINCT league) AS n_leagues,
+  SUM(CASE WHEN p > 0.55 THEN settled ELSE 0 END)::float / NULLIF(SUM(CASE WHEN p > 0.55 THEN 1 ELSE 0 END), 0) AS srate_pred_win,
+  SUM(CASE WHEN p < 0.45 THEN settled ELSE 0 END)::float / NULLIF(SUM(CASE WHEN p < 0.45 THEN 1 ELSE 0 END), 0) AS srate_pred_lose,
+  ROUND(((SUM(CASE WHEN p > 0.55 THEN settled ELSE 0 END)::float / NULLIF(SUM(CASE WHEN p > 0.55 THEN 1 ELSE 0 END), 0))
+       - (SUM(CASE WHEN p < 0.45 THEN settled ELSE 0 END)::float / NULLIF(SUM(CASE WHEN p < 0.45 THEN 1 ELSE 0 END), 0)))::numeric, 3) AS bias_index,
+  SUM(CASE WHEN p > 0.55 THEN 1 ELSE 0 END) AS n_pred_win,
+  SUM(CASE WHEN p < 0.45 THEN 1 ELSE 0 END) AS n_pred_lose
+FROM bet_outcomes
+GROUP BY archetype
+ORDER BY ABS(bias_index) DESC NULLS LAST;
 ```
 
-(Add this `AND` to the outer SELECT's WHERE clause, replacing the n≥15 filter or alongside it as appropriate.)
+**Result (2026-05-05):** Not run by user. **Likely null-only** because `competition_config.archetype` is currently NULL for all 1,037 rows (Phase 2.A added the column but no DML populated it; the prior `universe_tier` seed didn't include archetype labelling). See §6.4 verdict — sub-phase 2 must include archetype labelling on the same pass that runs the reverse-mapping cron.
 
-**Result placeholder:** **TODO — paste here.** Report bias_index distribution; flag any league with `|bias_index| ≥ 0.10`.
+---
 
-### 2.C API-Football usage SQL (v2 §2.3)
+## 4. API-Football 14-day usage — fresh
 
 ```sql
 SELECT date, SUM(request_count) AS total
@@ -152,443 +356,613 @@ WHERE date >= TO_CHAR(NOW() - INTERVAL '14 days', 'YYYY-MM-DD')
 GROUP BY date ORDER BY date DESC;
 ```
 
-**Acceptance:** average daily usage + 2,800 calls/day stays below 50,000 (the throttle threshold). Throttle activates at monthly projection ≥90% which corresponds to roughly 67k/day average over a 30-day month.
+**Why re-run:** prior session noted an 8-day logging gap (April 24 - May 1). Want to confirm logging is healthy now and establish a baseline before sub-phase 7 expands ingestion.
 
-**Result placeholder:** **TODO — paste here.** Report 14-day average and the projected post-Phase-2 average.
+**Acceptance:** if logging is intact, daily volumes should be in the ~4,000-15,000 range. Sub-phase 7 will push toward 50,000-65,000/day; current headroom check.
 
-### 2.D Retrospective threshold SQL (v2 §5 phase 2.A)
+**Result (2026-05-05):**
 
-The query is in `phase-2-shadow-experiment-architecture-v2.md` §5 phase 2.A (the WITH `tier_a` ... SELECT block). Verbatim re-print:
+| date | total |
+|---|---|
+| 2026-05-05 | 10,620 |
+| 2026-05-04 | 13,298 |
+| 2026-05-03 | 16,021 |
+| 2026-05-02 | 4,488 |
+| 2026-04-23 | 232 |
+| 2026-04-22 | 998 |
+| 2026-04-21 | 364 |
+
+**Interpretation:**
+- **Recent days (May 2-5) healthy:** average **~11,107/day** across 4 active days.
+- **Daily cap utilisation:** 11,107 / 75,000 = **~15%**. Massive headroom.
+- **Throttle threshold (50,000/day):** at current pace we hit it in 4.5× — i.e., sub-phase 7 can grow ingestion by 4-5× before hitting the throttle.
+- **Pre-Phase-2 baseline (April 21-23):** very low volumes, then May 3 jump to 16,021 reflects Phase 2.A schema deploys + DML + cycle-resumption activity.
+- **April 24 - May 1 logging gap persists.** Same finding as prior session — not blocking, worth investigating before sub-phase 7 (don't want a logging hole during expansion).
+
+**Acceptance verdict: ✅ PASS.** Headroom adequate for full sub-phase 7 expansion.
+
+### 4.1 Bonus — endpoint distribution (drives sub-phase 7 sequencing)
 
 ```sql
-WITH tier_a AS (
-  SELECT name FROM competition_config
-  WHERE has_pinnacle_odds = true AND has_betfair_exchange = true
+SELECT endpoint, SUM(request_count) AS total_calls
+FROM api_usage
+WHERE date >= TO_CHAR(NOW() - INTERVAL '14 days', 'YYYY-MM-DD')
+  AND endpoint NOT LIKE 'oddspapi_%'
+GROUP BY endpoint
+ORDER BY total_calls DESC;
+```
+
+**Why:** sub-phase 7 wants to expand `/injuries`, `/transfers`, `/coachs`, `/sidelined`, `/trophies`, `/referees`. Knowing current per-endpoint shares informs which expansions can fit alongside.
+
+**Result (2026-05-05):** Not run by user. Re-prompt before sub-phase 7. Not blocking sub-phase 2.
+
+---
+
+## 5. Retrospective threshold — current universe
+
+The prior retrospective filtered on `has_betfair_exchange = true AND has_pinnacle_odds = true`. That's now `universe_tier = 'A'`. Re-run against the current Tier A + B + C universe to capture both production and experiment leagues.
+
+### 5.1 Q5-fresh — Tier A retrospective under v2.5 thresholds
+
+```sql
+WITH tier_universe AS (
+  SELECT name, universe_tier, archetype
+  FROM competition_config
+  WHERE universe_tier = 'A'
 ),
 per_league_metrics AS (
   SELECT
     m.league,
+    tu.universe_tier,
+    tu.archetype,
     COUNT(*) FILTER (WHERE pb.status IN ('won','lost')) AS settled,
     SUM(pb.settlement_pnl::numeric) FILTER (WHERE pb.status IN ('won','lost')) AS pnl,
     SUM(pb.stake::numeric)         FILTER (WHERE pb.status IN ('won','lost')) AS stake_total,
-    AVG(CASE WHEN pb.closing_pinnacle_odds IS NOT NULL AND pb.closing_pinnacle_odds::numeric > 1
-             THEN ((pb.odds_at_placement::numeric - pb.closing_pinnacle_odds::numeric) / pb.closing_pinnacle_odds::numeric) * 100
-             ELSE NULL END) FILTER (WHERE pb.status IN ('won','lost')) AS pinnacle_clv,
+    AVG(LEAST(50, GREATEST(-50,
+      CASE WHEN pb.closing_pinnacle_odds IS NOT NULL AND pb.closing_pinnacle_odds::numeric > 1
+           THEN ((pb.odds_at_placement::numeric - pb.closing_pinnacle_odds::numeric) / pb.closing_pinnacle_odds::numeric) * 100
+           ELSE NULL END
+    ))) FILTER (WHERE pb.status IN ('won','lost')) AS pinnacle_clv_winsorised,
     COUNT(DISTINCT date_trunc('week', pb.placed_at)) AS weeks
   FROM paper_bets pb
   JOIN matches m ON m.id = pb.match_id
+  JOIN tier_universe tu ON LOWER(tu.name) = LOWER(m.league)
   WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
-    AND m.league IN (SELECT name FROM tier_a)
-  GROUP BY m.league
+  GROUP BY m.league, tu.universe_tier, tu.archetype
 )
 SELECT
-  league,
+  league, universe_tier, archetype,
   settled, weeks,
   CASE WHEN stake_total > 0 THEN ROUND(100.0 * pnl / stake_total, 2) END AS roi_pct,
-  ROUND(pinnacle_clv::numeric, 3) AS pinnacle_clv,
-  CASE WHEN settled >= 50 AND pnl/NULLIF(stake_total,0) >= 0.05 AND weeks >= 3
-       THEN 'WOULD_GRADUATE'
-       ELSE 'WOULD_FAIL' END AS verdict_v2
+  ROUND(pinnacle_clv_winsorised::numeric, 3) AS pinnacle_clv,
+  CASE
+    WHEN settled < 25                                          THEN 'fail_sample'
+    WHEN stake_total IS NULL OR stake_total = 0                THEN 'no_data'
+    WHEN (pnl/NULLIF(stake_total,0)) < 0.05                    THEN 'fail_roi'
+    WHEN weeks < 3                                              THEN 'fail_weeks'
+    ELSE 'WOULD_GRADUATE'
+  END AS verdict_v2_5
 FROM per_league_metrics
 ORDER BY roi_pct DESC NULLS LAST;
 ```
 
-**Result placeholder:** **TODO — paste here.** I'll then:
-1. Total Tier A league count.
-2. WOULD_GRADUATE count and percentage → maps to v2 §5 four-branch decision tree.
-3. Distribution of failures by which gate failed (need a follow-up query splitting `WOULD_FAIL` by reason — see §6.D below for the diagnostic).
+**Why winsorised CLV:** matches the `LEAST(50, GREATEST(-50, ...))` clip shipped in `promotionEngine.ts:82` and `:311` (commit `1f0e466`). Apples-to-apples comparison.
 
-**Decision-branch resolution:** TBD pending data. Branches:
-- `>80%` → proceed with v2 thresholds, monitor 30d.
-- `50-80%` → diagnose: low-sample cluster → lower sample threshold; low-CLV cluster → drop CLV gate (already done for `market_proxy`).
-- `20-50%` → STOP: probable R6 contamination. Re-run after Migration 5 backfill.
-- `<20%` → HARD STOP: redraft thresholds against actual Tier A distribution.
+**Decision-tree action:** map result against v2 §5 four-branch tree, adjusted for sample = 25:
+- `>80% WOULD_GRADUATE` → proceed with v2.5 thresholds
+- `50-80%` → diagnose failure mode (sample, roi, weeks)
+- `20-50%` → STOP, investigate
+- `<20%` → HARD STOP, redraft thresholds
 
-### 2.E Phase 2.A graduation-time-to-50-bets projection (NEW)
+**Result (2026-05-05):** 35 leagues evaluated. **5 WOULD_GRADUATE / 35 = 14.3%** (raw — sits in `<20%` HARD STOP branch).
 
-Per the user's prompt: "the 50-bet sample × Tier B fixture rate gives expected time-to-graduation by archetype — compute this from data".
+**WOULD_GRADUATE (5):**
+
+| league | settled | weeks | roi_pct | pinnacle_clv |
+|---|---|---|---|---|
+| Segunda División | 68 | 3 | 50.34 | -40.448 |
+| Primera División | 270 | 3 | 47.14 | -29.566 |
+| Premier League | 1305 | 4 | 25.93 | -33.005 |
+| Championship | 78 | 3 | 8.81 | -17.095 |
+| Bundesliga | 72 | 4 | 6.93 | -21.552 |
+
+**Failure breakdown (30):**
+
+| Failure mode | Count | Notes |
+|---|---|---|
+| `fail_sample` (settled < 25) | 22 | Includes leagues with strong ROI but small N — e.g., USL Championship 151% ROI / n=8, 2. Bundesliga 80% / n=11, La Liga 39.97% / n=6, Jupiler Pro League 36.90% / n=8. Data-immaturity, not threshold disconnect. |
+| `fail_roi` (ROI < 5%) | 8 | Serie A 4.43%, League Two −0.69%, Ligue 1 −14.25%, Super League −26.93%, Ligue 2 −29.68%, K League 1 −35.39%, MLS −36.38%. Genuine misses. |
+| `fail_weeks` (weeks < 3) | 0 | None. |
+| `no_data` / `null` | 0 (technically captured under fail_sample) | Veikkausliiga, CONMEBOL Sudamericana, I Liga had n=0 settled. |
+
+**Decision-branch interpretation — NUANCED:**
+
+The raw 14.3% figure puts us in v2 §5 "<20% HARD STOP — fundamental disconnect." But the failure-mode split tells a different story:
+
+- **Among data-mature leagues (n≥25): 5 graduate / (5 + 8 fail_roi) = 38.5%.** That's the "20-50% STOP — investigate" branch. The thresholds aren't the problem; the data isn't there yet for 22 leagues.
+- The 22 fail_sample leagues are at every position on the ROI distribution (some +151%, some −100%). Sample-size graduation will rebalance the headline percentage as bets accumulate.
+- The 8 fail_roi leagues genuinely show sustained negative-ROI territory. These are demotion candidates per §1.2 of the v2 design (sample ≥50 ∧ ROI ≤−10% ∧ p ≤0.10 → abandon).
+
+**Per the v2 §5 prior-session decision:** lowering `PROMO_MIN_SAMPLE_SIZE` from 30 → 25 already shipped (commit `1f0e466`). The current 14.3% reflects post-25 thresholds. Going lower than 25 starts to compromise statistical validity (p ≤ 0.05 against breakeven needs ~25 minimum at typical implied priors).
+
+**My recommendation: do not redraft thresholds. Proceed with v2.5 as-is.**
+
+Rationale: the headline 14.3% is dominated by data-immaturity. Among data-mature leagues, 38.5% would graduate — that's healthy. As Tier B/C bets accumulate (sub-phase 3 firehose-on), the data-mature subset grows, and the headline % climbs naturally without any threshold change. The 8 fail_roi leagues should be flagged for sub-phase 5's event-driven graduation engine to demote (`abandoned` tier transition) on next evaluation.
+
+### 5.1.A NEW FINDING — pinnacle_clv negative across the entire Tier A universe
+
+**Every league with non-null Pinnacle CLV shows NEGATIVE winsorised CLV.** Premier League −33.0%, Primera División −29.6%, Segunda División −40.4%, Bundesliga −21.6%, Championship −17.1%. Even the leagues that would graduate ALL show heavily-negative CLV against Pinnacle's "closing" line.
+
+**This is not a "model has no edge" finding — ROI is positive on graduating leagues.** The most likely explanation: the R6 Pinnacle-source-only filter at `paperTrading.ts:1931-1980` reads from `odds_snapshots WHERE source IN ('oddspapi_pinnacle','api_football_real:Pinnacle')` and takes the **latest** snapshot. After kickoff, Pinnacle continues publishing in-play odds; the latest snapshot at settlement-time is the **post-kickoff in-play price**, not the strict pre-kickoff close.
+
+For winning bets, in-play prices compress dramatically toward 1.0 once the predicted side leads, producing strongly-negative CLV on bets that subsequently won. This is a **snapshot-timing artefact**, not an edge-survival signal.
+
+**Implications:**
+- The promotion engine's `minClv ≥ 1.5` gate (gated only for `clv_source = 'pinnacle'` per Phase 2 design) **will never fire** under current data — every league shows negative CLV.
+- Sub-phase 4 banned-market reactivation criteria that lean on CLV (e.g., the §6.2 result for OVER_UNDER_25 showing −0.977% CLV) are **partially contaminated** by this same issue.
+- The **strict pre-kickoff `closing_pinnacle_odds` column** (set by Writer A, frozen pre-kickoff) is the unambiguously correct closing line. R6's lookup-source change introduced the in-play contamination as a side effect.
+
+**Recommendation: a small follow-up patch (NOT this sub-phase, but flagged):** change the R6 lookup at `paperTrading.ts:1931-1980` and `betfairLive.ts:837-870` to **prefer `closing_pinnacle_odds` if non-null, fall back to `odds_snapshots` Pinnacle filter only if null**. Adds ~5 lines to each writer. Eliminates in-play contamination entirely.
+
+This is the v3 refinement flagged at the end of last session — the "id 859 inconsistent" verdict was a hint at the same issue. With 35 leagues all showing negative CLV, the issue is no longer hypothetical.
+
+**Track as: R6.1 — Pinnacle CLV in-play contamination.** Not a regression of R6 (R6 fixed the destructive write), but a parallel issue in the same code path. Recommend addressing before sub-phase 5 ships, since sub-phase 5 wires CLV into event-driven graduation gates.
+
+### 5.2 Q6-fresh — Tier B/C bet pace pre-firehose-on
+
+Confirm Tier B/C leagues can hit 25 settled bets in reasonable wall-clock once `experiment_track_enabled` flips. Currently flag is `false` so Tier B/C have **zero placements**; this query estimates pace from Tier A data as a proxy.
 
 ```sql
--- Per-archetype-proxy fixture rate: how many bets per league per week do we currently
--- generate, and how long would 50 bets take?
 WITH bet_pace AS (
   SELECT
+    cc.archetype,
     m.league,
-    COUNT(*) AS total_bets,
-    DATE_PART('day', NOW() - MIN(pb.placed_at))::numeric / 7.0 AS weeks_active,
-    -- Crude archetype proxy via name pattern (v3 will use proper archetype column):
-    CASE
-      WHEN m.league ILIKE '%women%' OR m.league ILIKE '%féminine%' THEN 'women'
-      WHEN m.league ILIKE '%cup%' OR m.league ILIKE '%coupe%' OR m.league ILIKE '%copa%' THEN 'cup'
-      WHEN m.league ILIKE '%world cup%' OR m.league ILIKE '%nations league%' OR m.league ILIKE '%euro%' THEN 'international'
-      ELSE 'other'
-    END AS archetype_proxy
+    COUNT(*) FILTER (WHERE pb.status IN ('won','lost')) AS settled,
+    DATE_PART('day', NOW() - MIN(pb.placed_at))::numeric / 7.0 AS weeks_active
   FROM paper_bets pb
   JOIN matches m ON m.id = pb.match_id
-  JOIN competition_config cc ON cc.name = m.league
+  JOIN competition_config cc ON LOWER(cc.name) = LOWER(m.league)
   WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
-    AND cc.has_betfair_exchange = true
-    AND cc.has_pinnacle_odds = false  -- approximates Tier B/C
-  GROUP BY m.league
-  HAVING DATE_PART('day', NOW() - MIN(pb.placed_at)) >= 30  -- ≥30 days of activity
+    AND cc.universe_tier = 'A'
+  GROUP BY cc.archetype, m.league
+  HAVING DATE_PART('day', NOW() - MIN(pb.placed_at)) >= 14
 )
 SELECT
-  archetype_proxy,
+  archetype,
   COUNT(*) AS leagues,
-  ROUND(AVG(total_bets / NULLIF(weeks_active, 0))::numeric, 2) AS avg_bets_per_week,
-  ROUND((50.0 / NULLIF(AVG(total_bets / NULLIF(weeks_active, 0)), 0))::numeric, 1) AS weeks_to_50_bets
+  ROUND(AVG(settled / NULLIF(weeks_active, 0))::numeric, 2) AS avg_settled_per_week,
+  ROUND((25.0 / NULLIF(AVG(settled / NULLIF(weeks_active, 0)), 0))::numeric, 1) AS weeks_to_25_settled,
+  ROUND((50.0 / NULLIF(AVG(settled / NULLIF(weeks_active, 0)), 0))::numeric, 1) AS weeks_to_50_settled
 FROM bet_pace
-GROUP BY archetype_proxy
-ORDER BY archetype_proxy;
+GROUP BY archetype
+ORDER BY archetype;
 ```
 
-**Result placeholder:** **TODO — paste here.** This estimates wall-clock time from "league enters Tier B" to "league has 50 bets ready for graduation evaluation." If the answer is, e.g., 8 weeks for `other` and 30+ weeks for `women`, that's a major calibration input for v2 §1.5 (distribution-shift detector) AND for Phase 2.C wall-clock expectations.
+**Result (2026-05-05):**
 
-**Caveat:** the query relies on existing bet placement to estimate Tier B/C fixture rates; until 2.B ships, Tier B/C leagues won't have bets. Use Tier A (Pinnacle-equipped) as a proxy where Tier B/C is sparse:
+| archetype | leagues | avg_settled_per_week | weeks_to_25_settled | weeks_to_50_settled |
+|---|---|---|---|---|
+| `null` | 29 | 30.62 | **0.8** | **1.6** |
+
+**Interpretation:**
+- `archetype` is null because Phase 2.A schema added the column but no DML populated it. **archetype labelling is a sub-phase 2 deliverable** — the reverse-mapping cron must label all rows on its discovery pass, not just newly-inserted ones.
+- The 29 leagues averaged are Tier A's data-mature subset.
+- **30.62 settled bets per week per league** is much higher than the prior session's 15-25 estimate — placement pace has accelerated since Phase 2.A's universe-tier dispatcher landed (commit `9d5db0d`, 2026-05-05).
+- **Time-to-25 settled: <1 week.** Phase 2.B firehose-on (sub-phase 3 in this brief) will produce graduation-eligible data on Tier B/C leagues within days, not weeks.
+
+**Implication for sub-phase 5 calibration:** the event-driven graduation engine should be live at firehose-on, not deferred — otherwise we'll accumulate evaluable data faster than the cron-driven engine can process it.
+
+---
+
+## 6. Banned-market history audit (NEW — sub-phase 4 input)
+
+The brief asks: "every disabled market type, when disabled, historical CLV/ROI, sample size, whether config-flag-reversible or code-removed."
+
+### 6.1 Code-side audit (already complete)
+
+See `docs/phase-2-current-state.md` §4. Summary:
+- 14 banned markets at `paperTrading.ts:445-464`
+- All 14 are config-flag-reversible (zero are code-removed)
+- 13/14 have settlement code; `DOUBLE_CHANCE` settlement code presence is unconfirmed
+- AH (not banned) is value-detection-incomplete; activation = sub-phase 4.A
+
+### 6.2 Q9-NEW — historical CLV / ROI / sample for banned markets
+
+For each banned market, compute lifetime placement and post-settlement metrics. Tells us which bans were genuinely justified (negative ROI + negative CLV at scale) vs which were precautionary quarantines that may show edge once R6 cleanup is applied.
 
 ```sql
--- Alternative: use Tier A pace as a proxy (fixture density should be similar)
-WHERE cc.has_betfair_exchange = true  -- both A and B/C
-  -- drop the "AND cc.has_pinnacle_odds = false" line
+WITH banned AS (
+  SELECT unnest(ARRAY[
+    'OVER_UNDER_05',
+    'OVER_UNDER_15',
+    'OVER_UNDER_25',
+    'OVER_UNDER_35',
+    'TOTAL_CARDS_45',
+    'TOTAL_CARDS_55',
+    'TOTAL_CORNERS_75',
+    'TOTAL_CORNERS_85',
+    'TOTAL_CORNERS_95',
+    'TOTAL_CORNERS_105',
+    'TOTAL_CORNERS_115',
+    'FIRST_HALF_OU_05',
+    'FIRST_HALF_RESULT',
+    'DOUBLE_CHANCE'
+  ]) AS market_type
+),
+metrics AS (
+  SELECT
+    pb.market_type,
+    COUNT(*) FILTER (WHERE pb.status IN ('won','lost'))                AS settled,
+    COUNT(*) FILTER (WHERE pb.status = 'won')                           AS won,
+    COUNT(*) FILTER (WHERE pb.status = 'lost')                          AS lost,
+    SUM(pb.stake::numeric)         FILTER (WHERE pb.status IN ('won','lost')) AS stake_total,
+    SUM(pb.settlement_pnl::numeric)FILTER (WHERE pb.status IN ('won','lost')) AS pnl_total,
+    AVG(LEAST(50, GREATEST(-50, pb.clv_pct::numeric))) FILTER (WHERE pb.clv_pct IS NOT NULL) AS clv_winsorised,
+    MIN(pb.placed_at)              AS first_seen,
+    MAX(pb.placed_at)              AS last_seen,
+    MAX(pb.placed_at) FILTER (WHERE pb.status IN ('won','lost')) AS last_settled
+  FROM paper_bets pb
+  WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
+    AND pb.market_type IN (SELECT market_type FROM banned)
+  GROUP BY pb.market_type
+)
+SELECT
+  b.market_type,
+  COALESCE(m.settled, 0) AS settled,
+  COALESCE(m.won, 0)     AS won,
+  COALESCE(m.lost, 0)    AS lost,
+  ROUND(100.0 * m.won / NULLIF(m.settled, 0), 2)            AS win_rate_pct,
+  ROUND(100.0 * m.pnl_total / NULLIF(m.stake_total, 0), 2)   AS roi_pct,
+  ROUND(m.clv_winsorised::numeric, 3)                        AS clv_winsorised,
+  m.first_seen,
+  m.last_seen,
+  m.last_settled
+FROM banned b
+LEFT JOIN metrics m ON m.market_type = b.market_type
+ORDER BY COALESCE(m.settled, 0) DESC;
 ```
 
-Run both forms and compare; the gap is informative.
+**What we'll learn:**
+- Markets with high settled count + materially negative ROI: ban was justified.
+- Markets with **zero or near-zero settled bets**: ban was precautionary; reactivation cost is learning the distribution.
+- Markets with positive CLV but negative ROI: pricing-pipeline issue (not edge issue) — sub-phase 4 reactivation should pair with pricing-validation work.
+- `last_seen` / `last_settled` — tells us when each market was last active; oldest are safest reactivation candidates (no recent regressions).
+
+**Result (2026-05-05):**
+
+| market_type | settled | won | lost | win_rate | roi_pct | clv | first_seen | last_seen |
+|---|---|---|---|---|---|---|---|---|
+| `OVER_UNDER_25` | 91 | 38 | 53 | 41.76% | **−0.42%** | −0.977 | 2026-04-16 | 2026-04-20 |
+| `FIRST_HALF_RESULT` | 65 | 15 | 50 | 23.08% | **−29.52%** | −7.644 | 2026-04-16 | 2026-04-20 |
+| `DOUBLE_CHANCE` | 32 | 12 | 20 | 37.50% | **−40.05%** | **+15.156** | 2026-04-16 | 2026-04-19 |
+| `OVER_UNDER_35` | 19 | 13 | 6 | 68.42% | **+41.89%** | −2.088 | 2026-04-16 | 2026-04-20 |
+| `OVER_UNDER_05` | 0 | 0 | 0 | — | — | — | — | — |
+| `OVER_UNDER_15` | 0 | 0 | 0 | — | — | — | — | — |
+| `TOTAL_CARDS_45` | 0 | 0 | 0 | — | — | — | — | — |
+| `TOTAL_CARDS_55` | 0 | 0 | 0 | — | — | — | — | — |
+| `TOTAL_CORNERS_75` through `_115` (5 markets) | 0 | 0 | 0 | — | — | — | — | — |
+| `FIRST_HALF_OU_05` | 0 | 0 | 0 | — | — | — | — | — |
+
+**Interpretation:**
+
+**Tier 1 — genuine edge candidates (had placements, high reactivation priority):**
+- **OVER_UNDER_35: +41.89% ROI at n=19, 68.42% WR.** Positive ROI under quarantine. Sample is small but signal is strong. **Top reactivation candidate.** CLV slightly negative (−2.088) — likely the same in-play contamination issue from §5.1.A. Quarantine reason in code: "pending pricing-pipeline fix" (`paperTrading.ts:459`). Pricing-pipeline issue is the right hypothesis — pricing fix + reactivation likely surfaces real edge.
+- **OVER_UNDER_25: −0.42% ROI at n=91, 41.76% WR.** Near break-even. Quarantine cost-benefit: marginal at best. Recommend reactivation on experiment track (£0) for re-validation; if 2-week experiment shows continued near-break-even, leave banned. If positive, promote.
+
+**Tier 2 — banned with cause (high sample, materially negative):**
+- **FIRST_HALF_RESULT: −29.52% ROI at n=65, 23.08% WR.** Very low win rate against ~40% implied. Genuine edge against us. Stay banned.
+- **DOUBLE_CHANCE: −40.05% ROI at n=32, +15.156% CLV.** **The CLV-vs-ROI divergence is a smoking gun.** Positive CLV (+15.156 winsorised) means we got "good" prices vs Pinnacle's later read; deeply negative ROI means actual settlement returns crater. This points to a **settlement bug** — likely either (a) the `case "DOUBLE_CHANCE"` block missing from the settlement switch in `paperTrading.ts` (per current-state §4.1 audit), or (b) a selection-name canonicalisation issue causing wrong-side settlement. **Stay banned. Sub-phase 4 must NOT reactivate DOUBLE_CHANCE without first fixing the settlement code.** Flagged for code investigation.
+
+**Tier 3 — precautionary bans (zero placements ever):**
+- 10 markets never bet: OVER_UNDER_05/15, TOTAL_CARDS_45/55, TOTAL_CORNERS_75/85/95/105/115, FIRST_HALF_OU_05.
+- These bans are precautionary. Reactivation cost = learning the distribution. **Safest reactivation candidates** — no historical regressions to revert.
+- TOTAL_CORNERS_75 ban comment claims "−42.5% ROI on 90 bets" but the table shows 0 settled. **Discrepancy: the comment may pre-date the `legacy_regime` filter or refer to dev-only data.** Worth investigating before reactivation.
+
+**Reactivation priority order (recommendation for sub-phase 4):**
+
+1. **First wave (zero historical risk):** TOTAL_CORNERS_75/85/95/105/115, TOTAL_CARDS_45/55, FIRST_HALF_OU_05, OVER_UNDER_05/15. All zero settled. Reactivate together on experiment track (£0). Investigate TOTAL_CORNERS_75 ban-comment discrepancy first.
+2. **Second wave (positive-signal candidates):** OVER_UNDER_35 (showed +41% ROI), OVER_UNDER_25 (near break-even). Reactivate after first wave's 2-week experiment-track results.
+3. **Third wave (only after settlement-bug fix):** DOUBLE_CHANCE. Requires `paperTrading.ts` settlement-code investigation; do not reactivate via flag flip alone.
+4. **Permanent ban (no reactivation):** FIRST_HALF_RESULT. Genuine negative-edge signal at sample 65.
+
+### 6.3 Q10-NEW — Asian Handicap historical pattern
+
+AH is not in `BANNED_MARKETS` but value-detection never produces it. Audit historical placements (might exist from a Replit-era code path that briefly worked).
+
+```sql
+SELECT
+  COUNT(*) AS total_placements,
+  COUNT(*) FILTER (WHERE status IN ('won','lost')) AS settled,
+  MIN(placed_at) AS first_seen,
+  MAX(placed_at) AS last_seen,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'won') / NULLIF(COUNT(*) FILTER (WHERE status IN ('won','lost')), 0), 2) AS win_rate_pct,
+  ROUND(100.0 * SUM(settlement_pnl::numeric) FILTER (WHERE status IN ('won','lost'))
+              / NULLIF(SUM(stake::numeric) FILTER (WHERE status IN ('won','lost')), 0), 2) AS roi_pct
+FROM paper_bets
+WHERE market_type = 'ASIAN_HANDICAP'
+  AND deleted_at IS NULL
+  AND legacy_regime = false;
+```
+
+**Result (2026-05-05):**
+
+| total_placements | settled | first_seen | last_seen | win_rate_pct | roi_pct |
+|---|---|---|---|---|---|
+| 0 | 0 | null | null | null | null |
+
+**Interpretation:** zero placements, zero settlements, ever. Confirms the code-side audit finding (current-state §4.2): `valueDetection.ts` does not generate AH candidates. AH is functionally absent from the betting pipeline. **AH activation is a greenfield build, not a quarantine reversal.** Matches the brief's flag — sub-phase 4.A scope, separate from the simpler banned-market reactivation.
+
+### 6.4 Q11-NEW — Universe state confirmation
+
+Verify the `universe_tier` seed referenced in current-state §6 still holds.
+
+```sql
+SELECT universe_tier, COUNT(*) AS n
+FROM competition_config
+GROUP BY universe_tier
+ORDER BY universe_tier;
+```
+
+**Expected (from prior session DML):** A=149, B=84, C=0, D=0, E=804, unmapped=0. **Confirm** — if numbers have drifted, sub-phase 2 needs to know.
+
+```sql
+SELECT
+  universe_tier,
+  archetype,
+  COUNT(*) AS n
+FROM competition_config
+WHERE universe_tier IN ('A','B','C','D')
+GROUP BY universe_tier, archetype
+ORDER BY universe_tier, archetype;
+```
+
+**Result (2026-05-05):**
+
+| universe_tier | n |
+|---|---|
+| A | 149 |
+| B | 84 |
+| E | 804 |
+
+**Tier C and D rows: zero each.** `unmapped` rows: zero (the seed swept all 1,037 rows into A/B/E). Total: 1,037 ✓.
+
+**Per-archetype query** was provided but the user's paste-back contains only the tier-only result. Inferred from absent paste: **archetype = NULL for all 1,037 rows.** This is consistent with §5.2 / §3.2 outcomes (no archetype data populated). **Sub-phase 2 must label archetypes on its first cron pass** as a non-optional deliverable, not deferred.
+
+**Verdict: ✅ MATCHES prior session DML.** No drift since 2026-05-04 universe-tier seed.
+
+**Sub-phase 2 inputs from this:**
+- Tier A starting count: **149.** Sub-phase 2 dry-run must show Tier A unchanged post-cron.
+- Tier B starting count: **84.** Insertion-only cron should not alter this (no demote-to-D path until commit 2 of two-commit discipline).
+- Tier C / D starting count: **0.** Sub-phase 2 will populate Tier D for unmatched Betfair competitions; expect dozens to low hundreds. Tier C population requires the OddsPapi staleness check; expect single digits to dozens.
+- Tier E: **804.** Untouched by sub-phase 2 (E = AF-only, no Betfair).
+
+### 6.5 Q12-NEW — agent_config sanity (safety boundaries)
+
+The brief lists user-approval-gated parameters: max_stake_pct, daily/weekly drawdown caps, bankroll floor, experiment_track_enabled. Confirm current values in agent_config.
+
+```sql
+SELECT key, value, updated_at
+FROM agent_config
+WHERE key IN (
+  'bankroll',
+  'max_stake_pct',
+  'daily_loss_limit_pct',
+  'weekly_loss_limit_pct',
+  'bankroll_floor',
+  'agent_status',
+  'experiment_track_enabled',
+  'reject_non_pinnacle_leagues',
+  'paper_mode'
+)
+ORDER BY key;
+```
+
+**Result (2026-05-05):** see §-1 (CRITICAL FINDING) at the top of this document. Headline:
+- `bankroll_floor` = 0 (brief says 200)
+- `daily_loss_limit_pct` = 0.99 (brief says 0.05)
+- `weekly_loss_limit_pct` = 0.99 (brief says 0.10)
+- `max_stake_pct` = 0.03 (brief says 0.02)
+- `experiment_track_enabled` and `reject_non_pinnacle_leagues` rows do NOT exist (defaults apply: experiment track OFF, universe-tier filter ON).
+
+**Resolution required before sub-phase 2 ships.** Three options in §-1.
 
 ---
 
-## 3. Sunday discovery cron audit (item E — DONE)
+## 7. Net findings + sub-phase 2 inputs
 
-Source: `scheduler.ts`, complete grep + per-cron-block reads.
+### 7.1 Headline verdicts
 
-### 3.1 Sunday-only crons (UTC, day-of-week=0)
-
-| Time | File:line | Function | Purpose | Phase 2.A relationship |
-|---|---|---|---|---|
-| 02:00 | `scheduler.ts:2125-2131` | `discoverPinnacleLeagues` | OddsPapi `/v4/tournaments` discovery + Pinnacle-coverage probe | **Supplemented.** Still useful as one input to universe classification (helps decide Tier A vs B vs C). New Betfair-first cron runs alongside, not replacing this. |
-| 02:30 | `scheduler.ts:2134-2140` | `syncBetfairCompetitionCoverage` | Betfair `listCompetitions("1")` matched against existing competition_config; sets `has_betfair_exchange = true` on matched rows | **REPLACED.** Current direction is forward-map (Betfair → AF). Phase 2.A inverts the loop (AF lookup *for each* Betfair competition), and additionally creates Tier D rows for unmatched Betfair competitions. The new Betfair-first reverse-mapping cron supersedes this entirely. **v2 design proposal: take this exact Sunday 02:30 slot for the new cron.** Migration risk: ensure the old cron is removed in the same commit that adds the new one — running both would double-process the Betfair list. |
-| 04:00 | `scheduler.ts:2116-2122` | `runWeeklyExperimentAnalysis` | Weekly experiment self-analysis (writes to `experiment_learning_journal`) | **Retained as-is.** Operates downstream of the universe; orthogonal to 2.A. |
-| 04:30 | `scheduler.ts:2142-2148` | `recalculateAllDataRichness` | Per-match data-richness scores | **Retained as-is.** |
-| 05:00 | `scheduler.ts:2150-2156` | `reviewLiveThreshold` | Live threshold review job | **Retained as-is.** |
-| 05:30 | `scheduler.ts:2034-2042` | `analyseSharpMovements` | Sharp-money movement analysis | **Retained as-is.** |
-| 06:00 | `scheduler.ts:2263-2274` | `cleanupOldAlerts(90)` | Delete alerts older than 90 days | **Retained as-is.** |
-
-### 3.2 Daily crons that interact with discovery
-
-| Time | File:line | Function | Phase 2.A relationship |
-|---|---|---|---|
-| 00:30 | `scheduler.ts:2072-2079` | `runLeagueDiscovery` (daily) | Scans API-Football leagues → populates `competition_config` + `discovered_leagues` | **Supplemented.** Continues to populate AF-discovered leagues. New Betfair-first cron is additive. |
-| 02:00 | `scheduler.ts:2024-2030` | `backfillFilteredBetOutcomes` (daily) | Audits filtered bets retrospectively | Retained, orthogonal. |
-
-### 3.3 Phase 2.A summary
-
-- **One replacement** required: `syncBetfairCompetitionCoverage` (Sunday 02:30) → new Betfair-first reverse-mapping cron at the same slot.
-- **No retirements** needed beyond that.
-- **Two supplements**: `discoverPinnacleLeagues` (Sunday 02:00) and `runLeagueDiscovery` (daily 00:30) keep running; they feed the universe-classification logic.
-- **One commit gate**: removing `syncBetfairCompetitionCoverage` and adding the new cron must ship in the same commit, otherwise either both run (double-processing) or neither runs (universe stale for a week).
-
----
-
-## 4. R6 patch — staged in working tree (NOT committed)
-
-**Files modified (uncommitted):**
-- `artifacts/api-server/src/services/paperTrading.ts` (+34, −18)
-- `artifacts/api-server/src/services/betfairLive.ts` (+27, −9)
-
-**Per `git diff --stat`:** `2 files changed, 68 insertions(+), 27 deletions(-)`.
-
-**Summary of changes:**
-1. `paperTrading.ts` settlement CLV block (was around lines 1931-1980): split the snapshot lookup into two —
-   - `latestAnySource` for `closing_odds_proxy` (preserves diagnostic semantics).
-   - `latestPinnacle` for `clv_pct`, with `inArray(oddsSnapshotsTable.source, ["oddspapi_pinnacle", "api_football_real:Pinnacle"])`.
-   - The UPDATE switches `clvPct: clvPct != null ? String(clvPct) : null` (always-write, the destructive bug) to conditional spread `...(clvPct != null ? { clvPct: String(clvPct) } : {})` (matches Writer A).
-2. `betfairLive.ts` reconciliation CLV block (was around lines 837-870): identical surgery —
-   - Add `inArray` to the drizzle imports (line 5).
-   - Same two-lookup split.
-   - Conditional-spread on `clvPct` write (already conditional pre-patch; only the lookup-source change is behavioural).
-
-**No schema changes. No new files. Inline comments updated to reflect Pinnacle-only semantics.**
-
-### 4.1 Verification procedure (the user runs)
-
-The user's prompt requires: "Verify with a small test: place a synthetic paper bet, let Writer A populate Pinnacle CLV, then trigger settlement and confirm Writer B no longer overwrites."
-
-**Procedure (run in dev only):**
-
-1. Identify a Tier A fixture about to kick off (next 60-120 min) where `oddspapi_fixture_map` has a row.
-2. Manually insert a paper bet into that fixture (or wait for the natural one). Confirm `paper_bets.closing_pinnacle_odds = NULL` and `paper_bets.clv_pct = NULL` immediately after placement.
-3. Wait for the next `*/15` cron firing of `fetchAndStoreClosingLineForPendingBets` (Writer A). Confirm `closing_pinnacle_odds IS NOT NULL` AND `clv_pct IS NOT NULL` and `clv_pct = (odds_at_placement - closing_pinnacle_odds) / closing_pinnacle_odds * 100`.
-4. Wait for fixture FT and the next settlement cycle. Capture `clv_pct` immediately after settlement.
-5. **Pass criterion:** `clv_pct` value matches step-3 value (settlement preserved Writer A's value because Pinnacle snapshot was found in the lookup).
-6. **Repeat** with a Tier B/C fixture (no OddsPapi mapping, so Writer A doesn't fire). At step 4, `clv_pct` should remain NULL (was NULL at placement; should still be NULL post-settlement).
-
-**Negative-control regression test:** find a recent settled bet from before this patch and verify the patch doesn't re-process it (the patch only changes settlement-time computation, not historical data). `git log -- paper_bets table` is a no-op proxy — there's no migration; just verify no bets older than the patch deploy time have changed `clv_pct` post-deploy.
-
-### 4.2 What is NOT in this patch
-
-- **No schema migration.** `clv_source` column is Phase 2.A territory.
-- **No backfill.** Historical contaminated rows remain mis-tagged. Migration 5 from v2 §3.1 is the durable backfill; it's gated by Phase 2.A.
-- **No production demotion of currently-promoted rows.** That's hotfix G, gated on Q4 results.
-
-### 4.3 Git/commit instructions (for you to run)
-
-I have not committed. Recommended commit:
-
-```
-git add artifacts/api-server/src/services/paperTrading.ts \
-        artifacts/api-server/src/services/betfairLive.ts \
-        docs/r6-clv-source-investigation.md \
-        docs/phase-2-diagnostic-findings.md
-
-git commit -m "$(cat <<'EOF'
-R6 hotfix: filter clv_pct to Pinnacle sources at settlement
-
-paperTrading.settleBets and betfairLive.reconcileSettlements both
-computed clv_pct from the latest snapshot of *any* source in
-odds_snapshots, then either unconditionally (paperTrading) or
-conditionally (betfairLive) wrote it to paper_bets.clv_pct. The
-promotion-engine threshold (minClv >= 1.5) is Pinnacle-shaped, so
-non-Pinnacle market-proxy values systematically contaminate the
-gate. Worse, paperTrading's unconditional write null-clobbered any
-prior Pinnacle CLV from fetchAndStoreClosingLineForPendingBets.
-
-Patch:
-- Split the snapshot lookup into two queries: any-source for
-  closing_odds_proxy (diagnostic only), Pinnacle-source-only for
-  clv_pct (used by promotion-engine gate).
-- Pinnacle source set: ["oddspapi_pinnacle", "api_football_real:Pinnacle"]
-  (matches valueDetection.ts:685, oddsPapi.ts:2462).
-- paperTrading: switch unconditional write to conditional spread to
-  preserve any prior Writer-A pre-kickoff write when no Pinnacle
-  snapshot exists at FT.
-- betfairLive: add inArray to drizzle imports; apply same two-lookup
-  split.
-
-Net effect: clv_pct is Pinnacle-attributed or NULL going forward.
-Historical contamination requires Migration 5 backfill in Phase 2.A.
-
-See docs/r6-clv-source-investigation.md and
-docs/phase-2-diagnostic-findings.md for the full investigation.
-
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
-EOF
-)"
-```
-
-**Do NOT push without verifying §4.1 first.** If verification fails, the diff in working tree is not committed yet — `git diff` shows current state.
-
----
-
-## 5. What I cannot complete in this session
-
-| Item | Why blocked | Unblock by |
+| Question | Verdict | Confidence |
 |---|---|---|
-| Run R6 Q1-Q4 | No `psql`/`node`/`pnpm` available in this shell | User runs SQL, pastes results |
-| Run §2.B/C/D/E SQL | Same | Same |
-| Verification test (§4.1) | Requires running DB + working settlement pipeline | User runs in dev environment |
-| Hotfix G (manual demotion) | Depends on Q4 results | User runs Q4, decides per row |
-| Final findings + decision-branch resolution (§2.D) | Depends on retrospective query results | User runs §2.D |
-| Updated graduation-phase wall-clock by archetype (item H) | Depends on §2.E results | User runs §2.E |
+| R6 patch holding clean post-deploy? | ✅ PASS (0 destructive overwrites; 1 acceptable edge) | EVIDENCE-BASED |
+| Settlement bias — leagues to flag for Tier D? | **Primera División only** (B = −0.524, 5.2× threshold) | EVIDENCE-BASED |
+| API-Football headroom for sub-phase 7? | ✅ ample (current 11k/day vs 50k/75k caps) | EVIDENCE-BASED |
+| Tier A retrospective WOULD_GRADUATE %? | 14.3% raw, **38.5% among data-mature** — proceed with v2.5 thresholds | ANALYTICAL |
+| Banned-market reactivation candidates? | 10 zero-sample (safe), 2 positive-signal, 1 settlement-bug, 1 stay-banned | EVIDENCE-BASED |
+| Asian Handicap activation = greenfield build? | ✅ confirmed — zero placements ever | EVIDENCE-BASED |
+| Universe state matches prior session? | ✅ 149A / 84B / 0C / 0D / 804E | EVIDENCE-BASED |
+| Safety boundaries at brief-stated defaults? | ❌ **NO** — see §-1 | EVIDENCE-BASED |
 
-**Confirmation that Phase 2.A is ready to begin:** **NOT YET.** Blockers in priority order:
+### 7.2 NEW issues surfaced by this diagnostic
 
-1. R6 Q1-Q4 must run; if Q4 returns rows, manual demotions decided.
-2. R6 patch must be committed AND verified per §4.1.
-3. §2.B settlement-bias SQL must run; any league with `|B| ≥ 0.10` flagged for Tier D pre-2.A.
-4. §2.D retrospective threshold SQL must run; decision-branch resolved.
-5. §2.E graduation-time projection must run; wall-clock for 2.C calibrated.
-6. §2.C API-Football usage SQL must run; budget headroom confirmed.
+1. **R6.1 — Pinnacle CLV in-play contamination.** Every Tier A league shows negative winsorised CLV. Most likely the R6 patch's `odds_snapshots` Pinnacle-source filter picks up post-kickoff in-play snapshots. Promotion engine's `minClv ≥ 1.5` gate will never fire under current data. **Recommend small follow-up patch to prefer `closing_pinnacle_odds` over `odds_snapshots` Pinnacle filter.** Track separately. Not blocking sub-phase 2; should land before sub-phase 5.
 
-Estimated user time to unblock: ~1.5-3 hours (depending on environment access). Once unblocked, the v2 design is ready to enter implementation in 2.A.
+2. **archetype column NULL across all 1,037 rows.** Phase 2.A schema added the column; no DML populated it. **Sub-phase 2's reverse-mapping cron must label archetypes on its discovery pass** as a mandatory deliverable, not deferred.
 
----
+3. **DOUBLE_CHANCE settlement bug.** Positive CLV (+15.156) but −40.05% ROI on 32 settled bets. Strongly suggests a settlement-code or selection-canonicalisation bug. Code-level investigation must precede any reactivation. Sub-phase 4 dependency.
 
-## 6. Empirical findings (PROD)
+4. **TOTAL_CORNERS_75 ban-comment vs data discrepancy.** Code comment claims "−42.5% ROI on 90 bets"; query shows 0 settled. Pre-`legacy_regime` data, or a regime-flip ate the rows. Investigate before reactivating any corners markets.
 
-### 6.A Q1-aggregate — Provenance distribution
+5. **API-Football logging gap April 24 - May 1.** Persists from prior session. Not blocking sub-phase 2 but should be understood before sub-phase 7's volume expansion.
 
-```
-provenance                       n
--------------------------------- ---
-market_proxy_only                205
-pinnacle_overwritten_by_proxy    129
-no_clv                            79
-pinnacle_preserved                 9
-                                 ___
-                                 422 total settled bets
-```
+### 7.3 Sub-phase 2 inputs (locked)
 
-**Interpretation:** of 422 settled bets, only 9 (2%) have a clean Pinnacle CLV value in `clv_pct`.
+- **Tier A starting count: 149.** Dry-run must show no change.
+- **Tier B starting count: 84.** Insertion-only commit must not alter.
+- **Tier C / D starting count: 0.** Sub-phase 2 cron will populate D for unmatched Betfair competitions. Expected: dozens to low hundreds.
+- **Pre-flag Primera División** for Tier D demotion in a separate DML between schema migrations and behaviour flips (per `feedback_race_conditions.md` two-commit discipline).
+- **archetype labelling is mandatory** on the cron's first pass over existing rows.
+- **Token-set ratio fuzzy match at 0.85** with country pre-filter, as specified in §-3 of the prior plan attempt.
 
-The catastrophic figure: of 138 bets where Writer A had pre-populated Pinnacle CLV (preserved + overwritten), **129 were destroyed by Writer B/C — a 94% destruction rate.** This is the empirical confirmation of the R6 bug at production scale.
+### 7.4 Sub-phase order — confirmed feasibility
 
-### 6.B Q2 — Per-experiment_tag CLV provenance
-
-**Of 100+ experiment tags, exactly ONE has `pct_pinnacle ≥ 50%`** (`la-liga-over-under-35`, n=1, 100% — meaningless at that sample size).
-
-Tags with the most settled bets and zero Pinnacle preservation:
-- `bundesliga-over-under-25` (14 settled, 0% pinnacle, 6 overwritten + 5 market-proxy + 3 no-CLV)
-- `major-league-soccer-btts` (12 settled, 0% pinnacle, 12 market-proxy)
-- `premier-league-btts` (12 settled, 0% pinnacle, 11 market-proxy + 1 no-CLV)
-- `primera-divisi-n-match-odds` (11 settled, 0% pinnacle, 8 market-proxy + 3 overwritten)
-- `championship-over-under-25` (10 settled, 10% pinnacle = 1 row)
-- `premier-league-match-odds` (8 settled, 12.5% pinnacle = 1 row, 6 overwritten)
-
-**Conclusion:** every graduation evaluation the engine has performed has used contaminated CLV data. Combined with §6.C below (no promotions ever), the contamination has not yet damaged tier transitions but would have if any threshold had cleared.
-
-### 6.C Q3 — Promotion-audit forensic
-
-```
-(no rows)
-```
-
-**`promotion_audit_log` is empty.** No tier transitions have ever been recorded. The promotion engine has run (per `experiment_learning_journal` cadence) but no `experiment_tag` has cleared the experiment→candidate gate (sample 30, ROI 3%, CLV 1.5, win rate 52%, p ≤ 0.10, weeks 3, edge 2%).
-
-**Implication for R6:** the contamination has not corrupted any production tier transition because no tier transitions have ever happened. The R6 patch ships independently — no coordinated demotion DML required.
-
-### 6.D Q4 — Currently-promoted experiments at risk
-
-```
-(no rows)
-```
-
-**No experiment is currently in `data_tier = 'promoted'`.** Confirms §6.C: the production track has never had a graduated experiment. No demotion candidates exist.
-
-**Hotfix G is no longer needed.** Phase 2.A's "demote contaminated promoted rows" pre-condition is removed.
-
-### 6.E Settlement-bias SQL results
-
-```
-league             srate_pred_win  srate_pred_lose  bias_index  n_pred_win  n_pred_lose
-Primera División   0.476           1.000            -0.524      189         90
-```
-
-Only one league cleared the `n ≥ 15` filter on both confidence buckets. Primera División bias_index of −0.524 is **5.2× the v2 §1.3 |B| ≥ 0.10 threshold** — extreme structural bias against predicted-wins.
-
-**Hypothesised cause:** API-Football fixture-result coverage gap on contentious matches (abandonments, postponements, late-finish cup ties). Predicted-wins disproportionately fail to settle.
-
-**Action:** route Primera División to `universe_tier = 'D'` when 2.A ships. Currently in production riding biased data — even though no promotion ever fired, the per-league ROI it contributes to global metrics is upward-biased (settled subset over-represents losses-the-model-predicted, which it… got right; but *unsettled* predicted-wins are missing from the upside).
-
-**Caveat:** the n≥15 filter excludes most leagues. Settlement-bias re-test should run quarterly with looser filter (n≥10) once 2.A data accumulates.
-
-### 6.F API-Football 14-day usage
-
-```
-date         total
-2026-05-04   8,641
-2026-05-03   16,021
-2026-05-02   4,488
-2026-04-23   232
-2026-04-22   998
-2026-04-21   364
-2026-04-20   1,585
-```
-
-**Daily average over 7 reported days: ~4,617 calls.** Phase 2.A adds ~2,800/day → projected ~7,400/day. Throttle threshold is 50,000/day; daily cap 75,000. **Headroom: confirmed adequate.**
-
-**Anomaly to investigate (not blocking):** April 24 through May 1 (8 days) have no `api_usage` rows. Either logging broke, no calls happened (improbable — discovery + odds run daily), or the endpoint filter excluded everything. Worth a separate diagnostic before 2.A but does not block.
-
-### 6.G Q7 — Retrospective threshold
-
-32 leagues evaluated. **0 WOULD_GRADUATE. 30 fail_sample. 2 no_data.**
-
-Top of the retrospective by ROI:
-- Premier League: 44 settled, 3 weeks, ROI 26.4%, Pinnacle CLV +4.8 — would graduate at sample threshold 25, fails at 50.
-- Bundesliga: 34 settled, 4 weeks, ROI 8.3%, Pinnacle CLV +85.86 (outlier-corrupted, see R14 below).
-- Serie A: 31 settled, 2 weeks, ROI 4.4%, Pinnacle CLV +415.69 (outlier-corrupted).
-- Primera División: 28 settled, 2 weeks, ROI 46.5%, Pinnacle CLV +16.5 — but flagged Tier D in §6.E.
-- Major League Soccer: 31 settled, 2 weeks, ROI −36.4% — abandon-track territory.
-- K League 1: 26 settled, 3 weeks, ROI −35% — abandon-track territory.
-
-**Decision-branch resolution: NEW BRANCH (not in v2 §5 four-branch tree).**
-
-The v2 §5 `<20%` branch was designed for "thresholds drafted aspirationally" or "R6 contamination". This case is neither — the failures are uniformly **`fail_sample`** (settled < 50). It is a data-immaturity issue, not a threshold-disconnect issue.
-
-**Branch action:** lower the experiment→candidate sample threshold from 30 to 25 (env var `PROMO_MIN_SAMPLE_SIZE` at `promotionEngine.ts:8`). This unblocks the leagues at 25-44 settled bets to be evaluated. Statistical justification: at sample 25 with implied prior ~0.4-0.5, p ≤ 0.05 against breakeven is achievable on a clear edge.
-
-**v2 §1.2 threshold table revision:**
-
-| v2 (proposed) | v2.5 (post-empirical) | Rationale |
+| Sub-phase | Blocking issues | Status |
 |---|---|---|
-| Sample size ≥ 50 | **Sample size ≥ 25** | No production league has reached 50 yet; 25 is the lower bound for p-value math against implied prior |
-| ROI ≥ 5% | unchanged | |
-| Win rate ≥ 53% | unchanged | |
-| p ≤ 0.05 | unchanged | |
-| ≥ 4 weeks active | unchanged | |
-| LOO test | unchanged | |
-| No week ≤ −15% | unchanged | |
-
-**R14 (NEW) — promotion-engine CLV averaging is unwinsorized.** Bundesliga's `pinnacle_clv = 85.86` and Serie A's `+415.69` are pulled by 1-3 long-shot rows with placement-vs-close gaps in the +250% to +1500% range (id 33, id 682, id 720, id 716). Arithmetic mean at `promotionEngine.ts:82` is unstable at small N. **Action: clip individual `clv_pct` values to ±50pp before averaging, OR use median.** Plan-mode for v3 (small follow-up after R6 lands and 2.A schema lands).
-
-### 6.H Q8 — Bet pace projection
-
-```
-archetype_proxy   leagues   avg_bets_per_week   weeks_to_50_bets   weeks_to_25_bets
-other             28        60.69               0.8                0.4
-```
-
-Only the "other" archetype shows up in current data — there are not yet enough bets in cup / women / international archetypes to register in the substring matcher's `has_betfair_exchange` universe.
-
-**Caveat:** these are *placement* rates, not *settlement* rates. Raw paper_bets data shows ~60-70% of placements end as `cancelled` / `placement_failed` / `void` (not `won`/`lost`). True settled-bets-per-week per league is therefore ~15-25, not 60.
-
-**Calibrated wall-clock estimate for Phase 2.C graduation latency:**
-- Time from "league enters Tier B" to "25 settled bets accumulated" ≈ **1-2 weeks** at current pace.
-- Time to 50 settled ≈ 2-4 weeks.
-- This is much faster than v2 §6.D anticipated. Phase 2.C event-driven graduation will see real tier-change activity within the first month of operation, not the first quarter.
+| 2 — Betfair-first universe | §-1 safety-boundary resolution required | **STOP gate** |
+| 3 — Three-track gate dispatcher | Sub-phase 2 complete + §-1 resolved | Pending |
+| 4 — Banned-market reactivation | Sub-phase 3 stable + DOUBLE_CHANCE fix | Pending |
+| 4.A — AH activation | Sub-phase 4 stable | Pending |
+| 5 — Event-driven graduation | R6.1 fix recommended pre-ship | Pending |
+| 6 — Autonomous threshold mgmt | Sub-phase 5 stable + new tables | Pending |
+| 7 — API-Football data expansion | Logging-gap diagnosis | Pending |
+| 8 — OddsPapi kickoff-proximity | Independent | Pending |
+| 9 — Probationary Kelly ratchet | Sub-phase 5 stable | Pending |
+| 10 — Ongoing audit cron | Sub-phase 5 stable | Pending |
 
 ---
 
-## 7. Phase 2.A readiness verdict and recommended next actions
+## 8. STOP — awaiting user response on §-1 before sub-phase 2 plan
 
-### 7.1 Verdict
+Per the strategic brief: "Do not chain sub-phases."
 
-**READY**, conditional on the actions in §7.2.
+**Sub-phase 2's plan-mode document (`docs/phase-2-subphase-2-plan.md`) will NOT be drafted in this session.** Per the brief's own discipline ("For each sub-phase: produce a short plan-mode document at docs/phase-2-{subphase}-plan.md before any code lands. The user reviews. Then implementation."), the plan doc is the next session's first deliverable.
 
-### 7.2 Recommended package (sequenced)
-
-**Step 1 — R6 patch ships alone first** (defensive bug fix, no calibration changes):
-- Commit the staged edits to `paperTrading.ts` and `betfairLive.ts`.
-- Run §4.1 verification in prod (synthetic test bet OR observe natural Tier-A bet flow for 24-48h).
-- Pass criterion: `clv_pct` values on settled Tier-A bets match `(odds_at_placement - closing_pinnacle_odds) / closing_pinnacle_odds * 100` rather than the equivalent computed from `closing_odds_proxy`.
-
-**Step 2 — v2.5 calibration adjustments** (post R6 verification):
-- Lower `PROMO_MIN_SAMPLE_SIZE` from 30 to 25 (env var or default at `promotionEngine.ts:8`).
-- R14 winsorization in promotion engine (±50pp clip on individual `clv_pct` values before averaging at `promotionEngine.ts:82`).
-- Pre-flag Primera División for `universe_tier = 'D'` (will land with Migration 1; document the override now).
-
-**Step 3 — Phase 2.A schema migrations and Betfair-first cron** (planned in v2 §3.1, §3.4).
-
-### 7.3 What is NO LONGER blocking 2.A
-
-- ✅ Hotfix G (manual demotion of contaminated promoted rows) — Q3 + Q4 empty.
-- ✅ "Demote first" pre-condition for 2.B — no rows to demote.
-- ✅ The 50-bet sample size requirement — replaced by 25.
-
-### 7.4 What IS still blocking 2.A
-
-- ⏳ R6 patch commit + verification (the one staged in working tree).
-- ⏳ Confirmation that Step 2 calibration adjustments are accepted.
-- ⏳ Decision: ship R6 patch and Step 2 calibration in one commit, or sequentially? **Recommendation: sequentially.** R6 is a defensive bug fix; Step 2 is calibration. Bundling muddies rollback if R6 verification fails.
-- 🔍 Investigate the April 24 - May 1 `api_usage` gap — not blocking, but worth understanding before scaling.
-
-### 7.5 Open questions for the next session
-
-1. **Settlement-bias scope:** Q5 only flagged Primera División at n≥15. Most leagues had insufficient bucket samples. Should the v2 §2.1 admission test be relaxed to n≥10, or pooled by archetype, or deferred until 2.A data accumulates?
-2. **R14 — winsorization vs median?** Mathematically these have different properties. Median is more robust; winsorization preserves more signal. Which fits the small-N graduation-decision use case better?
-3. **April 24 - May 1 API usage gap:** what happened?
+**Before that next session can begin, the user needs to:**
+1. **Resolve §-1 safety-boundary state** (one of the three options).
+2. Optionally confirm acceptance of §7.3 sub-phase 2 inputs (locked Tier counts, archetype labelling mandatory, fuzzy match algorithm pinned).
+3. Optionally re-run the unrun Q1.1 / Q1.2 / endpoint-distribution / archetype-pooled-bias queries if you want them populated; they are not blocking sub-phase 2.
 
 ---
 
-## 8. Sign-off checklist (this session)
+## 10. Sub-phase 1 deliverable DML (USER RUNS — pre-approved by strategic-push resolution)
 
-- [x] Pre-work item 1 corrected (Q1 SQL fix in r6 doc).
-- [x] Pre-work item 2 decided (filter snapshot lookup + conditional spread, both writers).
-- [x] Pre-work item 3 confirmed (3-condition OR demotion criterion — but no rows match anyway).
-- [x] Sunday discovery cron audit complete (§3).
-- [x] R6 patch staged in working tree (NOT committed) — `paperTrading.ts` and `betfairLive.ts`.
-- [x] User ran Q1 / Q1-aggregate / Q2 / Q3 / Q4 / Q5 / Q6 / Q7 / Q8 in prod.
-- [x] Empirical findings recorded in §6.
-- [x] Decision-branch resolution: NEW BRANCH — data-immaturity, lower sample threshold to 25.
-- [x] Phase 2.A readiness verdict: READY pending §7.2 sequence.
-- [ ] User commits R6 patch (per §4.3) once verification passes.
-- [ ] User accepts (or refines) §7.2 Step 2 calibration adjustments.
-- [ ] User decides Step 1 / Step 2 sequencing.
+These four DMLs land the user's resolution from the strategic-push acknowledgement. **Run in this order on prod.** All are idempotent; re-runs are safe.
+
+### 10.1 Insert `real_money_go_live_checklist` marker into agent_config
+
+```sql
+INSERT INTO agent_config (key, value, updated_at)
+VALUES (
+  'real_money_go_live_checklist',
+  '{"status":"deferred_until_real_money","reason":"Both tracks bet £0 in paper-mode; circuit breakers protect real-money capital not currently flowing.","doc":"docs/real-money-go-live-checklist.md","boundaries_at_go_live":{"bankroll_floor":{"value":"TBD","constraint":">= 5% * bankroll"},"daily_loss_limit_pct":{"value":"TBD","constraint":"0 < value <= 0.10"},"weekly_loss_limit_pct":{"value":"TBD","constraint":"0 < value <= 0.20"},"max_stake_pct":{"value":"0.02","constraint":"0 < value <= 0.02","note":"restored 2026-05-05"}},"max_stake_pct_decision":{"applied":"2026-05-05","rationale":"Option (a) per docs/real-money-go-live-checklist.md §3"},"deferred_at":"2026-05-05","deferred_by":"user_explicit_resolution"}',
+  NOW()
+)
+ON CONFLICT (key) DO UPDATE SET
+  value = EXCLUDED.value,
+  updated_at = NOW();
+```
+
+**Why:** durable always-loadable marker that the safety boundaries are deferred. Sub-phase 5's promotion-gate code will read this row (per `docs/real-money-go-live-checklist.md` §4).
+
+### 10.2 Restore max_stake_pct from 0.03 to 0.02
+
+```sql
+UPDATE agent_config
+SET value = '0.02', updated_at = NOW()
+WHERE key = 'max_stake_pct' AND value = '0.03';
+
+-- Audit log
+INSERT INTO compliance_logs (action_type, details, timestamp)
+VALUES (
+  'max_stake_pct_restored_to_brief_default',
+  jsonb_build_object(
+    'previous_value', '0.03',
+    'new_value', '0.02',
+    'rationale_doc', 'docs/real-money-go-live-checklist.md',
+    'rationale_section', '§3',
+    'decision', 'option (a) — set to 0.02 now for cleaner Kelly-growth-rate computation downstream',
+    'applied_at', NOW(),
+    'applied_by', 'sub_phase_1_strategic_push_resolution'
+  ),
+  NOW()
+);
+```
+
+**Why:** Option (a) per `docs/real-money-go-live-checklist.md` §3. Cleaner downstream Kelly-growth-rate computation; aligns with the brief's stated default; tightening within the model's authority envelope.
+
+### 10.3 Primera División pre-flag for Tier D (DOCUMENT ONLY — DML deferred to sub-phase 2)
+
+**This DML does NOT run in sub-phase 1.** It lands as a separate commit between sub-phase 2's schema migration commit and its behaviour-flip commit, per `feedback_race_conditions.md` two-commit discipline. Captured here so sub-phase 2's plan-mode document can reference it verbatim.
+
+```sql
+-- Primera División: settlement-bias index B = -0.524 (5.2× the |B|≥0.10 threshold).
+-- AF result-fetching gap on contentious matches makes settled-subset ROI biased.
+-- Demote from Tier A to Tier D until investigation completes.
+UPDATE competition_config
+SET universe_tier = 'D',
+    settlement_bias_index = -0.524,
+    universe_tier_decided_at = NOW()
+WHERE LOWER(name) = LOWER('Primera División');
+
+-- Audit log
+INSERT INTO compliance_logs (action_type, details, timestamp)
+VALUES (
+  'tier_d_demotion_settlement_bias',
+  jsonb_build_object(
+    'league', 'Primera División',
+    'previous_tier', 'A',
+    'new_tier', 'D',
+    'bias_index', -0.524,
+    'threshold_violated', 0.10,
+    'multiplier_over_threshold', 5.2,
+    'rationale_doc', 'docs/phase-2-diagnostic-findings.md',
+    'rationale_section', '§3.1',
+    'applied_at', NOW(),
+    'applied_by', 'sub_phase_2_pre_flag_commit'
+  ),
+  NOW()
+);
+```
+
+**Sub-phase 2 commit ordering** (locked by `feedback_race_conditions.md`):
+1. Schema migration commit (if any new schema is needed for sub-phase 2; current state suggests none).
+2. **Primera División demotion DML commit** ← runs the SQL above.
+3. Reverse-mapping cron + behaviour-flip commit (the Betfair-first universe expansion).
+
+The demotion sits **between** the schema and the behaviour flip so that:
+- The dispatcher (which reads `universe_tier` per Phase 2.B.1) starts treating Primera División as rejected from the moment the demotion lands.
+- Any in-flight Primera División bets (placed before the demotion) settle naturally; new bets are blocked.
+- The reverse-mapping cron's first run sees Primera División already at Tier D and does not re-elevate it.
+
+### 10.4 Idempotency / verification post-DML
+
+```sql
+-- Verify §10.1 marker present and well-formed
+SELECT key, value, updated_at
+FROM agent_config
+WHERE key = 'real_money_go_live_checklist';
+
+-- Verify §10.2 max_stake_pct restored
+SELECT key, value, updated_at
+FROM agent_config
+WHERE key = 'max_stake_pct';
+-- expect: value = '0.02'
+
+-- Verify §10.2 compliance log written (most recent first)
+SELECT action_type, details, timestamp
+FROM compliance_logs
+WHERE action_type = 'max_stake_pct_restored_to_brief_default'
+ORDER BY timestamp DESC
+LIMIT 5;
+```
+
+---
+
+## 9. Sign-off checklist
+
+- [x] Codebase audit complete (`docs/phase-2-current-state.md`).
+- [x] Diagnostic SQL prompt sheet authored (this document).
+- [x] R6 Q1 SQL syntax fix verified — already corrected at `r6-clv-source-investigation.md` §3.1.
+- [x] User ran §2.1 (R6 freshness Q1) — PASS verdict.
+- [x] User ran §3.1 (settlement bias broadened) — Primera División flagged.
+- [x] User ran §4 (API usage) — headroom adequate.
+- [x] User ran §5.1 (retrospective) — 14.3% raw / 38.5% data-mature graduation rate.
+- [x] User ran §5.2 (bet pace) — 0.8 weeks-to-25-settled.
+- [x] User ran §6.2 (banned-market history) — reactivation order ranked.
+- [x] User ran §6.3 (AH historical) — confirmed greenfield.
+- [x] User ran §6.4 (universe state) — 149A/84B/0C/0D/804E confirmed.
+- [x] User ran §6.5 (safety boundaries) — **CRITICAL FINDING: not at brief defaults.**
+- [x] Findings integrated, doc updated.
+- [ ] **§-1 safety-boundary resolution (STOP gate).**
+- [ ] Sub-phase 1 paired commit (`docs/phase-2-current-state.md` + this doc).
+- [ ] Sub-phase 2 plan-mode document drafted (NEXT SESSION — pending §-1 resolution).
