@@ -1069,7 +1069,20 @@ export async function detectValueBets(options?: {
       // CLV-style edge: positive iff the exchange back price beats sharp
       // consensus implied probability. Replaces the legacy modelProb-based
       // edge formula which conflated forecast accuracy with price quality.
-      const edge = (1 / fairValueOdds) - (1 / actionablePrice);
+      //
+      // Wave 1.5 (2026-05-05): Tier B/C / non-Pinnacle leagues have no
+      // sharp reference — selectPricingSources() falls back to the
+      // betfair_exchange row as fairValueSource, which IS the actionable
+      // price. That gives edge = 0 always and structurally rejects every
+      // experiment-track selection. For the degenerate case, fall back to
+      // the legacy model-prob-vs-market edge so the experiment track can
+      // produce candidates. Tier A behaviour byte-identical because fv
+      // comes from oddspapi_pinnacle or api_football_real:Pinnacle
+      // (≠ exchange) — the degenerate branch never fires there.
+      const fvDegenerate = fairValueSource === actionableSource;
+      const edge = fvDegenerate
+        ? modelProb - (1 / actionablePrice)
+        : (1 / fairValueOdds) - (1 / actionablePrice);
 
       const effectiveMinEdge = DERIVED_MARKETS.has(oddsRow.marketType)
         ? Math.max(minEdge, 0.08)
