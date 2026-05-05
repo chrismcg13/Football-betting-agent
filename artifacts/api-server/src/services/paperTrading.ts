@@ -30,6 +30,7 @@ import {
 import { isLeagueMarketTier1Eligible } from "./dataRichness";
 import { getLiveOppScoreThreshold } from "./liveThresholdReview";
 import { storePinnacleSnapshot } from "./oddsPapi";
+import { evaluateExperimentTag, computeArchetypeDistributionShift } from "./promotionEngine";
 import { shouldBlockBet, getSegmentKellyMultiplier, getMarketFamily } from "./edgeConcentration";
 import {
   getEffectiveLimits,
@@ -2152,6 +2153,31 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       },
       "Bet settled",
     );
+
+    // ─── Sub-phase 5: event-driven graduation evaluator hook ──────────────
+    // Per docs/phase-2-wave-3-subphase-5-plan.md §3.1.
+    // Non-blocking: void + .catch. Settlement never fails on evaluator error.
+    // Soft-revert via agent_config.event_driven_graduation_enabled='false'.
+    // The 04:00 UTC cron continues to run as a reconciler regardless.
+    if (bet.experimentTag) {
+      const flagRaw = (await getConfigValue("event_driven_graduation_enabled")) ?? "true";
+      const flagEnabled = flagRaw.toLowerCase() === "true";
+      if (flagEnabled) {
+        void evaluateExperimentTag(bet.experimentTag, {
+          triggeredBy: "settlement",
+          triggerBetId: bet.id,
+        }).catch((err) => {
+          logger.warn(
+            { err, betId: bet.id, tag: bet.experimentTag },
+            "Sub-phase 5 event-driven evaluator failed — 04:00 cron reconciler will catch it",
+          );
+        });
+        // Distribution-shift A(archetype) — fire-and-forget, internally cached 5min.
+        void computeArchetypeDistributionShift().catch((err) => {
+          logger.warn({ err }, "Sub-phase 5 distribution-shift compute failed — non-fatal");
+        });
+      }
+    }
   }
 
   if (settled > 0) {

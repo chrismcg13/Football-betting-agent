@@ -114,20 +114,36 @@ The thresholds and gates are NOT changed in this sub-phase. Sub-phase 6 (autonom
 | `promoted` | rolling-30 ROI < 0 OR ≥3 consecutive negative weeks | `demote` → `candidate` | promotionEngine.ts:273-294 |
 | All other | metrics below thresholds | `hold` (no transition) | implicit |
 
-### 3.5 Kelly-fraction side effect on tier transitions (LOCKED)
+### 3.5 Kelly-fraction side effect on tier transitions (LOCKED — v1 placeholders)
 
 `experiment_registry.kelly_fraction` set per the v2 §3.3 design table:
 
-| New tier | kelly_fraction set to |
+| New tier | kelly_fraction set to (v1 placeholder) |
 |---|---|
 | `experiment` | 0 (£0 stake architectural guarantee — sub-phase 9 wires it into placement) |
 | `candidate` | 0.25 |
 | `promoted` | 1.0 |
 | `abandoned` | 0 |
 
+**These are v1 placeholders.** Per user's R-Notes: sub-phase 6's autonomous threshold-management evaluator will propose **per-league dynamic kelly_fraction values** based on Kelly-growth retrospective analysis. The schema column accepts the full range `[0, 1.0]` per Phase 2.A CHECK constraint at `migrate.ts:992-997`. Sub-phase 5's writes use the placeholders but do not lock the column to those three values — sub-phase 6 freely overrides.
+
 **Note:** kelly_fraction is currently UNREAD by `placePaperBet` (per current-state §2.10). Sub-phase 9 wires it. Sub-phase 5 just sets the value so sub-phase 9 finds it correctly when implemented.
 
-### 3.6 Distribution-shift detector A(archetype) (LOCKED)
+### 3.5a Per-league granularity (LOCKED — Refinement 1)
+
+The `experiment_tag` is the per-league-per-market keying entity. Format: `LEAGUE_<canonical_name_lower>__MARKET_<market_type>` or similar (per `valueDetection.ts` placement code; existing tags follow this pattern, e.g., `serie-a-double-chance`, `bundesliga-over-under-25`).
+
+**Per-league granularity is preserved end-to-end:**
+
+- **Metrics:** `computeMetricsForExperiment(tag)` filters `WHERE experiment_tag = tag` — no cross-league aggregation.
+- **Tier transitions:** each tag has its own `data_tier` column in `experiment_registry`. No global tier.
+- **Audit log:** `model_decision_audit_log.subject = "experiment_tag:<tag>"` — every row identifies the specific league+market entity that transitioned.
+- **Distribution-shift:** A(archetype) is per-archetype, but the audit log writes one row per archetype with `subject = "archetype:<name>"`. Cross-archetype aggregation does NOT happen at this stage.
+- **Sub-phase 6 inheritance:** the per-league `kelly_fraction` field, the per-tag `current_*` metric fields, and the `model_decision_audit_log.supporting_metrics` JSONB all preserve the per-league dimension. Sub-phase 6's autonomous threshold-management evaluator reads these directly and proposes per-league threshold revisions without any aggregation upstream.
+
+**No collapsing** — the autonomy the strategic brief mandates is per-league/per-archetype, not global. Sub-phase 5 ships scaffolding that respects this.
+
+### 3.6 Distribution-shift detector A(archetype) (LOCKED — Refinement 3)
 
 Per brief: "Per-archetype distribution-shift detector runs on every settlement: A(archetype) computed and logged; persistent |A| > 1.5 raises a flag for model-bug investigation, NOT threshold tightening."
 
@@ -141,9 +157,40 @@ Where:
 - `ROI(global)` = aggregate ROI across all settled bets globally (last 30 days)
 - `N(archetype)` = sample size of settled bets in this archetype (last 30 days)
 
-**Run cadence:** computed on every settlement-triggered evaluator call, per-archetype. Logged to `model_decision_audit_log` with `decision_type = 'distribution_shift_observation'`. Threshold flag at |A| > 1.5 across two consecutive 30-day windows triggers an alert (warning-level log + `experiment_learning_journal` entry with `analysisType = 'distribution_drift'`). NO threshold tightening — this is a model-bug detector, not a graduation gate.
+**Run cadence:** computed on every settlement-triggered evaluator call, per-archetype. Cached for 5 minutes per archetype.
 
-**Implementation:** separate function `computeArchetypeDistributionShift()` in `promotionEngine.ts`. Called from the same hook as `evaluateExperimentTag`. Cached for 5 minutes (don't recompute on every single settlement).
+**Findings written as STRUCTURED JSONB to BOTH `model_decision_audit_log` AND `experiment_learning_journal`** so sub-phase 6's autonomous threshold-management evaluator can consume programmatically without parsing free-form text.
+
+`model_decision_audit_log` row:
+- `decision_type = "distribution_shift_observation"`
+- `subject = "archetype:<name>"`
+- `prior_state = null`, `new_state = null` (observational, not a state change)
+- `reasoning` = brief human-readable summary
+- `supporting_metrics` JSONB pinned shape:
+
+```json
+{
+  "archetype": "women",
+  "n_archetype_30d": 47,
+  "roi_archetype_30d": -0.082,
+  "n_global_30d": 1247,
+  "roi_global_30d": 0.041,
+  "a_score": -2.31,
+  "consecutive_windows_breaching": 1,
+  "kelly_growth_archetype_30d": -0.0034,
+  "kelly_growth_global_30d": 0.0019
+}
+```
+
+`experiment_learning_journal` row (parallel write, same JSONB content):
+- `analysisType = "distribution_drift"`
+- `findings` = same JSONB shape as supporting_metrics above
+- `experimentTag` = null (archetype-level, not tag-level)
+- `recommendations`, `actionsTaken` = null in sub-phase 5 (sub-phase 6 populates these)
+
+**Threshold for alert:** `|a_score| > 1.5` AND `consecutive_windows_breaching >= 2` triggers a warning-level log + flags the row for sub-phase 6 review. NO threshold tightening — this is a model-bug detector, not a graduation gate.
+
+**Implementation:** separate function `computeArchetypeDistributionShift()` in `promotionEngine.ts`. Called from the same hook as `evaluateExperimentTag`. 5-min in-memory cache per archetype.
 
 ### 3.7 Cron reconciler relationship (LOCKED)
 
@@ -167,25 +214,60 @@ export async function runPromotionEngine(): Promise<{...}> {
 
 **Net behaviour:** event-driven catches transitions within seconds; cron sweeps everything daily as belt-and-braces.
 
-### 3.8 Audit trail to model_decision_audit_log (LOCKED)
+### 3.8 Audit trail to model_decision_audit_log (LOCKED — Refinement 2)
 
-Every tier transition writes a row to `model_decision_audit_log`:
+Every tier transition writes a row to `model_decision_audit_log` with **Kelly-growth-rate as a first-class metric in `supporting_metrics`**, alongside ROI:
 
 ```json
 {
   "decision_at": "<NOW>",
   "decision_type": "tier_transition",
   "subject": "experiment_tag:<tag>",
-  "prior_state": { "data_tier": "experiment", "kelly_fraction": 0 },
+  "prior_state": { "data_tier": "experiment", "kelly_fraction": 0.0 },
   "new_state": { "data_tier": "candidate", "kelly_fraction": 0.25 },
-  "reasoning": "Met all experiment→candidate thresholds: sample=27/25, ROI=8.4%/5%, ...",
-  "supporting_metrics": { ... ExperimentMetrics ... },
+  "reasoning": "Met all experiment→candidate thresholds: sample=27/25, realised_roi=8.4%/5%, kelly_growth=0.0042/bet, ...",
+  "supporting_metrics": {
+    "sample_size": 27,
+    "realised_roi": 0.084,
+    "realised_kelly_growth_rate": 0.0042,
+    "kelly_growth_30d_rolling": 0.0061,
+    "clv": 2.1,
+    "win_rate": 0.556,
+    "p_value": 0.038,
+    "edge": 3.2,
+    "weeks_active": 4
+  },
   "expected_impact": null,
   "review_status": "automatic"
 }
 ```
 
-`expected_impact` is null in this sub-phase (sub-phase 6 will compute Kelly-growth-rate predictions). All transitions are `'automatic'` — user reviews retrospectively.
+**Kelly-growth-rate computation (LOCKED):**
+
+Per-bet log-return:
+```
+g_i = ln(max(0.001, (effective_stake_i + pnl_i) / effective_stake_i))
+```
+
+Where:
+- `effective_stake_i = stake > 0 ? stake : shadow_stake` (handles shadow bets)
+- `pnl_i = settlement_pnl > 0 ? settlement_pnl : shadow_pnl ?? 0`
+- `max(0.001, ...)` clip prevents `log(0) = -∞` on full losses
+
+Aggregate metrics:
+- `realised_kelly_growth_rate = sum(g_i) / N` over all settled bets in the experiment_tag (mean log-return per bet)
+- `kelly_growth_30d_rolling = sum(g_i) / N_30d` over last 30 days only
+
+**Why Kelly-growth-rate as first-class:**
+- (a) Sub-phase 6 needs historical Kelly-growth in audit logs to operate without retroactive recomputation.
+- (b) User's weekly review surfaces variance via Kelly-growth, not just mean ROI. ROI alone hides variance traps.
+
+**Implementation note on `expected_impact` field:**
+`NUMERIC(10,6)` accepts the Kelly-growth-rate delta semantics. Sub-phase 5 leaves it `null` (no prediction made — transitions are deterministic against thresholds). **Sub-phase 6 populates it** with the predicted Kelly-growth-rate change from autonomous threshold revisions. The column semantics are pinned now: any non-null value in `expected_impact` is a Kelly-growth-rate delta in absolute terms (e.g., +0.0008 means predicted +0.08% per-bet log-return improvement).
+
+`reasoning` field includes Kelly-growth in human-readable form alongside ROI.
+
+All transitions are `'automatic'`. User reviews retrospectively via the weekly weekly-review query.
 
 ---
 
