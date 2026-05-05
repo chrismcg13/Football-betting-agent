@@ -412,6 +412,7 @@ export interface BetfairReverseMappingResult {
       score: number;
     }>;
   };
+  unmappedRegionsHistogram: Record<string, number>;
   archetypeLabellingPass: {
     rowsLabelled: number;
     rowsAlreadyLabelled: number;
@@ -503,6 +504,7 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
     updateUniverseTier: 0,
   };
   const fuzzyFailures: Array<{ betfairName: string; bestAfMatch: string | null; score: number }> = [];
+  const unmappedRegions = new Map<string, number>();
   let skippedUnmappedRegion = 0;
   let writesApplied = 0;
 
@@ -522,6 +524,8 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
       candidates = afByCountry.get(mappedCountry) ?? [];
     } else {
       skippedUnmappedRegion++;
+      const rawRegion = (bfComp.competitionRegion ?? "(empty)").trim() || "(empty)";
+      unmappedRegions.set(rawRegion, (unmappedRegions.get(rawRegion) ?? 0) + 1);
       candidates = afLeagues;
       usedThreshold = NO_REGION_FUZZY_THRESHOLD;
     }
@@ -737,6 +741,9 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
       belowThresholdCount: fuzzyFailures.length,
       belowThresholdSample: fuzzyFailures.slice(0, FUZZY_FAILURE_SAMPLE_SIZE),
     },
+    unmappedRegionsHistogram: Object.fromEntries(
+      [...unmappedRegions.entries()].sort((a, b) => b[1] - a[1]),
+    ),
     archetypeLabellingPass: {
       rowsLabelled: archetypeLabelled,
       rowsAlreadyLabelled: archetypeAlreadyLabelled,
@@ -767,6 +774,7 @@ function emptyResult(runId: string, dryRun: boolean, startedAt: number): Betfair
     writesApplied: 0,
     skippedUnmappedRegion: 0,
     fuzzyMatchFailures: { belowThresholdCount: 0, belowThresholdSample: [] },
+    unmappedRegionsHistogram: {},
     archetypeLabellingPass: { rowsLabelled: 0, rowsAlreadyLabelled: 0 },
     durationMs: Date.now() - startedAt,
   };
