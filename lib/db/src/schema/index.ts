@@ -29,3 +29,5 @@ export * from "./exchanges";
 export * from "./commissionTracking";
 export * from "./tournamentConfig";
 export * from "./graduationEvaluationLog";
+export * from "./modelDecisionAuditLog";
+export * from "./pendingThresholdRevisions";

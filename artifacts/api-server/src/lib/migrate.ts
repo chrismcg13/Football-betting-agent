@@ -1048,6 +1048,108 @@ export async function runMigrations() {
         ON graduation_evaluation_log(experiment_tag, evaluated_at DESC)
     `);
 
+    // ── Wave 2 #1 schema migrations (2026-05-05) ──────────────────────────
+    // model_decision_audit_log: every autonomous decision the model makes
+    // logs here per the strategic brief's audit mandate.
+    // pending_threshold_revisions: looser threshold proposals queue here for
+    // user approval (tighter is autonomous; looser requires human gate).
+    //
+    // Both tables are net-new (no interaction with existing data). Sub-phase 6
+    // (autonomous threshold management) is the primary writer. DDL pinned in
+    // docs/phase-2-wave-2-schema-plan.md §2 and §3.
+
+    // 1. model_decision_audit_log
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS model_decision_audit_log (
+        id SERIAL PRIMARY KEY,
+        decision_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        decision_type TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        prior_state JSONB,
+        new_state JSONB,
+        reasoning TEXT NOT NULL,
+        supporting_metrics JSONB,
+        expected_impact NUMERIC(10,6),
+        review_status TEXT NOT NULL DEFAULT 'automatic'
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'model_decision_audit_log_review_status_check'
+        ) THEN
+          ALTER TABLE model_decision_audit_log
+            ADD CONSTRAINT model_decision_audit_log_review_status_check
+            CHECK (review_status IN ('automatic','user_reviewed','user_overridden'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS model_decision_audit_log_decided_idx
+        ON model_decision_audit_log(decision_at DESC)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS model_decision_audit_log_subject_idx
+        ON model_decision_audit_log(decision_type, subject)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS model_decision_audit_log_review_idx
+        ON model_decision_audit_log(review_status)
+        WHERE review_status != 'automatic'
+    `);
+
+    // 2. pending_threshold_revisions
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS pending_threshold_revisions (
+        id SERIAL PRIMARY KEY,
+        proposed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        threshold_name TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'global',
+        current_value JSONB NOT NULL,
+        proposed_value JSONB NOT NULL,
+        direction TEXT NOT NULL,
+        reasoning TEXT NOT NULL,
+        supporting_metrics JSONB,
+        expected_impact NUMERIC(10,6),
+        status TEXT NOT NULL DEFAULT 'pending',
+        reviewed_at TIMESTAMPTZ,
+        reviewed_by TEXT,
+        review_note TEXT
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'pending_threshold_revisions_direction_check'
+        ) THEN
+          ALTER TABLE pending_threshold_revisions
+            ADD CONSTRAINT pending_threshold_revisions_direction_check
+            CHECK (direction IN ('tighter','looser'));
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'pending_threshold_revisions_status_check'
+        ) THEN
+          ALTER TABLE pending_threshold_revisions
+            ADD CONSTRAINT pending_threshold_revisions_status_check
+            CHECK (status IN ('pending','approved','rejected','expired'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS pending_threshold_revisions_status_idx
+        ON pending_threshold_revisions(status, proposed_at DESC)
+        WHERE status = 'pending'
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS pending_threshold_revisions_scope_idx
+        ON pending_threshold_revisions(threshold_name, scope)
+    `);
+
     // Change C (2026-04-22): create paper_bets_current view + partial index.
     // MUST run AFTER every `ALTER TABLE paper_bets` in this migrate() —
     // Postgres freezes a view's column list at CREATE time. If a new column
