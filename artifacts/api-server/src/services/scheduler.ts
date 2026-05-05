@@ -919,39 +919,50 @@ export async function runTradingCycle(options?: {
 
     funnel["07_post_correlation"] = selectedBets.length;
 
-    // ─── PINNACLE-LEAGUE SELECTION FILTER (scope v3 §6 step 1) ───
-    // Reject any candidate whose match league is NOT in competition_config WHERE has_pinnacle_odds=true.
-    // Rationale: if we cannot validate CLV against a genuine Pinnacle line, we do not bet the match.
-    // Toggle via reject_non_pinnacle_leagues config flag (default "true"). Logs every rejection
-    // for the first 7 days for audit. Set flag to "false" for instant rollback without redeploy.
+    // ─── UNIVERSE-TIER SELECTION FILTER (Phase 2.B.1, 2026-05-05) ───
+    // Reads competition_config.universe_tier and routes by tier:
+    //   Tier A → kept (production track; Pinnacle CLV gate runs downstream)
+    //   Tier B/C → rejected (Phase 2.B.2 will route these to shadow-stake
+    //                        path; until then, behave like pre-2.B "no Pinnacle")
+    //   Tier D/E/unmapped → rejected
+    //
+    // Replaces the prior `WHERE has_pinnacle_odds = true` check. Net behaviour
+    // change: leagues with has_pinnacle_odds=true but missing has_betfair_exchange
+    // OR is_active=false are now rejected (correct per v2 design — Tier A
+    // requires both flags + active). Empirically this is a small subset (149
+    // Tier A vs ~150 has_pinnacle_odds-only after the 2026-05-05 seed).
+    //
+    // Backwards-compatible toggle: reject_non_pinnacle_leagues="false" still
+    // disables the gate entirely (rollback path). The flag's name is
+    // historical; functionally it now toggles the universe-tier gate.
     {
       const flagRaw = (await getConfigValue("reject_non_pinnacle_leagues")) ?? "true";
       const flagEnabled = flagRaw.toLowerCase() === "true";
       if (!flagEnabled) {
         logger.warn(
           { tier, candidates: selectedBets.length },
-          "Pinnacle-league filter DISABLED via reject_non_pinnacle_leagues=false (rollback mode)",
+          "Universe-tier filter DISABLED via reject_non_pinnacle_leagues=false (rollback mode)",
         );
-        funnel["07a_pinnacle_league_filter"] = "disabled" as unknown as number;
+        funnel["07a_universe_tier_filter"] = "disabled" as unknown as number;
       } else if (selectedBets.length > 0) {
         const ccRows = await db.execute(sql`
-          SELECT LOWER(name) AS name, LOWER(country) AS country
-          FROM competition_config WHERE has_pinnacle_odds = true
+          SELECT LOWER(name) AS name, LOWER(country) AS country, universe_tier
+          FROM competition_config
+          WHERE universe_tier IN ('A','B','C')
         `);
-        const ccData = ((ccRows as unknown as { rows?: Array<{ name: string; country: string }> }).rows
-          ?? (ccRows as unknown as Array<{ name: string; country: string }>));
-        const pinKey = new Set<string>();
-        const pinName = new Set<string>();
+        const ccData = ((ccRows as unknown as { rows?: Array<{ name: string; country: string; universe_tier: string }> }).rows
+          ?? (ccRows as unknown as Array<{ name: string; country: string; universe_tier: string }>));
+        // Build (key→tier) and (name→tier) maps so the strict-tuple lookup
+        // can fall back to name-only when matches.country is empty (same
+        // semantics as the prior pinKey/pinName pair).
+        const tierByKey = new Map<string, string>();
+        const tierByName = new Map<string, string>();
         for (const r of ccData) {
-          pinName.add(r.name);
-          pinKey.add(`${r.name}|${r.country}`);
+          tierByName.set(r.name, r.universe_tier);
+          tierByKey.set(`${r.name}|${r.country}`, r.universe_tier);
         }
 
         const matchIds = Array.from(new Set(selectedBets.map((b) => b.matchId)));
-        // Fix: drizzle's sql template interpolates JS arrays as ($1, $2, ...)
-        // tuples, which Postgres rejects for ANY(). Use inArray() for proper
-        // array binding. Also short-circuit on empty input to avoid an
-        // invalid empty-IN query.
         const matchMeta = new Map<number, { league: string; country: string }>();
         if (matchIds.length > 0) {
           const matchRows = await db
@@ -968,27 +979,56 @@ export async function runTradingCycle(options?: {
         }
 
         const before = selectedBets.length;
-        const rejectionDetails: Array<{ matchId: number; league: string; country: string; market: string; selection: string }> = [];
+        const rejectionDetails: Array<{ matchId: number; league: string; country: string; market: string; selection: string; reason: string }> = [];
         const kept: BetCandidate[] = [];
+        // Telemetry: count candidates per tier classification (incl. no-tier-found)
+        const tierCounts: Record<string, number> = { A: 0, B: 0, C: 0, none: 0 };
         for (const c of selectedBets) {
           const meta = matchMeta.get(c.matchId);
           const league = meta?.league ?? "";
           const country = meta?.country ?? "";
-          // Strict country match when matches.country is populated; fall back to name-only otherwise.
-          const inPinLeague = country
-            ? (pinKey.has(`${league}|${country}`) || (pinName.has(league) && country === ""))
-            : pinName.has(league);
-          if (!inPinLeague) {
+          // Same lookup semantics as pre-2.B: strict tuple, fall back to name-
+          // only when matches.country is empty.
+          let candidateTier: string | null = null;
+          if (country) {
+            candidateTier = tierByKey.get(`${league}|${country}`) ?? null;
+            if (!candidateTier && tierByName.has(league) && country === "") {
+              candidateTier = tierByName.get(league) ?? null;
+            }
+          } else {
+            candidateTier = tierByName.get(league) ?? null;
+          }
+
+          if (candidateTier === "A") {
+            tierCounts.A++;
+            kept.push(c);
+          } else if (candidateTier === "B" || candidateTier === "C") {
+            // Phase 2.B.2 will route these through the shadow-stake path
+            // when experiment_track_enabled=true. Until then, reject (matches
+            // pre-2.B behaviour for non-Pinnacle leagues).
+            tierCounts[candidateTier]++;
             rejectionDetails.push({
               matchId: c.matchId,
               league: league || "(unknown)",
               country: country || "(unknown)",
               market: c.marketType,
               selection: c.selectionName,
+              reason: `tier_${candidateTier}_not_yet_routed`,
+            });
+            continue;
+          } else {
+            // No CC row, or universe_tier is D/E/unmapped — reject
+            tierCounts.none++;
+            rejectionDetails.push({
+              matchId: c.matchId,
+              league: league || "(unknown)",
+              country: country || "(unknown)",
+              market: c.marketType,
+              selection: c.selectionName,
+              reason: "no_universe_tier_match",
             });
             continue;
           }
-          kept.push(c);
         }
         selectedBets.length = 0;
         selectedBets.push(...kept);
@@ -1000,20 +1040,32 @@ export async function runTradingCycle(options?: {
               before,
               after: selectedBets.length,
               rejected,
-              pinLeaguesLoaded: pinName.size,
+              tierCounts,
+              tierALeaguesLoaded: Array.from(tierByName.values()).filter(t => t === "A").length,
+              tierBLeaguesLoaded: Array.from(tierByName.values()).filter(t => t === "B").length,
+              tierCLeaguesLoaded: Array.from(tierByName.values()).filter(t => t === "C").length,
               sampleRejections: rejectionDetails.slice(0, 25),
               totalRejections: rejectionDetails.length,
-              scope: "v3_section6_step1_audit",
+              scope: "phase_2b1_universe_tier_audit",
             },
-            "Pinnacle-league selection filter rejected non-Pinnacle-league candidates",
+            "Universe-tier filter rejected non-Tier-A candidates",
           );
         } else {
           logger.info(
-            { tier, kept: selectedBets.length, pinLeaguesLoaded: pinName.size },
-            "Pinnacle-league filter: all candidates in Pinnacle leagues",
+            {
+              tier,
+              kept: selectedBets.length,
+              tierCounts,
+              tierALeaguesLoaded: Array.from(tierByName.values()).filter(t => t === "A").length,
+            },
+            "Universe-tier filter: all candidates in Tier A",
           );
         }
-        funnel["07a_rejected_non_pinnacle_league"] = rejected;
+        funnel["07a_rejected_non_tier_a_candidates"] = rejected;
+        funnel["07a_tier_a_candidates"] = tierCounts.A;
+        funnel["07a_tier_b_candidates_rejected"] = tierCounts.B;
+        funnel["07a_tier_c_candidates_rejected"] = tierCounts.C;
+        funnel["07a_no_tier_match_rejected"] = tierCounts.none;
       }
     }
 
