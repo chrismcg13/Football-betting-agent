@@ -8,9 +8,21 @@ The 10 sub-phases in the strategic brief are flattened into **four execution wav
 
 ---
 
-## Wave 1 — Close sub-phase 2 + open the firehose
+## Wave 1 — Close sub-phase 2 + open the firehose ✅ CLOSED 2026-05-05
 
 **Goal:** Betfair-first universe expansion writes go live; experiment track flips on. Tier B/C bets begin placing at £0 + shadow_stake.
+
+**Closed:** 2026-05-05 17:15:48 UTC. First Tier B shadow bet placed. Tier A behaviour byte-identical (verified via pre/post snapshot diff). Required two follow-on commits (Wave 1.5) to actually unblock Tier B candidate generation.
+
+**Wave 1.5 commits:**
+- `209b2c1` — extend exchange-book-sweep window 24h → 48h
+- `004df69` — model-prob fallback edge when fairValueSource is degenerate
+
+**Why Wave 1.5 was needed:** the firehose flag flipped cleanly but Tier B candidates never reached the dispatcher. Two upstream blockers identified:
+1. exchange-book-sweep covered 0-24h while valueDetection evaluates 1-48h, leaving half of matches without `betfair_exchange` snapshots.
+2. valueDetection's CLV-style edge formula `(1/fv) - (1/actionable)` returned 0 for non-Pinnacle leagues (where `fairValueSource = exchangeForFv = actionable`), structurally rejecting every Tier B/C selection.
+
+Both fixes were tight-scope, single-purpose commits.
 
 | # | Step | Type | Risk | Quick-revert |
 |---|---|---|---|---|
