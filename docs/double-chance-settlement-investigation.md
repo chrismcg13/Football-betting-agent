@@ -1,6 +1,6 @@
 # DOUBLE_CHANCE Settlement Investigation
 
-**Status:** investigation document only. **No code fix proposed.** **No sub-phase ship is bundled with this work.** Per the strategic brief: "Investigate before sub-phase 4 reactivates DOUBLE_CHANCE on the experiment track."
+**Status:** **CLOSED 2026-05-05** — verdict at §4 below. Settlement code is correct. The +15% CLV / −40% ROI contradiction is fully explained by R6 market-proxy contamination on Replit-era data. No code fix needed. DOUBLE_CHANCE can be reactivated on the experiment track via Wave 2 #4 alongside other quarantined markets.
 
 **Authored:** 2026-05-05, sub-phase 1 of the strategic Phase 2 push.
 **Trigger:** banned-market history audit (`docs/phase-2-diagnostic-findings.md` §6.2) returned a structurally implausible result for DOUBLE_CHANCE: **+15.156% winsorised CLV alongside −40.05% ROI on 32 settled bets**.
@@ -199,15 +199,34 @@ Once the SQL above is run, the diagnosis maps as follows:
 
 ---
 
-## 4. Sign-off (when complete)
+## 4. Sign-off — CLOSED 2026-05-05
 
-- [ ] Q-DC-1 results pasted.
-- [ ] Q-DC-2 verdict (agree / DISAGREE / unknown_selection breakdown).
-- [ ] Q-DC-3 selection-canonical distribution.
-- [ ] Q-DC-4 origin attribution.
-- [ ] Q-DC-5 raw-data sanity check.
-- [ ] Diagnosis pinned in §2 table.
-- [ ] Fix surface identified.
-- [ ] Decision: reactivate (after fix) / leave permanently banned / further investigation.
+### 4.1 Test results (run by user on prod, 2026-05-05)
 
-This document is the durable record of what the bug was and how it was diagnosed. The fix (if any) ships as a separate commit referencing this document by name in the commit message.
+| Test | Result | Verdict |
+|---|---|---|
+| Q-DC-1 | 32 rows; all dates 2026-04-16 to 2026-04-19 (Replit-era model, pre-May-3 cutoff); selection_name uses `1X`/`X2`/`12` consistently | data context confirmed |
+| Q-DC-2 | 20 should_lose/lost = AGREE; 12 should_win/won = AGREE; **zero disagreements** | ✅ settlement code is correct |
+| Q-DC-3 | (skipped — Q-DC-1 confirmed format consistency) | not needed |
+| Q-DC-4 | 21/32 settled via Betfair (live-mode `reconcileSettlements`); 11/32 via paper-mode `_settleBetsInner` | Mixed paths; both produce correct outcomes |
+| Q-DC-5 | n=32, ROI=−40.05%, winsorised CLV=−3.304%, **with_pinnacle_close=0**, clv_without_pinnacle=24 | ✅ R6 contamination confirmed — every CLV value is market-proxy artefact, not Pinnacle |
+
+### 4.2 Diagnosis
+
+**The +15% unwinsorised CLV was a metric artefact, not a system bug.** Three contributing factors:
+
+1. **R6 contamination (root cause):** 0 of 32 bets had `closing_pinnacle_odds` populated. The recorded `clv_pct` is computed against `closing_odds_proxy` (any-source close), not Pinnacle. Per R6 findings (`docs/r6-clv-source-investigation.md`), this CLV is unreliable.
+
+2. **Outlier-driven mean:** five rows (ids 3, 6, 7, 9, 527) show CLV values of +40 to +109. Each represents a bet where the market moved dramatically away from the placement-time price *toward the actual outcome opposite our bet*. The high "CLV" reads positive only because placement-time odds were much higher than the closing-time short-side odds. Hindsight reads positive; the bet still lost. Winsorising at ±50pp brings the average to −3.304%, much more aligned with the −40% ROI.
+
+3. **Replit-era model context:** all 32 bets are pre-May-3 cutoff. Per user direction: "any data from before the 3rd May is on Replit model which was buggy and wasn't a good judge." The model placed wrong-side bets; the closing market correctly re-priced toward the true outcome.
+
+### 4.3 Conclusion
+
+- **Settlement code:** ✅ no fix needed. `paperTrading.ts:1640-1644` correctly handles all three DOUBLE_CHANCE selection forms.
+- **Selection canonicalisation:** ✅ no fix needed. Both short (`1X`/`X2`/`12`) and long (`Home or Draw`/...) forms handled in the case branch.
+- **DOUBLE_CHANCE reactivation:** the historical data is uninformative for "is DOUBLE_CHANCE a tradable market?" because all evidence is from the buggy Replit model. **Recommend including DOUBLE_CHANCE in Wave 2 #4 banned-market reactivation** on the experiment track. Fresh Claude Code-era data on Tier B/C £0 stakes will reveal the genuine signal.
+
+### 4.4 No follow-up code commit needed
+
+This document closes Wave 2 #5 (DOUBLE_CHANCE investigation) without code change. Sub-phase 4 banned-market reactivation (Wave 2 #4) proceeds with DOUBLE_CHANCE in scope alongside the other quarantined markets.
