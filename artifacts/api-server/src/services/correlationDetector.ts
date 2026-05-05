@@ -37,6 +37,11 @@ export interface BetCandidate extends ValueBet {
   stakeMultiplier: number;
   estimatedStake: number;
   enhanced?: boolean;
+  // Phase 2.B.2: set by the gate dispatcher when classifying candidates;
+  // 'A' = production track (full Kelly stake), 'B'|'C' = experiment track
+  // (shadow-stake at 0.25× full Kelly with actual stake = 0). Undefined
+  // means the gate hasn't classified the candidate yet.
+  universeTier?: "A" | "B" | "C";
 }
 
 export interface CorrelationResult {

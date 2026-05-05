@@ -605,6 +605,12 @@ export interface PaperBetOptions {
   fairValueOdds?: number | null;
   fairValueSource?: string | null;
   validatorBestOdds?: number | null;
+  // Phase 2.B.2: when set to 'B' or 'C', placement enters shadow-stake
+  // mode — actual stake is set to 0 and shadow_stake records what
+  // 0.25× full Kelly would have been. Min-stake / exposure / live-
+  // concentration gates are bypassed for shadow bets. 'A' (or null/
+  // undefined) leaves the existing production-stake flow untouched.
+  universeTier?: "A" | "B" | "C" | null;
 }
 
 export async function placePaperBet(
@@ -638,7 +644,11 @@ export async function placePaperBet(
     fairValueOdds = null,
     fairValueSource = null,
     validatorBestOdds = null,
+    universeTier = null,
   } = options;
+  // Phase 2.B.2: shadow-bet flag. When set, placement bypasses min-stake /
+  // exposure / live-concentration gates and writes stake=0 + shadow_stake.
+  const isShadowBet = universeTier === "B" || universeTier === "C";
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;
   // Mutable: boosted bets that pre-qualify for Tier 1B get tagged "1B_boosted"
@@ -1053,7 +1063,30 @@ export async function placePaperBet(
     }
   }
 
-  if (stake < 2) {
+  // ── Phase 2.B.2: shadow-stake branch ──────────────────────────────────
+  // For Tier B/C candidates: capture what 0.25× full Kelly would have been
+  // (matches the candidate-tier multiplier so experiment-phase shadow ROI
+  // and candidate-phase real ROI are apples-to-apples for the edge-
+  // survival graduation gate), then set actual stake to 0. Subsequent
+  // gates (min-stake, exposure, live-concentration) are bypassed because
+  // a £0 bet contributes nothing to exposure and the min-stake guard is
+  // for protecting against tiny accidental stakes, not legitimate £0
+  // shadow bets.
+  let shadowStake: number | null = null;
+  let shadowStakeKellyFraction: number | null = null;
+  if (isShadowBet) {
+    const SHADOW_KELLY_FRACTION = 0.25;
+    const fullKellyStake = stake;
+    shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+    shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+    stake = 0;
+    logger.info(
+      { matchId, marketType, universeTier, fullKellyStake, shadowStake, shadowStakeKellyFraction },
+      "Phase 2.B.2 shadow bet — actual stake = 0; shadow_stake recorded",
+    );
+  }
+
+  if (!isShadowBet && stake < 2) {
     return logReject(`Calculated stake £${stake} is below minimum £2`);
   }
 
@@ -1067,8 +1100,12 @@ export async function placePaperBet(
   // ── Exposure-based risk gate ─────────────────────────────────────────────
   // In LIVE mode: uses progressive level limits (Level 1 starts at 25%, earns up to 40% at Level 4)
   // In PAPER mode: uses legacy 40% default from agent_config
+  // Phase 2.B.2: shadow bets (stake=0) bypass — they contribute nothing to
+  // exposure by construction; running the check would be a no-op anyway,
+  // but we explicitly skip to avoid coupling shadow-stake telemetry to the
+  // exposure metric.
   let exposureAtPlacement: { current: number; max: number; pct: number } = { current: 0, max: 0, pct: 0 };
-  {
+  if (!isShadowBet) {
     const maxExposurePct = liveLimits
       ? liveLimits.config.maxOpenExposurePct
       : Number((await getConfigValue("max_unsettled_exposure_pct")) ?? "0.40");
@@ -1085,7 +1122,9 @@ export async function placePaperBet(
   }
 
   // ── Live concentration limits (per-league, per-market-type, per-fixture) ──
-  if (isLiveMode()) {
+  // Phase 2.B.2: shadow bets bypass — they don't go to Betfair and have no
+  // real-money concentration implications.
+  if (isLiveMode() && !isShadowBet) {
     const concentrationCheck = await runLiveConcentrationChecks(matchId, marketType, stake);
     if (!concentrationCheck.passed) {
       return logReject(`Live concentration limit: ${concentrationCheck.reason}`);
@@ -1242,6 +1281,15 @@ export async function placePaperBet(
         fairValueOdds: fairValueOdds != null ? String(fairValueOdds) : null,
         fairValueSource: fairValueSource ?? null,
         validatorBestOdds: validatorBestOdds != null ? String(validatorBestOdds) : null,
+        // Phase 2.B.2 shadow-stake columns + universe-tier capture.
+        // For Tier A bets: shadow_stake/fraction stay null, universe_tier_at_placement='A'.
+        // For Tier B/C shadow bets: shadow_stake = full_Kelly × 0.25, stake = 0,
+        //   universe_tier_at_placement='B'|'C', clv_source initially null
+        //   (settlement will tag it 'pinnacle' / 'market_proxy' / 'none').
+        shadowStake: shadowStake != null ? String(shadowStake) : null,
+        shadowStakeKellyFraction: shadowStakeKellyFraction,
+        universeTierAtPlacement: universeTier ?? null,
+        clvSource: null,
       })
       .returning();
 
@@ -1924,6 +1972,22 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       : calculateSettlementWithCommission(stake, odds, betWon, commissionRate);
 
     const settlementPnl = commResult.netPnl;
+
+    // ── Phase 2.B.2: shadow_pnl computation ────────────────────────────────
+    // For shadow bets (Tier B/C with stake=0), compute the P&L as if the
+    // bet had been placed at shadow_stake. This is the experiment-phase
+    // analogue of settlementPnl and feeds the edge-survival graduation
+    // gate (experiment-phase shadow ROI vs candidate-phase real ROI).
+    // Real bets (stake > 0) leave shadow_pnl = null.
+    let shadowPnl: number | null = null;
+    const recordedShadowStake = bet.shadowStake != null ? Number(bet.shadowStake) : 0;
+    if (recordedShadowStake > 0) {
+      const shadowComm = isVoid
+        ? { netPnl: 0 }
+        : calculateSettlementWithCommission(recordedShadowStake, odds, betWon, commissionRate);
+      shadowPnl = shadowComm.netPnl;
+    }
+
     const newStatus = isVoid ? "void" : betWon ? "won" : "lost";
     const now = new Date();
 
@@ -1985,6 +2049,18 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       // CLV is best-effort; don't block settlement
     }
 
+    // Phase 2.B.2: derive clv_source from the Pinnacle-source-only lookup
+    // above. clv_pct is non-null iff a Pinnacle snapshot was found, so we
+    // can use it as the source signal. When no Pinnacle close was found,
+    // we tag 'none' for shadow bets (no proxy fallback for Tier B/C — their
+    // CLV semantics differ structurally and Phase 2.C will gate threshold
+    // by source). For Tier A bets, leave clv_source null (R6 patch path
+    // already handles this).
+    const clvSourceTag: "pinnacle" | "none" | null =
+      recordedShadowStake > 0
+        ? clvPct != null ? "pinnacle" : "none"
+        : null;
+
     await db
       .update(paperBetsTable)
       .set({
@@ -1993,6 +2069,8 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         settledAt: now,
         closingOddsProxy: closingOddsProxy != null ? String(closingOddsProxy) : null,
         ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
+        ...(shadowPnl != null ? { shadowPnl: String(shadowPnl) } : {}),
+        ...(clvSourceTag != null ? { clvSource: clvSourceTag } : {}),
         exchangeId,
         grossPnl: String(commResult.grossPnl),
         commissionRate: String(commResult.commissionRate),

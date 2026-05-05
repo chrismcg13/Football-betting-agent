@@ -938,6 +938,12 @@ export async function runTradingCycle(options?: {
     {
       const flagRaw = (await getConfigValue("reject_non_pinnacle_leagues")) ?? "true";
       const flagEnabled = flagRaw.toLowerCase() === "true";
+      // Phase 2.B.2 flag: when true, Tier B/C candidates are routed through
+      // the £0 shadow-stake placement path. Default false → Tier B/C still
+      // rejected (matches 2.B.1 behaviour). Flip via:
+      //   UPDATE agent_config SET value = 'true' WHERE key = 'experiment_track_enabled';
+      const experimentTrackFlagRaw = (await getConfigValue("experiment_track_enabled")) ?? "false";
+      const experimentTrackEnabled = experimentTrackFlagRaw.toLowerCase() === "true";
       if (!flagEnabled) {
         logger.warn(
           { tier, candidates: selectedBets.length },
@@ -1001,21 +1007,28 @@ export async function runTradingCycle(options?: {
 
           if (candidateTier === "A") {
             tierCounts.A++;
+            c.universeTier = "A";
             kept.push(c);
           } else if (candidateTier === "B" || candidateTier === "C") {
-            // Phase 2.B.2 will route these through the shadow-stake path
-            // when experiment_track_enabled=true. Until then, reject (matches
-            // pre-2.B behaviour for non-Pinnacle leagues).
             tierCounts[candidateTier]++;
-            rejectionDetails.push({
-              matchId: c.matchId,
-              league: league || "(unknown)",
-              country: country || "(unknown)",
-              market: c.marketType,
-              selection: c.selectionName,
-              reason: `tier_${candidateTier}_not_yet_routed`,
-            });
-            continue;
+            if (experimentTrackEnabled) {
+              // Phase 2.B.2: route through shadow-stake placement path.
+              // placePaperBet sees universeTier='B'|'C' and writes a £0
+              // actual-stake bet with shadow_stake = full_Kelly × 0.25.
+              c.universeTier = candidateTier;
+              kept.push(c);
+            } else {
+              // Flag off — reject as in 2.B.1.
+              rejectionDetails.push({
+                matchId: c.matchId,
+                league: league || "(unknown)",
+                country: country || "(unknown)",
+                market: c.marketType,
+                selection: c.selectionName,
+                reason: `tier_${candidateTier}_flag_off`,
+              });
+              continue;
+            }
           } else {
             // No CC row, or universe_tier is D/E/unmapped — reject
             tierCounts.none++;
@@ -1305,41 +1318,53 @@ export async function runTradingCycle(options?: {
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
+      // Phase 2.B.2: Tier B/C shadow bets bypass the Pinnacle pre-bet filter
+      // because, by definition, they're for leagues without reliable Pinnacle
+      // pricing. Tier A bets continue through the filter unchanged.
+      const isShadowBet = candidate.universeTier === "B" || candidate.universeTier === "C";
+
       let filterPassed = true;
       let filterEdgeCategory: string | null = null;
       let filterLineDirection: string | null = null;
-      try {
-        const filterResult = await pinnaclePreBetFilter({
-          matchId: candidate.matchId,
-          marketType: candidate.marketType,
-          selectionName: candidate.selectionName,
-          modelProbability: candidate.modelProbability,
-          marketOdds: backOdds,
-          opportunityScore: effectiveScore,
-          league: candidate.league,
-          pinnacleOdds: validation?.pinnacleOdds ?? null,
-          pinnacleImplied: validation?.pinnacleImplied ?? null,
-        });
+      if (!isShadowBet) {
+        try {
+          const filterResult = await pinnaclePreBetFilter({
+            matchId: candidate.matchId,
+            marketType: candidate.marketType,
+            selectionName: candidate.selectionName,
+            modelProbability: candidate.modelProbability,
+            marketOdds: backOdds,
+            opportunityScore: effectiveScore,
+            league: candidate.league,
+            pinnacleOdds: validation?.pinnacleOdds ?? null,
+            pinnacleImplied: validation?.pinnacleImplied ?? null,
+          });
 
-        filterEdgeCategory = filterResult.edgeCategory !== "filtered" ? filterResult.edgeCategory : null;
-        filterLineDirection = filterResult.lineDirection !== "unknown" ? filterResult.lineDirection : null;
+          filterEdgeCategory = filterResult.edgeCategory !== "filtered" ? filterResult.edgeCategory : null;
+          filterLineDirection = filterResult.lineDirection !== "unknown" ? filterResult.lineDirection : null;
 
-        if (!filterResult.passed) {
-          logger.info(
-            {
-              matchId: candidate.matchId,
-              market: candidate.marketType,
-              selection: candidate.selectionName,
-              edgePct: filterResult.edgePct.toFixed(2),
-              reason: filterResult.filterReason,
-              lineDirection: filterResult.lineDirection,
-            },
-            "Bet filtered out by Pinnacle pre-bet filter",
-          );
-          filterPassed = false;
+          if (!filterResult.passed) {
+            logger.info(
+              {
+                matchId: candidate.matchId,
+                market: candidate.marketType,
+                selection: candidate.selectionName,
+                edgePct: filterResult.edgePct.toFixed(2),
+                reason: filterResult.filterReason,
+                lineDirection: filterResult.lineDirection,
+              },
+              "Bet filtered out by Pinnacle pre-bet filter",
+            );
+            filterPassed = false;
+          }
+        } catch (filterErr) {
+          logger.error({ err: filterErr, matchId: candidate.matchId }, "Pinnacle pre-bet filter error — allowing bet through");
         }
-      } catch (filterErr) {
-        logger.error({ err: filterErr, matchId: candidate.matchId }, "Pinnacle pre-bet filter error — allowing bet through");
+      } else {
+        logger.info(
+          { matchId: candidate.matchId, universeTier: candidate.universeTier, market: candidate.marketType },
+          "Phase 2.B.2 shadow bet — bypassing Pinnacle pre-bet filter (no Pinnacle line for Tier B/C leagues by design)",
+        );
       }
 
       if (!filterPassed) continue;
@@ -1374,6 +1399,9 @@ export async function runTradingCycle(options?: {
         fairValueOdds: candidate.fairValueOdds,
         fairValueSource: candidate.fairValueSource,
         validatorBestOdds,
+        // Phase 2.B.2: tier carried through to placePaperBet for the
+        // shadow-stake branch.
+        universeTier: candidate.universeTier ?? null,
       });
     }
 
@@ -1427,6 +1455,10 @@ export async function runTradingCycle(options?: {
           fairValueOdds: order.fairValueOdds,
           fairValueSource: order.fairValueSource,
           validatorBestOdds: order.validatorBestOdds,
+          // Phase 2.B.2: tier propagated through so placePaperBet's shadow
+          // -stake branch fires for Tier B/C bets (stake=0, shadow_stake=
+          // full_Kelly × 0.25).
+          universeTier: order.universeTier,
         },
       );
 
