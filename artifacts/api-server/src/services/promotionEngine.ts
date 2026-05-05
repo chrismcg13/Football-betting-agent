@@ -5,7 +5,7 @@ import crypto from "crypto";
 
 const THRESHOLDS = {
   experimentToCandidate: {
-    minSampleSize: parseInt(process.env.PROMO_MIN_SAMPLE_SIZE ?? "30"),
+    minSampleSize: parseInt(process.env.PROMO_MIN_SAMPLE_SIZE ?? "25"),
     minRoi: parseFloat(process.env.PROMO_MIN_ROI ?? "3.0"),
     minClv: parseFloat(process.env.PROMO_MIN_CLV ?? "1.5"),
     minWinRate: parseFloat(process.env.PROMO_MIN_WIN_RATE ?? "52.0"),
@@ -79,7 +79,12 @@ async function computeMetricsForExperiment(experimentTag: string, tierFilter?: s
       COUNT(*) FILTER (WHERE status = 'won') as wins,
       COALESCE(SUM(settlement_pnl::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as total_pnl,
       COALESCE(SUM(stake::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as total_staked,
-      COALESCE(AVG(clv_pct::numeric) FILTER (WHERE status IN ('won', 'lost') AND clv_pct IS NOT NULL), 0) as avg_clv,
+      -- R14 winsorization (v2.5 calibration): clip individual clv_pct to ±50pp
+      -- before averaging so single long-shot outliers (e.g. +1500% on a 26.0
+      -- placement vs 1.55 close) don't corrupt the league average. Outliers
+      -- like Bundesliga's +85% mean and Serie A's +416% mean in the original
+      -- diagnostic were each driven by 1-3 such rows.
+      COALESCE(AVG(LEAST(50, GREATEST(-50, clv_pct::numeric))) FILTER (WHERE status IN ('won', 'lost') AND clv_pct IS NOT NULL), 0) as avg_clv,
       COALESCE(AVG(calculated_edge::numeric) FILTER (WHERE status IN ('won', 'lost')), 0) as avg_edge,
       COALESCE(AVG(
         CASE WHEN odds_at_placement::numeric > 0 THEN 1.0 / odds_at_placement::numeric ELSE NULL END
@@ -308,7 +313,9 @@ async function computeRollingMetrics(tag: string, window: number): Promise<{ roi
     SELECT 
       COALESCE(SUM(settlement_pnl::numeric), 0) as pnl,
       COALESCE(SUM(stake::numeric), 0) as staked,
-      COALESCE(AVG(clv_pct::numeric), 0) as clv
+      -- R14 winsorization (v2.5 calibration): same ±50pp clip as
+      -- computeMetricsForExperiment for consistent rolling-window CLV.
+      COALESCE(AVG(LEAST(50, GREATEST(-50, clv_pct::numeric))), 0) as clv
     FROM (
       SELECT settlement_pnl, stake, clv_pct
       FROM paper_bets
