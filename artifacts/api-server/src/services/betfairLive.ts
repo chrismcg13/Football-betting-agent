@@ -704,6 +704,17 @@ export async function reconcileSettlements(): Promise<{
       settlementPnl: paperBetsTable.settlementPnl,
       status: paperBetsTable.status,
       stake: paperBetsTable.stake,
+      // R6.1 (2026-05-05): added so the CLV block below can compute clv_pct
+      // correctly. The prior R6 patch referenced these fields without adding
+      // them to the projection — the queries silently filtered on undefined
+      // and never returned rows. No production impact (this writer is
+      // isLiveMode()-gated and live mode is currently off), but a latent
+      // bug for the live-mode flip.
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+      closingPinnacleOdds: paperBetsTable.closingPinnacleOdds,
     })
     .from(paperBetsTable)
     .where(
@@ -862,27 +873,49 @@ export async function reconcileSettlements(): Promise<{
         closingOddsProxy = Number(latestAnySource[0].backOdds);
       }
 
-      const latestPinnacle = await db
-        .select({ backOdds: oddsSnapshotsTable.backOdds })
-        .from(oddsSnapshotsTable)
-        .where(
-          and(
-            eq(oddsSnapshotsTable.matchId, bet.matchId),
-            eq(oddsSnapshotsTable.marketType, bet.marketType),
-            eq(oddsSnapshotsTable.selectionName, bet.selectionName),
-            inArray(oddsSnapshotsTable.source, ["oddspapi_pinnacle", "api_football_real:Pinnacle"]),
-          ),
-        )
-        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
-        .limit(1);
-      if (latestPinnacle[0]?.backOdds) {
-        const pinnacleClose = Number(latestPinnacle[0].backOdds);
-        if (pinnacleClose > 1) {
-          const placementOdds = Number(bet.oddsAtPlacement ?? 0);
-          if (placementOdds > 1) {
-            clvPct = ((placementOdds - pinnacleClose) / pinnacleClose) * 100;
-            clvPct = Math.round(clvPct * 1000) / 1000;
+      // R6.1 (2026-05-05): prefer paper_bets.closing_pinnacle_odds when non-null.
+      // See docs/r6-1-in-play-clv-fix-plan.md §0 for rationale. Mirror of the
+      // logic in paperTrading._settleBetsInner.
+      let pinnacleClose: number | null = null;
+      let pinnacleSource: "closing_column" | "snapshot" | null = null;
+      if (bet.closingPinnacleOdds != null) {
+        const fromColumn = Number(bet.closingPinnacleOdds);
+        if (fromColumn > 1) {
+          pinnacleClose = fromColumn;
+          pinnacleSource = "closing_column";
+        }
+      }
+      if (pinnacleClose == null) {
+        const latestPinnacle = await db
+          .select({ backOdds: oddsSnapshotsTable.backOdds })
+          .from(oddsSnapshotsTable)
+          .where(
+            and(
+              eq(oddsSnapshotsTable.matchId, bet.matchId),
+              eq(oddsSnapshotsTable.marketType, bet.marketType),
+              eq(oddsSnapshotsTable.selectionName, bet.selectionName),
+              inArray(oddsSnapshotsTable.source, ["oddspapi_pinnacle", "api_football_real:Pinnacle"]),
+            ),
+          )
+          .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+          .limit(1);
+        if (latestPinnacle[0]?.backOdds) {
+          const fromSnapshot = Number(latestPinnacle[0].backOdds);
+          if (fromSnapshot > 1) {
+            pinnacleClose = fromSnapshot;
+            pinnacleSource = "snapshot";
           }
+        }
+      }
+      if (pinnacleClose != null) {
+        const placementOdds = Number(bet.oddsAtPlacement ?? 0);
+        if (placementOdds > 1) {
+          clvPct = ((placementOdds - pinnacleClose) / pinnacleClose) * 100;
+          clvPct = Math.round(clvPct * 1000) / 1000;
+          logger.info(
+            { betId: bet.id, placementOdds, pinnacleClose, pinnacleSource, clvPct },
+            "CLV calculated from Pinnacle source (live-mode reconciliation)",
+          );
         }
       }
     } catch {

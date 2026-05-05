@@ -2021,29 +2021,52 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         closingOddsProxy = Number(latestAnySource[0].backOdds);
       }
 
-      const latestPinnacle = await db
-        .select({ backOdds: oddsSnapshotsTable.backOdds })
-        .from(oddsSnapshotsTable)
-        .where(
-          and(
-            eq(oddsSnapshotsTable.matchId, bet.matchId),
-            eq(oddsSnapshotsTable.marketType, bet.marketType),
-            eq(oddsSnapshotsTable.selectionName, bet.selectionName),
-            inArray(oddsSnapshotsTable.source, ["oddspapi_pinnacle", "api_football_real:Pinnacle"]),
-          ),
-        )
-        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
-        .limit(1);
-      if (latestPinnacle[0]?.backOdds) {
-        const pinnacleClose = Number(latestPinnacle[0].backOdds);
-        if (pinnacleClose > 1) {
-          clvPct = ((odds - pinnacleClose) / pinnacleClose) * 100;
-          clvPct = Math.round(clvPct * 1000) / 1000;
-          logger.info(
-            { betId: bet.id, placementOdds: odds, pinnacleClose, clvPct },
-            "CLV calculated from Pinnacle snapshot (oddspapi_pinnacle | api_football_real:Pinnacle)",
-          );
+      // R6.1 (2026-05-05): prefer paper_bets.closing_pinnacle_odds when non-null.
+      // The column is frozen pre-kickoff by Writer A (fetchAndStoreClosingLineForPendingBets,
+      // oddsPapi.ts:2596-2731). The fallback odds_snapshots Pinnacle filter takes
+      // the LATEST Pinnacle snapshot, which can be POST-kickoff in-play for
+      // matches already started — using it as "closing line" produces strongly-
+      // negative CLV on bets that subsequently won (in-play prices compress
+      // toward 1.0). closing_pinnacle_odds is unambiguous strict-pre-kickoff.
+      // See docs/r6-1-in-play-clv-fix-plan.md.
+      let pinnacleClose: number | null = null;
+      let pinnacleSource: "closing_column" | "snapshot" | null = null;
+      if (bet.closingPinnacleOdds != null) {
+        const fromColumn = Number(bet.closingPinnacleOdds);
+        if (fromColumn > 1) {
+          pinnacleClose = fromColumn;
+          pinnacleSource = "closing_column";
         }
+      }
+      if (pinnacleClose == null) {
+        const latestPinnacle = await db
+          .select({ backOdds: oddsSnapshotsTable.backOdds })
+          .from(oddsSnapshotsTable)
+          .where(
+            and(
+              eq(oddsSnapshotsTable.matchId, bet.matchId),
+              eq(oddsSnapshotsTable.marketType, bet.marketType),
+              eq(oddsSnapshotsTable.selectionName, bet.selectionName),
+              inArray(oddsSnapshotsTable.source, ["oddspapi_pinnacle", "api_football_real:Pinnacle"]),
+            ),
+          )
+          .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+          .limit(1);
+        if (latestPinnacle[0]?.backOdds) {
+          const fromSnapshot = Number(latestPinnacle[0].backOdds);
+          if (fromSnapshot > 1) {
+            pinnacleClose = fromSnapshot;
+            pinnacleSource = "snapshot";
+          }
+        }
+      }
+      if (pinnacleClose != null) {
+        clvPct = ((odds - pinnacleClose) / pinnacleClose) * 100;
+        clvPct = Math.round(clvPct * 1000) / 1000;
+        logger.info(
+          { betId: bet.id, placementOdds: odds, pinnacleClose, pinnacleSource, clvPct },
+          "CLV calculated from Pinnacle source",
+        );
       }
     } catch (_err) {
       // CLV is best-effort; don't block settlement
