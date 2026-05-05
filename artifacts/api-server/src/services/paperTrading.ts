@@ -680,9 +680,20 @@ export async function placePaperBet(
   };
 
   // ── Banned-market hardstop (uses module-level BANNED_MARKETS) ─────────────
-  if (BANNED_MARKETS.has(marketType)) {
+  // Wave 2 #4 (2026-05-05): production track keeps bans; experiment track
+  // (Tier B/C, £0 stake architectural guarantee) bypasses them. Strategic
+  // intent: let the model re-prove edge or non-edge with current
+  // post-Replit-migration infrastructure. £0 stake means zero capital at
+  // risk; correlation + duplicate-bet rejection still apply.
+  if (BANNED_MARKETS.has(marketType) && !isShadowBet) {
     logger.warn({ matchId, marketType, selectionName }, "HARDSTOP: Banned market — bet blocked at placement");
     return logReject(`Banned market: ${marketType}`);
+  }
+  if (BANNED_MARKETS.has(marketType) && isShadowBet) {
+    logger.info(
+      { matchId, marketType, selectionName, universeTier },
+      "Wave 2 #4: experiment-track shadow bet on previously-banned market — admitted for relearning",
+    );
   }
 
   // ── Edge concentration gates ─────────────────────────────────────────────

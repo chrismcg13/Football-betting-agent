@@ -789,21 +789,26 @@ export async function detectValueBets(options?: {
   // Pre-load everything once into Maps for O(1) lookups inside the loop.
   const preloadStart = Date.now();
 
-  // 1. Competitions config (per league: apiFootballId, seasonalStart, seasonalEnd)
+  // 1. Competitions config (per league: apiFootballId, seasonalStart, seasonalEnd, universeTier)
+  // universeTier added Wave 2 #4 — used to gate the per-selection BANNED_MARKETS
+  // filter so experiment-track candidates (Tier B/C) flow through; production-
+  // track (Tier A) keeps the bans.
   const competitionRows = await db
     .select({
       name: competitionConfigTable.name,
       apiFootballId: competitionConfigTable.apiFootballId,
       seasonalStart: competitionConfigTable.seasonalStart,
       seasonalEnd: competitionConfigTable.seasonalEnd,
+      universeTier: competitionConfigTable.universeTier,
     })
     .from(competitionConfigTable);
-  const competitionMap = new Map<string, { apiFootballId: number; seasonalStart: string | null; seasonalEnd: string | null }>();
+  const competitionMap = new Map<string, { apiFootballId: number; seasonalStart: string | null; seasonalEnd: string | null; universeTier: string | null }>();
   for (const c of competitionRows) {
     competitionMap.set(c.name, {
       apiFootballId: c.apiFootballId ?? 0,
       seasonalStart: c.seasonalStart,
       seasonalEnd: c.seasonalEnd,
+      universeTier: c.universeTier ?? null,
     });
   }
 
@@ -981,6 +986,11 @@ export async function detectValueBets(options?: {
   for (const match of matches) {
     const ccRow = competitionMap.get(match.league);
     const matchLeagueId = ccRow?.apiFootballId ?? 0;
+    // Wave 2 #4 (2026-05-05): match-level universe_tier so per-selection
+    // BANNED_MARKETS filter can gate by data_tier. Tier A keeps bans;
+    // Tier B/C (experiment track) bypasses to admit relearning candidates.
+    const matchUniverseTier = ccRow?.universeTier ?? null;
+    const isExperimentTrack = matchUniverseTier === "B" || matchUniverseTier === "C";
     const seasonalPhase = ccRow
       ? detectSeasonalPhase(ccRow.seasonalStart, ccRow.seasonalEnd, match.league)
       : ("unknown" as const);
@@ -1031,8 +1041,12 @@ export async function detectValueBets(options?: {
       const marketType = groupKey.slice(0, sep);
       const selectionName = groupKey.slice(sep + 1);
 
-      // Banned-market hardstop (cheap check before pricing selection)
-      if (BANNED_MARKETS.has(marketType)) continue;
+      // Banned-market hardstop (cheap check before pricing selection).
+      // Wave 2 #4 (2026-05-05): experiment-track (Tier B/C) bypasses bans —
+      // candidates flow through to placement where the data_tier-gated
+      // hardstop at paperTrading.ts:683 confirms £0 stake. Production
+      // track (Tier A) keeps the bans untouched.
+      if (BANNED_MARKETS.has(marketType) && !isExperimentTrack) continue;
 
       const pricing = selectPricingSources(groupRows);
       if (!pricing.ok) {
