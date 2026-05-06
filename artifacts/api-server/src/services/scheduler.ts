@@ -17,6 +17,7 @@ import {
   deactivateLowValueLeagues,
   getLeaguesWithPendingBets,
   capturePreKickoffLineups,
+  fetchInjuriesForUpcomingMatches,
   getApiBudgetStatus,
 } from "./apiFootball";
 import { runXGIngestion } from "./xgIngestionService";
@@ -2265,6 +2266,18 @@ export function startScheduler(): void {
     });
   }, { timezone: "UTC" });
   logger.info("Pre-kickoff lineup capture active — every 15 min");
+
+  // Sub-phase 7.0a: daily injury ingestion. Pulls /injuries for fixtures
+  // kicking off in the next 24h with placed bets. ~50-100 calls/day, well
+  // within the 75k/day budget. No feature wiring yet — sub-commit 7.0b
+  // validates predictive power before any feature ships.
+  cron.schedule("0 6 * * *", () => {
+    logger.info("Injury ingestion triggered (daily 06:00 UTC)");
+    void fetchInjuriesForUpcomingMatches().catch((err) => {
+      logger.error({ err }, "Injury ingestion failed");
+    });
+  }, { timezone: "UTC" });
+  logger.info("Injury ingestion scheduler active — daily at 06:00 UTC");
 
   cron.schedule("0 3 1 * *", () => {
     logger.info("Monthly league performance scoring + deactivation triggered");

@@ -2030,3 +2030,112 @@ export async function capturePreKickoffLineups(): Promise<{
   logger.info({ checked: matchesWithBets.rows.length, captured, keyPlayerMissing }, "Pre-kickoff lineup capture complete");
   return { checked: matchesWithBets.rows.length, captured, keyPlayerMissing };
 }
+
+// ─── Sub-phase 7.0a: API-Football /injuries ingestion ────────────────────────
+// Pulls per-fixture injury data into injury_reports for prospective accumulation.
+// No feature wiring yet — sub-commit 7.0b runs the retrospective predictive-power
+// validation against settled bets before any feature ships into prediction.
+
+interface ApiInjury {
+  player: { id: number | null; name: string | null; type: string | null; reason: string | null };
+  team: { id: number; name: string };
+  fixture: { id: number };
+  league: { id: number; season: number };
+}
+
+export async function fetchAndStoreInjuriesForFixture(
+  apiFixtureId: number,
+  matchId: number | null,
+): Promise<{ inserted: number; skipped: boolean }> {
+  if (!(await canMakeRequest())) return { inserted: 0, skipped: true };
+
+  const result = await fetchApiFootball<ApiInjury[]>("/injuries", { fixture: apiFixtureId });
+  if (!result) return { inserted: 0, skipped: true };
+
+  // Idempotent: delete prior rows for this fixture, then insert the current
+  // snapshot. A player who has recovered between fetches no longer appears.
+  await db.execute(sql`
+    DELETE FROM injury_reports WHERE api_fixture_id = ${apiFixtureId}
+  `);
+
+  if (result.length === 0) return { inserted: 0, skipped: false };
+
+  let inserted = 0;
+  for (const inj of result) {
+    const playerName = inj.player?.name ?? null;
+    const rawType = inj.player?.type ?? null;
+    if (!playerName || !rawType) continue;
+    // API-Football returns the type field as 'Missing Fixture' or 'Questionable'.
+    // Skip anything else defensively (matches the CHECK constraint).
+    if (rawType !== "Missing Fixture" && rawType !== "Questionable") continue;
+    if (!inj.team?.id || !inj.team?.name) continue;
+
+    await db.execute(sql`
+      INSERT INTO injury_reports (
+        api_fixture_id, match_id, team_api_id, team_name,
+        player_api_id, player_name, injury_type, injury_reason
+      ) VALUES (
+        ${apiFixtureId}, ${matchId},
+        ${inj.team.id}, ${inj.team.name},
+        ${inj.player?.id ?? null}, ${playerName},
+        ${rawType}, ${inj.player?.reason ?? null}
+      )
+    `);
+    inserted++;
+  }
+  return { inserted, skipped: false };
+}
+
+export async function fetchInjuriesForUpcomingMatches(): Promise<{
+  checked: number;
+  fixturesIngested: number;
+  injuriesInserted: number;
+  skippedBudget: number;
+}> {
+  // Fixtures kicking off in the next 24h that have placed bets. Mirrors the
+  // capturePreKickoffLineups selection but with a 24h window (vs 30-90min)
+  // so daily 06:00 UTC cron covers the day's slate before kickoffs.
+  const now = new Date();
+  const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+  const matchesWithBets = await db.execute(sql`
+    SELECT DISTINCT m.id, m.api_fixture_id, m.kickoff_time
+    FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    WHERE pb.status = 'pending'
+      AND m.status = 'scheduled'
+      AND m.kickoff_time BETWEEN ${now} AND ${in24h}
+      AND m.api_fixture_id IS NOT NULL
+  `);
+
+  const rows = matchesWithBets.rows as Array<{ id: number; api_fixture_id: number; kickoff_time: Date }>;
+  let fixturesIngested = 0;
+  let injuriesInserted = 0;
+  let skippedBudget = 0;
+
+  for (const row of rows) {
+    const fixtureId = Number(row.api_fixture_id);
+    if (!fixtureId) continue;
+    if (!(await canMakeRequest())) {
+      skippedBudget++;
+      continue;
+    }
+    try {
+      const r = await fetchAndStoreInjuriesForFixture(fixtureId, Number(row.id));
+      if (r.skipped) {
+        skippedBudget++;
+      } else {
+        fixturesIngested++;
+        injuriesInserted += r.inserted;
+      }
+    } catch (err) {
+      logger.error({ err, fixtureId, matchId: row.id }, "Injury fetch failed for fixture");
+    }
+  }
+
+  logger.info(
+    { checked: rows.length, fixturesIngested, injuriesInserted, skippedBudget },
+    "Injury ingestion complete",
+  );
+  return { checked: rows.length, fixturesIngested, injuriesInserted, skippedBudget };
+}

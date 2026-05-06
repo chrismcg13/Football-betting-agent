@@ -1175,6 +1175,47 @@ export async function runMigrations() {
         WHERE legacy_regime = false
     `);
 
+    // Sub-phase 7.0a: injury_reports — per-fixture-per-team-per-player snapshot
+    // ingested from API-Football /injuries. Idempotent fetch pattern:
+    // delete-then-insert per (api_fixture_id, team_api_id) so a fresh fetch
+    // always reflects the current API state (player recovers → row removed).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS injury_reports (
+        id SERIAL PRIMARY KEY,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        api_fixture_id INTEGER NOT NULL,
+        match_id INTEGER REFERENCES matches(id),
+        team_api_id INTEGER NOT NULL,
+        team_name TEXT NOT NULL,
+        player_api_id INTEGER,
+        player_name TEXT NOT NULL,
+        injury_type TEXT NOT NULL,
+        injury_reason TEXT
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'injury_reports_type_check'
+        ) THEN
+          ALTER TABLE injury_reports
+            ADD CONSTRAINT injury_reports_type_check
+            CHECK (injury_type IN ('Missing Fixture','Questionable'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS injury_reports_fixture_team_idx
+        ON injury_reports(api_fixture_id, team_api_id)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS injury_reports_match_idx
+        ON injury_reports(match_id)
+        WHERE match_id IS NOT NULL
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
