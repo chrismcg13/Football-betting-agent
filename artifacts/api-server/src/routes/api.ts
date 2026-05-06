@@ -1990,6 +1990,7 @@ router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
 
 import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runCounterfactualReplay, runProposalGenerator, listPendingThresholdRevisions, reviewPendingThresholdRevision, type PendingRevisionStatusFilter } from "../services/promotionEngine";
 import { runOngoingAudit } from "../services/auditCron";
+import { runClvTimeBucketRetrospective } from "../services/oddsPapiRetrospective";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 
 router.get("/admin/experiments", async (_req, res) => {
@@ -3154,6 +3155,20 @@ router.post("/admin/run-ongoing-audit", async (req, res) => {
     const { dryRun, lookbackDays } = req.body ?? {};
     const result = await runOngoingAudit({
       dryRun: dryRun === true,
+      lookbackDays: typeof lookbackDays === "number" ? lookbackDays : undefined,
+    });
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Sub-phase 8.a: CLV-by-time-to-kickoff retrospective. Read-only.
+// Body: { lookbackDays?: number (default 90, hard-floored at 2026-05-03) }
+router.post("/admin/run-clv-time-bucket-retrospective", async (req, res) => {
+  try {
+    const { lookbackDays } = req.body ?? {};
+    const result = await runClvTimeBucketRetrospective({
       lookbackDays: typeof lookbackDays === "number" ? lookbackDays : undefined,
     });
     res.json({ success: true, result });
