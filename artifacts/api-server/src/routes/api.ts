@@ -1794,6 +1794,61 @@ router.post("/admin/settle", async (_req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// POST /api/admin/reconcile-stale-pending — manually trigger the post-kickoff
+// stale-pending escalator. Normally runs hourly; this is for on-demand
+// triage. Idempotent (alert dedup + state checks make repeat calls safe).
+// ─────────────────────────────────────────────
+router.post("/admin/reconcile-stale-pending", async (_req, res) => {
+  logger.info("Manual stale-pending reconciliation triggered via API");
+  try {
+    const { reconcileStalePending } = await import("../services/paperTrading");
+    const result = await reconcileStalePending();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "Manual stale-pending reconciliation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/reconcile-live-balance — on-demand balance vs ledger check.
+// Returns drift diagnostics; alerts at warning/critical thresholds. No-op
+// outside live mode (returns null result).
+// ─────────────────────────────────────────────
+router.post("/admin/reconcile-live-balance", async (_req, res) => {
+  logger.info("Manual live balance reconciliation triggered via API");
+  try {
+    const { reconcileLiveBalance } = await import("../services/liveReconciliation");
+    const result = await reconcileLiveBalance();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual live balance reconciliation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/admin/reconcile-live-statement — on-demand account-statement walk.
+// Optional `lookbackHours` body param (default 48). Detects orphans, missing
+// entries, and per-bet P&L drift. No-op outside live mode.
+// ─────────────────────────────────────────────
+router.post("/admin/reconcile-live-statement", async (req, res) => {
+  logger.info("Manual live statement reconciliation triggered via API");
+  try {
+    const lookbackHours = Number((req.body as { lookbackHours?: number })?.lookbackHours ?? 48);
+    if (!Number.isFinite(lookbackHours) || lookbackHours <= 0 || lookbackHours > 720) {
+      return res.status(400).json({ success: false, message: "lookbackHours must be between 1 and 720" });
+    }
+    const { reconcileLiveAccountStatement } = await import("../services/liveReconciliation");
+    const result = await reconcileLiveAccountStatement(lookbackHours);
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual live statement reconciliation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// ─────────────────────────────────────────────
 // POST /api/admin/void-banned-bets — void all pending bets on banned markets
 // Refunds stakes to bankroll. Safe to run multiple times (idempotent).
 // ─────────────────────────────────────────────
@@ -1933,7 +1988,7 @@ router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
 // Experiment Pipeline API
 // ─────────────────────────────────────────────
 
-import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runRetrospectiveAnalysis } from "../services/promotionEngine";
+import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runRetrospectiveAnalysis, runProposalGenerator } from "../services/promotionEngine";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 
 router.get("/admin/experiments", async (_req, res) => {
@@ -2965,6 +3020,31 @@ router.post("/admin/run-retrospective-analysis", async (req, res) => {
       thresholdName,
       lookbackDays: typeof lookbackDays === "number" ? lookbackDays : undefined,
       alternatives: Array.isArray(alternatives) ? alternatives.filter((v: any) => typeof v === "number") : undefined,
+    });
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Sub-phase 6.3: proposal generator (Path A — pragmatic).
+// Body: { scope?: string, thresholdNames?: string[], lookbackDays?: number,
+//         dryRun?: boolean (default false) }
+// Writes are gated by env flag THRESHOLD_PROPOSAL_GENERATOR_ENABLED (default
+// false). When dryRun=true, never writes regardless of flag — returns the
+// proposals that WOULD have been written. When flag=false and dryRun=false,
+// proposals are computed but not persisted (response includes
+// proposalGeneratorEnabledFlag=false so the caller can see why).
+router.post("/admin/run-proposal-generator", async (req, res) => {
+  try {
+    const { scope, thresholdNames, lookbackDays, dryRun } = req.body ?? {};
+    const result = await runProposalGenerator({
+      scope: typeof scope === "string" ? scope : undefined,
+      thresholdNames: Array.isArray(thresholdNames)
+        ? thresholdNames.filter((n: any) => typeof n === "string")
+        : undefined,
+      lookbackDays: typeof lookbackDays === "number" ? lookbackDays : undefined,
+      dryRun: dryRun === true,
     });
     res.json({ success: true, result });
   } catch (err) {

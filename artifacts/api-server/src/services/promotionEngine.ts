@@ -1102,6 +1102,386 @@ export async function runRetrospectiveAnalysis(
   };
 }
 
+// ─── Sub-phase 6.3: proposal generator (Path A — pragmatic) ────────────────
+// Per docs/phase-2-wave-3-subphase-6-plan.md §5 sub-commit 6.3.
+//
+// For each (scope × threshold_dim), runs runRetrospectiveAnalysis and
+// applies a conservative decision rule:
+//   - Skip if nEvaluations < 30 (insufficient data)
+//   - Skip if distribution-shift alert active for the archetype
+//   - Skip if a proposal for this (scope, threshold_name) was reviewed in
+//     the last 30 days (user-override stickiness)
+//   - direction = "tighter" if alt makes the threshold stricter, "looser"
+//     otherwise (handles min_* vs max_* semantics)
+//   - improvement_score = +1 × |kellyFractionImpactSum|  if  (baseline_kg < 0
+//     AND alt is tighter)  OR  (baseline_kg > 0 AND alt is looser);
+//     otherwise -1 × |kellyFractionImpactSum|
+//   - Pick alt with highest positive improvement_score AND
+//     |kellyFractionImpactSum| >= MIN_IMPACT (default 0.1)
+//   - Tighter → INSERT with status='approved' (autonomous)
+//   - Looser  → INSERT with status='pending' (user review in sub-commit 6.4)
+//
+// Path A is heuristic-based (uses sign of realisedKellyGrowthRate as
+// performance signal, magnitude misleading per Signal B from 6.2 verification).
+// Full counterfactual replay is a follow-up sub-commit (6.3.5) before 6.5
+// cron-on. This deliverable establishes the proposal/audit pipeline with
+// honest disclosures.
+
+const MAX_AUTONOMOUS_KELLY_FRACTION = 0.5;
+const PROPOSAL_STICKINESS_DAYS = 30;
+const PROPOSAL_MIN_EVALUATIONS = 30;
+const PROPOSAL_MIN_KELLY_IMPACT = 0.1;
+const DISTRIBUTION_SHIFT_LOOKBACK_HOURS = 24;
+const DISTRIBUTION_SHIFT_BREACH_THRESHOLD = 2;
+
+// Threshold names where the meaning of "tighter" is non-obvious. Anything
+// matching `.max_*` is "lower = stricter"; anything else with a numeric
+// value is "higher = stricter" (the .min_* convention). The rolling_window
+// dimension has no strictness sense and is excluded from auto-proposals.
+const PROPOSAL_EXCLUDED_THRESHOLDS = new Set<string>([
+  "demotion_promoted_to_candidate.rolling_window",
+]);
+
+const ALL_THRESHOLD_NAMES: readonly string[] = [
+  "experiment_to_candidate.min_sample_size",
+  "experiment_to_candidate.min_roi",
+  "experiment_to_candidate.min_clv",
+  "experiment_to_candidate.min_win_rate",
+  "experiment_to_candidate.max_p_value",
+  "experiment_to_candidate.min_weeks_active",
+  "experiment_to_candidate.min_edge",
+  "candidate_to_promoted.min_sample_size",
+  "candidate_to_promoted.min_roi",
+  "candidate_to_promoted.min_clv",
+  "candidate_to_promoted.max_p_value",
+  "candidate_to_promoted.min_weeks_active",
+  "demotion_promoted_to_candidate.min_roi",
+  "demotion_promoted_to_candidate.min_clv",
+  "demotion_promoted_to_candidate.max_consecutive_negative_weeks",
+  "demotion_candidate_to_experiment.min_roi",
+  "demotion_candidate_to_experiment.min_clv",
+  "abandon_threshold.min_sample",
+  "abandon_threshold.max_roi",
+  "abandon_threshold.max_p_value",
+];
+
+function strictnessDirection(thresholdName: string, currentValue: number, altValue: number): "tighter" | "looser" {
+  const isMaxThreshold = /\.max_/.test(thresholdName);
+  if (isMaxThreshold) return altValue < currentValue ? "tighter" : "looser";
+  return altValue > currentValue ? "tighter" : "looser";
+}
+
+export interface ProposalGeneratorOpts {
+  scope?: string;
+  thresholdNames?: string[];
+  lookbackDays?: number;
+  dryRun?: boolean;
+}
+
+export interface ProposalRecord {
+  scope: string;
+  thresholdName: string;
+  currentValue: number;
+  proposedValue: number;
+  direction: "tighter" | "looser";
+  status: "approved" | "pending";
+  improvementScore: number;
+  kellyFractionImpactSum: number;
+  baselineKellyGrowth: number;
+  nEvaluationsInScope: number;
+  reasoning: string;
+}
+
+export interface ProposalGeneratorSkip {
+  scope: string;
+  thresholdName: string;
+  reason: string;
+}
+
+export interface ProposalGeneratorResult {
+  scopesProcessed: string[];
+  thresholdsConsidered: number;
+  proposalsApproved: number;
+  proposalsPending: number;
+  skipped: ProposalGeneratorSkip[];
+  proposals: ProposalRecord[];
+  dryRun: boolean;
+  proposalGeneratorEnabledFlag: boolean;
+}
+
+async function getActiveDistributionShiftArchetypes(): Promise<Set<string>> {
+  const cutoff = new Date(Date.now() - DISTRIBUTION_SHIFT_LOOKBACK_HOURS * 60 * 60 * 1000);
+  const rows = await db.execute(sql`
+    SELECT DISTINCT ON (subject)
+      subject,
+      supporting_metrics
+    FROM model_decision_audit_log
+    WHERE decision_type = 'distribution_shift_observation'
+      AND decision_at >= ${cutoff}
+    ORDER BY subject, decision_at DESC
+  `);
+  const out = new Set<string>();
+  for (const r of (rows as any).rows ?? []) {
+    const breaching = (r.supporting_metrics as any)?.consecutive_windows_breaching ?? 0;
+    if (breaching >= DISTRIBUTION_SHIFT_BREACH_THRESHOLD) {
+      const subject = r.subject as string;
+      if (subject?.startsWith("archetype:")) {
+        out.add(subject.slice("archetype:".length));
+      }
+    }
+  }
+  return out;
+}
+
+async function getStickyOverrides(): Promise<Set<string>> {
+  // Returns Set of "${scope}|${threshold_name}" pairs that are sticky
+  // (any reviewed_at within last 30 days, regardless of status).
+  const cutoff = new Date(Date.now() - PROPOSAL_STICKINESS_DAYS * 24 * 60 * 60 * 1000);
+  const rows = await db.execute(sql`
+    SELECT DISTINCT scope, threshold_name
+    FROM pending_threshold_revisions
+    WHERE reviewed_at >= ${cutoff}
+  `);
+  const out = new Set<string>();
+  for (const r of (rows as any).rows ?? []) {
+    out.add(`${r.scope}|${r.threshold_name}`);
+  }
+  return out;
+}
+
+async function buildDefaultScopeList(): Promise<string[]> {
+  const scopes: string[] = ["global"];
+
+  // Per-archetype: include all archetypes from competition_config in tiers A/B/C.
+  const archetypeRows = await db.execute(sql`
+    SELECT DISTINCT archetype FROM competition_config
+    WHERE archetype IS NOT NULL AND universe_tier IN ('A','B','C')
+  `);
+  for (const r of (archetypeRows as any).rows ?? []) {
+    if (r.archetype) scopes.push(`per_archetype:${r.archetype}`);
+  }
+
+  // Per-league: only leagues with sufficient evaluation history (>= 30 evals
+  // post-2026-05-03). Avoids generating dead proposals for leagues with no signal.
+  const leagueRows = await db.execute(sql`
+    SELECT er.league_code
+    FROM experiment_registry er
+    JOIN graduation_evaluation_log gel ON gel.experiment_tag = er.experiment_tag
+    WHERE gel.evaluated_at >= ${THRESHOLD_RETROSPECTIVE_MIN_DATE}
+      AND er.league_code IS NOT NULL
+    GROUP BY er.league_code
+    HAVING COUNT(*) >= ${PROPOSAL_MIN_EVALUATIONS}
+  `);
+  for (const r of (leagueRows as any).rows ?? []) {
+    if (r.league_code) scopes.push(`per_league:${r.league_code}`);
+  }
+
+  return scopes;
+}
+
+function archetypeForScope(scope: string): string | null {
+  if (scope.startsWith("per_archetype:")) return scope.slice("per_archetype:".length);
+  return null;
+}
+
+async function archetypeForLeagueScope(scope: string): Promise<string | null> {
+  if (!scope.startsWith("per_league:")) return null;
+  return getArchetypeForLeague(scope.slice("per_league:".length));
+}
+
+export async function runProposalGenerator(
+  opts: ProposalGeneratorOpts = {},
+): Promise<ProposalGeneratorResult> {
+  const dryRun = opts.dryRun ?? false;
+  const flagRaw = process.env.THRESHOLD_PROPOSAL_GENERATOR_ENABLED ?? "false";
+  const flagEnabled = flagRaw.toLowerCase() === "true";
+  const willWrite = !dryRun && flagEnabled;
+
+  const scopes = opts.scope ? [opts.scope] : await buildDefaultScopeList();
+  const thresholds = (opts.thresholdNames ?? ALL_THRESHOLD_NAMES)
+    .filter((n) => !PROPOSAL_EXCLUDED_THRESHOLDS.has(n));
+
+  const flaggedArchetypes = await getActiveDistributionShiftArchetypes();
+  const sticky = await getStickyOverrides();
+
+  const proposals: ProposalRecord[] = [];
+  const skipped: ProposalGeneratorSkip[] = [];
+
+  for (const scope of scopes) {
+    // Archetype-blocking: skip per_archetype scopes flagged; also skip per_league
+    // scopes whose archetype is flagged (the model is wrong about that archetype,
+    // so threshold tweaks won't fix it).
+    const directArchetype = archetypeForScope(scope);
+    const indirectArchetype = await archetypeForLeagueScope(scope);
+    const blockingArchetype = directArchetype && flaggedArchetypes.has(directArchetype)
+      ? directArchetype
+      : indirectArchetype && flaggedArchetypes.has(indirectArchetype)
+        ? indirectArchetype
+        : null;
+    if (blockingArchetype) {
+      for (const t of thresholds) {
+        skipped.push({ scope, thresholdName: t, reason: `distribution_shift_active:${blockingArchetype}` });
+      }
+      continue;
+    }
+
+    for (const thresholdName of thresholds) {
+      // Stickiness: don't propose against an override reviewed within 30d.
+      if (sticky.has(`${scope}|${thresholdName}`)) {
+        skipped.push({ scope, thresholdName, reason: "sticky_30d_override" });
+        continue;
+      }
+
+      let retro: RetrospectiveAnalysisResult;
+      try {
+        retro = await runRetrospectiveAnalysis({
+          scope,
+          thresholdName,
+          lookbackDays: opts.lookbackDays,
+        });
+      } catch (err) {
+        skipped.push({ scope, thresholdName, reason: `retrospective_failed:${String(err).slice(0, 80)}` });
+        continue;
+      }
+
+      if (retro.baselineMetrics.nEvaluationsInScope < PROPOSAL_MIN_EVALUATIONS) {
+        skipped.push({ scope, thresholdName, reason: `insufficient_data_n=${retro.baselineMetrics.nEvaluationsInScope}` });
+        continue;
+      }
+
+      const baselineKg = retro.baselineMetrics.realisedKellyGrowthRate;
+
+      // Pick the alternative with highest positive improvement_score.
+      let bestAlt: RetrospectiveAlternative | null = null;
+      let bestImprovement = 0;
+      let bestStrictness: "tighter" | "looser" | null = null;
+
+      for (const alt of retro.alternatives) {
+        if (Math.abs(alt.kellyFractionImpactSum) < PROPOSAL_MIN_KELLY_IMPACT) continue;
+        const direction = strictnessDirection(thresholdName, retro.currentValue, alt.value);
+        // Direction-of-improvement rule:
+        //   bad performance (baseline<0): tighter helps, looser hurts
+        //   good performance (baseline>0): looser helps, tighter hurts
+        //   ambiguous (baseline≈0): no proposal
+        const directionSign =
+          baselineKg < -1e-9 && direction === "tighter" ? +1 :
+          baselineKg >  1e-9 && direction === "looser"  ? +1 :
+          -1;
+        const improvement = directionSign * Math.abs(alt.kellyFractionImpactSum);
+        if (improvement > bestImprovement) {
+          bestImprovement = improvement;
+          bestAlt = alt;
+          bestStrictness = direction;
+        }
+      }
+
+      if (!bestAlt || !bestStrictness || bestImprovement <= 0) {
+        skipped.push({ scope, thresholdName, reason: "no_positive_improvement_signal" });
+        continue;
+      }
+
+      // MAX_AUTONOMOUS_KELLY_FRACTION ceiling: if this proposal would raise
+      // any tier's kelly_fraction beyond 0.5 (e.g. by promoting more tags
+      // faster), force status='pending' instead of autonomous.
+      // For Path A heuristic: applies only when bestStrictness === 'looser'.
+      // Tighter never raises kelly_fraction.
+
+      const status: "approved" | "pending" = bestStrictness === "tighter" ? "approved" : "pending";
+
+      const reasoning =
+        `Path A heuristic proposal (sub-commit 6.3): scope=${scope}, ` +
+        `threshold=${thresholdName} ${retro.currentValue} → ${bestAlt.value} ` +
+        `(${bestStrictness}). Baseline realised Kelly-growth=${baselineKg.toFixed(4)} ` +
+        `over ${retro.baselineMetrics.nEvaluationsInScope} evaluations, ` +
+        `${retro.baselineMetrics.nSettledBetsInScope} settled bets. ` +
+        `Alternative would flip ${bestAlt.wouldChangeNEvaluations} evaluation(s) ` +
+        `across ${bestAlt.wouldChangeNTags} tag(s), kelly_fraction impact ` +
+        `magnitude=${bestAlt.kellyFractionImpactSum.toFixed(3)}. ` +
+        `NOTE: Heuristic (kelly_fraction-impact-magnitude × performance sign), ` +
+        `not full counterfactual replay. Sign-of-realised-Kelly-growth used as ` +
+        `direction signal (magnitude misleading per Signal B in 6.2 verification).`;
+
+      proposals.push({
+        scope,
+        thresholdName,
+        currentValue: retro.currentValue,
+        proposedValue: bestAlt.value,
+        direction: bestStrictness,
+        status,
+        improvementScore: bestImprovement,
+        kellyFractionImpactSum: bestAlt.kellyFractionImpactSum,
+        baselineKellyGrowth: baselineKg,
+        nEvaluationsInScope: retro.baselineMetrics.nEvaluationsInScope,
+        reasoning,
+      });
+    }
+  }
+
+  let proposalsApproved = 0;
+  let proposalsPending = 0;
+  if (willWrite) {
+    for (const p of proposals) {
+      const supportingMetrics = {
+        baseline_realised_kelly_growth_rate: p.baselineKellyGrowth,
+        n_evaluations_in_scope: p.nEvaluationsInScope,
+        kelly_fraction_impact_sum: p.kellyFractionImpactSum,
+        improvement_score: p.improvementScore,
+      };
+      const reviewedAt = p.status === "approved" ? new Date() : null;
+      const reviewedBy = p.status === "approved" ? "auto_proposal_generator" : null;
+      const reviewNote = p.status === "approved" ? "autonomous tightening (Path A heuristic)" : null;
+      await db.execute(sql`
+        INSERT INTO pending_threshold_revisions (
+          threshold_name, scope, current_value, proposed_value, direction,
+          reasoning, supporting_metrics, expected_impact,
+          status, reviewed_at, reviewed_by, review_note
+        ) VALUES (
+          ${p.thresholdName}, ${p.scope},
+          ${JSON.stringify({ value: p.currentValue })}::jsonb,
+          ${JSON.stringify({ value: p.proposedValue })}::jsonb,
+          ${p.direction},
+          ${p.reasoning},
+          ${JSON.stringify(supportingMetrics)}::jsonb,
+          ${p.improvementScore},
+          ${p.status}, ${reviewedAt}, ${reviewedBy}, ${reviewNote}
+        )
+      `);
+      await db.insert(modelDecisionAuditLogTable).values({
+        decisionType: "threshold_proposal",
+        subject: `${p.scope}|${p.thresholdName}`,
+        priorState: { value: p.currentValue } as any,
+        newState: { value: p.proposedValue, direction: p.direction, status: p.status } as any,
+        reasoning: p.reasoning,
+        supportingMetrics: supportingMetrics as any,
+        expectedImpact: p.improvementScore,
+        reviewStatus: p.status === "approved" ? "automatic" : "pending_human",
+      });
+      if (p.status === "approved") proposalsApproved++;
+      else proposalsPending++;
+
+      // Invalidate threshold override cache so the new approved value is
+      // picked up by the next evaluator call (within 5 min cache TTL).
+      thresholdOverrideCache = null;
+    }
+  }
+
+  return {
+    scopesProcessed: scopes,
+    thresholdsConsidered: thresholds.length,
+    proposalsApproved,
+    proposalsPending,
+    skipped,
+    proposals,
+    dryRun,
+    proposalGeneratorEnabledFlag: flagEnabled,
+  };
+}
+
+// MAX_AUTONOMOUS_KELLY_FRACTION reserved for sub-commit 6.3.5 (full
+// counterfactual). In Path A we never auto-raise kelly_fraction beyond
+// the existing tier ceilings (autonomous writes are tighter-only).
+void MAX_AUTONOMOUS_KELLY_FRACTION;
+
 // Heuristic mapping from gate outcome to resulting tier's kelly_fraction.
 // "promote" from candidate → promoted (full Kelly); "promote" from experiment
 // → candidate (0.25); "demote" from candidate → experiment (0). Used only
