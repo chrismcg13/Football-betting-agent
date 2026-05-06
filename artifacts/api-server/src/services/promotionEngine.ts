@@ -1091,9 +1091,15 @@ function replayWithThresholds(
       let altKelly = TIER_TO_KELLY_FRACTION[tier] ?? 0;
       if (altKelly > 1.0) altKelly = 1.0;
 
-      const effectiveStake = bet.stake > 0 ? bet.stake : (bet.shadow_stake ?? 0);
+      // Shadow bets store settlement_pnl=0 (not null) and the real signal in
+      // shadow_pnl. Mirror the 6.2 baseline SQL's NULLIF(settlement_pnl, 0)
+      // semantics: tie pnl-source to stake-source so a virtually-promoted
+      // shadow bet uses shadow_pnl/shadow_stake (correct r_i) instead of
+      // settlement_pnl=0 (would zero out the signal).
+      const isShadowBet = !(bet.stake > 0);
+      const effectiveStake = isShadowBet ? (bet.shadow_stake ?? 0) : bet.stake;
       if (effectiveStake > 0) {
-        const effectivePnl = bet.settlement_pnl != null ? bet.settlement_pnl : (bet.shadow_pnl ?? 0);
+        const effectivePnl = isShadowBet ? (bet.shadow_pnl ?? 0) : (bet.settlement_pnl ?? 0);
         const rUnit = effectivePnl / effectiveStake;
         const altReturn = 1 + altKelly * rUnit;
         sumLogGrowth += Math.log(Math.max(0.001, altReturn));
