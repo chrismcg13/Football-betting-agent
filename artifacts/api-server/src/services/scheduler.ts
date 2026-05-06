@@ -2328,6 +2328,27 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Ongoing audit scheduler active — Sunday 09:00 UTC");
 
+  // Sub-phase 9 v2: weekly Kelly-optimiser pass over all candidate+promoted
+  // tags. Sits at Sunday 09:30 UTC, after ongoing audit (09:00) which may
+  // have demoted some tags. Per-settlement event-driven optimiser handles
+  // the steady state; this cron catches dormant tags + global re-pass.
+  cron.schedule("30 9 * * 0", () => {
+    logger.info("Kelly optimiser weekly cron triggered (Sunday 09:30 UTC)");
+    void (async () => {
+      try {
+        const { runKellyOptimizerForAllTags } = await import("./promotionEngine");
+        const result = await runKellyOptimizerForAllTags();
+        logger.info(
+          { checked: result.checked, ratcheted: result.ratcheted, skipped: result.skipped },
+          "Kelly optimiser weekly pass complete",
+        );
+      } catch (err) {
+        logger.error({ err }, "Kelly optimiser weekly pass failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Kelly optimiser weekly cron active — Sunday 09:30 UTC");
+
   cron.schedule("0 3 1 * *", () => {
     logger.info("Monthly league performance scoring + deactivation triggered");
     void (async () => {

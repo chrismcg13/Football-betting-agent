@@ -59,21 +59,29 @@ const TIER_TO_KELLY_FRACTION: Record<string, number> = {
   abandoned: 0,
 };
 
-// Sub-phase 9: probationary Kelly ratchet.
-// New candidate→promoted transitions seed kelly_fraction at this value
-// instead of TIER_TO_KELLY_FRACTION.promoted (1.0). Ratchets to 1.0 only
-// after PROBATIONARY_RATCHET_MIN_BETS real-money settled bets accumulate
-// AND rolling-30d ROI > PROBATIONARY_RATCHET_MIN_ROI_PCT. Existing
-// promoted-tier rows already at 1.0 are NOT reset — the probationary
-// state applies only to NEW promotions going forward.
+// Sub-phase 9 v2: data-driven Kelly-optimiser (replaces v1 heuristic ratchet).
+// Per Chris's 2026-05-07 correction: use empirical Kelly-growth maximisation
+// instead of arbitrary "100 bets + ROI > 0" gate. The seed value below applies
+// only on the candidate→promoted transition; the optimiser then refines.
 const INITIAL_PROMOTED_KELLY_FRACTION = parseFloat(
   process.env.INITIAL_PROMOTED_KELLY_FRACTION ?? "0.5",
 );
-const PROBATIONARY_RATCHET_MIN_BETS = parseInt(
-  process.env.PROBATIONARY_RATCHET_MIN_BETS ?? "100",
+
+// Kelly-optimiser constants. Grid-step + lookback are tunable via env. The
+// "minimum sample" is a numerical-stability floor only — real gating happens
+// via 95% CI non-overlap between optimal-f and current-f, which auto-loosens
+// as samples accumulate.
+const KELLY_OPTIMIZER_LOOKBACK_DAYS = parseInt(
+  process.env.KELLY_OPTIMIZER_LOOKBACK_DAYS ?? "90",
 );
-const PROBATIONARY_RATCHET_MIN_ROI_PCT = parseFloat(
-  process.env.PROBATIONARY_RATCHET_MIN_ROI_PCT ?? "0",
+const KELLY_OPTIMIZER_GRID_STEP = parseFloat(
+  process.env.KELLY_OPTIMIZER_GRID_STEP ?? "0.05",
+);
+const KELLY_OPTIMIZER_MIN_SAMPLE = parseInt(
+  process.env.KELLY_OPTIMIZER_MIN_SAMPLE ?? "10",
+);
+const KELLY_OPTIMIZER_CI_Z = parseFloat(
+  process.env.KELLY_OPTIMIZER_CI_Z ?? "1.96",
 );
 
 // Sub-phase 5: dedupe window for event-driven evaluation (Refinement: idempotency).
@@ -646,109 +654,274 @@ export async function evaluateExperimentTag(
 
   await writeGraduationEvaluationLog(tag, outcome === "skipped_dedupe" ? "hold" : outcome, metrics, opts);
 
-  // Sub-phase 9: probationary Kelly ratchet check. Runs after every settlement
-  // event. Ratchets kelly_fraction 0.5 → 1.0 if 100+ real-money settled bets
-  // accumulate AND rolling-30d ROI is positive. No-op for non-promoted tiers
-  // and for already-ratcheted (kelly_fraction >= 1.0) tags.
+  // Sub-phase 9 v2: data-driven Kelly-optimiser. Runs after every settlement
+  // event. Maximises empirical E[ln(1 + f × r)] over a grid of candidate
+  // kelly_fractions per tag, applying the change only when the optimal-f's
+  // 95% CI doesn't overlap the current-f's CI. Bidirectional within tier
+  // ceiling. Operates on candidate AND promoted tiers.
   try {
-    await checkAndApplyKellyRatchet(tag);
+    await runKellyOptimizerForTag(tag);
   } catch (err) {
-    logger.error({ err, tag }, "Kelly ratchet check failed — non-fatal");
+    logger.error({ err, tag }, "Kelly optimiser run failed — non-fatal");
   }
 
   return { tag, evaluated: true, outcome, newTier, metrics };
 }
 
-// ─── Sub-phase 9: probationary Kelly ratchet ─────────────────────────────────
-// Ratchets a probationary-promoted tag's kelly_fraction from
-// INITIAL_PROMOTED_KELLY_FRACTION (0.5) up to TIER_TO_KELLY_FRACTION.promoted
-// (1.0) once PROBATIONARY_RATCHET_MIN_BETS real-money settled bets confirm
-// rolling-30d ROI > PROBATIONARY_RATCHET_MIN_ROI_PCT. No-op for:
-//   - non-promoted tiers
-//   - kelly_fraction already at or above the ceiling
-//   - insufficient real-money sample
-//   - non-positive rolling ROI (tag stays at probationary; eventual demote
-//     handled by existing demotion gates if performance keeps deteriorating)
-// Idempotent: the UPDATE WHERE kelly_fraction < ceiling guard makes
-// concurrent ratchet attempts no-op for the second one.
+// ─── Sub-phase 9 v2: data-driven Kelly-optimiser ────────────────────────────
+// Per-tag kelly_fraction tuner. Maximises empirical Kelly-growth (the actual
+// E[ln(1 + f × r)] objective, not a proxy) over a grid of candidate
+// fractions, using 95% CI non-overlap between optimal-f and current-f as the
+// significance gate. Sample-size threshold is data-driven: low-N tags have
+// wide CIs that overlap → no change; high-N tags have tight CIs that
+// distinguish optimal from current.
+//
+// Bidirectional: ratchets UP when data confirms edge, DOWN when data flags
+// decay. Bounded by tier ceiling (TIER_TO_KELLY_FRACTION.{candidate, promoted}
+// = 0.25, 1.0 respectively) — user-owned guardrail. Floor 0 (model can
+// effectively halt staking on a tag if data demands it).
+//
+// Runs on every settlement event (per-tag, called from evaluateExperimentTag)
+// AND in a weekly cron pass for tags without recent settlements.
 
-export async function checkAndApplyKellyRatchet(tag: string): Promise<{
+export interface KellyOptimizerGridPoint {
+  f: number;
+  growth: number;
+  ciLow: number;
+  ciHigh: number;
+}
+
+export interface KellyOptimizerResult {
+  tag: string;
   ratcheted: boolean;
   reason: string;
-  nRealMoneyBets?: number;
-  rollingRoi30dPct?: number;
-}> {
-  const rows = await db.execute(sql`
+  dataTier?: string;
+  currentKellyFraction: number;
+  optimalKellyFraction: number | null;
+  tierCeiling?: number;
+  nBets?: number;
+  growthAtCurrent?: number;
+  growthAtOptimal?: number;
+  ciAtCurrent?: { lower: number; upper: number };
+  ciAtOptimal?: { lower: number; upper: number };
+  gridResults?: KellyOptimizerGridPoint[];
+}
+
+interface KellyGrowthStats {
+  mean: number;
+  ciLow: number;
+  ciHigh: number;
+}
+
+function roundN(v: number, dp: number): number {
+  const k = 10 ** dp;
+  return Math.round(v * k) / k;
+}
+
+function computeKellyGrowthStats(returns: number[], f: number): KellyGrowthStats {
+  const n = returns.length;
+  if (n === 0) return { mean: 0, ciLow: 0, ciHigh: 0 };
+  let sum = 0;
+  let sumSq = 0;
+  for (const r of returns) {
+    const g = Math.log(Math.max(0.001, 1 + f * r));
+    sum += g;
+    sumSq += g * g;
+  }
+  const mean = sum / n;
+  const variance = n > 1 ? (sumSq - (sum * sum) / n) / (n - 1) : 0;
+  const sd = Math.sqrt(Math.max(0, variance));
+  const halfWidth = KELLY_OPTIMIZER_CI_Z * sd / Math.sqrt(n);
+  return { mean, ciLow: mean - halfWidth, ciHigh: mean + halfWidth };
+}
+
+export async function runKellyOptimizerForTag(tag: string): Promise<KellyOptimizerResult> {
+  const regRows = await db.execute(sql`
     SELECT id, data_tier, kelly_fraction
     FROM experiment_registry
     WHERE experiment_tag = ${tag}
     LIMIT 1
   `);
-  const r = (rows as any).rows?.[0];
-  if (!r) return { ratcheted: false, reason: "no_registry_row" };
-  if (r.data_tier !== "promoted") return { ratcheted: false, reason: `not_promoted_tier:${r.data_tier}` };
-  const currentKf = parseFloat(r.kelly_fraction ?? "0");
-  if (currentKf >= TIER_TO_KELLY_FRACTION.promoted) {
-    return { ratcheted: false, reason: "already_at_ceiling" };
+  const reg = (regRows as any).rows?.[0];
+  if (!reg) {
+    return { tag, ratcheted: false, reason: "no_registry_row", currentKellyFraction: 0, optimalKellyFraction: null };
+  }
+  const dataTier = reg.data_tier as string;
+  const currentKf = parseFloat(reg.kelly_fraction ?? "0");
+
+  // Optimiser scope: candidate and promoted only. Experiment tier is shadow-
+  // only (kelly_fraction=0 always); abandoned is terminal.
+  if (dataTier !== "candidate" && dataTier !== "promoted") {
+    return {
+      tag, ratcheted: false, reason: `tier_not_optimisable:${dataTier}`,
+      dataTier, currentKellyFraction: currentKf, optimalKellyFraction: null,
+    };
   }
 
-  // Count real-money settled bets for the tag.
-  const cntRows = await db.execute(sql`
-    SELECT COUNT(*)::int AS n
+  const tierCeiling = TIER_TO_KELLY_FRACTION[dataTier] ?? 1.0;
+
+  // Pull bets with effective stake/pnl using the same NULLIF source-selection
+  // as 6.3.5 counterfactual replay. Includes shadow bets — per-bet return r_i
+  // is outcome-driven (independent of stake source).
+  const requestedStart = new Date(Date.now() - KELLY_OPTIMIZER_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+  const lookbackStart = requestedStart > THRESHOLD_RETROSPECTIVE_MIN_DATE
+    ? requestedStart
+    : THRESHOLD_RETROSPECTIVE_MIN_DATE;
+
+  const betRows = await db.execute(sql`
+    SELECT
+      COALESCE(NULLIF(stake::numeric, 0), shadow_stake::numeric, 0)::float8 AS effective_stake,
+      COALESCE(NULLIF(settlement_pnl::numeric, 0), shadow_pnl::numeric, 0)::float8 AS effective_pnl
     FROM paper_bets
     WHERE experiment_tag = ${tag}
-      AND status IN ('won','lost')
-      AND stake::numeric > 0
+      AND status IN ('won', 'lost')
       AND legacy_regime = false
       AND deleted_at IS NULL
+      AND placed_at >= ${lookbackStart}
   `);
-  const nRealMoneyBets = parseInt((cntRows as any).rows?.[0]?.n ?? "0");
-  if (nRealMoneyBets < PROBATIONARY_RATCHET_MIN_BETS) {
-    return { ratcheted: false, reason: `insufficient_sample:${nRealMoneyBets}/${PROBATIONARY_RATCHET_MIN_BETS}`, nRealMoneyBets };
+  const bets = ((betRows as any).rows ?? [])
+    .map((r: any) => ({
+      stake: typeof r.effective_stake === "number" ? r.effective_stake : parseFloat(r.effective_stake ?? "0"),
+      pnl: typeof r.effective_pnl === "number" ? r.effective_pnl : parseFloat(r.effective_pnl ?? "0"),
+    }))
+    .filter((b: { stake: number; pnl: number }) => b.stake > 0);
+
+  const n = bets.length;
+  if (n < KELLY_OPTIMIZER_MIN_SAMPLE) {
+    return {
+      tag, ratcheted: false, reason: `insufficient_sample:${n}<${KELLY_OPTIMIZER_MIN_SAMPLE}`,
+      dataTier, currentKellyFraction: currentKf, optimalKellyFraction: null,
+      tierCeiling, nBets: n,
+    };
   }
 
-  // Rolling-30-bet ROI via the existing helper (matches demotion-gate window).
-  const rolling = await computeRollingMetrics(tag, 30);
-  const rollingRoi30dPct = rolling.roi;
-  if (rollingRoi30dPct <= PROBATIONARY_RATCHET_MIN_ROI_PCT) {
-    logger.warn(
-      { tag, nRealMoneyBets, rollingRoi30dPct },
-      "Probationary tag has 100+ real-money bets but ROI not positive — staying at probationary kelly_fraction",
-    );
-    return { ratcheted: false, reason: `roi_not_positive:${rollingRoi30dPct.toFixed(2)}`, nRealMoneyBets, rollingRoi30dPct };
+  const returns: number[] = bets.map((b: { stake: number; pnl: number }) => b.pnl / b.stake);
+
+  // Grid scan over [0, tierCeiling] in KELLY_OPTIMIZER_GRID_STEP increments.
+  const gridResults: KellyOptimizerGridPoint[] = [];
+  for (let f = 0; f <= tierCeiling + 1e-9; f += KELLY_OPTIMIZER_GRID_STEP) {
+    const fRounded = roundN(f, 4);
+    const stats = computeKellyGrowthStats(returns, fRounded);
+    gridResults.push({
+      f: fRounded,
+      growth: roundN(stats.mean, 6),
+      ciLow: roundN(stats.ciLow, 6),
+      ciHigh: roundN(stats.ciHigh, 6),
+    });
   }
 
-  // Apply ratchet. The race-safe WHERE kelly_fraction < ceiling makes
-  // concurrent settlement events no-op for the second invocation.
+  let bestIdx = 0;
+  for (let i = 1; i < gridResults.length; i++) {
+    if (gridResults[i]!.growth > gridResults[bestIdx]!.growth) bestIdx = i;
+  }
+  const optimal = gridResults[bestIdx]!;
+
+  // Compute current's stats (current_kf may not lie on the grid).
+  const currentStats = computeKellyGrowthStats(returns, currentKf);
+
+  const sameAsCurrent = Math.abs(optimal.f - currentKf) < KELLY_OPTIMIZER_GRID_STEP / 2;
+  const cisOverlap = optimal.ciLow <= currentStats.ciHigh && currentStats.ciLow <= optimal.ciHigh;
+
+  const reportable: KellyOptimizerResult = {
+    tag,
+    ratcheted: false,
+    reason: "",
+    dataTier,
+    currentKellyFraction: currentKf,
+    optimalKellyFraction: optimal.f,
+    tierCeiling,
+    nBets: n,
+    growthAtCurrent: roundN(currentStats.mean, 6),
+    growthAtOptimal: optimal.growth,
+    ciAtCurrent: { lower: roundN(currentStats.ciLow, 6), upper: roundN(currentStats.ciHigh, 6) },
+    ciAtOptimal: { lower: optimal.ciLow, upper: optimal.ciHigh },
+    gridResults,
+  };
+
+  if (sameAsCurrent) {
+    return { ...reportable, ratcheted: false, reason: "optimal_equals_current" };
+  }
+  if (cisOverlap) {
+    return { ...reportable, ratcheted: false, reason: "cis_overlap_insufficient_significance" };
+  }
+
+  // Race-safe: WHERE kelly_fraction = currentKf guards concurrent invocations.
   await db.execute(sql`
     UPDATE experiment_registry
-    SET kelly_fraction = ${TIER_TO_KELLY_FRACTION.promoted},
-        tier_changed_at = NOW()
-    WHERE id = ${r.id} AND kelly_fraction < ${TIER_TO_KELLY_FRACTION.promoted}
+    SET kelly_fraction = ${optimal.f}, tier_changed_at = NOW()
+    WHERE id = ${reg.id} AND kelly_fraction = ${currentKf}
   `);
 
+  const direction = optimal.f > currentKf ? "up" : "down";
   await db.insert(modelDecisionAuditLogTable).values({
-    decisionType: "kelly_ratchet_applied",
+    decisionType: "kelly_optimizer_applied",
     subject: `tag:${tag}`,
-    priorState: { kelly_fraction: currentKf, data_tier: "promoted" } as any,
-    newState: { kelly_fraction: TIER_TO_KELLY_FRACTION.promoted, data_tier: "promoted" } as any,
-    reasoning: `Probationary Kelly ratchet: ${nRealMoneyBets} settled real-money bets accumulated (≥${PROBATIONARY_RATCHET_MIN_BETS} threshold) with rolling-30 ROI = ${rollingRoi30dPct.toFixed(2)}%. Ratcheting kelly_fraction ${currentKf.toFixed(2)} → ${TIER_TO_KELLY_FRACTION.promoted.toFixed(2)}.`,
+    priorState: { kelly_fraction: currentKf, data_tier: dataTier } as any,
+    newState: { kelly_fraction: optimal.f, data_tier: dataTier } as any,
+    reasoning:
+      `Kelly-optimiser (${direction}): argmax over [0, ${tierCeiling.toFixed(2)}] grid (step ${KELLY_OPTIMIZER_GRID_STEP}) ` +
+      `gave optimal_f=${optimal.f.toFixed(2)} vs current=${currentKf.toFixed(2)}. ` +
+      `Realised log-growth: optimal=${optimal.growth.toFixed(6)}/bet ` +
+      `[CI ${optimal.ciLow.toFixed(6)}, ${optimal.ciHigh.toFixed(6)}], ` +
+      `current=${currentStats.mean.toFixed(6)}/bet ` +
+      `[CI ${roundN(currentStats.ciLow, 6).toFixed(6)}, ${roundN(currentStats.ciHigh, 6).toFixed(6)}]. ` +
+      `CIs non-overlapping over n=${n} bets; applying.`,
     supportingMetrics: {
-      n_real_money_settled: nRealMoneyBets,
-      rolling_roi_30d_pct: rollingRoi30dPct,
-      min_bets_threshold: PROBATIONARY_RATCHET_MIN_BETS,
-      min_roi_threshold_pct: PROBATIONARY_RATCHET_MIN_ROI_PCT,
+      n_bets: n,
+      lookback_days: KELLY_OPTIMIZER_LOOKBACK_DAYS,
+      tier_ceiling: tierCeiling,
+      grid_step: KELLY_OPTIMIZER_GRID_STEP,
+      direction,
+      growth_at_current: roundN(currentStats.mean, 6),
+      growth_at_optimal: optimal.growth,
+      ci_at_current: [roundN(currentStats.ciLow, 6), roundN(currentStats.ciHigh, 6)],
+      ci_at_optimal: [optimal.ciLow, optimal.ciHigh],
+      grid_results: gridResults,
       prior_kelly_fraction: currentKf,
     } as any,
-    expectedImpact: null,
+    expectedImpact: roundN(optimal.growth - currentStats.mean, 6),
     reviewStatus: "automatic",
   });
 
   logger.info(
-    { tag, nRealMoneyBets, rollingRoi30dPct, priorKf: currentKf, newKf: TIER_TO_KELLY_FRACTION.promoted },
-    "Probationary Kelly ratchet applied (sub-phase 9)",
+    { tag, n, dataTier, priorKf: currentKf, newKf: optimal.f, direction, growthDelta: optimal.growth - currentStats.mean },
+    "Kelly-optimiser applied (sub-phase 9 v2)",
   );
-  return { ratcheted: true, reason: "ok", nRealMoneyBets, rollingRoi30dPct };
+
+  return { ...reportable, ratcheted: true, reason: "ok" };
+}
+
+export async function runKellyOptimizerForAllTags(): Promise<{
+  checked: number;
+  ratcheted: number;
+  skipped: number;
+  results: KellyOptimizerResult[];
+}> {
+  const tagRows = await db.execute(sql`
+    SELECT experiment_tag
+    FROM experiment_registry
+    WHERE data_tier IN ('candidate', 'promoted')
+  `);
+  const tags = ((tagRows as any).rows ?? [])
+    .map((r: any) => r.experiment_tag as string)
+    .filter((t: string) => typeof t === "string" && t.length > 0);
+
+  let ratcheted = 0;
+  const results: KellyOptimizerResult[] = [];
+  for (const tag of tags) {
+    try {
+      const r = await runKellyOptimizerForTag(tag);
+      if (r.ratcheted) ratcheted++;
+      results.push(r);
+    } catch (err) {
+      logger.error({ err, tag }, "Kelly optimiser failed for tag");
+    }
+  }
+  logger.info(
+    { checked: tags.length, ratcheted, skipped: tags.length - ratcheted },
+    "Kelly optimiser batch pass complete",
+  );
+  return { checked: tags.length, ratcheted, skipped: tags.length - ratcheted, results };
 }
 
 // ─── Sub-phase 5: distribution-shift detector A(archetype) ──────────────────

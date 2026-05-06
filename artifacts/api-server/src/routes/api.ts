@@ -1988,7 +1988,7 @@ router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
 // Experiment Pipeline API
 // ─────────────────────────────────────────────
 
-import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runCounterfactualReplay, runProposalGenerator, listPendingThresholdRevisions, reviewPendingThresholdRevision, type PendingRevisionStatusFilter } from "../services/promotionEngine";
+import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runCounterfactualReplay, runProposalGenerator, listPendingThresholdRevisions, reviewPendingThresholdRevision, runKellyOptimizerForTag, runKellyOptimizerForAllTags, type PendingRevisionStatusFilter } from "../services/promotionEngine";
 import { runOngoingAudit } from "../services/auditCron";
 import { runClvTimeBucketRetrospective } from "../services/oddsPapiRetrospective";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
@@ -3174,6 +3174,22 @@ router.post("/admin/run-clv-time-bucket-retrospective", async (req, res) => {
     res.json({ success: true, result });
   } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Sub-phase 9 v2: Kelly-optimiser. Body: { tag?: string } — if tag provided,
+// runs for that tag only; otherwise iterates over all candidate+promoted tags.
+router.post("/admin/run-kelly-optimizer", async (req, res) => {
+  try {
+    const { tag } = req.body ?? {};
+    if (typeof tag === "string" && tag.length > 0) {
+      const result = await runKellyOptimizerForTag(tag);
+      return res.json({ success: true, result });
+    }
+    const result = await runKellyOptimizerForAllTags();
+    return res.json({ success: true, result });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: String(err) });
   }
 });
 
