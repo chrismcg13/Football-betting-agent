@@ -230,6 +230,60 @@ function computeDaysSinceLastMatch(
   return Math.max(0, diffDays);
 }
 
+// ─── Sub-phase 7.6: Fixture density (congestion proxy) ──────────────────────
+// Counts completed fixtures per team in the last N days. Pairs with
+// computeDaysSinceLastMatch (single-fixture gap) to capture the
+// "team played 4 in 14d vs team played 2 in 14d" distinction. Both
+// signals together describe load — recency AND volume.
+
+function computeFixturesInLastDays(
+  matches: FDMatch[],
+  teamId: number,
+  days: number,
+): number {
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  return matches.filter(
+    (m) =>
+      (m.homeTeam?.id === teamId || m.awayTeam?.id === teamId) &&
+      m.score.winner !== null &&
+      new Date(m.utcDate).getTime() >= cutoffMs,
+  ).length;
+}
+
+// ─── Sub-phase 7.6: Lineup-publish-timing ────────────────────────────────────
+// Reads the _lineup_data feature row's computed_at (written by
+// capturePreKickoffLineups in apiFootball.ts when the lineup first appears)
+// and returns minutes pre-kickoff. Returns null if the lineup hasn't been
+// captured yet for this match — caller should skip the upsert in that case
+// (the feature simply won't exist for that match's row set, which the
+// retrospective will treat as "absent" rather than zero).
+
+async function computeLineupPublishMinsPreKickoff(matchId: number): Promise<number | null> {
+  const lineupRows = await db
+    .select({ computedAt: featuresTable.computedAt })
+    .from(featuresTable)
+    .where(
+      and(
+        eq(featuresTable.matchId, matchId),
+        eq(featuresTable.featureName, "_lineup_data"),
+      ),
+    )
+    .limit(1);
+  if (lineupRows.length === 0 || !lineupRows[0]?.computedAt) return null;
+
+  const matchRows = await db
+    .select({ kickoffTime: matchesTable.kickoffTime })
+    .from(matchesTable)
+    .where(eq(matchesTable.id, matchId))
+    .limit(1);
+  if (matchRows.length === 0 || !matchRows[0]?.kickoffTime) return null;
+
+  const kickoffMs = new Date(matchRows[0].kickoffTime).getTime();
+  const publishedMs = new Date(lineupRows[0].computedAt).getTime();
+  const minsPreKickoff = (kickoffMs - publishedMs) / 60_000;
+  return Math.round(minsPreKickoff * 100) / 100;
+}
+
 // ─── New: xG proxy from goal conversion rates ─────────────────────────────────
 
 function computeXgProxy(
@@ -381,6 +435,16 @@ export async function computeFeaturesForMatch(
   const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
   const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
 
+  // Sub-phase 7.6: fixture density (last 14 days) + congestion diff.
+  const homeFixtures14d = computeFixturesInLastDays(homeMatches, homeTeamId, 14);
+  const awayFixtures14d = computeFixturesInLastDays(awayMatches, awayTeamId, 14);
+  const fixturesCongestionDiff = homeFixtures14d - awayFixtures14d;
+
+  // Sub-phase 7.6: lineup-publish timing. May be null if lineup not yet
+  // captured (capturePreKickoffLineups runs every 15min in 30-90min pre-
+  // kickoff window — feature-engine cycles before that won't see it).
+  const lineupPublishMins = await computeLineupPublishMinsPreKickoff(matchId);
+
   const homeXg = computeXgProxy(homeMatches, homeTeamId, "home", 10);
   const awayXg = computeXgProxy(awayMatches, awayTeamId, "away", 10);
   const xgDiff = homeXg - awayXg;
@@ -437,6 +501,10 @@ export async function computeFeaturesForMatch(
     ["away_points_trajectory", awayPointsTraj],
     ["home_days_since_last_match", homeDaysSince],
     ["away_days_since_last_match", awayDaysSince],
+    // Sub-phase 7.6: fixture density (last 14 days)
+    ["home_fixtures_in_last_14d", homeFixtures14d],
+    ["away_fixtures_in_last_14d", awayFixtures14d],
+    ["fixtures_congestion_diff", fixturesCongestionDiff],
     ["home_xg_proxy", homeXg],
     ["away_xg_proxy", awayXg],
     ["xg_diff", xgDiff],
@@ -457,6 +525,11 @@ export async function computeFeaturesForMatch(
 
   for (const [name, value] of features) {
     await upsertFeature(matchId, name, value);
+  }
+
+  // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
+  if (lineupPublishMins !== null) {
+    await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
   }
 
   logger.info({ matchId, featureCount: features.length }, "Features saved");
@@ -572,6 +645,14 @@ async function computeFeaturesFromDb(
   const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
   const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
 
+  // Sub-phase 7.6: fixture density (last 14 days) + congestion diff.
+  const homeFixtures14d = computeFixturesInLastDays(homeMatches, homeTeamId, 14);
+  const awayFixtures14d = computeFixturesInLastDays(awayMatches, awayTeamId, 14);
+  const fixturesCongestionDiff = homeFixtures14d - awayFixtures14d;
+
+  // Sub-phase 7.6: lineup-publish timing (null if lineup not yet captured).
+  const lineupPublishMins = await computeLineupPublishMinsPreKickoff(matchId);
+
   const homeXgDb = computeXgProxy(homeMatches, homeTeamId, "home", 10);
   const awayXgDb = computeXgProxy(awayMatches, awayTeamId, "away", 10);
   const homeXg = hasDbHistory ? homeXgDb : homeGoalsScored;
@@ -612,6 +693,10 @@ async function computeFeaturesFromDb(
     ["away_points_trajectory", awayPointsTraj],
     ["home_days_since_last_match", homeDaysSince],
     ["away_days_since_last_match", awayDaysSince],
+    // Sub-phase 7.6: fixture density (last 14 days)
+    ["home_fixtures_in_last_14d", homeFixtures14d],
+    ["away_fixtures_in_last_14d", awayFixtures14d],
+    ["fixtures_congestion_diff", fixturesCongestionDiff],
     ["home_xg_proxy", homeXg],
     ["away_xg_proxy", awayXg],
     ["xg_diff", xgDiff],
@@ -631,6 +716,11 @@ async function computeFeaturesFromDb(
 
   for (const [name, value] of features) {
     await upsertFeature(matchId, name, value);
+  }
+
+  // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
+  if (lineupPublishMins !== null) {
+    await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
   }
 
   logger.info(
