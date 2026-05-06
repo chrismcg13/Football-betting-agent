@@ -805,19 +805,37 @@ export async function runPromotionEngine(): Promise<{
   return { promoted, demoted, abandoned, evaluated };
 }
 
-// ─── Sub-phase 6.2: retrospective analysis (read-only) ──────────────────────
-// Per docs/phase-2-wave-3-subphase-6-plan.md §5 sub-commit 6.2.
+// ─── Sub-phase 6.3.5: counterfactual replay ─────────────────────────────────
+// Per docs/phase-2-wave-3-subphase-6-plan.md §5 (replaces 6.2 first-order +
+// 6.3 Path A heuristic with full chronological replay).
 //
-// Walks graduation_evaluation_log rows in scope/window, re-evaluates the
-// gate condition under alternative threshold values, and reports per-
-// alternative how many evaluations would have flipped outcome and the
-// kelly_fraction-weighted impact magnitude.
+// For each (scope × threshold × alt_value) triple: merge-walk
+// graduation_evaluation_log + paper_bets in chronological order, maintain a
+// per-tag virtual data_tier (seeded from promotion_audit_log at lookbackStart),
+// and weight each settled bet's per-unit return r_i = effective_pnl /
+// effective_stake by alt-tier kelly_fraction to produce a real fractional-
+// Kelly log-growth-rate g_alt_i = ln(max(0.001, 1 + alt_kelly × r_i)). The
+// baseline reported in CounterfactualReplayResult uses the SAME engine with
+// current thresholds (apples-to-apples).
 //
-// First-order analysis only: does NOT model cascading transitions
-// (a tag promoted earlier would have placed bets at higher kelly_fraction,
-// which compounds into the realised Kelly-growth). Full counterfactual
-// replay ships in sub-commit 6.3. This deliverable validates the data
-// plumbing + threshold-name parsing under read-only scope discipline.
+// Demotion-from-promoted gates evaluable at replay time via per-tag rolling
+// 30-bet roi+clv (matches the 30-row LIMIT used by computeRollingMetrics) +
+// metrics_snapshot.weeklyRois (already populated). Replaces the 6.2
+// 'hold for promoted tier' limitation.
+//
+// Both tighter AND looser proposals auto-apply when delta clears
+// MIN_IMPROVEMENT_SCORE; gate-threshold tuning is data-driven model territory
+// per Chris's autonomy decision (2026-05-06). Only money guardrails
+// (kelly_fraction tier values, circuit breakers, real-money toggles) require
+// manual approval. MAX_AUTONOMOUS_KELLY_FRACTION is retained as a defensive
+// constant for future per-league kelly_fraction tuning (not exercised in
+// 6.3.5 — gate thresholds don't move kelly_fraction values).
+//
+// Known limitation: replay weights actual-placed bets by alt-tier
+// kelly_fraction. It cannot model bets that would have placed under alt
+// thresholds but didn't — those don't exist in paper_bets. Slight bias
+// toward changes that re-weight existing bets vs changes that expand the
+// betting set; documented but not fixed.
 
 // Hard floor on lookback. Pre-2026-05-03 data is Replit-era buggy and must
 // not influence threshold proposals. Per plan §6 R6.
@@ -825,34 +843,37 @@ const THRESHOLD_RETROSPECTIVE_MIN_DATE = new Date("2026-05-03T00:00:00Z");
 
 export type RetrospectiveScope = string; // 'global' | 'per_archetype:X' | 'per_league:Y'
 
-export interface RetrospectiveAnalysisOpts {
+export interface CounterfactualReplayOpts {
   scope: RetrospectiveScope;
   thresholdName: string;
   lookbackDays?: number;
   alternatives?: number[];
 }
 
-export interface RetrospectiveAlternative {
+export interface CounterfactualAlternative {
   value: number;
   direction: "looser" | "tighter" | "current";
-  wouldChangeNEvaluations: number;
-  wouldChangeNTags: number;
-  kellyFractionImpactSum: number;
+  proposedKellyGrowth: number;
+  deltaKellyGrowth: number;
+  nVirtualPromotions: number;
+  nVirtualDemotions: number;
+  nVirtualAbandons: number;
 }
 
-export interface RetrospectiveAnalysisResult {
+export interface CounterfactualReplayResult {
   scope: RetrospectiveScope;
   thresholdName: string;
   lookbackDays: number;
   lookbackStartDate: string;
-  baselineMetrics: {
-    nEvaluationsInScope: number;
-    nTagsInScope: number;
-    nSettledBetsInScope: number;
-    realisedKellyGrowthRate: number;
-  };
   currentValue: number;
-  alternatives: RetrospectiveAlternative[];
+  baselineKellyGrowth: number;
+  baselineVirtualPromotions: number;
+  baselineVirtualDemotions: number;
+  baselineVirtualAbandons: number;
+  nEvaluationsInScope: number;
+  nSettledBetsInScope: number;
+  nTagsInScope: number;
+  alternatives: CounterfactualAlternative[];
   notes: string;
 }
 
@@ -887,16 +908,24 @@ function getCurrentValue(t: ResolvedThresholds, thresholdName: string): number {
   return gate[parsed.fieldKey] as number;
 }
 
-// Pure gate evaluator. Mirrors the gate conditions in evaluateExperimentTag.
-// Does NOT cover the promoted→candidate gate fully (that requires rolling
-// metrics + consecutive_negative_weeks computed at evaluation time, which we
-// don't have in the snapshot). Returns "hold" for promoted-tier rows;
-// sub-commit 6.3 will model this fully.
+// Sub-phase 6.3.5: gate evaluator returns disambiguated outcome including
+// 'abandon' (previously the experiment-tier abandon branch returned 'promote'
+// indistinguishably from →candidate). Promoted-tier demotion now evaluable
+// when the caller passes rolling metrics + weeklyRois sourced from
+// metrics_snapshot. Mirrors the gate conditions in evaluateExperimentTag.
+export type GateOutcome = "promote" | "demote" | "abandon" | "hold";
+
+interface RollingMetricsInput {
+  rollingRoi: number; // %
+  rollingClv: number; // pct, winsorized to ±50pp by caller
+}
+
 function evaluateGateForRetrospective(
   metrics: ExperimentMetrics,
   currentTier: string,
   t: ResolvedThresholds,
-): "promote" | "demote" | "hold" {
+  rollingMetrics?: RollingMetricsInput,
+): GateOutcome {
   if (currentTier === "experiment") {
     const ec = t.experimentToCandidate;
     if (
@@ -912,7 +941,7 @@ function evaluateGateForRetrospective(
       metrics.sampleSize >= t.abandonThreshold.minSample &&
       metrics.roi <= t.abandonThreshold.maxRoi &&
       metrics.pValue <= t.abandonThreshold.maxPValue
-    ) return "promote"; // direction-agnostic transition (to abandoned)
+    ) return "abandon";
     return "hold";
   }
   if (currentTier === "candidate") {
@@ -930,7 +959,33 @@ function evaluateGateForRetrospective(
     ) return "demote";
     return "hold";
   }
-  return "hold"; // promoted/abandoned: not modelled in 6.2
+  if (currentTier === "promoted") {
+    if (!rollingMetrics) return "hold";
+    const dpc = t.demotionPromotedToCandidate;
+    const negWeeks = countConsecutiveNegativeWeeks(metrics.weeklyRois ?? []);
+    if (
+      rollingMetrics.rollingRoi < dpc.minRoi ||
+      rollingMetrics.rollingClv < dpc.minClv ||
+      negWeeks >= dpc.maxConsecutiveNegativeWeeks
+    ) return "demote";
+    return "hold";
+  }
+  return "hold"; // abandoned: terminal
+}
+
+function applyTierTransition(currentTier: string, outcome: GateOutcome): string {
+  if (outcome === "abandon") return "abandoned";
+  if (outcome === "promote") {
+    if (currentTier === "experiment") return "candidate";
+    if (currentTier === "candidate") return "promoted";
+    return currentTier;
+  }
+  if (outcome === "demote") {
+    if (currentTier === "candidate") return "experiment";
+    if (currentTier === "promoted") return "candidate";
+    return currentTier;
+  }
+  return currentTier;
 }
 
 async function resolveThresholdsForScope(scope: string): Promise<ResolvedThresholds> {
@@ -947,32 +1002,173 @@ async function resolveThresholdsForScope(scope: string): Promise<ResolvedThresho
   throw new Error(`Invalid scope: ${scope} (expected 'global' | 'per_archetype:X' | 'per_league:Y')`);
 }
 
-export async function runRetrospectiveAnalysis(
-  opts: RetrospectiveAnalysisOpts,
-): Promise<RetrospectiveAnalysisResult> {
+const REPLAY_ROLLING_WINDOW_BETS = 30; // matches THRESHOLDS.demotionPromotedToCandidate.rollingWindow
+
+interface ReplayBetEntry {
+  stake: number;
+  pnl: number;
+  clv: number;
+}
+
+interface ReplayEvalRow {
+  experiment_tag: string;
+  evaluated_at: Date;
+  metrics_snapshot: ExperimentMetrics;
+}
+
+interface ReplayBetRow {
+  experiment_tag: string;
+  placed_at: Date;
+  stake: number;
+  shadow_stake: number;
+  settlement_pnl: number | null;
+  shadow_pnl: number | null;
+  clv_pct: number;
+}
+
+function computeReplayRollingMetrics(window: ReplayBetEntry[]): RollingMetricsInput {
+  if (window.length === 0) return { rollingRoi: 0, rollingClv: 0 };
+  let pnl = 0, staked = 0, clvSum = 0;
+  for (const bet of window) {
+    pnl += bet.pnl;
+    staked += bet.stake;
+    // R14 winsorization (v2.5 calibration): same ±50pp clip as computeRollingMetrics.
+    clvSum += Math.max(-50, Math.min(50, bet.clv));
+  }
+  return {
+    rollingRoi: staked > 0 ? (pnl / staked) * 100 : 0,
+    rollingClv: clvSum / window.length,
+  };
+}
+
+interface ReplaySummary {
+  kellyGrowth: number;
+  nBetsCounted: number;
+  nVirtualPromotions: number;
+  nVirtualDemotions: number;
+  nVirtualAbandons: number;
+}
+
+function replayWithThresholds(
+  thresholds: ResolvedThresholds,
+  evals: ReplayEvalRow[],
+  bets: ReplayBetRow[],
+  initialTiers: Map<string, string>,
+): ReplaySummary {
+  const virtualTiers = new Map(initialTiers);
+  const betWindowPerTag = new Map<string, ReplayBetEntry[]>();
+
+  let sumLogGrowth = 0;
+  let nBetsCounted = 0;
+  let nPromotions = 0;
+  let nDemotions = 0;
+  let nAbandons = 0;
+
+  let ei = 0, bi = 0;
+  while (ei < evals.length || bi < bets.length) {
+    const evalT = ei < evals.length ? evals[ei].evaluated_at.getTime() : Number.POSITIVE_INFINITY;
+    const betT = bi < bets.length ? bets[bi].placed_at.getTime() : Number.POSITIVE_INFINITY;
+
+    if (evalT <= betT) {
+      const ev = evals[ei++];
+      if (!ev.metrics_snapshot || typeof ev.metrics_snapshot !== "object") continue;
+      const tag = ev.experiment_tag;
+      const tier = virtualTiers.get(tag) ?? "experiment";
+      const window = betWindowPerTag.get(tag) ?? [];
+      const rolling = tier === "promoted" ? computeReplayRollingMetrics(window) : undefined;
+      const outcome = evaluateGateForRetrospective(ev.metrics_snapshot, tier, thresholds, rolling);
+      const newTier = applyTierTransition(tier, outcome);
+      if (newTier !== tier) {
+        virtualTiers.set(tag, newTier);
+        if (outcome === "promote") nPromotions++;
+        else if (outcome === "demote") nDemotions++;
+        else if (outcome === "abandon") nAbandons++;
+      }
+    } else {
+      const bet = bets[bi++];
+      const tag = bet.experiment_tag;
+      const tier = virtualTiers.get(tag) ?? "experiment";
+      let altKelly = TIER_TO_KELLY_FRACTION[tier] ?? 0;
+      if (altKelly > 1.0) altKelly = 1.0;
+
+      const effectiveStake = bet.stake > 0 ? bet.stake : (bet.shadow_stake ?? 0);
+      if (effectiveStake > 0) {
+        const effectivePnl = bet.settlement_pnl != null ? bet.settlement_pnl : (bet.shadow_pnl ?? 0);
+        const rUnit = effectivePnl / effectiveStake;
+        const altReturn = 1 + altKelly * rUnit;
+        sumLogGrowth += Math.log(Math.max(0.001, altReturn));
+        nBetsCounted++;
+
+        const window = betWindowPerTag.get(tag) ?? [];
+        window.push({ stake: effectiveStake, pnl: effectivePnl, clv: bet.clv_pct ?? 0 });
+        if (window.length > REPLAY_ROLLING_WINDOW_BETS) window.shift();
+        betWindowPerTag.set(tag, window);
+      }
+    }
+  }
+
+  return {
+    kellyGrowth: nBetsCounted > 0 ? sumLogGrowth / nBetsCounted : 0,
+    nBetsCounted,
+    nVirtualPromotions: nPromotions,
+    nVirtualDemotions: nDemotions,
+    nVirtualAbandons: nAbandons,
+  };
+}
+
+async function getInitialVirtualTiers(tags: Set<string>, asOf: Date): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (tags.size === 0) return map;
+  const tagList = Array.from(tags);
+  const rows = await db.execute(sql`
+    SELECT DISTINCT ON (experiment_tag)
+      experiment_tag,
+      new_tier
+    FROM promotion_audit_log
+    WHERE experiment_tag IN (${sql.join(tagList.map((t) => sql`${t}`), sql`, `)})
+      AND decided_at < ${asOf}
+    ORDER BY experiment_tag, decided_at DESC
+  `);
+  for (const r of (rows as any).rows ?? []) {
+    if (typeof r.new_tier === "string") map.set(r.experiment_tag, r.new_tier);
+  }
+  for (const t of tags) {
+    if (!map.has(t)) map.set(t, "experiment");
+  }
+  return map;
+}
+
+function strictnessDirection(
+  thresholdName: string,
+  currentValue: number,
+  altValue: number,
+): "looser" | "tighter" | "current" {
+  if (altValue === currentValue) return "current";
+  const isMaxThreshold = /\.max_/.test(thresholdName);
+  if (isMaxThreshold) return altValue < currentValue ? "tighter" : "looser";
+  return altValue > currentValue ? "tighter" : "looser";
+}
+
+export async function runCounterfactualReplay(
+  opts: CounterfactualReplayOpts,
+): Promise<CounterfactualReplayResult> {
   const { scope, thresholdName } = opts;
   const lookbackDays = opts.lookbackDays ?? 90;
 
-  // Validate threshold name early.
   const parsed = parseThresholdName(thresholdName);
   if (!parsed) throw new Error(`Invalid thresholdName: ${thresholdName}`);
 
-  // Resolve current thresholds for this scope.
   const currentThresholds = await resolveThresholdsForScope(scope);
   const currentValue = getCurrentValue(currentThresholds, thresholdName);
 
-  // Default alternatives: ±10/25/50% perturbations + 2x. Excludes current.
-  const alternatives = (opts.alternatives ?? [0.5, 0.75, 0.9, 1.1, 1.25, 1.5, 2.0].map((m) => currentValue * m))
+  const altValues = (opts.alternatives ?? [0.5, 0.75, 0.9, 1.1, 1.25, 1.5, 2.0].map((m) => currentValue * m))
     .filter((v) => Number.isFinite(v) && v !== currentValue);
 
-  // Compute lookback window with hard floor at 2026-05-03.
   const requestedStart = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
   const lookbackStart = requestedStart > THRESHOLD_RETROSPECTIVE_MIN_DATE
     ? requestedStart
     : THRESHOLD_RETROSPECTIVE_MIN_DATE;
 
-  // Build scope SQL filter on the JOINED experiment_registry → competition_config
-  // pipeline. We use the same hyphen-normalisation used elsewhere (Wave 2 #4.1).
   let scopeFilter = sql``;
   if (scope.startsWith("per_archetype:")) {
     const archetype = scope.slice("per_archetype:".length);
@@ -991,97 +1187,71 @@ export async function runRetrospectiveAnalysis(
     `;
   }
 
-  // Pull evaluations + reconstruct tier-at-eval-time from promotion_audit_log.
-  const evalRows = await db.execute(sql`
+  const evalRowsResult = await db.execute(sql`
     SELECT
       gel.experiment_tag,
       gel.evaluated_at,
-      gel.metrics_snapshot,
-      gel.threshold_outcome,
-      COALESCE(
-        (SELECT pal.new_tier
-         FROM promotion_audit_log pal
-         WHERE pal.experiment_tag = gel.experiment_tag
-           AND pal.decided_at <= gel.evaluated_at
-         ORDER BY pal.decided_at DESC
-         LIMIT 1),
-        'experiment'
-      ) AS tier_at_eval
+      gel.metrics_snapshot
     FROM graduation_evaluation_log gel
     JOIN experiment_registry er ON er.experiment_tag = gel.experiment_tag
     WHERE gel.evaluated_at >= ${lookbackStart}
       ${scopeFilter}
+    ORDER BY gel.evaluated_at ASC
   `);
-  const rows = ((evalRows as any).rows ?? []) as Array<{
-    experiment_tag: string;
-    evaluated_at: Date;
-    metrics_snapshot: ExperimentMetrics;
-    threshold_outcome: string;
-    tier_at_eval: string;
-  }>;
+  const evals: ReplayEvalRow[] = ((evalRowsResult as any).rows ?? []).map((r: any) => ({
+    experiment_tag: r.experiment_tag,
+    evaluated_at: r.evaluated_at instanceof Date ? r.evaluated_at : new Date(r.evaluated_at),
+    metrics_snapshot: r.metrics_snapshot,
+  }));
 
-  // Baseline aggregates across the in-scope settled bets + tag count.
-  const baselineRows = await db.execute(sql`
+  const betRowsResult = await db.execute(sql`
     SELECT
-      COUNT(*) FILTER (WHERE pb.status IN ('won','lost')) AS n_settled,
-      COUNT(DISTINCT pb.experiment_tag) FILTER (WHERE pb.status IN ('won','lost')) AS n_tags,
-      COALESCE(SUM(
-        LN(GREATEST(0.001,
-          (COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1) +
-           COALESCE(NULLIF(pb.settlement_pnl::numeric, 0), pb.shadow_pnl::numeric, 0)) /
-          COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1)
-        ))
-      ) FILTER (WHERE pb.status IN ('won','lost')), 0) AS sum_log_growth
+      pb.experiment_tag,
+      pb.placed_at,
+      COALESCE(pb.stake::numeric, 0)::float8 AS stake,
+      COALESCE(pb.shadow_stake::numeric, 0)::float8 AS shadow_stake,
+      pb.settlement_pnl::numeric::float8 AS settlement_pnl,
+      pb.shadow_pnl::numeric::float8 AS shadow_pnl,
+      COALESCE(pb.clv_pct::numeric, 0)::float8 AS clv_pct
     FROM paper_bets pb
     JOIN experiment_registry er ON er.experiment_tag = pb.experiment_tag
     WHERE pb.placed_at >= ${lookbackStart}
       AND pb.deleted_at IS NULL
       AND pb.legacy_regime = false
+      AND pb.status IN ('won', 'lost')
       ${scopeFilter}
+    ORDER BY pb.placed_at ASC
   `);
-  const b = (baselineRows as any).rows?.[0] ?? {};
-  const nSettledBets = parseInt(b.n_settled ?? "0");
-  const nTagsInScope = parseInt(b.n_tags ?? "0");
-  const sumLogGrowth = parseFloat(b.sum_log_growth ?? "0");
-  const realisedKellyGrowthRate = nSettledBets > 0 ? sumLogGrowth / nSettledBets : 0;
+  const bets: ReplayBetRow[] = ((betRowsResult as any).rows ?? []).map((r: any) => ({
+    experiment_tag: r.experiment_tag,
+    placed_at: r.placed_at instanceof Date ? r.placed_at : new Date(r.placed_at),
+    stake: typeof r.stake === "number" ? r.stake : parseFloat(r.stake ?? "0"),
+    shadow_stake: typeof r.shadow_stake === "number" ? r.shadow_stake : parseFloat(r.shadow_stake ?? "0"),
+    settlement_pnl: r.settlement_pnl == null ? null : (typeof r.settlement_pnl === "number" ? r.settlement_pnl : parseFloat(r.settlement_pnl)),
+    shadow_pnl: r.shadow_pnl == null ? null : (typeof r.shadow_pnl === "number" ? r.shadow_pnl : parseFloat(r.shadow_pnl)),
+    clv_pct: typeof r.clv_pct === "number" ? r.clv_pct : parseFloat(r.clv_pct ?? "0"),
+  }));
 
-  // Per-alternative: re-evaluate each row with modified thresholds, count flips.
-  const altResults: RetrospectiveAlternative[] = [];
-  for (const altValue of alternatives) {
+  const allTags = new Set<string>();
+  for (const ev of evals) allTags.add(ev.experiment_tag);
+  for (const bet of bets) allTags.add(bet.experiment_tag);
+
+  const initialTiers = await getInitialVirtualTiers(allTags, lookbackStart);
+
+  const baselineReplay = replayWithThresholds(currentThresholds, evals, bets, initialTiers);
+
+  const altResults: CounterfactualAlternative[] = [];
+  for (const altValue of altValues) {
     const altThresholds = makeAlternativeThresholds(currentThresholds, thresholdName, altValue);
-    let changedN = 0;
-    const changedTags = new Set<string>();
-    let kellyImpactSum = 0;
-
-    for (const row of rows) {
-      const tier = row.tier_at_eval ?? "experiment";
-      // metrics_snapshot is JSONB — Postgres returns it as a parsed object.
-      const metrics = row.metrics_snapshot;
-      if (!metrics || typeof metrics !== "object") continue;
-
-      const origOut = evaluateGateForRetrospective(metrics, tier, currentThresholds);
-      const altOut = evaluateGateForRetrospective(metrics, tier, altThresholds);
-      if (origOut === altOut) continue;
-
-      changedN++;
-      changedTags.add(row.experiment_tag);
-
-      const origKelly = inferKellyFractionForOutcome(tier, origOut);
-      const altKelly = inferKellyFractionForOutcome(tier, altOut);
-      kellyImpactSum += Math.abs(altKelly - origKelly);
-    }
-
-    const direction: "looser" | "tighter" | "current" =
-      altValue > currentValue ? "looser" :
-      altValue < currentValue ? "tighter" :
-      "current";
-
+    const altReplay = replayWithThresholds(altThresholds, evals, bets, initialTiers);
     altResults.push({
       value: altValue,
-      direction,
-      wouldChangeNEvaluations: changedN,
-      wouldChangeNTags: changedTags.size,
-      kellyFractionImpactSum: kellyImpactSum,
+      direction: strictnessDirection(thresholdName, currentValue, altValue),
+      proposedKellyGrowth: altReplay.kellyGrowth,
+      deltaKellyGrowth: altReplay.kellyGrowth - baselineReplay.kellyGrowth,
+      nVirtualPromotions: altReplay.nVirtualPromotions,
+      nVirtualDemotions: altReplay.nVirtualDemotions,
+      nVirtualAbandons: altReplay.nVirtualAbandons,
     });
   }
 
@@ -1090,47 +1260,42 @@ export async function runRetrospectiveAnalysis(
     thresholdName,
     lookbackDays,
     lookbackStartDate: lookbackStart.toISOString(),
-    baselineMetrics: {
-      nEvaluationsInScope: rows.length,
-      nTagsInScope,
-      nSettledBetsInScope: nSettledBets,
-      realisedKellyGrowthRate,
-    },
     currentValue,
+    baselineKellyGrowth: baselineReplay.kellyGrowth,
+    baselineVirtualPromotions: baselineReplay.nVirtualPromotions,
+    baselineVirtualDemotions: baselineReplay.nVirtualDemotions,
+    baselineVirtualAbandons: baselineReplay.nVirtualAbandons,
+    nEvaluationsInScope: evals.length,
+    nSettledBetsInScope: baselineReplay.nBetsCounted,
+    nTagsInScope: allTags.size,
     alternatives: altResults,
-    notes: "First-order analysis: counts evaluations where the alternative threshold flips the gate outcome under each evaluation's stored metrics_snapshot. kellyFractionImpactSum is sum of |Δkelly_fraction| across changed evaluations — a magnitude signal, not a Kelly-growth-rate delta. Does NOT model cascading transitions (a tag promoted earlier would have placed bets at higher kelly_fraction, which compounds). Full counterfactual replay ships in sub-commit 6.3. Promoted-tier evaluations are treated as 'hold' (rolling metrics + consecutive_negative_weeks not in snapshot). Lookback hard-floored at 2026-05-03 (pre-Claude-Code-era data excluded).",
+    notes: "Full counterfactual replay (sub-commit 6.3.5): chronological merge of graduation_evaluation_log + paper_bets per scope. Per-tag virtual tier evolves via alt thresholds firing promote/demote/abandon outcomes (tier seeded from promotion_audit_log at lookbackStart, default 'experiment'). Each settled bet's per-unit return r_i = effective_pnl / effective_stake weighted by alt-tier kelly_fraction → g_alt_i = ln(max(0.001, 1 + alt_kelly × r_i)). Baseline = same engine with current thresholds (apples-to-apples, replaces 6.2's raw aggregate). Demotion-from-promoted gates use rolling-30-bet roi+clv from per-tag bet window plus consecutiveNegativeWeeks from metrics_snapshot.weeklyRois. Lookback hard-floored at 2026-05-03 (pre-Claude-Code-era data excluded). Limitation: replay weights actual-placed bets only — bets that would have placed under alt but didn't are not modelled (slight bias toward re-weighting changes vs betting-set-expanding changes).",
   };
 }
 
-// ─── Sub-phase 6.3: proposal generator (Path A — pragmatic) ────────────────
-// Per docs/phase-2-wave-3-subphase-6-plan.md §5 sub-commit 6.3.
+// ─── Sub-phase 6.3.5: proposal generator (counterfactual-replay-driven) ────
+// Per docs/phase-2-wave-3-subphase-6-plan.md §5 (replaces 6.3 Path A).
 //
-// For each (scope × threshold_dim), runs runRetrospectiveAnalysis and
-// applies a conservative decision rule:
-//   - Skip if nEvaluations < 30 (insufficient data)
+// For each (scope × threshold_dim), runs runCounterfactualReplay and applies
+// a delta-based decision rule:
+//   - Skip if nEvaluations < PROPOSAL_MIN_EVALUATIONS (insufficient data)
+//   - Skip if nSettledBets < PROPOSAL_MIN_SETTLED_BETS (replay needs bets)
 //   - Skip if distribution-shift alert active for the archetype
 //   - Skip if a proposal for this (scope, threshold_name) was reviewed in
-//     the last 30 days (user-override stickiness)
-//   - direction = "tighter" if alt makes the threshold stricter, "looser"
-//     otherwise (handles min_* vs max_* semantics)
-//   - improvement_score = +1 × |kellyFractionImpactSum|  if  (baseline_kg < 0
-//     AND alt is tighter)  OR  (baseline_kg > 0 AND alt is looser);
-//     otherwise -1 × |kellyFractionImpactSum|
-//   - Pick alt with highest positive improvement_score AND
-//     |kellyFractionImpactSum| >= MIN_IMPACT (default 0.1)
-//   - Tighter → INSERT with status='approved' (autonomous)
-//   - Looser  → INSERT with status='pending' (user review in sub-commit 6.4)
-//
-// Path A is heuristic-based (uses sign of realisedKellyGrowthRate as
-// performance signal, magnitude misleading per Signal B from 6.2 verification).
-// Full counterfactual replay is a follow-up sub-commit (6.3.5) before 6.5
-// cron-on. This deliverable establishes the proposal/audit pipeline with
-// honest disclosures.
+//     the last 30 days (oscillation guard)
+//   - improvement_score = proposed_kelly_growth - baseline_kelly_growth
+//     (signed log-growth-per-bet delta, real units)
+//   - Pick alt with highest positive delta >= MIN_IMPROVEMENT_SCORE
+//   - status='approved' regardless of direction (tighter OR looser); both
+//     directions are data-driven and the model owns gate-threshold tuning.
+//     Money guardrails (kelly_fraction tier values, circuit breakers,
+//     real-money toggles) sit elsewhere and require manual approval.
 
 const MAX_AUTONOMOUS_KELLY_FRACTION = 0.5;
 const PROPOSAL_STICKINESS_DAYS = 30;
 const PROPOSAL_MIN_EVALUATIONS = 30;
-const PROPOSAL_MIN_KELLY_IMPACT = 0.1;
+const PROPOSAL_MIN_SETTLED_BETS = 30;
+const MIN_IMPROVEMENT_SCORE = 1e-4;
 const DISTRIBUTION_SHIFT_LOOKBACK_HOURS = 24;
 const DISTRIBUTION_SHIFT_BREACH_THRESHOLD = 2;
 
@@ -1165,12 +1330,6 @@ const ALL_THRESHOLD_NAMES: readonly string[] = [
   "abandon_threshold.max_p_value",
 ];
 
-function strictnessDirection(thresholdName: string, currentValue: number, altValue: number): "tighter" | "looser" {
-  const isMaxThreshold = /\.max_/.test(thresholdName);
-  if (isMaxThreshold) return altValue < currentValue ? "tighter" : "looser";
-  return altValue > currentValue ? "tighter" : "looser";
-}
-
 export interface ProposalGeneratorOpts {
   scope?: string;
   thresholdNames?: string[];
@@ -1184,11 +1343,12 @@ export interface ProposalRecord {
   currentValue: number;
   proposedValue: number;
   direction: "tighter" | "looser";
-  status: "approved" | "pending";
-  improvementScore: number;
-  kellyFractionImpactSum: number;
+  status: "approved";
+  improvementScore: number;        // = deltaKellyGrowth (log-growth-per-bet)
   baselineKellyGrowth: number;
+  proposedKellyGrowth: number;
   nEvaluationsInScope: number;
+  nSettledBetsInScope: number;
   reasoning: string;
 }
 
@@ -1202,7 +1362,7 @@ export interface ProposalGeneratorResult {
   scopesProcessed: string[];
   thresholdsConsidered: number;
   proposalsApproved: number;
-  proposalsPending: number;
+  proposalsPending: number; // always 0 in 6.3.5 (kept for response-shape stability)
   skipped: ProposalGeneratorSkip[];
   proposals: ProposalRecord[];
   dryRun: boolean;
@@ -1326,110 +1486,87 @@ export async function runProposalGenerator(
     }
 
     for (const thresholdName of thresholds) {
-      // Stickiness: don't propose against an override reviewed within 30d.
+      // Oscillation guard: don't re-propose against any (scope, threshold) that
+      // had a decision (auto-approved or manually reviewed) in the last 30d.
       if (sticky.has(`${scope}|${thresholdName}`)) {
         skipped.push({ scope, thresholdName, reason: "sticky_30d_override" });
         continue;
       }
 
-      let retro: RetrospectiveAnalysisResult;
+      let replay: CounterfactualReplayResult;
       try {
-        retro = await runRetrospectiveAnalysis({
+        replay = await runCounterfactualReplay({
           scope,
           thresholdName,
           lookbackDays: opts.lookbackDays,
         });
       } catch (err) {
-        skipped.push({ scope, thresholdName, reason: `retrospective_failed:${String(err).slice(0, 80)}` });
+        skipped.push({ scope, thresholdName, reason: `replay_failed:${String(err).slice(0, 80)}` });
         continue;
       }
 
-      if (retro.baselineMetrics.nEvaluationsInScope < PROPOSAL_MIN_EVALUATIONS) {
-        skipped.push({ scope, thresholdName, reason: `insufficient_data_n=${retro.baselineMetrics.nEvaluationsInScope}` });
+      if (replay.nEvaluationsInScope < PROPOSAL_MIN_EVALUATIONS) {
+        skipped.push({ scope, thresholdName, reason: `insufficient_evaluations_n=${replay.nEvaluationsInScope}` });
+        continue;
+      }
+      if (replay.nSettledBetsInScope < PROPOSAL_MIN_SETTLED_BETS) {
+        skipped.push({ scope, thresholdName, reason: `insufficient_settled_bets_n=${replay.nSettledBetsInScope}` });
         continue;
       }
 
-      const baselineKg = retro.baselineMetrics.realisedKellyGrowthRate;
-
-      // Pick the alternative with highest positive improvement_score.
-      let bestAlt: RetrospectiveAlternative | null = null;
-      let bestImprovement = 0;
-      let bestStrictness: "tighter" | "looser" | null = null;
-
-      for (const alt of retro.alternatives) {
-        if (Math.abs(alt.kellyFractionImpactSum) < PROPOSAL_MIN_KELLY_IMPACT) continue;
-        const direction = strictnessDirection(thresholdName, retro.currentValue, alt.value);
-        // Direction-of-improvement rule:
-        //   bad performance (baseline<0): tighter helps, looser hurts
-        //   good performance (baseline>0): looser helps, tighter hurts
-        //   ambiguous (baseline≈0): no proposal
-        const directionSign =
-          baselineKg < -1e-9 && direction === "tighter" ? +1 :
-          baselineKg >  1e-9 && direction === "looser"  ? +1 :
-          -1;
-        const improvement = directionSign * Math.abs(alt.kellyFractionImpactSum);
-        if (improvement > bestImprovement) {
-          bestImprovement = improvement;
-          bestAlt = alt;
-          bestStrictness = direction;
-        }
+      // Pick alt with highest positive delta. Both directions eligible.
+      let bestAlt: CounterfactualAlternative | null = null;
+      for (const alt of replay.alternatives) {
+        if (alt.direction === "current") continue;
+        if (alt.deltaKellyGrowth < MIN_IMPROVEMENT_SCORE) continue;
+        if (!bestAlt || alt.deltaKellyGrowth > bestAlt.deltaKellyGrowth) bestAlt = alt;
       }
-
-      if (!bestAlt || !bestStrictness || bestImprovement <= 0) {
-        skipped.push({ scope, thresholdName, reason: "no_positive_improvement_signal" });
+      if (!bestAlt) {
+        skipped.push({ scope, thresholdName, reason: "no_alternative_above_min_improvement" });
         continue;
       }
 
-      // MAX_AUTONOMOUS_KELLY_FRACTION ceiling: if this proposal would raise
-      // any tier's kelly_fraction beyond 0.5 (e.g. by promoting more tags
-      // faster), force status='pending' instead of autonomous.
-      // For Path A heuristic: applies only when bestStrictness === 'looser'.
-      // Tighter never raises kelly_fraction.
-
-      const status: "approved" | "pending" = bestStrictness === "tighter" ? "approved" : "pending";
-
+      const direction: "tighter" | "looser" = bestAlt.direction === "looser" ? "looser" : "tighter";
       const reasoning =
-        `Path A heuristic proposal (sub-commit 6.3): scope=${scope}, ` +
-        `threshold=${thresholdName} ${retro.currentValue} → ${bestAlt.value} ` +
-        `(${bestStrictness}). Baseline realised Kelly-growth=${baselineKg.toFixed(4)} ` +
-        `over ${retro.baselineMetrics.nEvaluationsInScope} evaluations, ` +
-        `${retro.baselineMetrics.nSettledBetsInScope} settled bets. ` +
-        `Alternative would flip ${bestAlt.wouldChangeNEvaluations} evaluation(s) ` +
-        `across ${bestAlt.wouldChangeNTags} tag(s), kelly_fraction impact ` +
-        `magnitude=${bestAlt.kellyFractionImpactSum.toFixed(3)}. ` +
-        `NOTE: Heuristic (kelly_fraction-impact-magnitude × performance sign), ` +
-        `not full counterfactual replay. Sign-of-realised-Kelly-growth used as ` +
-        `direction signal (magnitude misleading per Signal B in 6.2 verification).`;
+        `Counterfactual replay (sub-commit 6.3.5): scope=${scope}, ` +
+        `threshold=${thresholdName} ${replay.currentValue} → ${bestAlt.value} (${direction}). ` +
+        `Baseline Kelly-growth=${replay.baselineKellyGrowth.toFixed(6)}/bet, ` +
+        `proposed=${bestAlt.proposedKellyGrowth.toFixed(6)}/bet, ` +
+        `delta=+${bestAlt.deltaKellyGrowth.toFixed(6)}/bet over ` +
+        `${replay.nSettledBetsInScope} settled bets across ${replay.nTagsInScope} tags. ` +
+        `Virtual transitions under proposal: ${bestAlt.nVirtualPromotions}P/${bestAlt.nVirtualDemotions}D/${bestAlt.nVirtualAbandons}A ` +
+        `(baseline: ${replay.baselineVirtualPromotions}P/${replay.baselineVirtualDemotions}D/${replay.baselineVirtualAbandons}A).`;
 
       proposals.push({
         scope,
         thresholdName,
-        currentValue: retro.currentValue,
+        currentValue: replay.currentValue,
         proposedValue: bestAlt.value,
-        direction: bestStrictness,
-        status,
-        improvementScore: bestImprovement,
-        kellyFractionImpactSum: bestAlt.kellyFractionImpactSum,
-        baselineKellyGrowth: baselineKg,
-        nEvaluationsInScope: retro.baselineMetrics.nEvaluationsInScope,
+        direction,
+        status: "approved",
+        improvementScore: bestAlt.deltaKellyGrowth,
+        baselineKellyGrowth: replay.baselineKellyGrowth,
+        proposedKellyGrowth: bestAlt.proposedKellyGrowth,
+        nEvaluationsInScope: replay.nEvaluationsInScope,
+        nSettledBetsInScope: replay.nSettledBetsInScope,
         reasoning,
       });
     }
   }
 
   let proposalsApproved = 0;
-  let proposalsPending = 0;
   if (willWrite) {
     for (const p of proposals) {
       const supportingMetrics = {
-        baseline_realised_kelly_growth_rate: p.baselineKellyGrowth,
+        baseline_kelly_growth: p.baselineKellyGrowth,
+        proposed_kelly_growth: p.proposedKellyGrowth,
+        delta_kelly_growth: p.improvementScore,
         n_evaluations_in_scope: p.nEvaluationsInScope,
-        kelly_fraction_impact_sum: p.kellyFractionImpactSum,
-        improvement_score: p.improvementScore,
+        n_settled_bets_in_scope: p.nSettledBetsInScope,
       };
-      const reviewedAt = p.status === "approved" ? new Date() : null;
-      const reviewedBy = p.status === "approved" ? "auto_proposal_generator" : null;
-      const reviewNote = p.status === "approved" ? "autonomous tightening (Path A heuristic)" : null;
+      const reviewedAt = new Date();
+      const reviewedBy = "auto_proposal_generator";
+      const reviewNote = `autonomous ${p.direction} (counterfactual replay, delta=+${p.improvementScore.toFixed(6)}/bet)`;
       await db.execute(sql`
         INSERT INTO pending_threshold_revisions (
           threshold_name, scope, current_value, proposed_value, direction,
@@ -1443,28 +1580,20 @@ export async function runProposalGenerator(
           ${p.reasoning},
           ${JSON.stringify(supportingMetrics)}::jsonb,
           ${p.improvementScore},
-          ${p.status}, ${reviewedAt}, ${reviewedBy}, ${reviewNote}
+          'approved', ${reviewedAt}, ${reviewedBy}, ${reviewNote}
         )
       `);
       await db.insert(modelDecisionAuditLogTable).values({
         decisionType: "threshold_proposal",
         subject: `${p.scope}|${p.thresholdName}`,
         priorState: { value: p.currentValue } as any,
-        newState: { value: p.proposedValue, direction: p.direction, status: p.status } as any,
+        newState: { value: p.proposedValue, direction: p.direction, status: "approved" } as any,
         reasoning: p.reasoning,
         supportingMetrics: supportingMetrics as any,
         expectedImpact: p.improvementScore,
-        // Both branches are autonomous writes by the proposal generator. The
-        // pending vs approved split is encoded in newState.status; review_status
-        // here only tracks who wrote the audit row (model = automatic). The
-        // model_decision_audit_log CHECK constraint only allows
-        // ('automatic','user_reviewed','user_overridden'); when a human later
-        // approves/rejects via the admin endpoints, that emits a separate audit
-        // row with reviewStatus='user_reviewed'.
         reviewStatus: "automatic",
       });
-      if (p.status === "approved") proposalsApproved++;
-      else proposalsPending++;
+      proposalsApproved++;
 
       // Invalidate threshold override cache so the new approved value is
       // picked up by the next evaluator call (within 5 min cache TTL).
@@ -1476,7 +1605,7 @@ export async function runProposalGenerator(
     scopesProcessed: scopes,
     thresholdsConsidered: thresholds.length,
     proposalsApproved,
-    proposalsPending,
+    proposalsPending: 0,
     skipped,
     proposals,
     dryRun,
@@ -1484,25 +1613,12 @@ export async function runProposalGenerator(
   };
 }
 
-// MAX_AUTONOMOUS_KELLY_FRACTION reserved for sub-commit 6.3.5 (full
-// counterfactual). In Path A we never auto-raise kelly_fraction beyond
-// the existing tier ceilings (autonomous writes are tighter-only).
+// Defensive constant. Reserved for future per-league kelly_fraction tuning;
+// not exercised by 6.3.5 (gate-threshold proposals don't move kelly_fraction
+// values directly). The kelly_fraction *value* per tier is a money guardrail
+// (user-owned); only the *decision to graduate a tag between tiers* is
+// data-driven (model-owned).
 void MAX_AUTONOMOUS_KELLY_FRACTION;
-
-// Heuristic mapping from gate outcome to resulting tier's kelly_fraction.
-// "promote" from candidate → promoted (full Kelly); "promote" from experiment
-// → candidate (0.25); "demote" from candidate → experiment (0). Used only
-// for the impact magnitude signal in the read-only retrospective.
-function inferKellyFractionForOutcome(currentTier: string, outcome: "promote" | "demote" | "hold"): number {
-  if (outcome === "hold") return TIER_TO_KELLY_FRACTION[currentTier] ?? 0;
-  if (currentTier === "experiment") {
-    return outcome === "promote" ? TIER_TO_KELLY_FRACTION.candidate : TIER_TO_KELLY_FRACTION.experiment;
-  }
-  if (currentTier === "candidate") {
-    return outcome === "promote" ? TIER_TO_KELLY_FRACTION.promoted : TIER_TO_KELLY_FRACTION.experiment;
-  }
-  return TIER_TO_KELLY_FRACTION[currentTier] ?? 0;
-}
 
 async function computeRollingMetrics(tag: string, window: number): Promise<{ roi: number; clv: number }> {
   const rows = await db.execute(sql`
