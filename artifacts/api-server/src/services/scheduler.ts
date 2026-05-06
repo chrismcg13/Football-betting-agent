@@ -2301,6 +2301,33 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("AF metadata bundle scheduler active — Sunday 07:00 UTC");
 
+  // Sub-phase 10: weekly ongoing audit (settlement-bias + auto-demote).
+  // Sits at Sunday 09:00 UTC, after threshold proposal generator (08:00).
+  // Always writes settlement_bias_observation rows; auto-demote action gated
+  // by ONGOING_AUDIT_AUTO_DEMOTE_ENABLED env flag (default false).
+  cron.schedule("0 9 * * 0", () => {
+    logger.info("Ongoing audit triggered (Sunday 09:00 UTC)");
+    void (async () => {
+      try {
+        const { runOngoingAudit } = await import("./auditCron");
+        const result = await runOngoingAudit();
+        logger.info(
+          {
+            observationsWritten: result.observationsWritten,
+            breachingLeagues: result.breachingLeagues,
+            demotionsPlanned: result.demotionsPlanned,
+            demotionsApplied: result.demotionsApplied,
+            autoDemoteFlagEnabled: result.autoDemoteFlagEnabled,
+          },
+          "Ongoing audit complete",
+        );
+      } catch (err) {
+        logger.error({ err }, "Ongoing audit failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Ongoing audit scheduler active — Sunday 09:00 UTC");
+
   cron.schedule("0 3 1 * *", () => {
     logger.info("Monthly league performance scoring + deactivation triggered");
     void (async () => {

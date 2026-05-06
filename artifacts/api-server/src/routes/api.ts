@@ -1989,6 +1989,7 @@ router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
 // ─────────────────────────────────────────────
 
 import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runCounterfactualReplay, runProposalGenerator, listPendingThresholdRevisions, reviewPendingThresholdRevision, type PendingRevisionStatusFilter } from "../services/promotionEngine";
+import { runOngoingAudit } from "../services/auditCron";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 
 router.get("/admin/experiments", async (_req, res) => {
@@ -3143,6 +3144,21 @@ router.post("/admin/pending-threshold-revisions/:id/reject", async (req, res) =>
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Sub-phase 10: ongoing audit (settlement-bias + auto-demote).
+// Body: { dryRun?: boolean (default false), lookbackDays?: number (default 30) }
+router.post("/admin/run-ongoing-audit", async (req, res) => {
+  try {
+    const { dryRun, lookbackDays } = req.body ?? {};
+    const result = await runOngoingAudit({
+      dryRun: dryRun === true,
+      lookbackDays: typeof lookbackDays === "number" ? lookbackDays : undefined,
+    });
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
   }
 });
 
