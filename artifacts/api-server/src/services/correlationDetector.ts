@@ -327,14 +327,25 @@ export async function applyCorrelationDetection(
     }
 
     let crossCycleDrops = 0;
+    let crossCycleConflictDrops = 0;
     for (const [matchId, bets] of byMatch) {
       const pending = pendingByMatch.get(matchId);
       if (!pending || pending.length === 0) continue;
 
       // For each candidate on this match, check if it would form a correlated
-      // pair with any pending bet. If yes, drop the candidate (cannot drop
-      // the pending bet — it's already placed).
+      // OR conflicting pair with any pending bet. If yes, drop the candidate
+      // (cannot drop the pending bet — it's already placed).
+      //
+      // Two rule sets are checked:
+      //   - CORRELATED_PAIRS: subset-domination (BTTS Yes vs Over 2.5, etc.)
+      //     drop the candidate to avoid paying vig twice on one underlying view.
+      //   - CONFLICTING_RULES: mutually-exclusive selections (MO Home vs Draw,
+      //     OU Over vs Under, BTTS Yes vs No). Backing both can never win
+      //     together; second-cycle candidate is dead money. Within-cycle this
+      //     is handled in step 1 by score comparison; across cycles the older
+      //     pending bet wins by default — drop the candidate.
       for (const cand of [...bets]) {
+        let dropped = false;
         for (const pb of pending) {
           let matched: CorrelatedPair | null = null;
           for (const rule of CORRELATED_PAIRS) {
@@ -361,13 +372,47 @@ export async function applyCorrelationDetection(
             );
             removeBet(selected, removed, byMatch, cand);
             crossCycleDrops++;
+            dropped = true;
+            break;
+          }
+        }
+        if (dropped) continue;
+
+        for (const pb of pending) {
+          let matchedConflict: ConflictingRule | null = null;
+          for (const rule of CONFLICTING_RULES) {
+            const candIs1 = ruleMatch(cand, rule.market1, rule.sel1Includes);
+            const candIs2 = ruleMatch(cand, rule.market2, rule.sel2Includes);
+            const pendIs1 = pb.marketType === rule.market1 && pb.selectionName.includes(rule.sel1Includes);
+            const pendIs2 = pb.marketType === rule.market2 && pb.selectionName.includes(rule.sel2Includes);
+            if ((candIs1 && pendIs2) || (candIs2 && pendIs1)) {
+              matchedConflict = rule;
+              break;
+            }
+          }
+          if (matchedConflict) {
+            const msg = `Cross-cycle conflict on ${cand.homeTeam} vs ${cand.awayTeam}: candidate ${cand.marketType}:${cand.selectionName} cannot co-win with pending ${pb.marketType}:${pb.selectionName} — candidate dropped.`;
+            narratives.push(msg);
+            logger.info(
+              {
+                matchId,
+                candidate: betKey(cand),
+                pending: `${matchId}::${pb.marketType}::${pb.selectionName}`,
+              },
+              "0C cross-cycle conflict: candidate dropped",
+            );
+            removeBet(selected, removed, byMatch, cand);
+            crossCycleConflictDrops++;
             break;
           }
         }
       }
     }
-    if (crossCycleDrops > 0) {
-      logger.info({ crossCycleDrops, totalCandidates: candidates.length }, "0C cross-cycle correlation summary");
+    if (crossCycleDrops > 0 || crossCycleConflictDrops > 0) {
+      logger.info(
+        { crossCycleDrops, crossCycleConflictDrops, totalCandidates: candidates.length },
+        "0C cross-cycle correlation summary",
+      );
     }
   }
 
