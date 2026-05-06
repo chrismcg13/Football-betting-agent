@@ -1988,7 +1988,7 @@ router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
 // Experiment Pipeline API
 // ─────────────────────────────────────────────
 
-import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runRetrospectiveAnalysis, runProposalGenerator } from "../services/promotionEngine";
+import { getExperimentsSummary, getExperimentDetail, getPromotionLog, getLatestLearningJournal, manualPromote, runPromotionEngine, backfillExperimentTags, runRetrospectiveAnalysis, runProposalGenerator, listPendingThresholdRevisions, reviewPendingThresholdRevision, type PendingRevisionStatusFilter } from "../services/promotionEngine";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 
 router.get("/admin/experiments", async (_req, res) => {
@@ -3049,6 +3049,100 @@ router.post("/admin/run-proposal-generator", async (req, res) => {
     res.json({ success: true, result });
   } catch (err) {
     res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Sub-phase 6.4: pending-revisions admin endpoints. Queue browser + manual
+// review for "looser" threshold proposals (tighter ones are auto-approved by
+// the proposal generator). Approving here flips the active threshold value
+// via the lookup chain in resolveAllThresholds; rejecting closes the row out
+// without altering active values.
+
+const ALLOWED_REVISION_STATUS_FILTERS: ReadonlySet<PendingRevisionStatusFilter> = new Set([
+  "pending",
+  "approved",
+  "rejected",
+  "expired",
+  "all",
+]);
+
+router.get("/admin/pending-threshold-revisions", async (req, res) => {
+  try {
+    const rawStatus = typeof req.query.status === "string" ? req.query.status : "pending";
+    if (!ALLOWED_REVISION_STATUS_FILTERS.has(rawStatus as PendingRevisionStatusFilter)) {
+      return res.status(400).json({
+        success: false,
+        error: `invalid status: must be one of ${Array.from(ALLOWED_REVISION_STATUS_FILTERS).join(", ")}`,
+      });
+    }
+    const scope = typeof req.query.scope === "string" && req.query.scope.length > 0
+      ? req.query.scope
+      : undefined;
+    const thresholdName = typeof req.query.thresholdName === "string" && req.query.thresholdName.length > 0
+      ? req.query.thresholdName
+      : undefined;
+    const limitRaw = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : NaN;
+    const limit = Number.isFinite(limitRaw) ? limitRaw : undefined;
+
+    const result = await listPendingThresholdRevisions({
+      status: rawStatus as PendingRevisionStatusFilter,
+      scope,
+      thresholdName,
+      limit,
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+function parseRevisionId(raw: string): number | null {
+  const id = parseInt(raw, 10);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  return id;
+}
+
+function normaliseReviewNote(body: any): string | null {
+  const raw = body?.reviewNote;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.slice(0, 1000);
+}
+
+router.post("/admin/pending-threshold-revisions/:id/approve", async (req, res) => {
+  try {
+    const id = parseRevisionId(req.params.id);
+    if (id == null) return res.status(400).json({ success: false, error: "invalid id" });
+    const reviewNote = normaliseReviewNote(req.body);
+    const result = await reviewPendingThresholdRevision({ id, decision: "approve", reviewNote });
+    if (result.success) return res.json({ success: true, row: result.row });
+    if (result.status === 404) return res.status(404).json({ success: false, error: "not found" });
+    return res.status(409).json({
+      success: false,
+      error: `already ${result.currentStatus}`,
+      currentStatus: result.currentStatus,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/pending-threshold-revisions/:id/reject", async (req, res) => {
+  try {
+    const id = parseRevisionId(req.params.id);
+    if (id == null) return res.status(400).json({ success: false, error: "invalid id" });
+    const reviewNote = normaliseReviewNote(req.body);
+    const result = await reviewPendingThresholdRevision({ id, decision: "reject", reviewNote });
+    if (result.success) return res.json({ success: true, row: result.row });
+    if (result.status === 404) return res.status(404).json({ success: false, error: "not found" });
+    return res.status(409).json({
+      success: false,
+      error: `already ${result.currentStatus}`,
+      currentStatus: result.currentStatus,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: String(err) });
   }
 });
 

@@ -1454,7 +1454,14 @@ export async function runProposalGenerator(
         reasoning: p.reasoning,
         supportingMetrics: supportingMetrics as any,
         expectedImpact: p.improvementScore,
-        reviewStatus: p.status === "approved" ? "automatic" : "pending_human",
+        // Both branches are autonomous writes by the proposal generator. The
+        // pending vs approved split is encoded in newState.status; review_status
+        // here only tracks who wrote the audit row (model = automatic). The
+        // model_decision_audit_log CHECK constraint only allows
+        // ('automatic','user_reviewed','user_overridden'); when a human later
+        // approves/rejects via the admin endpoints, that emits a separate audit
+        // row with reviewStatus='user_reviewed'.
+        reviewStatus: "automatic",
       });
       if (p.status === "approved") proposalsApproved++;
       else proposalsPending++;
@@ -1663,4 +1670,109 @@ export function getSettledBetCountForLeagueMarket(league: string, marketType: st
     WHERE experiment_tag = ${`${league}-${marketType}`.toLowerCase().replace(/[^a-z0-9-]/g, "-")}
       AND status IN ('won', 'lost')
   `).then(r => parseInt(((r as any).rows?.[0]?.cnt) ?? "0"));
+}
+
+// ─── Sub-phase 6.4: pending-revisions admin helpers ─────────────────────────
+// Per docs/phase-2-wave-3-subphase-6-plan.md §6.4. The HTTP layer (routes/api.ts)
+// is a thin shell over these — keeps audit-log + cache-invalidation atomic with
+// the row UPDATE, and avoids leaking modelDecisionAuditLogTable into routes.
+
+export type PendingRevisionStatusFilter =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "expired"
+  | "all";
+
+export async function listPendingThresholdRevisions(opts: {
+  status?: PendingRevisionStatusFilter;
+  scope?: string;
+  thresholdName?: string;
+  limit?: number;
+}): Promise<{ count: number; rows: any[] }> {
+  const status = opts.status ?? "pending";
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+
+  const conditions: any[] = [];
+  if (status !== "all") conditions.push(sql`status = ${status}`);
+  if (opts.scope) conditions.push(sql`scope = ${opts.scope}`);
+  if (opts.thresholdName) conditions.push(sql`threshold_name = ${opts.thresholdName}`);
+
+  const whereClause = conditions.length > 0
+    ? sql`WHERE ${sql.join(conditions, sql` AND `)}`
+    : sql``;
+
+  const result = await db.execute(sql`
+    SELECT * FROM pending_threshold_revisions
+    ${whereClause}
+    ORDER BY proposed_at DESC
+    LIMIT ${limit}
+  `);
+  const rows = (result as any).rows ?? [];
+  return { count: rows.length, rows };
+}
+
+export type ReviewPendingThresholdRevisionResult =
+  | { success: true; row: any }
+  | { success: false; status: 404 }
+  | { success: false; status: 409; currentStatus: string };
+
+export async function reviewPendingThresholdRevision(opts: {
+  id: number;
+  decision: "approve" | "reject";
+  reviewNote: string | null;
+}): Promise<ReviewPendingThresholdRevisionResult> {
+  const targetStatus = opts.decision === "approve" ? "approved" : "rejected";
+  const decisionType =
+    opts.decision === "approve"
+      ? "threshold_proposal_approved"
+      : "threshold_proposal_rejected";
+
+  // Race-safe: the WHERE status='pending' guard means concurrent calls on the
+  // same id will only succeed for the first one; the second sees zero rows.
+  const updateResult = await db.execute(sql`
+    UPDATE pending_threshold_revisions
+       SET status = ${targetStatus},
+           reviewed_at = NOW(),
+           reviewed_by = 'manual_user',
+           review_note = ${opts.reviewNote}
+     WHERE id = ${opts.id} AND status = 'pending'
+    RETURNING *
+  `);
+  const updatedRows = (updateResult as any).rows ?? [];
+
+  if (updatedRows.length === 0) {
+    const lookupResult = await db.execute(sql`
+      SELECT id, status FROM pending_threshold_revisions WHERE id = ${opts.id}
+    `);
+    const found = (lookupResult as any).rows ?? [];
+    if (found.length === 0) {
+      return { success: false, status: 404 };
+    }
+    return { success: false, status: 409, currentStatus: found[0].status as string };
+  }
+
+  const row = updatedRows[0];
+  await db.insert(modelDecisionAuditLogTable).values({
+    decisionType,
+    subject: `${row.scope}|${row.threshold_name}`,
+    priorState: { status: "pending", value: row.current_value } as any,
+    newState: {
+      status: row.status,
+      value: row.proposed_value,
+      reviewed_by: "manual_user",
+      review_note: row.review_note,
+    } as any,
+    reasoning: row.reasoning,
+    supportingMetrics: row.supporting_metrics as any,
+    expectedImpact: row.expected_impact != null ? Number(row.expected_impact) : null,
+    reviewStatus: "user_reviewed",
+  });
+
+  // An approval flips the active threshold for this (scope, threshold_name).
+  // Reject is a no-op for active values but invalidating costs nothing and
+  // keeps the two paths symmetric.
+  thresholdOverrideCache = null;
+
+  return { success: true, row };
 }
