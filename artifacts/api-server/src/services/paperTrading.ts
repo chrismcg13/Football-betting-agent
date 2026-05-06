@@ -475,6 +475,32 @@ function kellyFractionForScore(opportunityScore: number, marketType?: string): n
   return fraction;
 }
 
+// Sub-phase 9: tier kelly_fraction lookup. Replaces the env-flag-driven
+// CANDIDATE_STAKE_MULTIPLIER with a per-tag value sourced from
+// experiment_registry.kelly_fraction. Returns 1.0 (no multiplier) when:
+//   - tag is null/empty (Tier A legacy bet without a registry row)
+//   - registry row missing for the tag
+//   - registry row's kelly_fraction is null
+// Otherwise returns the row's value, clamped to [0, 1.0] defensively.
+async function getTierKellyFractionForTag(experimentTag: string | null | undefined): Promise<number> {
+  if (!experimentTag) return 1.0;
+  try {
+    const rows = await db.execute(sql`
+      SELECT kelly_fraction FROM experiment_registry
+      WHERE experiment_tag = ${experimentTag}
+      LIMIT 1
+    `);
+    const r = (rows as any).rows?.[0];
+    if (!r || r.kelly_fraction == null) return 1.0;
+    const v = parseFloat(r.kelly_fraction);
+    if (!Number.isFinite(v)) return 1.0;
+    return Math.max(0, Math.min(1.0, v));
+  } catch (err) {
+    logger.warn({ err, experimentTag }, "getTierKellyFractionForTag lookup failed — defaulting to 1.0");
+    return 1.0;
+  }
+}
+
 function calculateDynamicKellyStake(
   bankroll: number,
   edge: number,
@@ -1057,11 +1083,26 @@ export async function placePaperBet(
     }
   }
 
-  if (dataTier === "candidate") {
-    const CANDIDATE_STAKE_MULT = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");
+  // Sub-phase 9: tier kelly_fraction multiplier. Per-tag value from
+  // experiment_registry.kelly_fraction, applied after all conviction-based
+  // sizing and before the hard cap. Catches BOTH candidate-tier (0.25) and
+  // probationary-promoted (0.5 → ratchets to 1.0 after 100 real-money bets).
+  // Falls back to env-flag CANDIDATE_STAKE_MULTIPLIER for candidate-tier
+  // bets that don't have a registry row yet (defensive — should be rare
+  // post sub-phase 5).
+  let tierKellyFraction = 1.0;
+  if (experimentTag) {
+    tierKellyFraction = await getTierKellyFractionForTag(experimentTag);
+  } else if (dataTier === "candidate") {
+    tierKellyFraction = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");
+  }
+  if (tierKellyFraction < 1.0) {
     const originalStake = stake;
-    stake = Math.round(stake * CANDIDATE_STAKE_MULT * 100) / 100;
-    logger.info({ matchId, marketType, dataTier, originalStake, reducedStake: stake, multiplier: CANDIDATE_STAKE_MULT }, "Candidate-tier stake reduction applied");
+    stake = Math.round(stake * tierKellyFraction * 100) / 100;
+    logger.info(
+      { matchId, marketType, experimentTag, dataTier, originalStake, reducedStake: stake, tierKellyFraction },
+      "Tier kelly_fraction multiplier applied (sub-phase 9)",
+    );
   }
 
   if (liveLimits) {

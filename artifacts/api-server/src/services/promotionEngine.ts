@@ -59,6 +59,23 @@ const TIER_TO_KELLY_FRACTION: Record<string, number> = {
   abandoned: 0,
 };
 
+// Sub-phase 9: probationary Kelly ratchet.
+// New candidate→promoted transitions seed kelly_fraction at this value
+// instead of TIER_TO_KELLY_FRACTION.promoted (1.0). Ratchets to 1.0 only
+// after PROBATIONARY_RATCHET_MIN_BETS real-money settled bets accumulate
+// AND rolling-30d ROI > PROBATIONARY_RATCHET_MIN_ROI_PCT. Existing
+// promoted-tier rows already at 1.0 are NOT reset — the probationary
+// state applies only to NEW promotions going forward.
+const INITIAL_PROMOTED_KELLY_FRACTION = parseFloat(
+  process.env.INITIAL_PROMOTED_KELLY_FRACTION ?? "0.5",
+);
+const PROBATIONARY_RATCHET_MIN_BETS = parseInt(
+  process.env.PROBATIONARY_RATCHET_MIN_BETS ?? "100",
+);
+const PROBATIONARY_RATCHET_MIN_ROI_PCT = parseFloat(
+  process.env.PROBATIONARY_RATCHET_MIN_ROI_PCT ?? "0",
+);
+
 // Sub-phase 5: dedupe window for event-driven evaluation (Refinement: idempotency).
 // Within this window, repeat calls on the same tag with non-transition outcomes
 // are skipped. Transitions always re-evaluate (state changed; new gates apply).
@@ -570,9 +587,12 @@ export async function evaluateExperimentTag(
       const reason = `Met all candidate→promoted thresholds: candidateSample=${candidateMetrics.sampleSize}/${thresh.minSampleSize}, realised_roi=${candidateMetrics.roi.toFixed(1)}%/${thresh.minRoi}%, kelly_growth=${candidateMetrics.realisedKellyGrowthRate.toFixed(4)}/bet, CLV=${candidateMetrics.clv.toFixed(2)}/${thresh.minClv}, p=${candidateMetrics.pValue.toFixed(3)}/${thresh.maxPValue}`;
       const auditId = await logPromotion(tag, "candidate", "promoted", reason, candidateMetrics, thresh as any);
       await writeAuditLogForTransition(tag, "candidate", "promoted", reason, candidateMetrics);
+      // Sub-phase 9: new promotions start at probationary kelly_fraction
+      // (default 0.5), NOT the full ceiling of 1.0. Ratchets to 1.0 via
+      // checkAndApplyKellyRatchet once 100 real-money bets confirm edge.
       await db.update(experimentRegistryTable).set({
         dataTier: "promoted",
-        kellyFraction: TIER_TO_KELLY_FRACTION.promoted,
+        kellyFraction: INITIAL_PROMOTED_KELLY_FRACTION,
         tierChangedAt: new Date(),
       }).where(eq(experimentRegistryTable.id, exp.id));
       await db.execute(sql`
@@ -582,7 +602,7 @@ export async function evaluateExperimentTag(
       `);
       outcome = "promote";
       newTier = "promoted";
-      logger.info({ tag, triggeredBy: opts.triggeredBy }, "Candidate promoted to full promotion");
+      logger.info({ tag, triggeredBy: opts.triggeredBy, kellyFraction: INITIAL_PROMOTED_KELLY_FRACTION }, "Candidate promoted to probationary-promoted (sub-phase 9)");
     } else if (candidateMetrics.roi < t.demotionCandidateToExperiment.minRoi || candidateMetrics.clv < t.demotionCandidateToExperiment.minClv) {
       const reason = `Candidate demoted: realised_roi=${candidateMetrics.roi.toFixed(1)}% (min ${t.demotionCandidateToExperiment.minRoi}%), kelly_growth=${candidateMetrics.realisedKellyGrowthRate.toFixed(4)}/bet, CLV=${candidateMetrics.clv.toFixed(2)} (min ${t.demotionCandidateToExperiment.minClv})`;
       await logPromotion(tag, "candidate", "experiment", reason, candidateMetrics, t.demotionCandidateToExperiment as any);
@@ -626,7 +646,109 @@ export async function evaluateExperimentTag(
 
   await writeGraduationEvaluationLog(tag, outcome === "skipped_dedupe" ? "hold" : outcome, metrics, opts);
 
+  // Sub-phase 9: probationary Kelly ratchet check. Runs after every settlement
+  // event. Ratchets kelly_fraction 0.5 → 1.0 if 100+ real-money settled bets
+  // accumulate AND rolling-30d ROI is positive. No-op for non-promoted tiers
+  // and for already-ratcheted (kelly_fraction >= 1.0) tags.
+  try {
+    await checkAndApplyKellyRatchet(tag);
+  } catch (err) {
+    logger.error({ err, tag }, "Kelly ratchet check failed — non-fatal");
+  }
+
   return { tag, evaluated: true, outcome, newTier, metrics };
+}
+
+// ─── Sub-phase 9: probationary Kelly ratchet ─────────────────────────────────
+// Ratchets a probationary-promoted tag's kelly_fraction from
+// INITIAL_PROMOTED_KELLY_FRACTION (0.5) up to TIER_TO_KELLY_FRACTION.promoted
+// (1.0) once PROBATIONARY_RATCHET_MIN_BETS real-money settled bets confirm
+// rolling-30d ROI > PROBATIONARY_RATCHET_MIN_ROI_PCT. No-op for:
+//   - non-promoted tiers
+//   - kelly_fraction already at or above the ceiling
+//   - insufficient real-money sample
+//   - non-positive rolling ROI (tag stays at probationary; eventual demote
+//     handled by existing demotion gates if performance keeps deteriorating)
+// Idempotent: the UPDATE WHERE kelly_fraction < ceiling guard makes
+// concurrent ratchet attempts no-op for the second one.
+
+export async function checkAndApplyKellyRatchet(tag: string): Promise<{
+  ratcheted: boolean;
+  reason: string;
+  nRealMoneyBets?: number;
+  rollingRoi30dPct?: number;
+}> {
+  const rows = await db.execute(sql`
+    SELECT id, data_tier, kelly_fraction
+    FROM experiment_registry
+    WHERE experiment_tag = ${tag}
+    LIMIT 1
+  `);
+  const r = (rows as any).rows?.[0];
+  if (!r) return { ratcheted: false, reason: "no_registry_row" };
+  if (r.data_tier !== "promoted") return { ratcheted: false, reason: `not_promoted_tier:${r.data_tier}` };
+  const currentKf = parseFloat(r.kelly_fraction ?? "0");
+  if (currentKf >= TIER_TO_KELLY_FRACTION.promoted) {
+    return { ratcheted: false, reason: "already_at_ceiling" };
+  }
+
+  // Count real-money settled bets for the tag.
+  const cntRows = await db.execute(sql`
+    SELECT COUNT(*)::int AS n
+    FROM paper_bets
+    WHERE experiment_tag = ${tag}
+      AND status IN ('won','lost')
+      AND stake::numeric > 0
+      AND legacy_regime = false
+      AND deleted_at IS NULL
+  `);
+  const nRealMoneyBets = parseInt((cntRows as any).rows?.[0]?.n ?? "0");
+  if (nRealMoneyBets < PROBATIONARY_RATCHET_MIN_BETS) {
+    return { ratcheted: false, reason: `insufficient_sample:${nRealMoneyBets}/${PROBATIONARY_RATCHET_MIN_BETS}`, nRealMoneyBets };
+  }
+
+  // Rolling-30-bet ROI via the existing helper (matches demotion-gate window).
+  const rolling = await computeRollingMetrics(tag, 30);
+  const rollingRoi30dPct = rolling.roi;
+  if (rollingRoi30dPct <= PROBATIONARY_RATCHET_MIN_ROI_PCT) {
+    logger.warn(
+      { tag, nRealMoneyBets, rollingRoi30dPct },
+      "Probationary tag has 100+ real-money bets but ROI not positive — staying at probationary kelly_fraction",
+    );
+    return { ratcheted: false, reason: `roi_not_positive:${rollingRoi30dPct.toFixed(2)}`, nRealMoneyBets, rollingRoi30dPct };
+  }
+
+  // Apply ratchet. The race-safe WHERE kelly_fraction < ceiling makes
+  // concurrent settlement events no-op for the second invocation.
+  await db.execute(sql`
+    UPDATE experiment_registry
+    SET kelly_fraction = ${TIER_TO_KELLY_FRACTION.promoted},
+        tier_changed_at = NOW()
+    WHERE id = ${r.id} AND kelly_fraction < ${TIER_TO_KELLY_FRACTION.promoted}
+  `);
+
+  await db.insert(modelDecisionAuditLogTable).values({
+    decisionType: "kelly_ratchet_applied",
+    subject: `tag:${tag}`,
+    priorState: { kelly_fraction: currentKf, data_tier: "promoted" } as any,
+    newState: { kelly_fraction: TIER_TO_KELLY_FRACTION.promoted, data_tier: "promoted" } as any,
+    reasoning: `Probationary Kelly ratchet: ${nRealMoneyBets} settled real-money bets accumulated (≥${PROBATIONARY_RATCHET_MIN_BETS} threshold) with rolling-30 ROI = ${rollingRoi30dPct.toFixed(2)}%. Ratcheting kelly_fraction ${currentKf.toFixed(2)} → ${TIER_TO_KELLY_FRACTION.promoted.toFixed(2)}.`,
+    supportingMetrics: {
+      n_real_money_settled: nRealMoneyBets,
+      rolling_roi_30d_pct: rollingRoi30dPct,
+      min_bets_threshold: PROBATIONARY_RATCHET_MIN_BETS,
+      min_roi_threshold_pct: PROBATIONARY_RATCHET_MIN_ROI_PCT,
+      prior_kelly_fraction: currentKf,
+    } as any,
+    expectedImpact: null,
+    reviewStatus: "automatic",
+  });
+
+  logger.info(
+    { tag, nRealMoneyBets, rollingRoi30dPct, priorKf: currentKf, newKf: TIER_TO_KELLY_FRACTION.promoted },
+    "Probationary Kelly ratchet applied (sub-phase 9)",
+  );
+  return { ratcheted: true, reason: "ok", nRealMoneyBets, rollingRoi30dPct };
 }
 
 // ─── Sub-phase 5: distribution-shift detector A(archetype) ──────────────────
