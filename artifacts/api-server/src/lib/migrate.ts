@@ -1216,6 +1216,101 @@ export async function runMigrations() {
         WHERE match_id IS NOT NULL
     `);
 
+    // Sub-phase 7.x: AF metadata bundle — 4 endpoints (/transfers, /coachs,
+    // /sidelined, /trophies) ingested per docs/phase-2-subphase-7-x-plan.md.
+    // All idempotent delete-by-natural-key + insert-snapshot per fetch.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS team_transfers (
+        id SERIAL PRIMARY KEY,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        team_api_id INTEGER NOT NULL,
+        player_api_id INTEGER,
+        player_name TEXT NOT NULL,
+        transfer_date DATE,
+        team_in_api_id INTEGER,
+        team_in_name TEXT,
+        team_out_api_id INTEGER,
+        team_out_name TEXT,
+        transfer_type TEXT
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS team_transfers_team_idx
+        ON team_transfers(team_api_id, transfer_date DESC NULLS LAST)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS team_transfers_player_idx
+        ON team_transfers(player_api_id)
+        WHERE player_api_id IS NOT NULL
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS team_coaches (
+        id SERIAL PRIMARY KEY,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        team_api_id INTEGER NOT NULL,
+        coach_api_id INTEGER NOT NULL,
+        coach_name TEXT NOT NULL,
+        start_date DATE,
+        end_date DATE,
+        is_current BOOLEAN NOT NULL DEFAULT FALSE
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS team_coaches_team_idx
+        ON team_coaches(team_api_id, is_current)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS team_coaches_coach_idx
+        ON team_coaches(coach_api_id)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS player_sidelined (
+        id SERIAL PRIMARY KEY,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        player_api_id INTEGER NOT NULL,
+        player_name TEXT NOT NULL,
+        sideline_type TEXT NOT NULL,
+        start_date DATE,
+        end_date DATE
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS player_sidelined_player_idx
+        ON player_sidelined(player_api_id, start_date DESC NULLS LAST)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS player_trophies (
+        id SERIAL PRIMARY KEY,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        person_api_id INTEGER NOT NULL,
+        person_type TEXT NOT NULL,
+        league TEXT,
+        country TEXT,
+        season TEXT,
+        place TEXT
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'player_trophies_person_type_check'
+        ) THEN
+          ALTER TABLE player_trophies
+            ADD CONSTRAINT player_trophies_person_type_check
+            CHECK (person_type IN ('player','coach'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS player_trophies_person_idx
+        ON player_trophies(person_api_id, person_type)
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

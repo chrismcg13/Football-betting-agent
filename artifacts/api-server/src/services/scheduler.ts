@@ -18,6 +18,8 @@ import {
   getLeaguesWithPendingBets,
   capturePreKickoffLineups,
   fetchInjuriesForUpcomingMatches,
+  fetchTeamMetadataForUpcomingMatches,
+  fetchPlayerMetadataForRecentInjuries,
   getApiBudgetStatus,
 } from "./apiFootball";
 import { runXGIngestion } from "./xgIngestionService";
@@ -2278,6 +2280,26 @@ export function startScheduler(): void {
     });
   }, { timezone: "UTC" });
   logger.info("Injury ingestion scheduler active — daily at 06:00 UTC");
+
+  // Sub-phase 7.x: weekly AF metadata bundle (transfers/coaches/sidelined/
+  // trophies). Per-team orchestrator runs first then per-player. TTL-gated
+  // (6-day refresh window) so steady-state burns ~50 calls/week. Sits in the
+  // empty slot between injury ingestion (06:00) and threshold proposal
+  // generator (08:00) on Sundays.
+  cron.schedule("0 7 * * 0", () => {
+    logger.info("AF metadata bundle triggered (Sunday 07:00 UTC)");
+    void (async () => {
+      try {
+        const teamResult = await fetchTeamMetadataForUpcomingMatches();
+        logger.info(teamResult, "AF team metadata complete");
+        const playerResult = await fetchPlayerMetadataForRecentInjuries();
+        logger.info(playerResult, "AF player metadata complete");
+      } catch (err) {
+        logger.error({ err }, "AF metadata bundle failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("AF metadata bundle scheduler active — Sunday 07:00 UTC");
 
   cron.schedule("0 3 1 * *", () => {
     logger.info("Monthly league performance scoring + deactivation triggered");

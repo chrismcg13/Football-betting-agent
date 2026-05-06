@@ -2139,3 +2139,326 @@ export async function fetchInjuriesForUpcomingMatches(): Promise<{
   );
   return { checked: rows.length, fixturesIngested, injuriesInserted, skippedBudget };
 }
+
+// ─── Sub-phase 7.x: AF metadata bundle (transfers/coaches/sidelined/trophies) ─
+// Per docs/phase-2-subphase-7-x-plan.md. Ingestion-only. No feature wiring;
+// retrospective predictive-power validation in 7.x.b decides what ships.
+// All 4 fetchers use delete-by-natural-key + insert-snapshot for idempotency.
+
+const METADATA_TTL_DAYS = 6;
+
+interface ApiTransfer {
+  player: { id: number | null; name: string | null };
+  transfers?: Array<{
+    date: string;
+    type: string | null;
+    teams: {
+      in: { id: number | null; name: string | null };
+      out: { id: number | null; name: string | null };
+    };
+  }>;
+}
+
+export async function fetchAndStoreTransfersForTeam(
+  teamApiId: number,
+): Promise<{ inserted: number; skipped: boolean }> {
+  if (!(await canMakeRequest())) return { inserted: 0, skipped: true };
+  const result = await fetchApiFootball<ApiTransfer[]>("/transfers", { team: teamApiId });
+  if (!result) return { inserted: 0, skipped: true };
+
+  await db.execute(sql`DELETE FROM team_transfers WHERE team_api_id = ${teamApiId}`);
+
+  let inserted = 0;
+  for (const player of result) {
+    if (!player.transfers) continue;
+    for (const t of player.transfers) {
+      if (!t.date) continue;
+      await db.execute(sql`
+        INSERT INTO team_transfers (
+          team_api_id, player_api_id, player_name, transfer_date,
+          team_in_api_id, team_in_name, team_out_api_id, team_out_name, transfer_type
+        ) VALUES (
+          ${teamApiId},
+          ${player.player?.id ?? null},
+          ${player.player?.name ?? "Unknown"},
+          ${t.date},
+          ${t.teams?.in?.id ?? null}, ${t.teams?.in?.name ?? null},
+          ${t.teams?.out?.id ?? null}, ${t.teams?.out?.name ?? null},
+          ${t.type ?? null}
+        )
+      `);
+      inserted++;
+    }
+  }
+  return { inserted, skipped: false };
+}
+
+interface ApiCoach {
+  id: number;
+  name: string;
+  career?: Array<{
+    team: { id: number | null; name: string | null };
+    start: string | null;
+    end: string | null;
+  }>;
+}
+
+export async function fetchAndStoreCoachesForTeam(
+  teamApiId: number,
+): Promise<{ inserted: number; skipped: boolean }> {
+  if (!(await canMakeRequest())) return { inserted: 0, skipped: true };
+  const result = await fetchApiFootball<ApiCoach[]>("/coachs", { team: teamApiId });
+  if (!result) return { inserted: 0, skipped: true };
+
+  await db.execute(sql`DELETE FROM team_coaches WHERE team_api_id = ${teamApiId}`);
+
+  let inserted = 0;
+  for (const coach of result) {
+    if (!coach.id) continue;
+    // Filter career entries to those at THIS team (the response includes the
+    // coach's full career across all teams).
+    const career = (coach.career ?? []).filter((c) => c.team?.id === teamApiId);
+    for (const c of career) {
+      await db.execute(sql`
+        INSERT INTO team_coaches (
+          team_api_id, coach_api_id, coach_name, start_date, end_date, is_current
+        ) VALUES (
+          ${teamApiId}, ${coach.id}, ${coach.name},
+          ${c.start ?? null}, ${c.end ?? null}, ${c.end == null}
+        )
+      `);
+      inserted++;
+    }
+  }
+  return { inserted, skipped: false };
+}
+
+interface ApiSidelined {
+  type: string;
+  start: string | null;
+  end: string | null;
+}
+
+export async function fetchAndStoreSidelinedForPlayer(
+  playerApiId: number,
+  playerName: string,
+): Promise<{ inserted: number; skipped: boolean }> {
+  if (!(await canMakeRequest())) return { inserted: 0, skipped: true };
+  const result = await fetchApiFootball<ApiSidelined[]>("/sidelined", { player: playerApiId });
+  if (!result) return { inserted: 0, skipped: true };
+
+  await db.execute(sql`DELETE FROM player_sidelined WHERE player_api_id = ${playerApiId}`);
+
+  let inserted = 0;
+  for (const s of result) {
+    if (!s.type) continue;
+    await db.execute(sql`
+      INSERT INTO player_sidelined (
+        player_api_id, player_name, sideline_type, start_date, end_date
+      ) VALUES (
+        ${playerApiId}, ${playerName}, ${s.type}, ${s.start ?? null}, ${s.end ?? null}
+      )
+    `);
+    inserted++;
+  }
+  return { inserted, skipped: false };
+}
+
+interface ApiTrophy {
+  league: string | null;
+  country: string | null;
+  season: string | null;
+  place: string | null;
+}
+
+export async function fetchAndStoreTrophiesForPerson(
+  personApiId: number,
+  personType: "player" | "coach",
+): Promise<{ inserted: number; skipped: boolean }> {
+  if (!(await canMakeRequest())) return { inserted: 0, skipped: true };
+  const param = personType === "player" ? { player: personApiId } : { coach: personApiId };
+  const result = await fetchApiFootball<ApiTrophy[]>("/trophies", param);
+  if (!result) return { inserted: 0, skipped: true };
+
+  await db.execute(sql`
+    DELETE FROM player_trophies
+    WHERE person_api_id = ${personApiId} AND person_type = ${personType}
+  `);
+
+  let inserted = 0;
+  for (const t of result) {
+    await db.execute(sql`
+      INSERT INTO player_trophies (
+        person_api_id, person_type, league, country, season, place
+      ) VALUES (
+        ${personApiId}, ${personType},
+        ${t.league ?? null}, ${t.country ?? null}, ${t.season ?? null}, ${t.place ?? null}
+      )
+    `);
+    inserted++;
+  }
+  return { inserted, skipped: false };
+}
+
+// ── Per-team orchestrator (transfers + coaches) ─────────────────────────────
+
+export async function fetchTeamMetadataForUpcomingMatches(): Promise<{
+  teamsChecked: number;
+  transfersFetched: number;
+  coachesFetched: number;
+  totalInserted: number;
+  skippedRecent: number;
+  skippedBudget: number;
+}> {
+  const now = new Date();
+  const in7d = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+  // Seed: distinct AF team IDs from features for fixtures with placed bets.
+  // The _af_home_team_id / _af_away_team_id features are populated by team-stats
+  // ingestion (apiFootball.ts:fetchTeamStatsForUpcomingMatches).
+  const teamRows = await db.execute(sql`
+    SELECT DISTINCT CAST(f.feature_value AS INTEGER) AS team_api_id
+    FROM paper_bets pb
+    JOIN matches m ON pb.match_id = m.id
+    JOIN features f ON f.match_id = m.id
+    WHERE pb.status = 'pending'
+      AND m.status = 'scheduled'
+      AND m.kickoff_time BETWEEN ${now} AND ${in7d}
+      AND f.feature_name IN ('_af_home_team_id','_af_away_team_id')
+      AND f.feature_value IS NOT NULL
+  `);
+  const teamIds = ((teamRows as any).rows ?? [])
+    .map((r: any) => Number(r.team_api_id))
+    .filter((id: number) => Number.isFinite(id) && id > 0);
+  const uniqueTeamIds = Array.from(new Set<number>(teamIds));
+
+  const ttlCutoff = new Date(Date.now() - METADATA_TTL_DAYS * 24 * 60 * 60 * 1000);
+  let transfersFetched = 0;
+  let coachesFetched = 0;
+  let totalInserted = 0;
+  let skippedRecent = 0;
+  let skippedBudget = 0;
+
+  for (const teamId of uniqueTeamIds) {
+    // Transfers — TTL skip
+    const tLatest = await db.execute(sql`
+      SELECT MAX(fetched_at) AS latest FROM team_transfers WHERE team_api_id = ${teamId}
+    `);
+    const tl = (tLatest as any).rows?.[0]?.latest;
+    if (tl && new Date(tl) > ttlCutoff) {
+      skippedRecent++;
+    } else {
+      try {
+        const r = await fetchAndStoreTransfersForTeam(teamId);
+        if (r.skipped) skippedBudget++;
+        else { transfersFetched++; totalInserted += r.inserted; }
+      } catch (err) {
+        logger.error({ err, teamId }, "Transfers fetch failed");
+      }
+    }
+
+    // Coaches — TTL skip
+    const cLatest = await db.execute(sql`
+      SELECT MAX(fetched_at) AS latest FROM team_coaches WHERE team_api_id = ${teamId}
+    `);
+    const cl = (cLatest as any).rows?.[0]?.latest;
+    if (cl && new Date(cl) > ttlCutoff) {
+      skippedRecent++;
+    } else {
+      try {
+        const r = await fetchAndStoreCoachesForTeam(teamId);
+        if (r.skipped) skippedBudget++;
+        else { coachesFetched++; totalInserted += r.inserted; }
+      } catch (err) {
+        logger.error({ err, teamId }, "Coaches fetch failed");
+      }
+    }
+  }
+
+  logger.info(
+    { teamsChecked: uniqueTeamIds.length, transfersFetched, coachesFetched, totalInserted, skippedRecent, skippedBudget },
+    "AF team metadata ingestion complete",
+  );
+  return {
+    teamsChecked: uniqueTeamIds.length,
+    transfersFetched, coachesFetched, totalInserted, skippedRecent, skippedBudget,
+  };
+}
+
+// ── Per-player orchestrator (sidelined + trophies) ──────────────────────────
+
+export async function fetchPlayerMetadataForRecentInjuries(): Promise<{
+  playersChecked: number;
+  sidelinedFetched: number;
+  trophiesFetched: number;
+  totalInserted: number;
+  skippedRecent: number;
+  skippedBudget: number;
+}> {
+  // Seed: distinct player_api_ids appearing in injury_reports (last 30 days).
+  // Coverage grows as 7.0a's prospective injury data accumulates. Out-of-band
+  // /players?team= roster ingestion is a future expansion if needed.
+  const cutoff30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const playerRows = await db.execute(sql`
+    SELECT DISTINCT player_api_id, MIN(player_name) AS player_name
+    FROM injury_reports
+    WHERE fetched_at >= ${cutoff30} AND player_api_id IS NOT NULL
+    GROUP BY player_api_id
+  `);
+  const players = ((playerRows as any).rows ?? [])
+    .map((r: any) => ({ id: Number(r.player_api_id), name: String(r.player_name ?? "Unknown") }))
+    .filter((p: any) => Number.isFinite(p.id) && p.id > 0);
+
+  const ttlCutoff = new Date(Date.now() - METADATA_TTL_DAYS * 24 * 60 * 60 * 1000);
+  let sidelinedFetched = 0;
+  let trophiesFetched = 0;
+  let totalInserted = 0;
+  let skippedRecent = 0;
+  let skippedBudget = 0;
+
+  for (const player of players) {
+    // Sidelined — TTL skip
+    const sLatest = await db.execute(sql`
+      SELECT MAX(fetched_at) AS latest FROM player_sidelined WHERE player_api_id = ${player.id}
+    `);
+    const sl = (sLatest as any).rows?.[0]?.latest;
+    if (sl && new Date(sl) > ttlCutoff) {
+      skippedRecent++;
+    } else {
+      try {
+        const r = await fetchAndStoreSidelinedForPlayer(player.id, player.name);
+        if (r.skipped) skippedBudget++;
+        else { sidelinedFetched++; totalInserted += r.inserted; }
+      } catch (err) {
+        logger.error({ err, playerId: player.id }, "Sidelined fetch failed");
+      }
+    }
+
+    // Trophies — TTL skip
+    const tLatest = await db.execute(sql`
+      SELECT MAX(fetched_at) AS latest FROM player_trophies
+      WHERE person_api_id = ${player.id} AND person_type = 'player'
+    `);
+    const tl = (tLatest as any).rows?.[0]?.latest;
+    if (tl && new Date(tl) > ttlCutoff) {
+      skippedRecent++;
+    } else {
+      try {
+        const r = await fetchAndStoreTrophiesForPerson(player.id, "player");
+        if (r.skipped) skippedBudget++;
+        else { trophiesFetched++; totalInserted += r.inserted; }
+      } catch (err) {
+        logger.error({ err, playerId: player.id }, "Trophies fetch failed");
+      }
+    }
+  }
+
+  logger.info(
+    { playersChecked: players.length, sidelinedFetched, trophiesFetched, totalInserted, skippedRecent, skippedBudget },
+    "AF player metadata ingestion complete",
+  );
+  return {
+    playersChecked: players.length,
+    sidelinedFetched, trophiesFetched, totalInserted, skippedRecent, skippedBudget,
+  };
+}
