@@ -47,7 +47,7 @@ import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMa
 import { runBetfairReverseMapping } from "./betfairFirstUniverse";
 import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
 import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
-import { runPromotionEngine } from "./promotionEngine";
+import { runPromotionEngine, runProposalGenerator } from "./promotionEngine";
 import { runWeeklyExperimentAnalysis } from "./experimentAnalysis";
 import { syncDevToProd } from "./syncDevToProd";
 import { reconcileSettlements, getAccountFunds } from "./betfairLive";
@@ -2221,6 +2221,35 @@ export function startScheduler(): void {
     });
   }, { timezone: "UTC" });
   logger.info("Live threshold review scheduler active — Sunday 05:00 UTC");
+
+  // Sub-phase 6.5: weekly autonomous threshold proposal generator.
+  // Runs every Sunday 08:00 UTC, after the 04:00-05:00 Sunday cron cluster
+  // (promotion engine, weekly experiment analysis, data richness, live
+  // threshold review) so it reads metrics those runs have refreshed.
+  // Writes are env-gated by THRESHOLD_PROPOSAL_GENERATOR_ENABLED inside the
+  // function (default false). Cron always runs; only proposes when flag is on.
+  // Logs a summary (counts only) — full skip detail is available on demand
+  // via POST /api/admin/run-proposal-generator.
+  cron.schedule("0 8 * * 0", () => {
+    logger.info("Threshold proposal generator triggered (Sunday 08:00 UTC)");
+    void runProposalGenerator()
+      .then((result) => {
+        logger.info({
+          proposalsApproved: result.proposalsApproved,
+          proposalsPending: result.proposalsPending,
+          nProposals: result.proposals.length,
+          nSkipped: result.skipped.length,
+          scopesProcessed: result.scopesProcessed.length,
+          thresholdsConsidered: result.thresholdsConsidered,
+          dryRun: result.dryRun,
+          flagEnabled: result.proposalGeneratorEnabledFlag,
+        }, "Threshold proposal generator complete");
+      })
+      .catch((err) => {
+        logger.error({ err }, "Threshold proposal generator failed");
+      });
+  }, { timezone: "UTC" });
+  logger.info("Threshold proposal generator scheduler active — Sunday 08:00 UTC");
 
   cron.schedule("0 */6 * * *", () => {
     logger.info("Dev→Prod sync triggered (every 6 hours)");
