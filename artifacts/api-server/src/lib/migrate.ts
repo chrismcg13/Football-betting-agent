@@ -1159,6 +1159,58 @@ export async function runMigrations() {
         WHERE status = 'approved'
     `);
 
+    // 2026-05-06: partial unique index for pending paper-bet dedup.
+    // Schema (lib/db/src/schema/paperBets.ts) declared this index but it was
+    // never materialized because migrate.ts is hand-written and the declaration
+    // was missed. Without it, dedup rests entirely on the SELECT-then-INSERT
+    // pre-check in placeBet (paperTrading.ts:917), which has a race window
+    // between parallel cycles. Real duplicates leaked to production
+    // (e.g. two MO Draw 3.25 bets on A. Italiano vs Vasco placed 1 second apart).
+    //
+    // Step 1: idempotent cleanup of pre-existing duplicate pending rows.
+    // For each (match_id, market_type, selection_canonical) group with >1
+    // pending row in the index's scope, keep the newest by id and void the
+    // rest. Stake on voided rows is refunded (settlement_pnl=0). Idempotent:
+    // on future runs there are no duplicates so the UPDATE matches zero rows.
+    await db.execute(sql`
+      WITH duplicates AS (
+        SELECT id,
+               row_number() OVER (
+                 PARTITION BY match_id, market_type, selection_canonical
+                 ORDER BY id DESC
+               ) AS rn
+        FROM paper_bets
+        WHERE status IN ('pending','pending_placement')
+          AND deleted_at IS NULL
+          AND selection_canonical IS NOT NULL
+          AND placed_at >= '2026-04-19T20:00:00Z'
+      )
+      UPDATE paper_bets
+      SET status = 'void',
+          settlement_pnl = '0',
+          gross_pnl = '0',
+          commission_amount = '0',
+          net_pnl = '0',
+          settled_at = NOW(),
+          betfair_status = COALESCE(betfair_status || '|', '') || 'VOID_DEDUP_BACKFILL'
+      WHERE id IN (SELECT id FROM duplicates WHERE rn > 1)
+        AND betfair_bet_id IS NULL
+    `);
+
+    // Step 2: create the partial unique index. Mirrors the Drizzle declaration
+    // in lib/db/src/schema/paperBets.ts. Race-proof guarantee against parallel
+    // trading cycles attempting the same (match, market, selection) bet.
+    // Placement code already catches 23505 + this constraint name and converts
+    // it to a friendly logReject (paperTrading.ts:1346).
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS paper_bets_unique_pending_canonical_idx
+        ON paper_bets (match_id, market_type, selection_canonical)
+        WHERE status IN ('pending','pending_placement')
+          AND deleted_at IS NULL
+          AND selection_canonical IS NOT NULL
+          AND placed_at >= '2026-04-19T20:00:00Z'
+    `);
+
     // Change C (2026-04-22): create paper_bets_current view + partial index.
     // MUST run AFTER every `ALTER TABLE paper_bets` in this migrate() —
     // Postgres freezes a view's column list at CREATE time. If a new column
@@ -1309,58 +1361,6 @@ export async function runMigrations() {
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS player_trophies_person_idx
         ON player_trophies(person_api_id, person_type)
-    `);
-
-    // 2026-05-06: race-proof exact-duplicate pending paper bets.
-    // Two parallel trading cycles can both SELECT (no row visible) and both
-    // INSERT, producing duplicates with the same (match, market, selection).
-    // Three pairs leaked into production (e.g. paper_bets 929 / 930 — A.
-    // Italiano vs Vasco MATCH_ODDS Draw — placed 0.18s apart). Fix is one
-    // cleanup + one partial unique index on raw selection_name.
-    //
-    // NOTE: this does NOT use selection_canonical (which is a separate WIP
-    // — column declared in lib/db/src/schema/paperBets.ts but ALTER TABLE
-    // never landed). Raw selection_name catches all visible exact dups
-    // ('Draw', 'Yes' selections match exactly). The canonical-column work
-    // can ship later as an additive enhancement layered on top.
-    //
-    // Step 1: cleanup pre-existing duplicates. For each (match_id, market_
-    // type, selection_name) group with >1 pending row in the index's scope,
-    // keep the newest by id and void the rest. Idempotent: future runs find
-    // no duplicates so the UPDATE matches zero rows. Never voids a row that
-    // has a real betfair_bet_id (defensive against live-mode rows).
-    await db.execute(sql`
-      WITH duplicates AS (
-        SELECT id,
-               row_number() OVER (
-                 PARTITION BY match_id, market_type, selection_name
-                 ORDER BY id DESC
-               ) AS rn
-        FROM paper_bets
-        WHERE status IN ('pending','pending_placement')
-          AND deleted_at IS NULL
-          AND placed_at >= '2026-04-19T20:00:00Z'
-      )
-      UPDATE paper_bets
-      SET status = 'void',
-          settlement_pnl = '0',
-          settled_at = NOW(),
-          betfair_status = COALESCE(betfair_status || '|', '') || 'VOID_DEDUP_BACKFILL'
-      WHERE id IN (SELECT id FROM duplicates WHERE rn > 1)
-        AND betfair_bet_id IS NULL
-    `);
-
-    // Step 2: partial unique index. Race-proof against parallel cycles.
-    // Exact-name comparison: same selection_name string within the index's
-    // scope cannot have >1 row at a time. Future race attempts trigger PG
-    // error 23505 on the second INSERT — placement code's pre-check still
-    // catches the common case; the index is the fallback for the race.
-    await db.execute(sql`
-      CREATE UNIQUE INDEX IF NOT EXISTS paper_bets_unique_pending_name_idx
-        ON paper_bets (match_id, market_type, selection_name)
-        WHERE status IN ('pending','pending_placement')
-          AND deleted_at IS NULL
-          AND placed_at >= '2026-04-19T20:00:00Z'
     `);
 
     logger.info("Migrations complete");
