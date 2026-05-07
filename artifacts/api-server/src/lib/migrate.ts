@@ -1363,6 +1363,59 @@ export async function runMigrations() {
         ON player_trophies(person_api_id, person_type)
     `);
 
+    // 2026-05-07: autonomous_pauses — model self-audit's action layer.
+    // Daily runModelSelfAudit() cron computes per-market and per-(league
+    // × market) ROI / Kelly-growth-rate / Pinnacle-coverage metrics and
+    // pauses underperforming scopes. Capital-protective only: paused
+    // scopes block real-stake placement but allow shadow bets through
+    // (architectural principle that £0 learning-data bets bypass capital
+    // gates). Trial-mode auto-resume at 50% Kelly fraction; escalation
+    // on repeat offenders.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS autonomous_pauses (
+        id SERIAL PRIMARY KEY,
+        scope_type TEXT NOT NULL,
+        scope_value TEXT NOT NULL,
+        paused_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        paused_until TIMESTAMPTZ NOT NULL,
+        resumed_at TIMESTAMPTZ,
+        reason TEXT NOT NULL,
+        metric_type TEXT NOT NULL,
+        metric_value NUMERIC NOT NULL,
+        threshold_value NUMERIC NOT NULL,
+        sample_size INTEGER NOT NULL,
+        kelly_fraction_override NUMERIC,
+        pause_duration_days INTEGER NOT NULL,
+        escalation_level INTEGER NOT NULL DEFAULT 1,
+        audit_log_id INTEGER,
+        manual_override BOOLEAN NOT NULL DEFAULT FALSE,
+        notes TEXT
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'autonomous_pauses_scope_type_check'
+        ) THEN
+          ALTER TABLE autonomous_pauses
+            ADD CONSTRAINT autonomous_pauses_scope_type_check
+            CHECK (scope_type IN ('market','league','league_market','archetype','tag'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS autonomous_pauses_active_idx
+        ON autonomous_pauses(scope_type, scope_value)
+        WHERE resumed_at IS NULL
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS autonomous_pauses_paused_until_idx
+        ON autonomous_pauses(paused_until)
+        WHERE resumed_at IS NULL
+    `);
+
     // 2026-05-07: prevent matches-table fixture-level duplicates.
     // Pre-this-commit, AF and Betfair ingestion paths each checked existence
     // by their own external id (api_fixture_id / betfair_event_id), so the

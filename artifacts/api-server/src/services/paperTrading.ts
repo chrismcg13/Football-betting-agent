@@ -33,6 +33,7 @@ import { getLiveOppScoreThreshold } from "./liveThresholdReview";
 import { storePinnacleSnapshot } from "./oddsPapi";
 import { evaluateExperimentTag, computeArchetypeDistributionShift } from "./promotionEngine";
 import { shouldBlockBet, getSegmentKellyMultiplier, getMarketFamily } from "./edgeConcentration";
+import { checkAutonomousPauses } from "./modelSelfAudit";
 import {
   getEffectiveLimits,
   runLiveConcentrationChecks,
@@ -796,6 +797,79 @@ export async function placePaperBet(
       { matchId, marketType, selectionName, universeTier },
       "Wave 2 #4: experiment-track shadow bet on previously-banned market — admitted for relearning",
     );
+  }
+
+  // ── Autonomous-pause registry (model self-audit) ─────────────────────────
+  // Daily runModelSelfAudit() pauses scopes (market / league_market / league
+  // / archetype) where Kelly-growth-rate / ROI / data-coverage tripped a
+  // threshold. Tier B/C shadow bets bypass via checkAutonomousPauses (the
+  // architectural principle that £0 capture continues even on distressed
+  // markets — that's where the most valuable learning happens).
+  let stakeMultiplierFromPauseTrial = 1.0;
+  let pauseScopeContext: { league: string | null; archetype: string | null } = {
+    league: null,
+    archetype: null,
+  };
+  try {
+    const [matchInfo] = await db
+      .select({
+        league: matchesTable.league,
+      })
+      .from(matchesTable)
+      .where(eq(matchesTable.id, matchId))
+      .limit(1);
+    pauseScopeContext.league = matchInfo?.league ?? null;
+    if (pauseScopeContext.league) {
+      const [ccInfo] = await db
+        .select({ archetype: competitionConfigTable.archetype })
+        .from(competitionConfigTable)
+        .where(eq(competitionConfigTable.name, pauseScopeContext.league))
+        .limit(1);
+      pauseScopeContext.archetype = ccInfo?.archetype ?? null;
+    }
+
+    const pauseCheck = await checkAutonomousPauses({
+      marketType,
+      league: pauseScopeContext.league,
+      archetype: pauseScopeContext.archetype,
+      isShadowBet,
+    });
+    if (pauseCheck.paused) {
+      logger.warn(
+        {
+          matchId,
+          marketType,
+          scope: pauseCheck.pauseRow,
+        },
+        "Bet blocked by autonomous pause (self-audit)",
+      );
+      return logReject(
+        `Autonomous pause active on ${pauseCheck.pauseRow?.scopeType} ${pauseCheck.pauseRow?.scopeValue} (reason: ${pauseCheck.pauseRow?.reason}, until ${pauseCheck.pauseRow?.pausedUntil})`,
+      );
+    }
+    if (
+      pauseCheck.kellyFractionOverride !== null &&
+      pauseCheck.kellyFractionOverride < 1.0 &&
+      pauseCheck.kellyFractionOverride > 0
+    ) {
+      // Trial mode: scope reopened at reduced Kelly fraction. Multiply the
+      // computed stake by this override later in the sizing flow.
+      stakeMultiplierFromPauseTrial = pauseCheck.kellyFractionOverride;
+      stakeMultiplier *= stakeMultiplierFromPauseTrial;
+      logger.info(
+        {
+          matchId,
+          marketType,
+          scope: pauseCheck.pauseRow,
+          kellyFractionOverride: pauseCheck.kellyFractionOverride,
+          combinedStakeMultiplier: stakeMultiplier,
+        },
+        "Bet admitted at trial-mode reduced Kelly fraction (autonomous pause partial-reopen)",
+      );
+    }
+  } catch (pauseErr) {
+    // Pause-check failures must not block bet placement — fail-open.
+    logger.warn({ err: pauseErr, matchId }, "Autonomous pause check failed — proceeding");
   }
 
   // ── Edge concentration gates ─────────────────────────────────────────────

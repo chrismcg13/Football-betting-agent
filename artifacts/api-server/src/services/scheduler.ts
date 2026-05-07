@@ -2301,6 +2301,26 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("AF metadata bundle scheduler active — Sunday 07:00 UTC");
 
+  // 2026-05-07: model self-audit. Daily 03:30 UTC, before settlement /
+  // trading crons. Computes per-market, per-(league × market), per-archetype
+  // ROI / Kelly-growth / Pinnacle-coverage; pauses underperforming scopes
+  // via the autonomous_pauses registry. Shadow bets bypass pauses (capital-
+  // protective only). Auto-resume after pause window with trial-mode 50%
+  // Kelly fraction.
+  cron.schedule("30 3 * * *", () => {
+    logger.info("Model self-audit triggered (daily 03:30 UTC)");
+    void (async () => {
+      try {
+        const { runModelSelfAudit } = await import("./modelSelfAudit");
+        const result = await runModelSelfAudit();
+        logger.info(result, "Model self-audit complete");
+      } catch (err) {
+        logger.error({ err }, "Model self-audit failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Model self-audit scheduler active — daily 03:30 UTC");
+
   // Sub-phase 10: weekly ongoing audit (settlement-bias + auto-demote).
   // Sits at Sunday 09:00 UTC, after threshold proposal generator (08:00).
   // Always writes settlement_bias_observation rows; auto-demote action gated

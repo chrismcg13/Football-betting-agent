@@ -2054,6 +2054,75 @@ router.get("/admin/shadow-bet-volume", async (_req, res) => {
   }
 });
 
+// Wave 7.1+ (2026-05-07): model self-audit + autonomous pause registry.
+// View active pauses, recent audit observations, manually trigger a run.
+
+router.get("/admin/autonomous-pauses", async (_req, res) => {
+  try {
+    const active = await db.execute(sql`
+      SELECT id, scope_type, scope_value, paused_at::text AS paused_at,
+             paused_until::text AS paused_until, reason, metric_type,
+             metric_value::text, threshold_value::text, sample_size,
+             kelly_fraction_override::text, escalation_level, audit_log_id
+      FROM autonomous_pauses
+      WHERE resumed_at IS NULL
+      ORDER BY paused_at DESC LIMIT 200
+    `);
+    const recentResumed = await db.execute(sql`
+      SELECT id, scope_type, scope_value, paused_at::text AS paused_at,
+             paused_until::text AS paused_until, resumed_at::text AS resumed_at,
+             reason, kelly_fraction_override::text, escalation_level
+      FROM autonomous_pauses
+      WHERE resumed_at IS NOT NULL
+        AND resumed_at > NOW() - INTERVAL '30 days'
+      ORDER BY resumed_at DESC LIMIT 50
+    `);
+    res.json({
+      success: true,
+      active: (active as any).rows ?? [],
+      recently_resumed: (recentResumed as any).rows ?? [],
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/run-self-audit", async (_req, res) => {
+  try {
+    const { runModelSelfAudit } = await import("../services/modelSelfAudit");
+    const result = await runModelSelfAudit();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual self-audit trigger failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/autonomous-pauses/:id/resume", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ success: false, message: "Invalid id" });
+      return;
+    }
+    const updated = await db.execute(sql`
+      UPDATE autonomous_pauses
+      SET resumed_at = NOW(), manual_override = TRUE,
+          notes = COALESCE(notes || ' | ', '') || 'manually resumed via admin endpoint'
+      WHERE id = ${id} AND resumed_at IS NULL
+      RETURNING id, scope_type, scope_value, reason
+    `);
+    const row = ((updated as any).rows ?? [])[0];
+    if (!row) {
+      res.status(404).json({ success: false, message: "Active pause not found" });
+      return;
+    }
+    res.json({ success: true, resumed: row });
+  } catch (err) {
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.get("/admin/experiments", async (_req, res) => {
   try {
     const experiments = await getExperimentsSummary();
