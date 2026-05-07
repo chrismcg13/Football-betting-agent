@@ -1057,6 +1057,7 @@ export interface WcAuditResult {
   countriesWithCoverage: number;
   countriesWithoutCoverage: number;
   promotionsApplied: number;
+  insertsApplied: number;
   durationMs: number;
 }
 
@@ -1144,9 +1145,10 @@ export async function auditWorldCupParticipantCoverage(): Promise<WcAuditResult>
   }
 
   let promotionsApplied = 0;
+  let insertsApplied = 0;
   for (const country of gapCountries) {
-    // Find a Tier E top_flight_men row for this country (best candidate
-    // for promotion). Limit 1 per gap-country to avoid promoting many.
+    // Path A: Find a Tier E top_flight_men row for this country (best
+    // candidate for promotion).
     const candidateRow = await db.execute(sql`
       SELECT id, name, country
       FROM competition_config
@@ -1156,37 +1158,113 @@ export async function auditWorldCupParticipantCoverage(): Promise<WcAuditResult>
       ORDER BY universe_tier_decided_at DESC NULLS LAST
       LIMIT 1
     `);
-    const candidate = (candidateRow as any).rows?.[0];
-    if (!candidate) continue;
+    let candidate = (candidateRow as any).rows?.[0];
 
-    // Promote to Tier C (probationary — model will graduate via Z4 ladder)
-    await db
-      .update(competitionConfigTable)
-      .set({
-        universeTier: "C",
-        universeTierDecidedAt: new Date(),
+    if (candidate) {
+      // Existing CC row — promote to Tier C
+      await db
+        .update(competitionConfigTable)
+        .set({
+          universeTier: "C",
+          universeTierDecidedAt: new Date(),
+          isActive: true,
+        })
+        .where(eq(competitionConfigTable.id, candidate.id));
+
+      await db.insert(modelDecisionAuditLogTable).values({
+        decisionType: "wc_country_coverage_promotion",
+        subject: `competition:${candidate.id}:${candidate.name}/${candidate.country ?? "unknown"}`,
+        priorState: { universe_tier: "E_or_D" } as any,
+        newState: { universe_tier: "C", reason: "wc_participant_country_no_coverage" } as any,
+        reasoning: `Y3 autonomous promotion (existing-row path): country '${country}' has WC qualifying fixtures in last 90d / next 365d but had no top_flight_men league in active tier. Promoted candidate league to Tier C (probationary).`,
+        supportingMetrics: {
+          country,
+          path: "promote_existing",
+          wc_team_count: wcTeams.length,
+          wc_country_set_size: candidateCountries.size,
+          gap_countries_count: gapCountries.length,
+          runId,
+        } as any,
+        expectedImpact: null,
+        reviewStatus: "automatic",
+      });
+      promotionsApplied++;
+      continue;
+    }
+
+    // Path B: No existing Tier E/D row — query AF /leagues for that country
+    // and INSERT a new CC row at Tier C. Title-case the country for AF's
+    // expected format ("brazil" → "Brazil").
+    const titleCased = country
+      .split(" ")
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+    let afLeaguesRaw: AfLeagueRaw[] | null = null;
+    try {
+      afLeaguesRaw = await fetchApiFootball<AfLeagueRaw[]>("/leagues", {
+        country: titleCased,
+        current: "true",
+      });
+    } catch {
+      afLeaguesRaw = null;
+    }
+    if (!afLeaguesRaw || afLeaguesRaw.length === 0) continue;
+
+    // Pick the most likely top-flight men's league: type=League, prefer
+    // first match (AF returns league list in country-priority order).
+    const topFlightCandidate = afLeaguesRaw.find(
+      (l) => (l.league?.type === "League") && Boolean(l.league?.id) && Boolean(l.league?.name),
+    );
+    if (!topFlightCandidate?.league?.id || !topFlightCandidate?.league?.name) continue;
+
+    const afId = topFlightCandidate.league.id;
+    const afName = topFlightCandidate.league.name;
+    const afCountry = topFlightCandidate.country?.name ?? titleCased;
+
+    // INSERT new CC row at Tier C
+    try {
+      await db.insert(competitionConfigTable).values({
+        apiFootballId: afId,
+        name: afName,
+        country: afCountry,
+        type: "league",
+        gender: "male",
+        tier: 1,
         isActive: true,
-      })
-      .where(eq(competitionConfigTable.id, candidate.id));
+        hasStatistics: false,
+        hasLineups: false,
+        hasOdds: false,
+        hasEvents: false,
+        hasPinnacleOdds: false,
+        pollingFrequency: "low",
+        universeTier: "C",
+        archetype: "top_flight_men",
+        universeTierDecidedAt: new Date(),
+      }).onConflictDoNothing();
 
-    await db.insert(modelDecisionAuditLogTable).values({
-      decisionType: "wc_country_coverage_promotion",
-      subject: `competition:${candidate.id}:${candidate.name}/${candidate.country ?? "unknown"}`,
-      priorState: { universe_tier: "E_or_D" } as any,
-      newState: { universe_tier: "C", reason: "wc_participant_country_no_coverage" } as any,
-      reasoning: `Y3 autonomous promotion: country '${country}' has WC qualifying fixtures in last 90d / next 365d but had no top_flight_men league in active tier. Promoted candidate league to Tier C (probationary).`,
-      supportingMetrics: {
-        country,
-        wc_team_count: wcTeams.length,
-        wc_country_set_size: candidateCountries.size,
-        gap_countries_count: gapCountries.length,
-        runId,
-      } as any,
-      expectedImpact: null,
-      reviewStatus: "automatic",
-    });
-
-    promotionsApplied++;
+      await db.insert(modelDecisionAuditLogTable).values({
+        decisionType: "wc_country_coverage_insert",
+        subject: `competition:new:${afName}/${afCountry}`,
+        priorState: { universe_tier: "absent_from_cc" } as any,
+        newState: { universe_tier: "C", reason: "wc_participant_country_no_coverage_inserted" } as any,
+        reasoning: `Y3 autonomous insert (af-leagues path): country '${country}' has WC qualifying fixtures but no CC row at all. Queried AF /leagues for the country, found '${afName}' (af_id=${afId}, type=League), inserted at Tier C (probationary).`,
+        supportingMetrics: {
+          country,
+          path: "insert_via_af",
+          af_id: afId,
+          af_name: afName,
+          af_country: afCountry,
+          wc_team_count: wcTeams.length,
+          gap_countries_count: gapCountries.length,
+          runId,
+        } as any,
+        expectedImpact: null,
+        reviewStatus: "automatic",
+      });
+      insertsApplied++;
+    } catch (err) {
+      logger.warn({ err, country, afName, afId }, "WC audit INSERT path failed for country");
+    }
   }
 
   const result: WcAuditResult = {
@@ -1195,6 +1273,7 @@ export async function auditWorldCupParticipantCoverage(): Promise<WcAuditResult>
     countriesWithCoverage: candidateCountries.size - gapCountries.length,
     countriesWithoutCoverage: gapCountries.length,
     promotionsApplied,
+    insertsApplied,
     durationMs: Date.now() - startedAt,
   };
 

@@ -102,22 +102,18 @@ export async function runFeaturePredictivePowerScoring(): Promise<FeaturePredict
     const featureName = String(f.feature_name);
 
     // Pull settled-bet outcomes joined with this feature value.
-    // Safe-cast: regex filter runs in WHERE; CASE WHEN in SELECT prevents
-    // a stray non-numeric value from blowing up the entire query (Postgres
-    // evaluates the SELECT projection independently of WHERE in some plans).
+    // No SQL cast — return raw text, parse in JS. Avoids the Postgres
+    // planner-eager-cast problem where ::numeric tries to cast non-numeric
+    // strings even when WHERE/CASE should filter them.
     const data = await db.execute(sql`
       SELECT
         pb.status,
-        CASE WHEN f.feature_value ~ '^-?[0-9]+(\\.[0-9]+)?$'
-             THEN f.feature_value::numeric
-             ELSE NULL
-        END AS fv
+        f.feature_value AS fv_text
       FROM paper_bets pb
       JOIN features f ON f.match_id = pb.match_id AND f.feature_name = ${featureName}
       WHERE pb.status IN ('won', 'lost')
         AND pb.deleted_at IS NULL
         AND pb.legacy_regime = false
-        AND f.feature_value ~ '^-?[0-9]+(\\.[0-9]+)?$'
       LIMIT 5000
     `);
     const rows = (data as any).rows ?? [];
@@ -126,7 +122,7 @@ export async function runFeaturePredictivePowerScoring(): Promise<FeaturePredict
     const values: number[] = [];
     const outcomes: number[] = [];
     for (const r of rows) {
-      const v = Number(r.fv);
+      const v = parseFloat(String(r.fv_text ?? ""));
       if (!Number.isFinite(v)) continue;
       values.push(v);
       outcomes.push(r.status === "won" ? 1 : 0);
