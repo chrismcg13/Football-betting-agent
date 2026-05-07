@@ -539,6 +539,42 @@ function mapOddsToMarket(
     }
   }
 
+  // C4 (2026-05-07): Half-Time / Full-Time double — "HT/FT" / "Halftime/Fulltime"
+  // Values like "Home/Home", "Home/Draw", "Draw/Home", etc.
+  if (norm.includes("ht/ft") || norm.includes("half time/full time") || norm.includes("halftime/fulltime") || norm.includes("ht / ft")) {
+    if (/^(Home|Draw|Away)\/(Home|Draw|Away)$/.test(v)) {
+      return { marketType: "HALF_TIME_FULL_TIME", selectionName: v, backOdds: o };
+    }
+  }
+
+  // C4 (2026-05-07): BTTS in first / second half.
+  if (norm.includes("both teams") && norm.includes("score") && (norm.includes("first half") || norm.includes("1st half"))) {
+    if (v === "Yes" || v === "No") return { marketType: "BTTS_FIRST_HALF", selectionName: v, backOdds: o };
+  }
+  if (norm.includes("both teams") && norm.includes("score") && (norm.includes("second half") || norm.includes("2nd half"))) {
+    if (v === "Yes" || v === "No") return { marketType: "BTTS_SECOND_HALF", selectionName: v, backOdds: o };
+  }
+
+  // C4 (2026-05-07): 2nd-half 1X2 result.
+  if ((norm.includes("second half") || norm.includes("2nd half")) && (norm.includes("winner") || norm.includes("result"))) {
+    if (v === "Home" || v === "Draw" || v === "Away") {
+      return { marketType: "SECOND_HALF_RESULT", selectionName: v, backOdds: o };
+    }
+  }
+
+  // C4 (2026-05-07): Asian Total Goals (quarter lines). AF tags as
+  // "Asian Goals" / "Asian Total" with numeric lines like "2.25".
+  if ((norm.includes("asian") && (norm.includes("total") || norm.includes("goals"))) && (norm.includes("over") || norm.includes("under") || v.startsWith("Over") || v.startsWith("Under"))) {
+    const m = v.match(/^(Over|Under)\s+([\d.]+)$/);
+    if (m) {
+      const line = m[2];
+      // Bucket by line — keep one market type per *integer* boundary so
+      // PREFETCH/cache lookups work; selection carries the precise line.
+      const bucketSuffix = line.replace(".", "_");
+      return { marketType: `ASIAN_GOALS_${bucketSuffix}`, selectionName: `${m[1]} ${line}`, backOdds: o };
+    }
+  }
+
   return null;
 }
 

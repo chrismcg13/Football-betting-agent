@@ -25,6 +25,10 @@ import {
   predictWinToNil,
   predictOddEven,
   predictAsianHandicap,
+  predictHtFt,
+  predictBttsHalf,
+  predictSecondHalfResult,
+  predictAsianTotalGoals,
   getModelVersion,
 } from "./predictionEngine";
 import { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } from "./tournamentMode";
@@ -652,6 +656,44 @@ function getModelProbability(
     const line = parseFloat(m[2]);
     if (!Number.isFinite(line)) return null;
     return predictAsianHandicap(enriched, side, line);
+  }
+  // ─── C4 (2026-05-07): Half-Time / Full-Time joint outcome ──────────────────
+  // Selection format: "Home/Home", "Home/Draw", ..., "Away/Away".
+  if (marketType === "HALF_TIME_FULL_TIME") {
+    const htft = predictHtFt(enriched);
+    if (!htft) return null;
+    return htft[selectionName] ?? null;
+  }
+  // ─── C4: BTTS in first / second half ────────────────────────────────────────
+  if (marketType === "BTTS_FIRST_HALF") {
+    const r = predictBttsHalf(enriched, "first");
+    if (!r) return null;
+    if (selectionName === "Yes") return r.yes;
+    if (selectionName === "No") return r.no;
+  }
+  if (marketType === "BTTS_SECOND_HALF") {
+    const r = predictBttsHalf(enriched, "second");
+    if (!r) return null;
+    if (selectionName === "Yes") return r.yes;
+    if (selectionName === "No") return r.no;
+  }
+  // ─── C4: 2nd-half 1X2 — Poisson on second-half-only goal lambdas ──────────
+  if (marketType === "SECOND_HALF_RESULT") {
+    const r = predictSecondHalfResult(enriched);
+    if (!r) return null;
+    if (selectionName === "Home") return r.home;
+    if (selectionName === "Draw") return r.draw;
+    if (selectionName === "Away") return r.away;
+  }
+  // ─── C4: Asian Total Goals (quarter lines) ─────────────────────────────────
+  // Selection format: "Over 2.75", "Under 2.25", etc. Parse line from name.
+  if (marketType.startsWith("ASIAN_GOALS_")) {
+    const m = selectionName.match(/^(Over|Under)\s+([\d.]+)$/);
+    if (!m) return null;
+    const side = m[1].toLowerCase() as "over" | "under";
+    const line = parseFloat(m[2]);
+    if (!Number.isFinite(line)) return null;
+    return predictAsianTotalGoals(enriched, side, line);
   }
   return null;
 }

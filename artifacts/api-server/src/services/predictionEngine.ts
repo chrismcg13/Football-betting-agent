@@ -777,6 +777,123 @@ export function predictWinToNil(
   return Math.max(0.01, Math.min(0.99, p));
 }
 
+// C4 (2026-05-07): Half-Time/Full-Time 3×3 joint outcome distribution.
+// FH probabilities scaled toward uniform (matches existing FIRST_HALF_RESULT
+// derivation). Joint approximated as P(FH=X) × P(FT=Y) — independence
+// approximation. Renormalised so the 9 cells sum to 1.0.
+// Selections: "Home/Home", "Home/Draw", ..., "Away/Away".
+export function predictHtFt(
+  featureMap: Record<string, number>,
+): Record<string, number> | null {
+  const o = predictOutcome(featureMap);
+  if (!o) return null;
+  const scale = 0.7;
+  const mean = 1 / 3;
+  const fh = {
+    Home: Math.max(0.05, Math.min(0.85, mean + (o.home - mean) * scale)),
+    Draw: Math.max(0.15, Math.min(0.75, mean + (o.draw - mean) * scale)),
+    Away: Math.max(0.05, Math.min(0.85, mean + (o.away - mean) * scale)),
+  };
+  const ft = { Home: o.home, Draw: o.draw, Away: o.away };
+  const result: Record<string, number> = {};
+  for (const fhKey of ["Home", "Draw", "Away"] as const) {
+    for (const ftKey of ["Home", "Draw", "Away"] as const) {
+      result[`${fhKey}/${ftKey}`] = fh[fhKey] * ft[ftKey];
+    }
+  }
+  const total = Object.values(result).reduce((a, b) => a + b, 0);
+  if (total > 0) {
+    for (const k of Object.keys(result)) result[k] = result[k] / total;
+  }
+  return result;
+}
+
+// C4 (2026-05-07): BTTS in a single half — both teams score in given half.
+// Half-lambda = ~45% (FH) or ~55% (2H) of full-match scoring rate.
+// P(BTTS in half) = (1 - exp(-λH_half)) * (1 - exp(-λA_half)) under
+// independence between teams.
+export function predictBttsHalf(
+  featureMap: Record<string, number>,
+  half: "first" | "second",
+): { yes: number; no: number } | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null) return null;
+  if (homeLambda < 0 || awayLambda < 0) return null;
+  const halfFactor = half === "first" ? 0.45 : 0.55;
+  const lH = homeLambda * halfFactor;
+  const lA = awayLambda * halfFactor;
+  const yes = (1 - Math.exp(-lH)) * (1 - Math.exp(-lA));
+  return {
+    yes: Math.max(0.01, Math.min(0.99, yes)),
+    no: Math.max(0.01, Math.min(0.99, 1 - yes)),
+  };
+}
+
+// C4 (2026-05-07): 2nd-half 1X2 outcome from second-half-only Poisson.
+// Same scoreline-matrix engine as MATCH_ODDS but with 0.55× lambdas.
+export function predictSecondHalfResult(
+  featureMap: Record<string, number>,
+): { home: number; draw: number; away: number } | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null) return null;
+  if (homeLambda <= 0 || awayLambda <= 0) return null;
+  const matrix = scorelineMatrix(homeLambda * 0.55, awayLambda * 0.55);
+  let pHome = 0;
+  let pDraw = 0;
+  let pAway = 0;
+  for (let h = 0; h < matrix.length; h++) {
+    for (let a = 0; a < matrix[h].length; a++) {
+      if (h > a) pHome += matrix[h][a];
+      else if (h === a) pDraw += matrix[h][a];
+      else pAway += matrix[h][a];
+    }
+  }
+  const total = pHome + pDraw + pAway;
+  if (total <= 0) return null;
+  return { home: pHome / total, draw: pDraw / total, away: pAway / total };
+}
+
+// C4 (2026-05-07): Asian Total Goals at quarter lines (2.25, 2.75 etc).
+// Half-stake split between adjacent integer/half lines, mirroring AH push
+// rules. Integer lines (e.g. 2.0) → push when total = line; half lines
+// (e.g. 2.5) → no push.
+export function predictAsianTotalGoals(
+  featureMap: Record<string, number>,
+  side: "over" | "under",
+  line: number,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null) return null;
+  if (homeLambda <= 0 || awayLambda <= 0) return null;
+  const lambda = homeLambda + awayLambda;
+
+  // Quarter line — recurse on adjacent half/whole lines.
+  const quarterCheck = Math.round(line * 4);
+  if (Math.abs(quarterCheck - line * 4) < 1e-6 && Math.abs(quarterCheck % 2) === 1) {
+    const lower = predictAsianTotalGoals(featureMap, side, line - 0.25);
+    const upper = predictAsianTotalGoals(featureMap, side, line + 0.25);
+    if (lower == null || upper == null) return null;
+    return (lower + upper) / 2;
+  }
+
+  // Half line (.5) — pure over/under, no push.
+  const isHalf = Math.abs(line - Math.floor(line) - 0.5) < 1e-6;
+  if (isHalf) {
+    const overP = poissonOver(lambda, line);
+    return Math.max(0.01, Math.min(0.99, side === "over" ? overP : 1 - overP));
+  }
+
+  // Integer line — push if total goals === line. Half stake refunded on push.
+  const flooredLine = Math.floor(line);
+  const pPush = poissonPmf(lambda, flooredLine);
+  const pStrictlyOver = 1 - poissonProb(lambda, flooredLine);
+  const winSide = side === "over" ? pStrictlyOver : 1 - pStrictlyOver - pPush;
+  return Math.max(0.01, Math.min(0.99, winSide + pPush * 0.5));
+}
+
 // C1 (2026-05-07): Odd/Even total goals — closed-form Poisson identity.
 // P(even total) = (1 + e^{-2λ}) / 2 where λ = home + away scoring rate.
 export function predictOddEven(
