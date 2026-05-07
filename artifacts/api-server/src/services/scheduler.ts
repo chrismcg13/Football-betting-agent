@@ -2369,6 +2369,39 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("AF metadata bundle scheduler active — Sunday 07:00 UTC");
 
+  // C3a (2026-05-07): AF /predictions ingestion — every 12 hours UTC. Up to
+  // 500 fixtures per run; refreshes only fixtures whose prediction is >12h
+  // old or missing. Modest API cost (~1k calls/day) within 75k budget.
+  cron.schedule("0 8,20 * * *", () => {
+    logger.info("AF predictions ingestion triggered (12h cadence)");
+    void (async () => {
+      try {
+        const { captureUpcomingPredictions } = await import("./apiFootball");
+        const r = await captureUpcomingPredictions();
+        logger.info(r, "AF predictions ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "AF predictions ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("AF predictions ingestion scheduler active — 08:00 + 20:00 UTC daily");
+
+  // C3a (2026-05-07): AF /standings ingestion — daily 06:30 UTC.
+  // ~240 active leagues, one call each, idempotent upsert.
+  cron.schedule("30 6 * * *", () => {
+    logger.info("AF standings ingestion triggered (daily 06:30 UTC)");
+    void (async () => {
+      try {
+        const { captureAllActiveStandings } = await import("./apiFootball");
+        const r = await captureAllActiveStandings();
+        logger.info(r, "AF standings ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "AF standings ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("AF standings ingestion scheduler active — daily 06:30 UTC");
+
   // 2026-05-07: model self-audit. Daily 03:30 UTC, before settlement /
   // trading crons. Computes per-market, per-(league × market), per-archetype
   // ROI / Kelly-growth / Pinnacle-coverage; pauses underperforming scopes

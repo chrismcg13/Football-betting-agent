@@ -2390,6 +2390,201 @@ export async function fetchAndStoreTrophiesForPerson(
   return { inserted, skipped: false };
 }
 
+// ─── C3a (2026-05-07): /predictions ingestion ───────────────────────────────
+// AF's own model output per fixture. Stored verbatim; surfaced as features
+// (af_pct_home/draw/away, af_winner_team_id) by featureEngine in C3b.
+// Idempotent — INSERT ... ON CONFLICT (api_fixture_id) DO UPDATE.
+
+interface ApiPrediction {
+  predictions?: {
+    winner?: { id: number | null; name: string | null };
+    advice?: string;
+    percent?: { home?: string; draw?: string; away?: string };
+  };
+}
+
+function pctToNum(s: string | undefined): number | null {
+  if (!s) return null;
+  const n = parseFloat(s.replace("%", ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+export async function fetchAndStorePredictionForFixture(
+  apiFixtureId: number,
+  matchId: number | null,
+): Promise<{ stored: boolean; skipped: boolean }> {
+  if (!(await canMakeRequest())) return { stored: false, skipped: true };
+
+  const result = await fetchApiFootball<ApiPrediction[]>("/predictions", { fixture: apiFixtureId });
+  if (!result || result.length === 0) return { stored: false, skipped: false };
+
+  const row = result[0];
+  const pred = row?.predictions ?? {};
+  const winner = pred.winner ?? {};
+  const percent = pred.percent ?? {};
+
+  await db.execute(sql`
+    INSERT INTO af_predictions (
+      match_id, api_fixture_id, fetched_at, af_winner_team_id, af_winner_team_name,
+      af_advice, af_pct_home, af_pct_draw, af_pct_away, raw
+    ) VALUES (
+      ${matchId}, ${apiFixtureId}, NOW(),
+      ${winner.id ?? null}, ${winner.name ?? null},
+      ${pred.advice ?? null},
+      ${pctToNum(percent.home)}, ${pctToNum(percent.draw)}, ${pctToNum(percent.away)},
+      ${JSON.stringify(row)}::jsonb
+    )
+    ON CONFLICT (api_fixture_id) DO UPDATE SET
+      fetched_at = EXCLUDED.fetched_at,
+      af_winner_team_id = EXCLUDED.af_winner_team_id,
+      af_winner_team_name = EXCLUDED.af_winner_team_name,
+      af_advice = EXCLUDED.af_advice,
+      af_pct_home = EXCLUDED.af_pct_home,
+      af_pct_draw = EXCLUDED.af_pct_draw,
+      af_pct_away = EXCLUDED.af_pct_away,
+      raw = EXCLUDED.raw
+  `);
+  return { stored: true, skipped: false };
+}
+
+export async function captureUpcomingPredictions(): Promise<{
+  checked: number;
+  stored: number;
+  skipped: number;
+}> {
+  // Target window: Tier A/B/C upcoming matches in next 72h that don't yet
+  // have a fresh prediction (>12h old). Skips legacy/no-AF-id rows.
+  const rows = await db.execute(sql`
+    SELECT m.id AS match_id, m.api_fixture_id
+    FROM matches m
+    JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+    LEFT JOIN af_predictions p ON p.api_fixture_id = m.api_fixture_id
+    WHERE m.status = 'scheduled'
+      AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '72 hours'
+      AND m.api_fixture_id IS NOT NULL
+      AND cc.universe_tier IN ('A', 'B', 'C')
+      AND (p.fetched_at IS NULL OR p.fetched_at < NOW() - INTERVAL '12 hours')
+    ORDER BY m.kickoff_time ASC
+    LIMIT 500
+  `);
+
+  let stored = 0;
+  let skipped = 0;
+  const candidates = (rows as any).rows ?? [];
+  for (const r of candidates) {
+    const fixtureId = Number(r.api_fixture_id);
+    const matchId = r.match_id ? Number(r.match_id) : null;
+    if (!fixtureId) continue;
+    const result = await fetchAndStorePredictionForFixture(fixtureId, matchId);
+    if (result.stored) stored++;
+    else skipped++;
+    if (result.skipped) break; // Budget exhausted — stop calling.
+  }
+  logger.info({ checked: candidates.length, stored, skipped }, "AF predictions capture complete");
+  return { checked: candidates.length, stored, skipped };
+}
+
+// ─── C3a (2026-05-07): /standings ingestion ─────────────────────────────────
+// One row per (api_team_id, api_league_id, season). Refreshed daily for
+// active leagues. Surfaced as features (rank, points_per_game, goal_diff,
+// recent_form) by featureEngine in C3b.
+
+interface ApiStandings {
+  league?: {
+    id: number;
+    season: number;
+    standings?: Array<Array<{
+      rank: number;
+      team: { id: number; name: string };
+      points: number;
+      goalsDiff?: number;
+      form?: string;
+      all?: { played: number; win: number; draw: number; lose: number; goals: { for: number; against: number } };
+    }>>;
+  };
+}
+
+export async function fetchAndStoreStandingsForLeague(
+  apiLeagueId: number,
+  season: number,
+): Promise<{ inserted: number; skipped: boolean }> {
+  if (!(await canMakeRequest())) return { inserted: 0, skipped: true };
+
+  const result = await fetchApiFootball<ApiStandings[]>("/standings", { league: apiLeagueId, season });
+  if (!result || result.length === 0) return { inserted: 0, skipped: false };
+
+  const standings = result[0]?.league?.standings;
+  if (!standings || standings.length === 0) return { inserted: 0, skipped: false };
+
+  // standings is an array of group-tables; flatten.
+  const flat = standings.flat();
+  let inserted = 0;
+  for (const t of flat) {
+    if (!t.team?.id) continue;
+    const all = t.all;
+    if (!all) continue;
+    await db.execute(sql`
+      INSERT INTO team_standings (
+        api_team_id, team_name, api_league_id, season,
+        rank, played, wins, draws, losses,
+        goals_for, goals_against, points, recent_form, fetched_at
+      ) VALUES (
+        ${t.team.id}, ${t.team.name}, ${apiLeagueId}, ${season},
+        ${t.rank}, ${all.played}, ${all.win}, ${all.draw}, ${all.lose},
+        ${all.goals.for}, ${all.goals.against}, ${t.points},
+        ${t.form ?? null}, NOW()
+      )
+      ON CONFLICT (api_team_id, api_league_id, season) DO UPDATE SET
+        team_name = EXCLUDED.team_name,
+        rank = EXCLUDED.rank,
+        played = EXCLUDED.played,
+        wins = EXCLUDED.wins,
+        draws = EXCLUDED.draws,
+        losses = EXCLUDED.losses,
+        goals_for = EXCLUDED.goals_for,
+        goals_against = EXCLUDED.goals_against,
+        points = EXCLUDED.points,
+        recent_form = EXCLUDED.recent_form,
+        fetched_at = EXCLUDED.fetched_at
+    `);
+    inserted++;
+  }
+  return { inserted, skipped: false };
+}
+
+export async function captureAllActiveStandings(): Promise<{
+  leaguesChecked: number;
+  inserted: number;
+  skipped: number;
+}> {
+  // Pull all active Tier A/B/C competitions with current season.
+  const leagueRows = await db.execute(sql`
+    SELECT api_football_id, current_season
+    FROM competition_config
+    WHERE is_active = true
+      AND universe_tier IN ('A', 'B', 'C')
+      AND api_football_id IS NOT NULL
+      AND current_season IS NOT NULL
+  `);
+
+  let inserted = 0;
+  let skipped = 0;
+  const leagues = (leagueRows as any).rows ?? [];
+  for (const l of leagues) {
+    const id = Number(l.api_football_id);
+    const season = Number(l.current_season);
+    if (!id || !season) continue;
+    const result = await fetchAndStoreStandingsForLeague(id, season);
+    if (result.skipped) {
+      skipped++;
+      break; // Budget exhausted.
+    }
+    inserted += result.inserted;
+  }
+  logger.info({ leaguesChecked: leagues.length, inserted, skipped }, "Standings capture complete");
+  return { leaguesChecked: leagues.length, inserted, skipped };
+}
+
 // ── Per-team orchestrator (transfers + coaches) ─────────────────────────────
 
 export async function fetchTeamMetadataForUpcomingMatches(): Promise<{

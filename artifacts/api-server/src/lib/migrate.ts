@@ -1465,6 +1465,66 @@ export async function runMigrations() {
       END $$
     `);
 
+    // C3a (2026-05-07): API-Football /predictions per-fixture cache. AF's own
+    // model output as a comparator feature (their prediction percentages plus
+    // the 'advice' free-text). One row per fixture; refreshed daily. Used
+    // downstream as features (af_pct_home, af_pct_draw, af_pct_away) and as
+    // a meta-signal (model agreement / disagreement with AF).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS af_predictions (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
+        api_fixture_id INTEGER NOT NULL UNIQUE,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        af_winner_team_id INTEGER,
+        af_winner_team_name TEXT,
+        af_advice TEXT,
+        af_pct_home NUMERIC(5,2),
+        af_pct_draw NUMERIC(5,2),
+        af_pct_away NUMERIC(5,2),
+        raw JSONB NOT NULL
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS af_predictions_match_idx
+        ON af_predictions(match_id) WHERE match_id IS NOT NULL
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS af_predictions_fetched_idx
+        ON af_predictions(fetched_at DESC)
+    `);
+
+    // C3a (2026-05-07): API-Football /standings per (league, season, team).
+    // Refreshed daily for active competitions. Used downstream as features
+    // (table_position, points_per_game, goal_difference, recent_form_rate).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS team_standings (
+        id SERIAL PRIMARY KEY,
+        api_team_id INTEGER NOT NULL,
+        team_name TEXT NOT NULL,
+        api_league_id INTEGER NOT NULL,
+        season INTEGER NOT NULL,
+        rank INTEGER NOT NULL,
+        played INTEGER NOT NULL,
+        wins INTEGER NOT NULL,
+        draws INTEGER NOT NULL,
+        losses INTEGER NOT NULL,
+        goals_for INTEGER NOT NULL,
+        goals_against INTEGER NOT NULL,
+        points INTEGER NOT NULL,
+        recent_form TEXT,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS team_standings_unique
+        ON team_standings(api_team_id, api_league_id, season)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS team_standings_league_idx
+        ON team_standings(api_league_id, season)
+    `);
+
     // A2.1 (2026-05-07): one-shot idempotent cleanup of stale Primera División
     // bias contamination. The country-blind bug in auditCron (fixed in
     // ece5d4f) wrote a single Bolivia bias observation (-0.5240) onto all 9
