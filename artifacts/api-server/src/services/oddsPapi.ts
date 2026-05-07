@@ -1291,7 +1291,9 @@ export async function runOddspapiFixtureMapping(): Promise<{
       });
     }
 
-    // Pass 6: best-pair scoring — find the fixture with highest combined similarity
+    // Pass 6: best-pair scoring — find the fixture with highest combined similarity.
+    // 2026-05-07: lowered combined threshold 0.65 → 0.60 (individual ≥0.55 floors
+    // still safety-net against e.g. "Manchester United" / "Manchester City").
     if (!found) {
       let bestScore = 0;
       let bestCandidate: RawFixture | null = null;
@@ -1303,7 +1305,7 @@ export async function runOddspapiFixtureMapping(): Promise<{
         const homeSim = teamSimilarity(match.homeTeam, teams.home);
         const awaySim = teamSimilarity(match.awayTeam, teams.away);
         const combined = (homeSim + awaySim) / 2;
-        if (combined > bestScore && combined >= 0.65 && homeSim >= 0.55 && awaySim >= 0.55) {
+        if (combined > bestScore && combined >= 0.60 && homeSim >= 0.55 && awaySim >= 0.55) {
           bestScore = combined;
           bestCandidate = f;
         }
@@ -1312,9 +1314,43 @@ export async function runOddspapiFixtureMapping(): Promise<{
         found = bestCandidate;
         const teams = extractTeamNames(bestCandidate)!;
         logger.info(
-          { matchId: match.id, home: match.homeTeam, away: match.awayTeam, 
+          { matchId: match.id, home: match.homeTeam, away: match.awayTeam,
             opHome: teams.home, opAway: teams.away, score: bestScore.toFixed(3) },
           "Matched via best-pair scoring (Pass 6)",
+        );
+      }
+    }
+
+    // Pass 7 (2026-05-07): asymmetric strong-match — handles abbreviated-team-
+    // name cases where one side matches strongly (e.g. "PK-35" vs "PK-35 Helsinki"
+    // = 0.95) but the other side is abbreviated/aliased differently (e.g. "KuPS"
+    // vs "Kuopion Palloseura" = 0.22). If max similarity ≥ 0.92 AND opposite
+    // side ≥ 0.30 AND only one fixture in the date-window meets these, accept.
+    // The "only one" guard prevents accidentally matching when multiple
+    // candidates have one strong side but different opposites.
+    if (!found) {
+      const candidates: Array<{ f: RawFixture; max: number; min: number; combined: number }> = [];
+      for (const f of allFixtures) {
+        const teams = extractTeamNames(f);
+        if (!teams) continue;
+        const fd = extractFixtureDate(f);
+        if (fd !== matchDate && fd !== dayBefore && fd !== dayAfter) continue;
+        const homeSim = teamSimilarity(match.homeTeam, teams.home);
+        const awaySim = teamSimilarity(match.awayTeam, teams.away);
+        const max = Math.max(homeSim, awaySim);
+        const min = Math.min(homeSim, awaySim);
+        if (max >= 0.92 && min >= 0.30) {
+          candidates.push({ f, max, min, combined: (homeSim + awaySim) / 2 });
+        }
+      }
+      if (candidates.length === 1) {
+        found = candidates[0].f;
+        const teams = extractTeamNames(found)!;
+        logger.info(
+          { matchId: match.id, home: match.homeTeam, away: match.awayTeam,
+            opHome: teams.home, opAway: teams.away,
+            max: candidates[0].max.toFixed(3), min: candidates[0].min.toFixed(3) },
+          "Matched via asymmetric strong-match (Pass 7) — single date-window candidate",
         );
       }
     }

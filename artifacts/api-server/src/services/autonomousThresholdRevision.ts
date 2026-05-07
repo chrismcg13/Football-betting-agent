@@ -283,3 +283,108 @@ export async function runThresholdRevisionProposer(): Promise<ThresholdRevisionR
   logger.info(result, "autonomous_threshold_revision_complete");
   return result;
 }
+
+// ─── Z3-event-driven (2026-05-07): per-settlement scoped revision ────────────
+// On every settled bet, trigger threshold revision for that bet's
+// (league, market) scope. Per-scope in-memory dedupe (5-min TTL) prevents
+// thrash when many bets settle in same scope. Fire-and-forget from
+// paperTrading.ts:settleBets so settlement never waits.
+//
+// Cost analysis:
+//   - 1 scoped revision = 8 SQL queries (1 base + 6 deltas + 1 audit-log
+//     INSERT if revision applies)
+//   - Dedupe means at most 1 evaluation per scope per 5 min
+//   - Even at peak settlement volume of ~500/day, dedupe collapses to
+//     ~50 unique scope evaluations / hour = trivial Neon load
+//   - Stays well under the 75k/day AF budget (no AF calls at all)
+
+const SCOPE_DEDUPE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const recentEvalsByScope = new Map<string, number>(); // scopeKey → lastEvalMs
+
+export async function triggerScopedThresholdRevision(
+  league: string | null,
+  market: string | null,
+): Promise<{ skipped: boolean; reason?: string; applied?: boolean }> {
+  if (!league || !market) return { skipped: true, reason: "missing scope" };
+
+  const leagueKey = league.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  const marketKey = market.toUpperCase().replace(/[^A-Z0-9_]/g, "_");
+  const scopeIdent = `${leagueKey}::${marketKey}`;
+
+  const now = Date.now();
+  const lastEval = recentEvalsByScope.get(scopeIdent);
+  if (lastEval != null && now - lastEval < SCOPE_DEDUPE_TTL_MS) {
+    return { skipped: true, reason: "dedupe_window" };
+  }
+  recentEvalsByScope.set(scopeIdent, now);
+
+  // Garbage-collect stale dedupe entries every ~1000 evaluations
+  if (recentEvalsByScope.size > 1000) {
+    const cutoff = now - SCOPE_DEDUPE_TTL_MS;
+    for (const [k, v] of recentEvalsByScope) {
+      if (v < cutoff) recentEvalsByScope.delete(k);
+    }
+  }
+
+  const globalScore = await readGlobalDefault("min_opportunity_score", 50);
+  const currentKey = scopeKey("min_opportunity_score", { type: "per_league", value: leagueKey });
+  const current = await readGlobalDefault(currentKey, globalScore);
+
+  const baseSample = await simulateScope("per_league", leagueKey, current);
+  if (baseSample.n < ZS_MIN_SAMPLE) {
+    return { skipped: true, reason: `insufficient_sample:n=${baseSample.n}` };
+  }
+
+  const sims: SimulatedRevision[] = [
+    { proposedThreshold: current, simulatedGrowth: baseSample.growth, retainedSampleFraction: 1.0 },
+  ];
+  for (const d of ZS_DELTA_GRID) {
+    if (d === 0) continue;
+    const proposed = Math.max(0, Math.min(100, current * (1 + d)));
+    const sim = await simulateScope("per_league", leagueKey, proposed);
+    if (sim.n < 10) continue;
+    sims.push({
+      proposedThreshold: proposed,
+      simulatedGrowth: sim.growth,
+      retainedSampleFraction: sim.n / baseSample.n,
+    });
+  }
+
+  const eligible = sims.filter((s) => s.retainedSampleFraction >= 0.3);
+  if (eligible.length === 0) return { skipped: true, reason: "no_eligible_proposal" };
+  eligible.sort((a, b) => b.simulatedGrowth - a.simulatedGrowth);
+  const best = eligible[0];
+  if (Math.abs(best.proposedThreshold - current) < 0.5) return { skipped: true, reason: "no_meaningful_change" };
+
+  const newValue = best.proposedThreshold.toFixed(2);
+  await db.execute(sql`
+    INSERT INTO agent_config (key, value, updated_at)
+    VALUES (${currentKey}, ${newValue}, NOW())
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+  `);
+
+  await db.insert(modelDecisionAuditLogTable).values({
+    decisionType: "threshold_revision_event_driven",
+    subject: currentKey,
+    priorState: { value: current.toFixed(2) } as any,
+    newState: { value: newValue } as any,
+    reasoning: `Z3 event-driven (per-settlement) threshold revision: scope=per_league:${leagueKey} (triggered by settlement in market=${marketKey}), base_growth=${baseSample.growth.toFixed(4)}/bet on n=${baseSample.n}, proposed=${best.proposedThreshold.toFixed(2)} → simulated_growth=${best.simulatedGrowth.toFixed(4)}/bet retaining ${(best.retainedSampleFraction * 100).toFixed(0)}% of sample. Direction=${best.proposedThreshold > current ? "tighter" : "looser"}.`,
+    supportingMetrics: {
+      scope_type: "per_league",
+      scope_value: leagueKey,
+      trigger_market: marketKey,
+      current: current.toFixed(2),
+      proposed: best.proposedThreshold.toFixed(2),
+      base_growth: Number(baseSample.growth.toFixed(6)),
+      base_sample: baseSample.n,
+      simulated_growth: Number(best.simulatedGrowth.toFixed(6)),
+      retained_fraction: Number(best.retainedSampleFraction.toFixed(3)),
+      direction: best.proposedThreshold > current ? "tighter" : "looser",
+      trigger: "settlement",
+    } as any,
+    expectedImpact: best.simulatedGrowth - baseSample.growth,
+    reviewStatus: "automatic",
+  });
+
+  return { skipped: false, applied: true };
+}

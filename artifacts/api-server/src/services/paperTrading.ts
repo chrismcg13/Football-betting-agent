@@ -2696,6 +2696,28 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         });
       }
     }
+
+    // ─── Z3 event-driven (2026-05-07): per-settlement scoped threshold
+    // revision. Per Chris's directive — weekly is too slow; review on
+    // every settlement. In-memory 5-min dedupe per scope keeps Neon
+    // load trivial. Fire-and-forget; settlement never waits or fails.
+    if (bet.matchId && bet.marketType) {
+      void (async () => {
+        try {
+          const matchRow = await db
+            .select({ league: matchesTable.league })
+            .from(matchesTable)
+            .where(eq(matchesTable.id, bet.matchId))
+            .limit(1);
+          const league = matchRow[0]?.league ?? null;
+          if (!league) return;
+          const { triggerScopedThresholdRevision } = await import("./autonomousThresholdRevision");
+          await triggerScopedThresholdRevision(league, bet.marketType);
+        } catch (err) {
+          logger.debug({ err, betId: bet.id }, "Event-driven threshold revision failed — non-fatal");
+        }
+      })();
+    }
   }
 
   if (settled > 0) {
