@@ -2554,6 +2554,103 @@ export async function runDedicatedBulkPrefetch(
   return { fetched: cache.size, totalSelections };
 }
 
+// ─── C5 (2026-05-07): kickoff-proximity prefetch ─────────────────────────────
+// Replaces uniform every-2hr bulk prefetch. Runs every 15min. Calls the
+// existing prefetchAndStoreOddsPapiOdds with TIGHT kickoff-window slices
+// per bucket — that helper already filters fixtures by kickoff window,
+// orders by priority, and stores via the canonical pipeline. We just
+// drive it bucket-by-bucket with allocated budget per bucket.
+//
+// Buckets:
+//   T-0-1h    : drained first, max budget
+//   T-1-12h   : second priority
+//   T-12-72h  : third
+//   T-72h+    : remainder (often 0 calls if earlier buckets consume budget)
+//
+// Same monthly budget (100k cap, current avg ~2700/day). Reallocates volume
+// toward high-information T-0-1h window.
+
+interface KoBucket {
+  name: string;
+  minHrs: number;
+  maxHrs: number;
+  budgetShare: number; // fraction of remaining-budget allocated when this bucket runs
+}
+
+const KO_BUCKETS: KoBucket[] = [
+  // T-0-1h gets up to 50% of remaining budget (capped per cycle by fixture count)
+  { name: "T-0-1h",   minHrs: 0,   maxHrs: 1,   budgetShare: 0.50 },
+  // T-1-12h gets up to 60% of THEN-remaining budget
+  { name: "T-1-12h",  minHrs: 1,   maxHrs: 12,  budgetShare: 0.60 },
+  // T-12-72h gets up to 70% of remaining
+  { name: "T-12-72h", minHrs: 12,  maxHrs: 72,  budgetShare: 0.70 },
+  // T-72h+ gets whatever is left
+  { name: "T-72h+",   minHrs: 72,  maxHrs: 168, budgetShare: 1.00 },
+];
+
+export async function runKickoffProximityPrefetch(): Promise<{
+  totalFetched: number;
+  totalSelections: number;
+  bucketsProcessed: Array<{ name: string; fetched: number; budgetAllocated: number }>;
+  budgetRemainingAtStart: number;
+  budgetRemainingAtEnd: number;
+}> {
+  if (!process.env.ODDSPAPI_KEY) {
+    return { totalFetched: 0, totalSelections: 0, bucketsProcessed: [], budgetRemainingAtStart: 0, budgetRemainingAtEnd: 0 };
+  }
+
+  const [daily, effectiveCap] = await Promise.all([getOddspapiUsageToday(), getEffectiveDailyCap()]);
+  const reserveForCLV = 50; // CLV/snapshot crons need head-room
+  const budgetRemainingAtStart = Math.max(0, effectiveCap - daily - reserveForCLV);
+
+  if (budgetRemainingAtStart <= 0) {
+    logger.info({ daily, cap: effectiveCap }, "Kickoff-proximity prefetch — budget exhausted, skipping");
+    return { totalFetched: 0, totalSelections: 0, bucketsProcessed: [], budgetRemainingAtStart: 0, budgetRemainingAtEnd: 0 };
+  }
+
+  let remaining = budgetRemainingAtStart;
+  let totalFetched = 0;
+  let totalSelections = 0;
+  const bucketsProcessed: Array<{ name: string; fetched: number; budgetAllocated: number }> = [];
+  const now = Date.now();
+
+  for (const bucket of KO_BUCKETS) {
+    if (remaining <= 0) {
+      bucketsProcessed.push({ name: bucket.name, fetched: 0, budgetAllocated: 0 });
+      continue;
+    }
+    const earliest = new Date(now + bucket.minHrs * 3600_000);
+    const latest = new Date(now + bucket.maxHrs * 3600_000);
+    const allocated = Math.max(1, Math.floor(remaining * bucket.budgetShare));
+    const result = await prefetchAndStoreOddsPapiOdds(earliest, latest, allocated);
+    const fetched = result.size;
+    const selectionsThisBucket = [...result.values()].reduce((n, m) => n + Object.keys(m).length, 0);
+    totalFetched += fetched;
+    totalSelections += selectionsThisBucket;
+    remaining -= fetched;
+    bucketsProcessed.push({ name: bucket.name, fetched, budgetAllocated: allocated });
+  }
+
+  logger.info(
+    {
+      totalFetched,
+      totalSelections,
+      budgetRemainingAtStart,
+      budgetRemainingAtEnd: remaining,
+      bucketsProcessed,
+    },
+    "Kickoff-proximity prefetch complete",
+  );
+
+  return {
+    totalFetched,
+    totalSelections,
+    bucketsProcessed,
+    budgetRemainingAtStart,
+    budgetRemainingAtEnd: remaining,
+  };
+}
+
 // ─── Log daily budget usage summary ──────────────────────────────────────────
 
 export async function logDailyBudgetSummary(): Promise<void> {

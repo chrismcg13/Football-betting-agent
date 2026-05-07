@@ -29,7 +29,7 @@ import {
   getOddspapiValidation,
   prefetchAndStoreOddsPapiOdds,
   loadOddsPapiCacheFromSnapshots,
-  runDedicatedBulkPrefetch,
+  runKickoffProximityPrefetch,
   buildPinnacleValidationFromApiFootball,
   fetchAndStoreClosingLineForPendingBets,
   type OddsPapiValidationCache,
@@ -2081,24 +2081,24 @@ export function startScheduler(): void {
     }).catch((err) => logger.error({ err }, "Betfair event mapping startup failed"));
   }, 45_000);
 
-  // OddsPapi bulk prefetch: every 2 hours (was 4h — increased to lift Pinnacle
-  // coverage on newly-mapped fixtures; per-run cap stays at 1000 and the
-  // daily cap of 5000 is enforced by getEffectiveDailyCap, so we cannot
-  // exceed budget. In practice cache reuse means runs after the first stay
-  // small.)
-  cron.schedule("10 */2 * * *", () => {
-    logger.info("OddsPapi bulk prefetch triggered (7-day window, 1000 req max)");
-    void runDedicatedBulkPrefetch(7, 1000)
+  // C5 (2026-05-07): kickoff-proximity prefetch — replaces the every-2hr
+  // uniform bulk prefetch. Runs every 15min and allocates budget across 4
+  // T-to-kickoff buckets (T-0-1h drained first, T-72h+ last). Same monthly
+  // budget (100k cap, ~3300/day average), redistributed toward the high-
+  // information window where Pinnacle prices sharpen.
+  cron.schedule("*/15 * * * *", () => {
+    logger.info("OddsPapi kickoff-proximity prefetch triggered (every 15 min)");
+    void runKickoffProximityPrefetch()
       .then(async (r) => {
-        logger.info(r, "OddsPapi bulk prefetch complete");
+        logger.info(r, "OddsPapi kickoff-proximity prefetch complete");
         const dc = await derivePinnacleDCFromMatchOdds();
         logger.info(dc, "Post-prefetch DC derivation complete");
         const unified = await backfillPinnacleUnified();
         logger.info({ unified }, "Post-prefetch unified Pinnacle backfill complete");
       })
-      .catch((err) => logger.error({ err }, "OddsPapi bulk prefetch pipeline failed"));
+      .catch((err) => logger.error({ err }, "OddsPapi kickoff-proximity prefetch pipeline failed"));
   }, { timezone: "UTC" });
-  logger.info("OddsPapi bulk prefetch scheduler active — every 2 hours UTC (1000 req max, 5000 daily cap enforced)");
+  logger.info("OddsPapi kickoff-proximity prefetch scheduler active — every 15 min UTC (T-0-1h prioritised, daily cap enforced)");
 
   // OddsPapi budget summary: daily at 00:01 UTC
   cron.schedule("1 0 * * *", () => {
@@ -2678,8 +2678,8 @@ export function startScheduler(): void {
           logger.info(r, "Startup API-Football odds refresh complete");
           return r;
         }),
-        runDedicatedBulkPrefetch(7, 1000).then(async (r) => {
-          logger.info(r, "Startup OddsPapi bulk prefetch complete");
+        runKickoffProximityPrefetch().then(async (r) => {
+          logger.info(r, "Startup OddsPapi kickoff-proximity prefetch complete");
           const dc = await derivePinnacleDCFromMatchOdds();
           logger.info(dc, "Startup post-prefetch DC derivation complete");
           const unified = await backfillPinnacleUnified();
