@@ -55,8 +55,36 @@ interface AfLeagueRaw {
 
 // ─── Constants (locked in plan §3.1, §3.2, §3.4) ─────────────────────────────
 
-const FUZZY_MATCH_THRESHOLD = 0.85;
+// Wave 3 (Phase 2 closeout): threshold for matches scoped to a known
+// Betfair region (i.e. country candidates pre-filtered by mapBetfairRegion)
+// lowered from 0.85 → 0.78. Empirical context: ~22 Tier D leagues from
+// earlier dry-runs failed at 0.85 despite having a clear country match.
+// Hard threshold for unmapped regions stays 0.95 to preserve precision when
+// the candidate pool is the entire AF universe.
+const FUZZY_MATCH_THRESHOLD = 0.78;
 const NO_REGION_FUZZY_THRESHOLD = 0.95;
+
+// Wave 3: country-name normalization. AF data is inconsistent — same
+// country appears as "Costa-Rica" (4 rows) and "Costa Rica" (1 row),
+// "Czech-Republic" (11) vs "Czech Republic" (2), "South-Korea" (6) vs
+// "South Korea" (2), etc. Normalising both sides at lookup time
+// (lowercase, collapse-whitespace, swap-hyphens) catches every variant
+// without needing to enumerate them in BETFAIR_REGION_TO_AF_COUNTRIES.
+function normCountry(s: string): string {
+  return s.trim().toLowerCase().replace(/\s+/g, "-");
+}
+
+// Wave 3: aliases for cases where AF stores the same country under a
+// genuinely different name (not just a space-vs-hyphen variant).
+// Lookup normalises canonical → list of alternative AF country names.
+const COUNTRY_NAME_ALIASES: Record<string, string[]> = {
+  "bosnia": ["bosnia-herzegovina", "bosnia-and-herzegovina"],
+  "bosnia-herzegovina": ["bosnia"],
+  "north-macedonia": ["macedonia"],
+  "macedonia": ["north-macedonia"],
+  "united-arab-emirates": ["uae"],
+  "trinidad-and-tobago": ["trinidad-tobago"],
+};
 const ODDS_PAPI_STALENESS_DAYS = 14;
 const FUZZY_FAILURE_SAMPLE_SIZE = 30;
 
@@ -496,10 +524,12 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
     return emptyResult(runId, dryRun, startedAt);
   }
 
-  // Index AF leagues by country for fast pre-filter
+  // Index AF leagues by country for fast pre-filter.
+  // Wave 3: key on normCountry(name) so "Costa Rica" and "Costa-Rica" hash
+  // to the same bucket. Affects ~10 countries across the AF dataset.
   const afByCountry = new Map<string, typeof afLeagues>();
   for (const af of afLeagues) {
-    const country = (af.country?.name ?? "").trim();
+    const country = normCountry(af.country?.name ?? "");
     const list = afByCountry.get(country) ?? [];
     list.push(af);
     afByCountry.set(country, list);
@@ -560,7 +590,23 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
     let candidates: typeof afLeagues = [];
     let usedThreshold = FUZZY_MATCH_THRESHOLD;
     if (mappedCountries && mappedCountries.length > 0) {
-      candidates = mappedCountries.flatMap((c) => afByCountry.get(c) ?? []);
+      // Wave 3: each mapped country expands to {normalized form} +
+      // {known aliases} — both lookup keys point at the same map.
+      const seen = new Set<number>();
+      candidates = [];
+      for (const rawCountry of mappedCountries) {
+        const norm = normCountry(rawCountry);
+        const buckets = [norm, ...(COUNTRY_NAME_ALIASES[norm] ?? [])];
+        for (const key of buckets) {
+          for (const af of afByCountry.get(key) ?? []) {
+            const id = af.league?.id;
+            if (id != null && !seen.has(id)) {
+              seen.add(id);
+              candidates.push(af);
+            }
+          }
+        }
+      }
     } else {
       skippedUnmappedRegion++;
       const rawRegion = (bfComp.competitionRegion ?? "(empty)").trim() || "(empty)";
