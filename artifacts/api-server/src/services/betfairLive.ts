@@ -1193,7 +1193,58 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   TOTAL_CARDS_55: "OVER_UNDER_55_CARDS",
   // Half-time result — Betfair calls it HALF_TIME (1/X/2 outcomes for H1)
   FIRST_HALF_RESULT: "HALF_TIME",
+  // Sub-phase 4.B (2026-05-08): high-confidence Betfair Exchange football
+  // market codes per their public marketTypeCodes documentation. Each
+  // entry's code will be VERIFIED by the new discovery cron logging
+  // observed marketType values from listMarketCatalogue. Once verified,
+  // shadow capture for these markets has a real graduation path.
+  OVER_UNDER_05: "OVER_UNDER_05",
+  OVER_UNDER_55: "OVER_UNDER_55",
+  OVER_UNDER_65: "OVER_UNDER_65",
+  DRAW_NO_BET: "DRAW_NO_BET",
+  HALF_TIME_FULL_TIME: "HALF_TIME_FULL_TIME",
+  GOALS_ODD_EVEN: "ODD_OR_EVEN",
+  WIN_TO_NIL_HOME: "WIN_TO_NIL_HOME",
+  WIN_TO_NIL_AWAY: "WIN_TO_NIL_AWAY",
+  // Team-total goals — Betfair uses TEAM_A / TEAM_B naming
+  TEAM_TOTAL_HOME_05: "TEAM_A_OVER_UNDER_05",
+  TEAM_TOTAL_HOME_15: "TEAM_A_OVER_UNDER_15",
+  TEAM_TOTAL_HOME_25: "TEAM_A_OVER_UNDER_25",
+  TEAM_TOTAL_HOME_35: "TEAM_A_OVER_UNDER_35",
+  TEAM_TOTAL_AWAY_05: "TEAM_B_OVER_UNDER_05",
+  TEAM_TOTAL_AWAY_15: "TEAM_B_OVER_UNDER_15",
+  TEAM_TOTAL_AWAY_25: "TEAM_B_OVER_UNDER_25",
+  TEAM_TOTAL_AWAY_35: "TEAM_B_OVER_UNDER_35",
+  // Half-specific BTTS + 2H result
+  BTTS_FIRST_HALF: "FIRST_HALF_BTTS",
+  BTTS_SECOND_HALF: "SECOND_HALF_BTTS",
+  SECOND_HALF_RESULT: "SECOND_HALF",
 };
+
+// Sub-phase 4.B (2026-05-08): set of internal market types whose Betfair code
+// has been VERIFIED by observation in production catalogue responses. Used by
+// valueDetection's shadow-only fallthrough to gate shadow capture on
+// markets that have a real graduation path (vs writing dead-end shadow rows
+// for markets we can't ever place on Betfair Exchange).
+//
+// Initial set: the long-standing core that the existing exchange book sweep
+// captures. The discovery cron extends this set as new market codes are
+// observed in real Betfair catalogue responses (writes to compliance_logs +
+// proposes additions via model_decision_audit_log).
+export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
+  "MATCH_ODDS",
+  "BTTS",
+  "OVER_UNDER_15",
+  "OVER_UNDER_25",
+  "OVER_UNDER_35",
+  "OVER_UNDER_45",
+  "ASIAN_HANDICAP",
+  "DOUBLE_CHANCE",
+  "FIRST_HALF_RESULT",
+  "FIRST_HALF_OU_15",
+  "TOTAL_CARDS_25",
+  "TOTAL_CARDS_35",
+]);
 
 const NON_EXCHANGE_MARKETS = new Set([
   // Corners markets are still missing Exchange equivalents (sportsbook only)

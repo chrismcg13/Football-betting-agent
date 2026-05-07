@@ -14,6 +14,14 @@ import {
 import { eq, desc, and, gte, lte, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { ensureExperimentRegistered, getExperimentTier } from "./promotionEngine";
+import { MARKET_TYPE_MAP } from "./betfairLive";
+
+// Sub-phase 4.B (2026-05-08): set of internal market type keys that have
+// a Betfair Exchange placement path. Pricing pipeline uses this to decide
+// whether to allow Pinnacle-as-actionable shadow capture for markets
+// without an exchange odds row. Markets not in this set are still rejected
+// at the pricing gate so we don't write dead-end shadow rows.
+const MARKET_TYPE_MAP_KEYS: Set<string> = new Set(Object.keys(MARKET_TYPE_MAP));
 import {
   predictOutcome,
   predictBtts,
@@ -799,24 +807,33 @@ import { BANNED_MARKETS } from "./paperTrading";
 
 type PriceQuote = { backOdds: number; source: string };
 type FairValueSource = "oddspapi_pinnacle" | "api_football_real:Pinnacle" | "betfair_exchange";
-type RejectReason = "no_betfair_exchange" | "no_fair_value_source";
+type ActionableSource = "betfair_exchange" | "oddspapi_pinnacle" | "api_football_real:Pinnacle";
+type RejectReason = "no_actionable_source" | "no_fair_value_source";
 type PricingResult =
   | {
       ok: true;
       actionablePrice: number;
-      actionableSource: "betfair_exchange";
+      actionableSource: ActionableSource;
       fairValueOdds: number;
       fairValueSource: FairValueSource;
+      shadowOnly: boolean;
     }
   | { ok: false; reason: RejectReason };
 
+// Sub-phase 4.B (2026-05-08): pricing pipeline with gated shadow-only path.
+// betfair_exchange row → use it as actionable (real-stake placeable).
+// No exchange row but marketType IS in MARKET_TYPE_MAP (graduation path
+// exists) → fall through to Pinnacle as actionable + return shadowOnly=true.
+// Markets NOT in MARKET_TYPE_MAP have no graduation path → still rejected
+// to avoid dead-end Neon writes for un-placeable markets.
 function selectPricingSources(
   rows: Array<{ source?: string | null; backOdds: string | number | null }>,
+  marketType: string,
+  placeableMarketTypes: Set<string>,
 ): PricingResult {
-  let actionable: PriceQuote | null = null;
+  let exchange: PriceQuote | null = null;
   let oddspapiPinnacle: PriceQuote | null = null;
   let afPinnacle: PriceQuote | null = null;
-  let exchangeForFv: PriceQuote | null = null;
 
   for (const r of rows) {
     if (r.backOdds == null) continue;
@@ -824,8 +841,7 @@ function selectPricingSources(
     if (!(bo > 1.01)) continue;
     const src = r.source ?? "";
     if (src === "betfair_exchange") {
-      if (!actionable) actionable = { backOdds: bo, source: "betfair_exchange" };
-      if (!exchangeForFv) exchangeForFv = { backOdds: bo, source: "betfair_exchange" };
+      if (!exchange) exchange = { backOdds: bo, source: "betfair_exchange" };
     } else if (src === "oddspapi_pinnacle") {
       if (!oddspapiPinnacle) oddspapiPinnacle = { backOdds: bo, source: "oddspapi_pinnacle" };
     } else if (src === "api_football_real:Pinnacle") {
@@ -833,16 +849,35 @@ function selectPricingSources(
     }
   }
 
-  if (!actionable) return { ok: false, reason: "no_betfair_exchange" };
-  const fv = oddspapiPinnacle ?? afPinnacle ?? exchangeForFv;
+  const fv = oddspapiPinnacle ?? afPinnacle ?? exchange;
   if (!fv) return { ok: false, reason: "no_fair_value_source" };
 
+  if (exchange) {
+    return {
+      ok: true,
+      actionablePrice: exchange.backOdds,
+      actionableSource: "betfair_exchange",
+      fairValueOdds: fv.backOdds,
+      fairValueSource: fv.source as FairValueSource,
+      shadowOnly: false,
+    };
+  }
+
+  // No exchange row. Allow Pinnacle as actionable ONLY if marketType has
+  // a graduation path. Otherwise reject — shadow rows on never-placeable
+  // markets are dead-end (no path to real-stake → no Kelly-growth value).
+  if (!placeableMarketTypes.has(marketType)) {
+    return { ok: false, reason: "no_actionable_source" };
+  }
+  const actionable = oddspapiPinnacle ?? afPinnacle;
+  if (!actionable) return { ok: false, reason: "no_actionable_source" };
   return {
     ok: true,
     actionablePrice: actionable.backOdds,
-    actionableSource: "betfair_exchange",
+    actionableSource: actionable.source as ActionableSource,
     fairValueOdds: fv.backOdds,
     fairValueSource: fv.source as FairValueSource,
+    shadowOnly: true,
   };
 }
 
@@ -1195,16 +1230,16 @@ export async function detectValueBets(options?: {
       // track (Tier A) keeps the bans untouched.
       if (BANNED_MARKETS.has(marketType) && !isExperimentTrack) continue;
 
-      const pricing = selectPricingSources(groupRows);
+      const pricing = selectPricingSources(groupRows, marketType, MARKET_TYPE_MAP_KEYS);
       if (!pricing.ok) {
-        if (pricing.reason === "no_betfair_exchange") {
-          pricingRejectNoBetfairExchange++;
+        if (pricing.reason === "no_actionable_source") {
+          pricingRejectNoBetfairExchange++; // legacy counter — repurposed
         } else {
           pricingRejectNoFairValueSource++;
         }
         continue;
       }
-      const { actionablePrice, actionableSource, fairValueOdds, fairValueSource } = pricing;
+      const { actionablePrice, actionableSource, fairValueOdds, fairValueSource, shadowOnly } = pricing;
 
       // Minimum odds floor on the actionable (placed) price
       if (actionablePrice < minOddsThreshold) continue;
@@ -1358,8 +1393,15 @@ export async function detectValueBets(options?: {
       // tier-ladder gets continuous learning evidence.
       // Z1+Z5 (2026-05-07): use scoped threshold (per-league > per-market >
       // global). Auto-tuned by Z3 weekly retrospective cron.
+      // Sub-phase 4.B (2026-05-08): when actionable price comes from a
+      // non-exchange source (shadowOnly=true), the bet has no real-stake
+      // placement path — force placementTrack='shadow' regardless of tier
+      // or score. The graduation pathway is preserved because the
+      // marketType is in MARKET_TYPE_MAP (gate enforced by
+      // selectPricingSources).
       const effectiveMinScore = resolveScoped("min_opportunity_score", match.league ?? "", oddsRow.marketType, minOppScore);
       const meetsProduction =
+        !shadowOnly &&
         matchUniverseTier === "A" &&
         opportunityScore >= effectiveMinScore &&
         edge >= effectiveMinEdge;

@@ -2735,6 +2735,25 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Feature predictive-power scoring scheduler active — Sunday 11:00 UTC");
 
+  // Sub-phase 4.B (2026-05-08): Betfair market-type discovery — daily
+  // 03:50 UTC. Samples ~50 upcoming Tier A/B/C events, queries
+  // listMarketCatalogue with no marketTypeCodes filter, logs all
+  // observed marketType values. New unmapped codes auto-proposed via
+  // model_decision_audit_log for future MARKET_TYPE_MAP additions.
+  cron.schedule("50 3 * * *", () => {
+    logger.info("Betfair market discovery triggered (daily 03:50 UTC)");
+    void (async () => {
+      try {
+        const { runBetfairMarketDiscovery } = await import("./betfairMarketDiscovery");
+        const r = await runBetfairMarketDiscovery();
+        logger.info(r, "Betfair market discovery complete");
+      } catch (err) {
+        logger.error({ err }, "Betfair market discovery failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Betfair market discovery scheduler active — daily 03:50 UTC");
+
   // Y3 (2026-05-07): weekly autonomous WC participant coverage audit —
   // Sunday 05:30 UTC. Identifies countries playing in WC qualifying
   // fixtures that lack a Tier 1 active club league + auto-promotes a

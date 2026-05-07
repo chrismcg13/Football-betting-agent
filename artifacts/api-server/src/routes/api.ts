@@ -1999,6 +1999,18 @@ router.post("/leagues/tier-e-reevaluate/run", async (_req, res) => {
   }
 });
 
+// Sub-phase 4.B (2026-05-08): manual trigger for Betfair market-type discovery.
+router.post("/admin/run-betfair-market-discovery", async (_req, res) => {
+  try {
+    const { runBetfairMarketDiscovery } = await import("../services/betfairMarketDiscovery");
+    const result = await runBetfairMarketDiscovery();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual Betfair market discovery failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Y3 (2026-05-07): manual trigger for WC participant coverage audit.
 router.post("/leagues/wc-audit/run", async (_req, res) => {
   try {
