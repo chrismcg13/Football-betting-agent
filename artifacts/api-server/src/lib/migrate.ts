@@ -1465,6 +1465,26 @@ export async function runMigrations() {
       END $$
     `);
 
+    // A2.1 (2026-05-07): one-shot idempotent cleanup of stale Primera División
+    // bias contamination. The country-blind bug in auditCron (fixed in
+    // ece5d4f) wrote a single Bolivia bias observation (-0.5240) onto all 9
+    // same-named "Primera División" rows across South America via a name-only
+    // WHERE. Those rows are now stuck at universe_tier='D' from
+    // bias_threshold_violated despite having no per-country bias signal.
+    // This cleanup nulls the spurious bias and resets tier to 'unmapped' so
+    // the next reverse-mapping cron pass re-evaluates them on real Pinnacle
+    // / odds data. Idempotent: matches the exact-value spurious row signature
+    // (settlement_bias_index = -0.5240 + universe_tier = 'D' + name = same).
+    await db.execute(sql`
+      UPDATE competition_config
+      SET settlement_bias_index = NULL,
+          universe_tier = 'unmapped',
+          universe_tier_decided_at = NOW()
+      WHERE name = 'Primera División'
+        AND universe_tier = 'D'
+        AND settlement_bias_index = -0.5240
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

@@ -1054,8 +1054,22 @@ export async function runTradingCycle(options?: {
               });
               continue;
             }
+          } else if (candidateTier === "D" || candidateTier === null || candidateTier === "unmapped") {
+            // B3 (2026-05-07): Tier D (bias breach or no AF match) and
+            // unmapped/no-CC-row candidates fall through as shadow learning
+            // data per "every fixture is a learning opportunity". £0 stake
+            // means no capital risk — these are exactly the cases the
+            // tier-ladder needs evidence for to make A1/A2 decisions.
+            // Tier E (explicit exclusion list) stays rejected.
+            tierCounts.none++;
+            (c as { placementTrack?: "production" | "shadow" }).placementTrack = "shadow";
+            // Leave universeTier null/unmapped — paperTrading routes via
+            // placementTrack='shadow' regardless of tier label.
+            kept.push(c);
           } else {
-            // No CC row, or universe_tier is D/E/unmapped — reject
+            // Tier E or other explicit-exclusion → reject. E denotes leagues
+            // we've decided don't belong in the universe at all (women's
+            // reserves, U-21, etc) so even £0 capture isn't useful.
             tierCounts.none++;
             rejectionDetails.push({
               matchId: c.matchId,
@@ -1063,7 +1077,7 @@ export async function runTradingCycle(options?: {
               country: country || "(unknown)",
               market: c.marketType,
               selection: c.selectionName,
-              reason: "no_universe_tier_match",
+              reason: `tier_${candidateTier}_excluded`,
             });
             continue;
           }
@@ -1365,7 +1379,8 @@ export async function runTradingCycle(options?: {
         candidate.universeTier === "B" ||
         candidate.universeTier === "C";
 
-      let filterPassed = true;
+      // B3 (2026-05-07): filterPassed removed — Pinnacle rejection now
+      // downgrades to shadow rather than dropping the bet entirely.
       let filterEdgeCategory: string | null = null;
       let filterLineDirection: string | null = null;
       if (!isShadowBet) {
@@ -1386,6 +1401,12 @@ export async function runTradingCycle(options?: {
           filterLineDirection = filterResult.lineDirection !== "unknown" ? filterResult.lineDirection : null;
 
           if (!filterResult.passed) {
+            // B3 (2026-05-07): production-track Pinnacle rejection no longer
+            // drops the bet — it falls through to shadow capture. The
+            // rejection signal itself is learning data: model said edge,
+            // Pinnacle said no (or no Pinnacle data at all). Capture the
+            // bet at £0 so the tier-ladder learns whether model or Pinnacle
+            // was correct when the result settles.
             logger.info(
               {
                 matchId: candidate.matchId,
@@ -1394,10 +1415,11 @@ export async function runTradingCycle(options?: {
                 edgePct: filterResult.edgePct.toFixed(2),
                 reason: filterResult.filterReason,
                 lineDirection: filterResult.lineDirection,
+                fallthrough: "shadow",
               },
-              "Bet filtered out by Pinnacle pre-bet filter",
+              "Pinnacle pre-bet filter rejected production bet — falling through to shadow capture",
             );
-            filterPassed = false;
+            (candidate as { placementTrack?: "production" | "shadow" }).placementTrack = "shadow";
           }
         } catch (filterErr) {
           logger.error({ err: filterErr, matchId: candidate.matchId }, "Pinnacle pre-bet filter error — allowing bet through");
@@ -1414,7 +1436,9 @@ export async function runTradingCycle(options?: {
         );
       }
 
-      if (!filterPassed) continue;
+      // filterPassed remains true: B3 fall-through means rejected production
+      // bets are downgraded to shadow rather than dropped. Only filter errors
+      // above leave filterPassed=true (existing 'allow through' behaviour).
 
       betOrders.push({
         matchId: candidate.matchId,
