@@ -1,38 +1,59 @@
 // ============================================================================
-// Model self-audit (2026-05-07)
+// Model self-audit (2026-05-07, v2 with tier-ladder mobility)
 // ----------------------------------------------------------------------------
-// Daily 03:30 UTC cron that runs the diagnostic queries the model has the
-// data and tools to run on itself, but had no scheduled task driving. Three
-// analysis passes:
+// Daily 03:30 UTC cron that maintains a continuous tier assignment for every
+// (market) / (league × market) / (league) / (archetype) scope, moving each
+// scope up and down a Kelly-fraction ladder based on rolling-window
+// Kelly-growth-rate evidence.
 //
-//   1. Per-market (across all leagues): catches market-wide bleeds and
-//      data-coverage gaps. The thing that should have caught BTTS losing
-//      -£468 over 31 bets with 0% Pinnacle coverage.
+// Tier ladder
+//   SHADOW_ONLY        kelly_fraction_override = 0      (real blocked, shadow
+//                                                        on Tier B/C continues)
+//   TRIAL              kelly_fraction_override = 0.25   (real at quarter Kelly)
+//   STANDARD_REDUCED   kelly_fraction_override = 0.5    (real at half Kelly)
+//   DEFAULT            no override                      (sub-phase 9 v2 takes
+//                                                        over with per-tag
+//                                                        kelly_fraction)
+//   BOOSTED            kelly_fraction_override = 1.5    (high-confidence
+//                                                        scope, amplified)
 //
-//   2. Per (league × market): catches league-specific issues within a
-//      market that's globally OK (e.g., MATCH_ODDS profitable overall but
-//      USL Championship MATCH_ODDS underperforming).
+// The shadow track ALWAYS continues. Demoting a scope to SHADOW_ONLY just
+// blocks Tier A real-stake placement; Tier B/C shadow capture on that same
+// market keeps flowing so the model continues learning, can detect when the
+// regime improves, and promote the scope back up the ladder.
 //
-//   3. Per-archetype: cross-cuts above. Tier1B-style archetypes that
-//      struggle regardless of market.
+// Movement criteria (rolling 30-day window of settled bets):
 //
-// Each finding writes to model_decision_audit_log; severe anomalies trigger
-// autonomous_pauses rows that block real-stake placement at placePaperBet.
-// Shadow bets (Tier B/C, £0 stake, learning-data) bypass pauses by design —
-// the whole point of the shadow track is to keep capturing data on
-// distressed markets so the model can learn from the regime.
+// DEMOTIONS (capital protection)
+//   any tier → SHADOW_ONLY   real ROI < -25% with n >= 10           (severe)
+//   any tier → SHADOW_ONLY   Pinnacle coverage < 20% with n >= 5    (data gap)
+//   higher → next-lower      real ROI < -15% with n >= 20
+//   higher → next-lower      log-growth/bet < -0.005 with n >= 30
 //
-// Auto-resume policy:
-//   - Pause window default 14d (configurable per scope_type)
-//   - On expiry: pause closes, market re-opens at 50% Kelly via trial-mode
-//     row that the next audit observes
-//   - If next audit finds Kelly-growth recovered: clear override, full Kelly
-//   - If still failing: re-pause 30d, escalation_level++
+// PROMOTIONS (edge confirmed)
+//   SHADOW_ONLY → TRIAL      shadow log-growth/bet > +0.005, n >= 50
+//                            (shadow edge — even without CLV — initiates
+//                            small real-stake to confirm)
+//   TRIAL → STANDARD_REDUCED real log-growth/bet > +0.005, n >= 20
+//   STANDARD_REDUCED → DEFAULT real log-growth/bet > +0.005, n >= 30
+//   DEFAULT → BOOSTED        real log-growth > +0.01 AND ROI > +10%, n >= 50
 //
-// Primary metric: per-bet log-bankroll growth-rate (Kelly framing per the
-// strategic brief). ROI and CLV are supporting signals. Pinnacle coverage
-// rate is a data-quality signal (0% coverage on a market with stake means
-// the model is flying blind regardless of ROI).
+// Shadow bets generate the upward path's evidence. Without shadow flow, a
+// demoted scope can never come back. That's why the shadow track on Tier B/C
+// is architecturally untouchable — it's the model's exploration arm.
+//
+// Audit-log writes
+//   Every transition writes a model_decision_audit_log row with decision_type
+//   matching the movement direction (e.g. tier_promoted_from_shadow,
+//   tier_demoted_to_shadow, tier_boosted, tier_recovered_to_default). Every
+//   scope-evaluation also writes a self_audit_observation when no transition
+//   warranted, so the audit log is a complete record of what was checked.
+//
+// Database
+//   autonomous_pauses table is the active-tier registry. Only one active
+//   row per scope (resumed_at IS NULL). On transition, we set the prior
+//   row's resumed_at = NOW() and INSERT the new tier as a fresh row, so
+//   the table doubles as the full historical ladder for any scope.
 // ============================================================================
 
 import {
@@ -46,101 +67,150 @@ import {
 import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
-// ── Thresholds (conservative initial values; tunable via agent_config) ──────
-
 const ANALYSIS_WINDOW_DAYS = 30;
 
-// ROI anomaly: market is bleeding capital
-const ROI_ANOMALY_THRESHOLD = -0.15; // -15% ROI
-const ROI_ANOMALY_MIN_SAMPLE = 20;
-
-// Severe ROI: tighter sample, faster pause
-const SEVERE_ROI_THRESHOLD = -0.25; // -25% ROI
+// ── Demotion thresholds ─────────────────────────────────────────────────────
+const SEVERE_ROI_THRESHOLD = -0.25;
 const SEVERE_ROI_MIN_SAMPLE = 10;
 
-// Kelly-growth anomaly: log-bankroll growth-rate per bet
-const KELLY_GROWTH_THRESHOLD = -0.005; // -0.5% per bet
+const ROI_ANOMALY_THRESHOLD = -0.15;
+const ROI_ANOMALY_MIN_SAMPLE = 20;
+
+const KELLY_GROWTH_NEGATIVE_THRESHOLD = -0.005;
 const KELLY_GROWTH_MIN_SAMPLE = 30;
 
-// Data-coverage gap: model can't validate edge on this market
-const COVERAGE_GAP_THRESHOLD = 0.2; // < 20% Pinnacle coverage
+const COVERAGE_GAP_THRESHOLD = 0.2;
 const COVERAGE_GAP_MIN_SAMPLE = 5;
 
-// Pause durations (days)
-const STANDARD_PAUSE_DAYS = 14;
-const SEVERE_PAUSE_DAYS = 30;
-const COVERAGE_PAUSE_DAYS = 90; // data gaps tend to be structural — long pause
-const ESCALATED_PAUSE_DAYS = 30;
+// ── Promotion thresholds ────────────────────────────────────────────────────
+const SHADOW_EDGE_THRESHOLD = 0.005; // log-growth per bet
+const SHADOW_EDGE_MIN_SAMPLE = 50;
 
-// Trial-mode Kelly fraction on auto-resume
-const TRIAL_KELLY_FRACTION = 0.5;
+const TRIAL_RECOVERY_THRESHOLD = 0.005;
+const TRIAL_RECOVERY_MIN_SAMPLE = 20;
+
+const STANDARD_RECOVERY_THRESHOLD = 0.005;
+const STANDARD_RECOVERY_MIN_SAMPLE = 30;
+
+const BOOST_KELLY_GROWTH_THRESHOLD = 0.01;
+const BOOST_ROI_THRESHOLD = 0.1;
+const BOOST_MIN_SAMPLE = 50;
+
+// ── Tier definitions ────────────────────────────────────────────────────────
+type Tier = "SHADOW_ONLY" | "TRIAL" | "STANDARD_REDUCED" | "DEFAULT" | "BOOSTED";
+
+const TIER_ORDER: Record<Tier, number> = {
+  SHADOW_ONLY: 0,
+  TRIAL: 1,
+  STANDARD_REDUCED: 2,
+  DEFAULT: 3,
+  BOOSTED: 4,
+};
+
+function tierFromOverride(override: number | null): Tier {
+  if (override === null || override === undefined) return "DEFAULT";
+  if (override === 0) return "SHADOW_ONLY";
+  if (override <= 0.3) return "TRIAL";
+  if (override <= 0.6) return "STANDARD_REDUCED";
+  if (override > 1.0) return "BOOSTED";
+  return "DEFAULT";
+}
+
+function overrideFromTier(tier: Tier): number | null {
+  switch (tier) {
+    case "SHADOW_ONLY":
+      return 0;
+    case "TRIAL":
+      return 0.25;
+    case "STANDARD_REDUCED":
+      return 0.5;
+    case "DEFAULT":
+      return null;
+    case "BOOSTED":
+      return 1.5;
+  }
+}
+
+function nextLowerTier(tier: Tier): Tier {
+  switch (tier) {
+    case "BOOSTED":
+      return "DEFAULT";
+    case "DEFAULT":
+      return "STANDARD_REDUCED";
+    case "STANDARD_REDUCED":
+      return "TRIAL";
+    case "TRIAL":
+    case "SHADOW_ONLY":
+      return "SHADOW_ONLY";
+  }
+}
+
+function durationDaysForTier(tier: Tier, severity: "severe" | "standard"): number {
+  if (tier === "SHADOW_ONLY") return severity === "severe" ? 30 : 90;
+  if (tier === "TRIAL") return 14;
+  if (tier === "STANDARD_REDUCED") return 14;
+  if (tier === "BOOSTED") return 30; // boosted re-evaluation
+  return 30;
+}
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
 export interface SelfAuditResult {
   scopesAnalyzed: number;
   observationsLogged: number;
-  pausesAdded: number;
-  pausesResumed: number;
-  alreadyPausedScopes: number;
+  promotions: number;
+  demotions: number;
+  unchanged: number;
   durationMs: number;
 }
 
 interface ScopeStats {
   scope_value: string;
-  total_settled: number;
-  shadow_count: number;
+  // Real-stake metrics
   real_count: number;
-  total_stake: number;
-  total_pnl: number;
-  clv_measured: number;
-  log_growth_per_bet: number | null;
-  // derived
+  real_stake: number;
+  real_pnl: number;
   real_roi: number | null;
+  log_growth_per_bet: number | null; // real-bet log-growth
+  clv_measured: number;
   coverage_rate: number | null;
+  // Shadow metrics (the upward-path evidence)
+  shadow_count: number;
+  shadow_stake_total: number;
+  shadow_pnl_total: number;
+  shadow_log_growth_per_bet: number | null;
 }
 
-interface AnomalyFinding {
-  scopeType: "market" | "league_market" | "archetype";
-  scopeValue: string;
-  reason:
-    | "ROI_ANOMALY"
-    | "SEVERE_ROI_ANOMALY"
-    | "KELLY_GROWTH_ANOMALY"
-    | "DATA_COVERAGE_GAP";
-  metricType: "roi" | "kelly_growth" | "clv_coverage";
+interface TierDecision {
+  fromTier: Tier;
+  toTier: Tier;
+  reason: string;
+  metricType: "roi" | "kelly_growth" | "clv_coverage" | "shadow_kelly_growth";
   metricValue: number;
   thresholdValue: number;
   sampleSize: number;
-  pauseDurationDays: number;
-  stats: ScopeStats;
+  durationDays: number;
+  direction: "promotion" | "demotion";
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
 export async function runModelSelfAudit(): Promise<SelfAuditResult> {
   const startedAt = Date.now();
-  logger.info("Model self-audit starting");
+  logger.info("Model self-audit (tier-ladder) starting");
 
   const result: SelfAuditResult = {
     scopesAnalyzed: 0,
     observationsLogged: 0,
-    pausesAdded: 0,
-    pausesResumed: 0,
-    alreadyPausedScopes: 0,
+    promotions: 0,
+    demotions: 0,
+    unchanged: 0,
     durationMs: 0,
   };
 
-  // 1. Auto-resume any pauses whose window has expired
-  result.pausesResumed = await processAutoResumes();
-
-  // 2. Per-market analysis
   await analyzeMarketScope(result);
-
-  // 3. Per (league × market) analysis
   await analyzeLeagueMarketScope(result);
-
-  // 4. Per-archetype analysis
+  await analyzeLeagueScope(result);
   await analyzeArchetypeScope(result);
 
   result.durationMs = Date.now() - startedAt;
@@ -153,27 +223,28 @@ export async function runModelSelfAudit(): Promise<SelfAuditResult> {
       details: result as unknown as Record<string, unknown>,
       timestamp: new Date(),
     })
-    .catch((err) => {
-      logger.warn({ err }, "Failed to write self-audit compliance log");
-    });
+    .catch(() => {});
 
   return result;
 }
 
-// ── Analysis passes ─────────────────────────────────────────────────────────
+// ── Analysis passes (one per scope shape) ───────────────────────────────────
 
 async function analyzeMarketScope(result: SelfAuditResult): Promise<void> {
   const rows = await db.execute(sql`
     SELECT
       pb.market_type AS scope_value,
-      COUNT(*) AS total_settled,
-      COUNT(*) FILTER (WHERE pb.shadow_stake > 0) AS shadow_count,
       COUNT(*) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0) AS real_count,
-      ROUND(SUM(pb.stake::numeric), 2) AS total_stake,
-      ROUND(SUM(pb.settlement_pnl::numeric), 2) AS total_pnl,
-      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL) AS clv_measured,
+      ROUND(COALESCE(SUM(pb.stake::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_stake,
+      ROUND(COALESCE(SUM(pb.settlement_pnl::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_pnl,
       AVG(LN(GREATEST(0.0001, 1 + (pb.settlement_pnl::numeric / NULLIF(pb.stake::numeric, 0)))))
-        FILTER (WHERE pb.stake::numeric > 0) AS log_growth_per_bet
+        FILTER (WHERE pb.stake::numeric > 0 AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS log_growth_per_bet,
+      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS clv_measured,
+      COUNT(*) FILTER (WHERE pb.shadow_stake > 0) AS shadow_count,
+      ROUND(COALESCE(SUM(pb.shadow_stake::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_stake_total,
+      ROUND(COALESCE(SUM(pb.shadow_pnl::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_pnl_total,
+      AVG(LN(GREATEST(0.0001, 1 + (pb.shadow_pnl::numeric / NULLIF(pb.shadow_stake::numeric, 0)))))
+        FILTER (WHERE pb.shadow_stake::numeric > 0 AND pb.shadow_pnl IS NOT NULL) AS shadow_log_growth_per_bet
     FROM paper_bets pb
     WHERE pb.deleted_at IS NULL
       AND pb.legacy_regime = false
@@ -182,11 +253,8 @@ async function analyzeMarketScope(result: SelfAuditResult): Promise<void> {
     GROUP BY pb.market_type
     HAVING COUNT(*) >= 5
   `);
-
   for (const r of (rows as any).rows ?? []) {
-    const stats = normaliseStats(r);
-    result.scopesAnalyzed++;
-    await processScopeStats("market", stats, result);
+    await processScope("market", normaliseStats(r), result);
   }
 }
 
@@ -194,28 +262,55 @@ async function analyzeLeagueMarketScope(result: SelfAuditResult): Promise<void> 
   const rows = await db.execute(sql`
     SELECT
       m.league || ':' || pb.market_type AS scope_value,
-      COUNT(*) AS total_settled,
-      COUNT(*) FILTER (WHERE pb.shadow_stake > 0) AS shadow_count,
       COUNT(*) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0) AS real_count,
-      ROUND(SUM(pb.stake::numeric), 2) AS total_stake,
-      ROUND(SUM(pb.settlement_pnl::numeric), 2) AS total_pnl,
-      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL) AS clv_measured,
+      ROUND(COALESCE(SUM(pb.stake::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_stake,
+      ROUND(COALESCE(SUM(pb.settlement_pnl::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_pnl,
       AVG(LN(GREATEST(0.0001, 1 + (pb.settlement_pnl::numeric / NULLIF(pb.stake::numeric, 0)))))
-        FILTER (WHERE pb.stake::numeric > 0) AS log_growth_per_bet
+        FILTER (WHERE pb.stake::numeric > 0 AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS log_growth_per_bet,
+      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS clv_measured,
+      COUNT(*) FILTER (WHERE pb.shadow_stake > 0) AS shadow_count,
+      ROUND(COALESCE(SUM(pb.shadow_stake::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_stake_total,
+      ROUND(COALESCE(SUM(pb.shadow_pnl::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_pnl_total,
+      AVG(LN(GREATEST(0.0001, 1 + (pb.shadow_pnl::numeric / NULLIF(pb.shadow_stake::numeric, 0)))))
+        FILTER (WHERE pb.shadow_stake::numeric > 0 AND pb.shadow_pnl IS NOT NULL) AS shadow_log_growth_per_bet
     FROM paper_bets pb
     JOIN matches m ON m.id = pb.match_id
-    WHERE pb.deleted_at IS NULL
-      AND pb.legacy_regime = false
+    WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
       AND pb.status IN ('won','lost')
       AND pb.placed_at >= NOW() - (${ANALYSIS_WINDOW_DAYS}::int * INTERVAL '1 day')
     GROUP BY m.league, pb.market_type
     HAVING COUNT(*) >= 5
   `);
-
   for (const r of (rows as any).rows ?? []) {
-    const stats = normaliseStats(r);
-    result.scopesAnalyzed++;
-    await processScopeStats("league_market", stats, result);
+    await processScope("league_market", normaliseStats(r), result);
+  }
+}
+
+async function analyzeLeagueScope(result: SelfAuditResult): Promise<void> {
+  const rows = await db.execute(sql`
+    SELECT
+      m.league AS scope_value,
+      COUNT(*) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0) AS real_count,
+      ROUND(COALESCE(SUM(pb.stake::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_stake,
+      ROUND(COALESCE(SUM(pb.settlement_pnl::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_pnl,
+      AVG(LN(GREATEST(0.0001, 1 + (pb.settlement_pnl::numeric / NULLIF(pb.stake::numeric, 0)))))
+        FILTER (WHERE pb.stake::numeric > 0 AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS log_growth_per_bet,
+      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS clv_measured,
+      COUNT(*) FILTER (WHERE pb.shadow_stake > 0) AS shadow_count,
+      ROUND(COALESCE(SUM(pb.shadow_stake::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_stake_total,
+      ROUND(COALESCE(SUM(pb.shadow_pnl::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_pnl_total,
+      AVG(LN(GREATEST(0.0001, 1 + (pb.shadow_pnl::numeric / NULLIF(pb.shadow_stake::numeric, 0)))))
+        FILTER (WHERE pb.shadow_stake::numeric > 0 AND pb.shadow_pnl IS NOT NULL) AS shadow_log_growth_per_bet
+    FROM paper_bets pb
+    JOIN matches m ON m.id = pb.match_id
+    WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
+      AND pb.status IN ('won','lost')
+      AND pb.placed_at >= NOW() - (${ANALYSIS_WINDOW_DAYS}::int * INTERVAL '1 day')
+    GROUP BY m.league
+    HAVING COUNT(*) >= 10
+  `);
+  for (const r of (rows as any).rows ?? []) {
+    await processScope("league", normaliseStats(r), result);
   }
 }
 
@@ -223,277 +318,382 @@ async function analyzeArchetypeScope(result: SelfAuditResult): Promise<void> {
   const rows = await db.execute(sql`
     SELECT
       COALESCE(cc.archetype, 'unmapped') AS scope_value,
-      COUNT(*) AS total_settled,
-      COUNT(*) FILTER (WHERE pb.shadow_stake > 0) AS shadow_count,
       COUNT(*) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0) AS real_count,
-      ROUND(SUM(pb.stake::numeric), 2) AS total_stake,
-      ROUND(SUM(pb.settlement_pnl::numeric), 2) AS total_pnl,
-      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL) AS clv_measured,
+      ROUND(COALESCE(SUM(pb.stake::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_stake,
+      ROUND(COALESCE(SUM(pb.settlement_pnl::numeric) FILTER (WHERE pb.shadow_stake IS NULL OR pb.shadow_stake = 0), 0), 2) AS real_pnl,
       AVG(LN(GREATEST(0.0001, 1 + (pb.settlement_pnl::numeric / NULLIF(pb.stake::numeric, 0)))))
-        FILTER (WHERE pb.stake::numeric > 0) AS log_growth_per_bet
+        FILTER (WHERE pb.stake::numeric > 0 AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS log_growth_per_bet,
+      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL AND (pb.shadow_stake IS NULL OR pb.shadow_stake = 0)) AS clv_measured,
+      COUNT(*) FILTER (WHERE pb.shadow_stake > 0) AS shadow_count,
+      ROUND(COALESCE(SUM(pb.shadow_stake::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_stake_total,
+      ROUND(COALESCE(SUM(pb.shadow_pnl::numeric) FILTER (WHERE pb.shadow_stake > 0), 0), 2) AS shadow_pnl_total,
+      AVG(LN(GREATEST(0.0001, 1 + (pb.shadow_pnl::numeric / NULLIF(pb.shadow_stake::numeric, 0)))))
+        FILTER (WHERE pb.shadow_stake::numeric > 0 AND pb.shadow_pnl IS NOT NULL) AS shadow_log_growth_per_bet
     FROM paper_bets pb
     JOIN matches m ON m.id = pb.match_id
     LEFT JOIN competition_config cc ON cc.name = m.league
-    WHERE pb.deleted_at IS NULL
-      AND pb.legacy_regime = false
+    WHERE pb.deleted_at IS NULL AND pb.legacy_regime = false
       AND pb.status IN ('won','lost')
       AND pb.placed_at >= NOW() - (${ANALYSIS_WINDOW_DAYS}::int * INTERVAL '1 day')
     GROUP BY COALESCE(cc.archetype, 'unmapped')
-    HAVING COUNT(*) >= 5
+    HAVING COUNT(*) >= 10
   `);
-
   for (const r of (rows as any).rows ?? []) {
-    const stats = normaliseStats(r);
-    result.scopesAnalyzed++;
-    await processScopeStats("archetype", stats, result);
+    await processScope("archetype", normaliseStats(r), result);
   }
 }
 
-// ── Scope-stats normalisation + anomaly detection ───────────────────────────
-
 function normaliseStats(r: Record<string, unknown>): ScopeStats {
-  const totalSettled = Number(r["total_settled"] ?? 0);
   const realCount = Number(r["real_count"] ?? 0);
-  const totalStake = Number(r["total_stake"] ?? 0);
-  const totalPnl = Number(r["total_pnl"] ?? 0);
-  const clvMeasured = Number(r["clv_measured"] ?? 0);
+  const realStake = Number(r["real_stake"] ?? 0);
+  const realPnl = Number(r["real_pnl"] ?? 0);
   const logGrowthRaw = r["log_growth_per_bet"];
-  const logGrowth =
-    logGrowthRaw === null || logGrowthRaw === undefined ? null : Number(logGrowthRaw);
+  const shadowCount = Number(r["shadow_count"] ?? 0);
+  const shadowStakeTotal = Number(r["shadow_stake_total"] ?? 0);
+  const shadowPnlTotal = Number(r["shadow_pnl_total"] ?? 0);
+  const shadowLogRaw = r["shadow_log_growth_per_bet"];
+  const clvMeasured = Number(r["clv_measured"] ?? 0);
 
   return {
     scope_value: String(r["scope_value"] ?? "unknown"),
-    total_settled: totalSettled,
-    shadow_count: Number(r["shadow_count"] ?? 0),
     real_count: realCount,
-    total_stake: totalStake,
-    total_pnl: totalPnl,
+    real_stake: realStake,
+    real_pnl: realPnl,
+    real_roi: realStake > 0 ? realPnl / realStake : null,
+    log_growth_per_bet:
+      logGrowthRaw === null || logGrowthRaw === undefined ? null : Number(logGrowthRaw),
     clv_measured: clvMeasured,
-    log_growth_per_bet: logGrowth,
-    real_roi: totalStake > 0 ? totalPnl / totalStake : null,
-    coverage_rate: totalSettled > 0 ? clvMeasured / totalSettled : null,
+    coverage_rate: realCount > 0 ? clvMeasured / realCount : null,
+    shadow_count: shadowCount,
+    shadow_stake_total: shadowStakeTotal,
+    shadow_pnl_total: shadowPnlTotal,
+    shadow_log_growth_per_bet:
+      shadowLogRaw === null || shadowLogRaw === undefined ? null : Number(shadowLogRaw),
   };
 }
 
-async function processScopeStats(
-  scopeType: "market" | "league_market" | "archetype",
+// ── Per-scope tier decision and persistence ─────────────────────────────────
+
+async function processScope(
+  scopeType: "market" | "league_market" | "league" | "archetype",
   stats: ScopeStats,
   result: SelfAuditResult,
 ): Promise<void> {
-  // Skip scopes already actively paused — let the existing pause run its
-  // course rather than stacking duplicate pauses.
-  const existingActive = await db.execute(sql`
-    SELECT id FROM autonomous_pauses
+  result.scopesAnalyzed++;
+
+  // Find current active tier (most recent unresolved row)
+  const activeRows = await db.execute(sql`
+    SELECT id, kelly_fraction_override::text AS override
+    FROM autonomous_pauses
     WHERE scope_type = ${scopeType}
       AND scope_value = ${stats.scope_value}
       AND resumed_at IS NULL
+    ORDER BY paused_at DESC
     LIMIT 1
   `);
-  if (((existingActive as any).rows ?? []).length > 0) {
-    result.alreadyPausedScopes++;
-    return;
-  }
+  const activeRow = ((activeRows as any).rows ?? [])[0];
+  const currentOverride =
+    activeRow?.override === undefined || activeRow?.override === null
+      ? null
+      : Number(activeRow.override);
+  const currentTier = tierFromOverride(currentOverride);
 
-  const finding = detectAnomaly(scopeType, stats);
-  if (!finding) {
-    // No anomaly — log a self_audit_observation row so the audit log shows
-    // what was checked even when no action is taken. Keeps things visible.
+  const decision = decideTier(currentTier, stats);
+
+  if (!decision) {
+    // No transition warranted — log observation and move on
     await db
       .insert(modelDecisionAuditLogTable)
       .values({
         decisionType: "self_audit_observation",
         subject: `${scopeType}:${stats.scope_value}`,
-        priorState: { paused: false } as any,
-        newState: {
-          paused: false,
-          observed: {
-            sample: stats.total_settled,
-            real_roi: stats.real_roi,
-            kelly_growth_per_bet: stats.log_growth_per_bet,
-            coverage_rate: stats.coverage_rate,
-          },
-        } as any,
-        reasoning: `${scopeType} ${stats.scope_value}: within thresholds (sample ${stats.total_settled}, real ROI ${formatPct(stats.real_roi)}, coverage ${formatPct(stats.coverage_rate)})`,
+        priorState: { tier: currentTier, kelly_fraction_override: currentOverride } as any,
+        newState: { tier: currentTier, kelly_fraction_override: currentOverride } as any,
+        reasoning: `${scopeType} ${stats.scope_value} stays at ${currentTier} (real n=${stats.real_count}, ROI=${formatPct(stats.real_roi)}, kelly_growth=${formatNum(stats.log_growth_per_bet)}/bet, shadow n=${stats.shadow_count}, shadow_kelly_growth=${formatNum(stats.shadow_log_growth_per_bet)}/bet)`,
         supportingMetrics: { ...stats } as any,
         reviewStatus: "automatic",
       })
       .catch(() => {});
     result.observationsLogged++;
+    result.unchanged++;
     return;
   }
 
-  // Anomaly found — write audit row + insert pause.
+  // Persist transition: supersede prior active row, INSERT new tier
+  if (activeRow?.id) {
+    await db.execute(sql`
+      UPDATE autonomous_pauses SET resumed_at = NOW()
+      WHERE id = ${activeRow.id}
+    `);
+  }
+
   const auditRows = await db
     .insert(modelDecisionAuditLogTable)
     .values({
-      decisionType: `${scopeType}_paused`,
+      decisionType: decisionTypeFor(decision),
       subject: `${scopeType}:${stats.scope_value}`,
-      priorState: { paused: false, ...metricSnapshot(stats) } as any,
-      newState: {
-        paused: true,
-        paused_until_iso: new Date(
-          Date.now() + finding.pauseDurationDays * 24 * 3600 * 1000,
-        ).toISOString(),
-        kelly_fraction_override: 0,
+      priorState: {
+        tier: decision.fromTier,
+        kelly_fraction_override: overrideFromTier(decision.fromTier),
       } as any,
-      reasoning: buildReasoning(finding, stats),
+      newState: {
+        tier: decision.toTier,
+        kelly_fraction_override: overrideFromTier(decision.toTier),
+        duration_days: decision.durationDays,
+      } as any,
+      reasoning: buildReasoning(scopeType, stats, decision),
       supportingMetrics: {
         scope_type: scopeType,
         scope_value: stats.scope_value,
         ...stats,
-        threshold: finding.thresholdValue,
-        observed: finding.metricValue,
+        threshold: decision.thresholdValue,
+        observed: decision.metricValue,
       } as any,
-      expectedImpact: estimateExpectedImpact(stats),
+      expectedImpact: estimateExpectedImpact(stats, decision),
       reviewStatus: "automatic",
     })
     .returning({ id: modelDecisionAuditLogTable.id });
 
   const auditLogId = auditRows[0]?.id ?? null;
+  const newOverride = overrideFromTier(decision.toTier);
 
-  await db.execute(sql`
-    INSERT INTO autonomous_pauses (
-      scope_type, scope_value, paused_until,
-      reason, metric_type, metric_value, threshold_value, sample_size,
-      kelly_fraction_override, pause_duration_days, escalation_level, audit_log_id
-    ) VALUES (
-      ${scopeType},
-      ${stats.scope_value},
-      NOW() + (${finding.pauseDurationDays}::int * INTERVAL '1 day'),
-      ${finding.reason},
-      ${finding.metricType},
-      ${finding.metricValue},
-      ${finding.thresholdValue},
-      ${finding.sampleSize},
-      0,
-      ${finding.pauseDurationDays},
-      1,
-      ${auditLogId}
-    )
-  `);
+  if (decision.toTier === "DEFAULT") {
+    // Returning to DEFAULT just supersedes — no new active row needed.
+    // No-op besides the audit-log row already written.
+  } else {
+    await db.execute(sql`
+      INSERT INTO autonomous_pauses (
+        scope_type, scope_value, paused_until,
+        reason, metric_type, metric_value, threshold_value, sample_size,
+        kelly_fraction_override, pause_duration_days, escalation_level, audit_log_id
+      ) VALUES (
+        ${scopeType},
+        ${stats.scope_value},
+        NOW() + (${decision.durationDays}::int * INTERVAL '1 day'),
+        ${decision.reason},
+        ${decision.metricType},
+        ${decision.metricValue},
+        ${decision.thresholdValue},
+        ${decision.sampleSize},
+        ${newOverride},
+        ${decision.durationDays},
+        1,
+        ${auditLogId}
+      )
+    `);
+  }
 
-  result.pausesAdded++;
-  logger.warn(
+  if (decision.direction === "promotion") result.promotions++;
+  else result.demotions++;
+
+  logger.info(
     {
       scopeType,
       scopeValue: stats.scope_value,
-      reason: finding.reason,
-      metricType: finding.metricType,
-      metricValue: finding.metricValue,
-      threshold: finding.thresholdValue,
-      sample: finding.sampleSize,
-      durationDays: finding.pauseDurationDays,
+      from: decision.fromTier,
+      to: decision.toTier,
+      reason: decision.reason,
+      direction: decision.direction,
     },
-    "Self-audit auto-paused scope",
+    `Self-audit ${decision.direction}`,
   );
 }
 
-function detectAnomaly(
-  scopeType: "market" | "league_market" | "archetype",
-  stats: ScopeStats,
-): AnomalyFinding | null {
-  // Severe ROI gets first priority — fastest pause path.
+// ── Decision logic ──────────────────────────────────────────────────────────
+
+function decideTier(currentTier: Tier, stats: ScopeStats): TierDecision | null {
+  // ===== Demotion priority (capital protection first) =====
+
+  // Severe ROI: drop straight to SHADOW_ONLY regardless of current tier
   if (
     stats.real_count >= SEVERE_ROI_MIN_SAMPLE &&
     stats.real_roi !== null &&
-    stats.real_roi < SEVERE_ROI_THRESHOLD
+    stats.real_roi < SEVERE_ROI_THRESHOLD &&
+    currentTier !== "SHADOW_ONLY"
   ) {
     return {
-      scopeType,
-      scopeValue: stats.scope_value,
+      fromTier: currentTier,
+      toTier: "SHADOW_ONLY",
       reason: "SEVERE_ROI_ANOMALY",
       metricType: "roi",
       metricValue: stats.real_roi,
       thresholdValue: SEVERE_ROI_THRESHOLD,
       sampleSize: stats.real_count,
-      pauseDurationDays: SEVERE_PAUSE_DAYS,
-      stats,
+      durationDays: durationDaysForTier("SHADOW_ONLY", "severe"),
+      direction: "demotion",
     };
   }
 
-  // Standard ROI anomaly
-  if (
-    stats.real_count >= ROI_ANOMALY_MIN_SAMPLE &&
-    stats.real_roi !== null &&
-    stats.real_roi < ROI_ANOMALY_THRESHOLD
-  ) {
-    return {
-      scopeType,
-      scopeValue: stats.scope_value,
-      reason: "ROI_ANOMALY",
-      metricType: "roi",
-      metricValue: stats.real_roi,
-      thresholdValue: ROI_ANOMALY_THRESHOLD,
-      sampleSize: stats.real_count,
-      pauseDurationDays: STANDARD_PAUSE_DAYS,
-      stats,
-    };
-  }
-
-  // Kelly-growth anomaly (more sensitive on log-growth-rate)
-  if (
-    stats.real_count >= KELLY_GROWTH_MIN_SAMPLE &&
-    stats.log_growth_per_bet !== null &&
-    stats.log_growth_per_bet < KELLY_GROWTH_THRESHOLD
-  ) {
-    return {
-      scopeType,
-      scopeValue: stats.scope_value,
-      reason: "KELLY_GROWTH_ANOMALY",
-      metricType: "kelly_growth",
-      metricValue: stats.log_growth_per_bet,
-      thresholdValue: KELLY_GROWTH_THRESHOLD,
-      sampleSize: stats.real_count,
-      pauseDurationDays: STANDARD_PAUSE_DAYS,
-      stats,
-    };
-  }
-
-  // Data-coverage gap — model can't validate this market's edge.
-  // Only relevant when there are real-stake bets (shadow bets are
-  // designed to operate without Pinnacle anchor).
+  // Coverage gap: structural data deficit, drop to SHADOW_ONLY
   if (
     stats.real_count >= COVERAGE_GAP_MIN_SAMPLE &&
     stats.coverage_rate !== null &&
-    stats.coverage_rate < COVERAGE_GAP_THRESHOLD
+    stats.coverage_rate < COVERAGE_GAP_THRESHOLD &&
+    currentTier !== "SHADOW_ONLY"
   ) {
     return {
-      scopeType,
-      scopeValue: stats.scope_value,
+      fromTier: currentTier,
+      toTier: "SHADOW_ONLY",
       reason: "DATA_COVERAGE_GAP",
       metricType: "clv_coverage",
       metricValue: stats.coverage_rate,
       thresholdValue: COVERAGE_GAP_THRESHOLD,
       sampleSize: stats.real_count,
-      pauseDurationDays: COVERAGE_PAUSE_DAYS,
-      stats,
+      durationDays: durationDaysForTier("SHADOW_ONLY", "standard"),
+      direction: "demotion",
+    };
+  }
+
+  // Standard ROI demotion: one rung down
+  if (
+    stats.real_count >= ROI_ANOMALY_MIN_SAMPLE &&
+    stats.real_roi !== null &&
+    stats.real_roi < ROI_ANOMALY_THRESHOLD &&
+    currentTier !== "SHADOW_ONLY"
+  ) {
+    const target = nextLowerTier(currentTier);
+    return {
+      fromTier: currentTier,
+      toTier: target,
+      reason: "ROI_ANOMALY",
+      metricType: "roi",
+      metricValue: stats.real_roi,
+      thresholdValue: ROI_ANOMALY_THRESHOLD,
+      sampleSize: stats.real_count,
+      durationDays: durationDaysForTier(target, "standard"),
+      direction: "demotion",
+    };
+  }
+
+  // Kelly-growth demotion: one rung down on log-growth
+  if (
+    stats.real_count >= KELLY_GROWTH_MIN_SAMPLE &&
+    stats.log_growth_per_bet !== null &&
+    stats.log_growth_per_bet < KELLY_GROWTH_NEGATIVE_THRESHOLD &&
+    currentTier !== "SHADOW_ONLY"
+  ) {
+    const target = nextLowerTier(currentTier);
+    return {
+      fromTier: currentTier,
+      toTier: target,
+      reason: "KELLY_GROWTH_ANOMALY",
+      metricType: "kelly_growth",
+      metricValue: stats.log_growth_per_bet,
+      thresholdValue: KELLY_GROWTH_NEGATIVE_THRESHOLD,
+      sampleSize: stats.real_count,
+      durationDays: durationDaysForTier(target, "standard"),
+      direction: "demotion",
+    };
+  }
+
+  // ===== Promotion ladder (positive evidence) =====
+
+  // SHADOW_ONLY → TRIAL: shadow Kelly-growth shows edge even without CLV.
+  // This is the architectural primitive — shadow data is the upward path's
+  // evidence, lets the model rediscover edge on previously-failed scopes.
+  if (
+    currentTier === "SHADOW_ONLY" &&
+    stats.shadow_count >= SHADOW_EDGE_MIN_SAMPLE &&
+    stats.shadow_log_growth_per_bet !== null &&
+    stats.shadow_log_growth_per_bet > SHADOW_EDGE_THRESHOLD
+  ) {
+    return {
+      fromTier: currentTier,
+      toTier: "TRIAL",
+      reason: "SHADOW_EDGE_PROMOTION",
+      metricType: "shadow_kelly_growth",
+      metricValue: stats.shadow_log_growth_per_bet,
+      thresholdValue: SHADOW_EDGE_THRESHOLD,
+      sampleSize: stats.shadow_count,
+      durationDays: durationDaysForTier("TRIAL", "standard"),
+      direction: "promotion",
+    };
+  }
+
+  // TRIAL → STANDARD_REDUCED: real-stake at quarter-Kelly is recovering
+  if (
+    currentTier === "TRIAL" &&
+    stats.real_count >= TRIAL_RECOVERY_MIN_SAMPLE &&
+    stats.log_growth_per_bet !== null &&
+    stats.log_growth_per_bet > TRIAL_RECOVERY_THRESHOLD
+  ) {
+    return {
+      fromTier: currentTier,
+      toTier: "STANDARD_REDUCED",
+      reason: "TRIAL_RECOVERY",
+      metricType: "kelly_growth",
+      metricValue: stats.log_growth_per_bet,
+      thresholdValue: TRIAL_RECOVERY_THRESHOLD,
+      sampleSize: stats.real_count,
+      durationDays: durationDaysForTier("STANDARD_REDUCED", "standard"),
+      direction: "promotion",
+    };
+  }
+
+  // STANDARD_REDUCED → DEFAULT: full Kelly restored
+  if (
+    currentTier === "STANDARD_REDUCED" &&
+    stats.real_count >= STANDARD_RECOVERY_MIN_SAMPLE &&
+    stats.log_growth_per_bet !== null &&
+    stats.log_growth_per_bet > STANDARD_RECOVERY_THRESHOLD
+  ) {
+    return {
+      fromTier: currentTier,
+      toTier: "DEFAULT",
+      reason: "STANDARD_RECOVERY",
+      metricType: "kelly_growth",
+      metricValue: stats.log_growth_per_bet,
+      thresholdValue: STANDARD_RECOVERY_THRESHOLD,
+      sampleSize: stats.real_count,
+      durationDays: 0,
+      direction: "promotion",
+    };
+  }
+
+  // DEFAULT → BOOSTED: high-confidence amplification
+  if (
+    currentTier === "DEFAULT" &&
+    stats.real_count >= BOOST_MIN_SAMPLE &&
+    stats.log_growth_per_bet !== null &&
+    stats.log_growth_per_bet > BOOST_KELLY_GROWTH_THRESHOLD &&
+    stats.real_roi !== null &&
+    stats.real_roi > BOOST_ROI_THRESHOLD
+  ) {
+    return {
+      fromTier: currentTier,
+      toTier: "BOOSTED",
+      reason: "BOOSTED_EDGE",
+      metricType: "kelly_growth",
+      metricValue: stats.log_growth_per_bet,
+      thresholdValue: BOOST_KELLY_GROWTH_THRESHOLD,
+      sampleSize: stats.real_count,
+      durationDays: durationDaysForTier("BOOSTED", "standard"),
+      direction: "promotion",
     };
   }
 
   return null;
 }
 
-function metricSnapshot(stats: ScopeStats): Record<string, unknown> {
-  return {
-    real_roi: stats.real_roi,
-    kelly_growth_per_bet: stats.log_growth_per_bet,
-    coverage_rate: stats.coverage_rate,
-    sample: stats.real_count,
-    shadow_sample: stats.shadow_count,
-  };
+// ── Reporting helpers ───────────────────────────────────────────────────────
+
+function decisionTypeFor(decision: TierDecision): string {
+  if (decision.direction === "promotion") {
+    if (decision.fromTier === "SHADOW_ONLY") return "tier_promoted_from_shadow";
+    if (decision.toTier === "BOOSTED") return "tier_boosted";
+    return "tier_promoted";
+  }
+  if (decision.toTier === "SHADOW_ONLY") return "tier_demoted_to_shadow";
+  return "tier_demoted";
 }
 
-function buildReasoning(finding: AnomalyFinding, stats: ScopeStats): string {
-  switch (finding.reason) {
-    case "SEVERE_ROI_ANOMALY":
-      return `Severe ROI anomaly: ${finding.scopeType} ${stats.scope_value} returned ${formatPct(finding.metricValue)} ROI over ${finding.sampleSize} settled real-stake bets (threshold ${formatPct(finding.thresholdValue)}). Pausing real-stake placement for ${finding.pauseDurationDays} days. Shadow bets continue (architectural exemption — £0 stake captures regime-shift learning).`;
-    case "ROI_ANOMALY":
-      return `ROI anomaly: ${finding.scopeType} ${stats.scope_value} returned ${formatPct(finding.metricValue)} ROI over ${finding.sampleSize} settled real-stake bets (threshold ${formatPct(finding.thresholdValue)}). Pausing real-stake placement for ${finding.pauseDurationDays} days.`;
-    case "KELLY_GROWTH_ANOMALY":
-      return `Kelly-growth anomaly: ${finding.scopeType} ${stats.scope_value} log-bankroll growth-rate ${finding.metricValue.toFixed(4)}/bet over ${finding.sampleSize} bets (threshold ${finding.thresholdValue}). Pausing real-stake placement for ${finding.pauseDurationDays} days.`;
-    case "DATA_COVERAGE_GAP":
-      return `Data-coverage gap: ${finding.scopeType} ${stats.scope_value} has ${formatPct(finding.metricValue)} Pinnacle CLV coverage over ${finding.sampleSize} bets (threshold ${formatPct(finding.thresholdValue)}). Model cannot validate edge on this market. Pausing real-stake placement for ${finding.pauseDurationDays} days. Shadow bets continue and may surface enough data to lift the pause.`;
-  }
+function buildReasoning(
+  scopeType: string,
+  stats: ScopeStats,
+  decision: TierDecision,
+): string {
+  const arrow = decision.direction === "promotion" ? "↑" : "↓";
+  return `${scopeType} ${stats.scope_value} ${arrow} ${decision.fromTier} → ${decision.toTier} (${decision.reason}). real n=${stats.real_count} ROI=${formatPct(stats.real_roi)} kelly_growth=${formatNum(stats.log_growth_per_bet)}/bet | shadow n=${stats.shadow_count} kelly_growth=${formatNum(stats.shadow_log_growth_per_bet)}/bet | clv_coverage=${formatPct(stats.coverage_rate)}. Threshold ${decision.thresholdValue} ${decision.metricType}.`;
 }
 
 function formatPct(v: number | null | undefined): string {
@@ -501,52 +701,24 @@ function formatPct(v: number | null | undefined): string {
   return `${(v * 100).toFixed(2)}%`;
 }
 
-function estimateExpectedImpact(stats: ScopeStats): string | null {
-  if (stats.total_stake <= 0) return null;
-  const projectedSavingsPerBet = -(stats.total_pnl / stats.real_count);
-  return projectedSavingsPerBet.toFixed(4);
+function formatNum(v: number | null | undefined): string {
+  if (v === null || v === undefined) return "n/a";
+  return v.toFixed(4);
 }
 
-// ── Auto-resume ─────────────────────────────────────────────────────────────
-
-async function processAutoResumes(): Promise<number> {
-  const expired = await db.execute(sql`
-    SELECT id, scope_type, scope_value, reason, escalation_level
-    FROM autonomous_pauses
-    WHERE resumed_at IS NULL
-      AND paused_until < NOW()
-  `);
-
-  let resumed = 0;
-  for (const p of (expired as any).rows ?? []) {
-    await db.execute(sql`
-      UPDATE autonomous_pauses
-      SET resumed_at = NOW(), kelly_fraction_override = ${TRIAL_KELLY_FRACTION}
-      WHERE id = ${p.id}
-    `);
-
-    await db
-      .insert(modelDecisionAuditLogTable)
-      .values({
-        decisionType: `${p.scope_type}_resumed`,
-        subject: `${p.scope_type}:${p.scope_value}`,
-        priorState: { paused: true, reason: p.reason } as any,
-        newState: {
-          paused: false,
-          trial_mode: true,
-          kelly_fraction_override: TRIAL_KELLY_FRACTION,
-        } as any,
-        reasoning: `Pause window expired for ${p.scope_type} ${p.scope_value}. Auto-resuming at ${TRIAL_KELLY_FRACTION * 100}% Kelly fraction (trial mode). Next audit re-evaluates; if metrics recover, full Kelly restored, else re-pause with escalation.`,
-        reviewStatus: "automatic",
-      })
-      .catch(() => {});
-
-    resumed++;
+function estimateExpectedImpact(
+  stats: ScopeStats,
+  decision: TierDecision,
+): string | null {
+  if (decision.direction === "promotion") {
+    return null; // expected positive but uncertain magnitude
   }
-  return resumed;
+  if (stats.real_count <= 0) return null;
+  const projected = -(stats.real_pnl / stats.real_count);
+  return projected.toFixed(4);
 }
 
-// ── Placement-time check (called from placePaperBet) ────────────────────────
+// ── Placement-time check ────────────────────────────────────────────────────
 
 export interface PauseCheckResult {
   paused: boolean;
@@ -565,18 +737,21 @@ export async function checkAutonomousPauses(params: {
   archetype: string | null;
   isShadowBet: boolean;
 }): Promise<PauseCheckResult> {
-  // Shadow bets bypass the pause registry — capital-protective gates
-  // never apply to £0 learning-data bets (architectural principle).
+  // Shadow bets bypass tier-based capital gates entirely. The model needs
+  // continuous shadow capture across all markets/leagues to feed the
+  // upward-promotion path.
   if (params.isShadowBet) {
     return { paused: false, pauseRow: null, kellyFractionOverride: null };
   }
 
-  // Build the candidate scope keys this bet would match against
   const scopeKeys: Array<{ type: string; value: string }> = [
     { type: "market", value: params.marketType },
   ];
   if (params.league) {
-    scopeKeys.push({ type: "league_market", value: `${params.league}:${params.marketType}` });
+    scopeKeys.push({
+      type: "league_market",
+      value: `${params.league}:${params.marketType}`,
+    });
     scopeKeys.push({ type: "league", value: params.league });
   }
   if (params.archetype) {
@@ -590,38 +765,54 @@ export async function checkAutonomousPauses(params: {
     )
     .join(" OR ");
 
+  // If multiple scopes match, take the MOST RESTRICTIVE override (lowest
+  // kelly_fraction). This composes the demotion logic — a scope demoted at
+  // market level is not "rescued" by a non-demoted league.
   const rows = await db.execute(sql.raw(`
     SELECT scope_type, scope_value, reason, paused_until::text AS paused_until,
-           kelly_fraction_override
+           kelly_fraction_override::text AS kelly_fraction_override
     FROM autonomous_pauses
     WHERE resumed_at IS NULL
       AND (${conditions})
-    ORDER BY paused_at DESC
-    LIMIT 1
   `));
 
-  const row = ((rows as any).rows ?? [])[0];
-  if (!row) {
+  const candidates = ((rows as any).rows ?? []) as Array<{
+    scope_type: string;
+    scope_value: string;
+    reason: string;
+    paused_until: string;
+    kelly_fraction_override: string | null;
+  }>;
+
+  if (candidates.length === 0) {
     return { paused: false, pauseRow: null, kellyFractionOverride: null };
   }
 
-  const kellyOverride =
-    row.kelly_fraction_override !== null && row.kelly_fraction_override !== undefined
-      ? Number(row.kelly_fraction_override)
-      : null;
+  // Pick most restrictive: lowest kelly_fraction_override (treating null as
+  // no constraint = 1.0). Override of 0 = SHADOW_ONLY = fully blocked.
+  let mostRestrictive = candidates[0]!;
+  let mostRestrictiveOverride =
+    mostRestrictive.kelly_fraction_override === null
+      ? 1.0
+      : Number(mostRestrictive.kelly_fraction_override);
+  for (const c of candidates) {
+    const k = c.kelly_fraction_override === null ? 1.0 : Number(c.kelly_fraction_override);
+    if (k < mostRestrictiveOverride) {
+      mostRestrictive = c;
+      mostRestrictiveOverride = k;
+    }
+  }
 
-  // kelly_fraction_override = 0 (or null with active pause) → fully paused
-  // kelly_fraction_override > 0 → trial mode, allow bet at reduced size
-  const fullyPaused = kellyOverride === null || kellyOverride === 0;
+  const fullyPaused = mostRestrictiveOverride === 0;
 
   return {
     paused: fullyPaused,
     pauseRow: {
-      scopeType: row.scope_type,
-      scopeValue: row.scope_value,
-      reason: row.reason,
-      pausedUntil: row.paused_until,
+      scopeType: mostRestrictive.scope_type,
+      scopeValue: mostRestrictive.scope_value,
+      reason: mostRestrictive.reason,
+      pausedUntil: mostRestrictive.paused_until,
     },
-    kellyFractionOverride: kellyOverride,
+    kellyFractionOverride: mostRestrictiveOverride,
   };
 }

@@ -849,11 +849,15 @@ export async function placePaperBet(
     }
     if (
       pauseCheck.kellyFractionOverride !== null &&
-      pauseCheck.kellyFractionOverride < 1.0 &&
+      pauseCheck.kellyFractionOverride !== 1.0 &&
       pauseCheck.kellyFractionOverride > 0
     ) {
-      // Trial mode: scope reopened at reduced Kelly fraction. Multiply the
-      // computed stake by this override later in the sizing flow.
+      // Tier override active. Values < 1.0 are demotion-side trials (TRIAL
+      // = 0.25, STANDARD_REDUCED = 0.5). Values > 1.0 are promotion-side
+      // boosts (BOOSTED = 1.5). Multiply into existing stakeMultiplier so
+      // it composes with sub-phase 9 v2 per-tag kelly_fraction and other
+      // multipliers; the hard maxStakePct cap downstream still applies so
+      // boost can't run away.
       stakeMultiplierFromPauseTrial = pauseCheck.kellyFractionOverride;
       stakeMultiplier *= stakeMultiplierFromPauseTrial;
       logger.info(
@@ -863,8 +867,9 @@ export async function placePaperBet(
           scope: pauseCheck.pauseRow,
           kellyFractionOverride: pauseCheck.kellyFractionOverride,
           combinedStakeMultiplier: stakeMultiplier,
+          direction: pauseCheck.kellyFractionOverride < 1.0 ? "demoted" : "boosted",
         },
-        "Bet admitted at trial-mode reduced Kelly fraction (autonomous pause partial-reopen)",
+        "Bet admitted with autonomous tier override",
       );
     }
   } catch (pauseErr) {
