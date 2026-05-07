@@ -326,6 +326,22 @@ async function main() {
     } catch (err) {
       logger.error({ err }, "Startup reconciliation failed — will retry on hourly cron");
     }
+
+    // 5c. Startup stale-pending escalation — clear out any pending bets that
+    // sat through a long downtime past their kickoff window. Same auto-void /
+    // alert logic as the hourly cron.
+    try {
+      const { reconcileStalePending } = await import("./services/paperTrading");
+      const stalePending = await reconcileStalePending();
+      const total = stalePending.warned + stalePending.paperVoided + stalePending.betfairReconciled + stalePending.betfairFlagged;
+      if (total > 0) {
+        logger.warn(stalePending, "Startup stale-pending escalation found bets past kickoff");
+      } else {
+        logger.info("Startup stale-pending escalation: no post-kickoff stragglers");
+      }
+    } catch (err) {
+      logger.error({ err }, "Startup stale-pending escalation failed — will retry on hourly cron");
+    }
   }
 
   // 6. Log agent started to compliance audit trail

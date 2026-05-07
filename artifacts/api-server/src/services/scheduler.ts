@@ -2411,6 +2411,45 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Stale placement reconciliation active — hourly");
 
+  // Stale-pending escalation: every hour, offset 30 min from placement check.
+  // Warns at kickoff+4h, auto-voids at kickoff+24h. See reconcileStalePending().
+  cron.schedule("30 * * * *", () => {
+    void (async () => {
+      try {
+        const { reconcileStalePending } = await import("./paperTrading");
+        const result = await reconcileStalePending();
+        if (result.warned + result.paperVoided + result.betfairReconciled + result.betfairFlagged > 0) {
+          logger.info(result, "Stale-pending reconciliation complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Stale-pending reconciliation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Stale-pending escalation active — hourly (warn at +4h, auto-void at +24h)");
+
+  // Live balance + statement reconciliation: daily at 05:00 UTC. Two checks
+  // running back-to-back so a balance drift can be diagnosed against the
+  // statement walk in the same window. No-ops outside live mode.
+  cron.schedule("0 5 * * *", () => {
+    void (async () => {
+      try {
+        const { reconcileLiveBalance, reconcileLiveAccountStatement } = await import("./liveReconciliation");
+        const balance = await reconcileLiveBalance();
+        if (balance) {
+          logger.info(balance, "Daily live balance reconciliation");
+        }
+        const statement = await reconcileLiveAccountStatement();
+        if (statement) {
+          logger.info(statement, "Daily live statement reconciliation");
+        }
+      } catch (err) {
+        logger.error({ err }, "Live balance/statement reconciliation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Live balance + statement reconciliation active — daily 05:00 UTC");
+
   // Alert detection: every 5 minutes — check for critical/warning conditions
   cron.schedule("*/5 * * * *", () => {
     void (async () => {

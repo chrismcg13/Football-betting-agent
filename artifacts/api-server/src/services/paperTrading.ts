@@ -1661,6 +1661,196 @@ export async function reconcileStalePlacements(): Promise<{ reconciled: number; 
   return { reconciled, flagged };
 }
 
+// ===================== Reconcile stale POST-KICKOFF pending bets =====================
+//
+// 2026-05-06: bets that sit `pending` past match completion are usually data-feed
+// gaps — the matches table never received a final score, so settleBets() never
+// fires. Without this escalator they stay pending indefinitely. Two thresholds:
+//
+//   - WARN at kickoff + 4h. Raises STALE_PENDING_POSTKICKOFF (warning, code
+//     scoped per bet so each bet alerts independently). No state change. Most
+//     football fixtures finish well within 3h; 4h is past extra-time + penalties.
+//
+//   - AUTO-VOID at kickoff + 24h. Branching by bet type:
+//       paper / shadow (no betfair_bet_id): unconditional void with
+//         betfair_status='VOID_DATA_TIMEOUT'. Stake was synthetic so refund is
+//         a no-op for paper, and shadow bets had stake=0 anyway.
+//       real-money (has betfair_bet_id): try listClearedOrders(betIds=[id])
+//         across SETTLED/VOIDED/LAPSED/CANCELLED. If Betfair reports an outcome,
+//         reconcile to that outcome. If Betfair has no record after 24h that's
+//         unexpected for a placed bet — escalate as STALE_PENDING_BETFAIR_UNRESOLVED
+//         (critical) but DO NOT auto-void; refusing to silently zero out a
+//         real-money position the system can't confirm.
+const STALE_PENDING_WARN_HOURS = 4;
+const STALE_PENDING_VOID_HOURS = 24;
+
+export interface StalePendingResult {
+  warned: number;
+  paperVoided: number;
+  betfairReconciled: number;
+  betfairFlagged: number;
+}
+
+export async function reconcileStalePending(): Promise<StalePendingResult> {
+  const now = Date.now();
+  const warnCutoff = new Date(now - STALE_PENDING_WARN_HOURS * 3_600_000);
+  const voidCutoff = new Date(now - STALE_PENDING_VOID_HOURS * 3_600_000);
+
+  const stalePending = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      betfairBetId: paperBetsTable.betfairBetId,
+      stake: paperBetsTable.stake,
+      placedAt: paperBetsTable.placedAt,
+      kickoffTime: matchesTable.kickoffTime,
+      matchStatus: matchesTable.status,
+    })
+    .from(paperBetsTable)
+    .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
+    .where(
+      and(
+        eq(paperBetsTable.status, "pending"),
+        sql`${paperBetsTable.deletedAt} IS NULL`,
+        lte(matchesTable.kickoffTime, warnCutoff),
+      ),
+    );
+
+  if (stalePending.length === 0) {
+    return { warned: 0, paperVoided: 0, betfairReconciled: 0, betfairFlagged: 0 };
+  }
+
+  let warned = 0;
+  let paperVoided = 0;
+  let betfairReconciled = 0;
+  let betfairFlagged = 0;
+
+  for (const bet of stalePending) {
+    if (!bet.kickoffTime) continue;
+    const hoursPastKickoff = (now - bet.kickoffTime.getTime()) / 3_600_000;
+    const pastVoidCutoff = bet.kickoffTime.getTime() <= voidCutoff.getTime();
+
+    try {
+      if (!pastVoidCutoff) {
+        // Between WARN_HOURS and VOID_HOURS: alert only.
+        const { createAlert } = await import("./alerting");
+        const created = await createAlert({
+          severity: "warning",
+          category: "execution",
+          code: `STALE_PENDING_POSTKICKOFF_${bet.id}`,
+          title: "Bet pending past kickoff",
+          message: `Bet #${bet.id} (${bet.marketType}:${bet.selectionName} on match ${bet.matchId}) is ${hoursPastKickoff.toFixed(1)}h past kickoff and still pending. Will auto-void at ${STALE_PENDING_VOID_HOURS}h if unresolved.`,
+          metadata: {
+            betId: bet.id,
+            matchId: bet.matchId,
+            hoursPastKickoff: Math.round(hoursPastKickoff * 10) / 10,
+            matchStatus: bet.matchStatus,
+            hasBetfairBetId: !!bet.betfairBetId,
+          },
+        });
+        if (created != null) warned++;
+        continue;
+      }
+
+      // Past void cutoff — branch by bet type.
+      if (bet.betfairBetId) {
+        let resolved = false;
+        if (isLiveMode()) {
+          try {
+            const { listClearedOrders } = await import("./betfairLive");
+            for (const status of ["SETTLED", "VOIDED", "LAPSED", "CANCELLED"] as const) {
+              const cleared = await listClearedOrders(undefined, [bet.betfairBetId], status);
+              const order = cleared.find((o) => o.betId === bet.betfairBetId);
+              if (!order) continue;
+
+              const outcome = String(order.betOutcome ?? "").toUpperCase();
+              const profit = Number(order.profit ?? 0);
+              const newStatus = outcome === "WON" ? "won" : outcome === "LOST" ? "lost" : "void";
+              await db.update(paperBetsTable).set({
+                status: newStatus,
+                settlementPnl: String(profit),
+                grossPnl: String(profit),
+                betfairStatus: `RECONCILED_VIA_TIMEOUT:${status}`,
+                settledAt: new Date(),
+              }).where(eq(paperBetsTable.id, bet.id));
+              betfairReconciled++;
+              logger.info(
+                { betId: bet.id, betfairBetId: bet.betfairBetId, betfairStatus: status, outcome, profit },
+                "Stale Betfair bet reconciled via timeout path",
+              );
+              resolved = true;
+              break;
+            }
+          } catch (bfErr) {
+            logger.warn(
+              { betId: bet.id, err: bfErr },
+              "Could not query Betfair for stale-pending reconciliation",
+            );
+          }
+        }
+
+        if (!resolved) {
+          // Real-money bet we can't confirm — flag, do not auto-void.
+          const { createAlert } = await import("./alerting");
+          await createAlert({
+            severity: "critical",
+            category: "execution",
+            code: `STALE_PENDING_BETFAIR_UNRESOLVED_${bet.id}`,
+            title: "Real-money bet pending past void cutoff — manual reconciliation needed",
+            message: `Bet #${bet.id} (Betfair ${bet.betfairBetId}, ${bet.marketType}:${bet.selectionName} on match ${bet.matchId}) is ${hoursPastKickoff.toFixed(1)}h past kickoff and not in listClearedOrders. Refusing to auto-void real-money position; manual reconciliation required.`,
+            metadata: {
+              betId: bet.id,
+              matchId: bet.matchId,
+              betfairBetId: bet.betfairBetId,
+              hoursPastKickoff: Math.round(hoursPastKickoff * 10) / 10,
+            },
+          });
+          betfairFlagged++;
+          logger.warn(
+            { betId: bet.id, betfairBetId: bet.betfairBetId, hoursPastKickoff },
+            "Real-money bet stuck post-kickoff — flagged, not auto-voided",
+          );
+        }
+        continue;
+      }
+
+      // Paper / shadow: unconditional void.
+      await db.update(paperBetsTable).set({
+        status: "void",
+        settlementPnl: "0",
+        grossPnl: "0",
+        commissionAmount: "0",
+        netPnl: "0",
+        betfairStatus: "VOID_DATA_TIMEOUT",
+        settledAt: new Date(),
+      }).where(eq(paperBetsTable.id, bet.id));
+      paperVoided++;
+      logger.info(
+        { betId: bet.id, matchId: bet.matchId, hoursPastKickoff, matchStatus: bet.matchStatus },
+        "Paper/shadow bet auto-voided — pending past 24h cutoff",
+      );
+    } catch (err) {
+      logger.error({ err, betId: bet.id }, "Error reconciling stale-pending bet");
+    }
+  }
+
+  if (paperVoided + betfairReconciled + betfairFlagged > 0) {
+    await db.insert(complianceLogsTable).values({
+      actionType: "stale_pending_reconciliation",
+      details: { warned, paperVoided, betfairReconciled, betfairFlagged, total: stalePending.length },
+      timestamp: new Date(),
+    });
+  }
+
+  logger.info(
+    { warned, paperVoided, betfairReconciled, betfairFlagged, total: stalePending.length },
+    "Stale-pending reconciliation complete",
+  );
+  return { warned, paperVoided, betfairReconciled, betfairFlagged };
+}
+
 // ===================== Determine bet outcome from match result =====================
 
 // Returns true (won), false (lost), or null (void — data unavailable, stake refunded)
@@ -1895,7 +2085,23 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     // Fixture won't complete; void any unmatched paper-bet side. Real-money
     // matched bets are settled by reconcileSettlements (Betfair listClearedOrders),
     // so we only act on bets without a betfair_bet_id.
+    //
+    // 2026-05-06: post-kickoff guard. The data feed occasionally flips a
+    // kicked-off match to a cancelled-style status mid-game (or in error).
+    // If kickoff has already passed, refuse to void here — let
+    // reconcileStalePending() handle it after the 24h grace, which gives
+    // Betfair / data feeds time to settle authoritatively. Genuine in-play
+    // abandonment will still be caught, just on the timeout path.
     if (ABANDONMENT_STATUSES.has(match.status) && !bet.betfairBetId) {
+      const kickoffPassed = match.kickoffTime && match.kickoffTime.getTime() <= Date.now();
+      if (kickoffPassed) {
+        logger.warn(
+          { betId: bet.id, matchId: match.id, fixtureStatus: match.status, kickoffTime: match.kickoffTime },
+          "Skipping abandonment-void — kickoff already passed; deferring to stale-pending escalator",
+        );
+        continue;
+      }
+
       await db.update(paperBetsTable).set({
         status: "void",
         settlementPnl: "0",

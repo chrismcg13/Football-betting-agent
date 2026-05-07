@@ -52,3 +52,5 @@ Thumbs.db
 replit-secrets.txt
 migration-plan-v2.md
 .claude/
+file creation secrets.txt
+ssh-ed25519 *.txt

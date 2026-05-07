@@ -686,6 +686,79 @@ export async function listClearedOrders(
   return allOrders;
 }
 
+// ── Account statement (per-line balance ledger from Betfair) ──────────────
+// Returns every credit/debit on the wallet — stake debits, winnings credits,
+// commission deductions, deposits/withdrawals — for a date range. Each bet
+// generates multiple entries (debit at placement, credit at settlement).
+// Used by liveReconciliation to detect orphans (Betfair has, we don't),
+// missing entries (we have settled, Betfair has no record), and per-bet P&L
+// mismatches against our local net_pnl ledger.
+export interface AccountStatementItem {
+  refId: string;
+  itemDate: string;
+  amount: number;
+  balance: number;
+  itemClass: string;
+  itemClassData?: { unknownStatementItem?: string } | null;
+  legacyData?: {
+    avgPrice?: number;
+    betSize?: number;
+    betType?: string;
+    betCategoryType?: string;
+    commissionRate?: string;
+    eventId?: number;
+    eventTypeId?: number;
+    fullMarketName?: string;
+    grossBetAmount?: number;
+    marketName?: string;
+    marketType?: string;
+    placedDate?: string;
+    selectionId?: number;
+    selectionName?: string;
+    startDate?: string;
+    transactionType?: string;
+    transactionId?: number;
+    winLose?: string;
+    betId?: string;
+  } | null;
+}
+
+interface AccountStatementResponse {
+  accountStatement: AccountStatementItem[];
+  moreAvailable: boolean;
+}
+
+export async function listAccountStatement(
+  itemDateRange?: { from: string; to: string },
+  includeItem: "ALL" | "EXCHANGE" | "POKER_ROOM" | "DEPOSITS_WITHDRAWALS" = "EXCHANGE",
+): Promise<AccountStatementItem[]> {
+  const filter: Record<string, unknown> = {
+    locale: "en",
+    includeItem,
+    wallet: "UK",
+  };
+  if (itemDateRange) filter.itemDateRange = itemDateRange;
+
+  const all: AccountStatementItem[] = [];
+  let moreAvailable = true;
+  let fromRecord = 0;
+
+  while (moreAvailable) {
+    const result = await apiRequest<AccountStatementResponse>(
+      "account",
+      "/getAccountStatement/",
+      { ...filter, fromRecord, recordCount: 100 },
+      3,
+    );
+    all.push(...result.accountStatement);
+    moreAvailable = result.moreAvailable;
+    fromRecord += result.accountStatement.length;
+    if (result.accountStatement.length === 0) break;
+  }
+
+  return all;
+}
+
 export async function reconcileSettlements(): Promise<{
   matched: number;
   discrepancies: number;
