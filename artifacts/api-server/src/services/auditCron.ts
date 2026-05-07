@@ -23,6 +23,7 @@ const PRIOR_BREACH_LOOKBACK_DAYS = 14;
 
 interface LeagueBias {
   league: string;
+  country: string | null;
   nBets: number;
   actualWins: number;
   expectedWins: number;
@@ -32,11 +33,16 @@ interface LeagueBias {
 
 interface DemotionPlan {
   league: string;
+  country: string | null;
   fromTier: string;
   toTier: string;
   currentBiasZ: number;
   priorBiasZ: number;
   priorObservedAt: string;
+}
+
+function biasSubject(league: string, country: string | null): string {
+  return country ? `league:${country}/${league}` : `league:${league}`;
 }
 
 interface DemotionResult extends DemotionPlan {
@@ -70,9 +76,14 @@ export interface OngoingAuditResult {
 // ─── Bias computation ───────────────────────────────────────────────────────
 
 async function computeLeagueSettlementBias(lookbackDays: number): Promise<LeagueBias[]> {
+  // Partition by (league, country) — many leagues share names across countries
+  // (e.g. "Primera División" exists in 9 South American countries). A league-
+  // only GROUP BY conflates them and a single biased country pollutes the
+  // bias reading for all same-named leagues.
   const rows = await db.execute(sql`
     SELECT
       m.league,
+      m.country,
       COUNT(*) AS n_bets,
       SUM(CASE WHEN pb.status = 'won' THEN 1 ELSE 0 END) AS actual_wins,
       SUM(pb.model_probability::numeric) AS expected_wins,
@@ -84,7 +95,7 @@ async function computeLeagueSettlementBias(lookbackDays: number): Promise<League
       AND pb.legacy_regime = false
       AND pb.deleted_at IS NULL
       AND pb.model_probability IS NOT NULL
-    GROUP BY m.league
+    GROUP BY m.league, m.country
     HAVING COUNT(*) >= ${BIAS_MIN_SAMPLE}
   `);
 
@@ -97,6 +108,7 @@ async function computeLeagueSettlementBias(lookbackDays: number): Promise<League
     const biasZ = varianceSum > 0 ? (actualWins - expectedWins) / Math.sqrt(varianceSum) : 0;
     out.push({
       league: r.league as string,
+      country: (r.country as string | null) ?? null,
       nBets,
       actualWins,
       expectedWins,
@@ -109,6 +121,7 @@ async function computeLeagueSettlementBias(lookbackDays: number): Promise<League
 
 async function findPriorBreach(
   league: string,
+  country: string | null,
   excludeAfter: Date,
 ): Promise<{ biasZ: number; observedAt: Date } | null> {
   const cutoff = new Date(Date.now() - PRIOR_BREACH_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
@@ -116,7 +129,7 @@ async function findPriorBreach(
     SELECT decision_at, supporting_metrics
     FROM model_decision_audit_log
     WHERE decision_type = 'settlement_bias_observation'
-      AND subject = ${`league:${league}`}
+      AND subject = ${biasSubject(league, country)}
       AND decision_at >= ${cutoff}
       AND decision_at < ${excludeAfter}
     ORDER BY decision_at DESC
@@ -130,11 +143,12 @@ async function findPriorBreach(
   return { biasZ, observedAt: r.decision_at instanceof Date ? r.decision_at : new Date(r.decision_at) };
 }
 
-async function getCurrentTier(league: string): Promise<string | null> {
+async function getCurrentTier(league: string, country: string | null): Promise<string | null> {
   const rows = await db.execute(sql`
     SELECT universe_tier
     FROM competition_config
     WHERE LOWER(REPLACE(name, '-', ' ')) = LOWER(REPLACE(${league}, '-', ' '))
+      AND (${country}::text IS NULL OR LOWER(REPLACE(country, '-', ' ')) = LOWER(REPLACE(${country}, '-', ' ')))
     LIMIT 1
   `);
   const t = (rows as any).rows?.[0]?.universe_tier;
@@ -191,7 +205,7 @@ export async function runOngoingAudit(opts: OngoingAuditOpts = {}): Promise<Ongo
   const demotions: DemotionResult[] = [];
 
   for (const obs of observations) {
-    const currentTier = await getCurrentTier(obs.league);
+    const currentTier = await getCurrentTier(obs.league, obs.country);
     const supportingMetrics = {
       n_bets: obs.nBets,
       actual_wins: obs.actualWins,
@@ -199,13 +213,14 @@ export async function runOngoingAudit(opts: OngoingAuditOpts = {}): Promise<Ongo
       bias_z: Number(obs.biasZ.toFixed(4)),
       breaching: obs.breaching,
       lookback_days: lookbackDays,
+      country: obs.country,
     };
-    const reasoning = `Settlement-bias z=${obs.biasZ.toFixed(3)} over ${obs.nBets} bets in last ${lookbackDays}d (actual_wins=${obs.actualWins}, expected_wins=${obs.expectedWins.toFixed(2)}). ${obs.breaching ? "BREACHING |z|>1.5" : "Within tolerance"}.`;
+    const reasoning = `Settlement-bias z=${obs.biasZ.toFixed(3)} over ${obs.nBets} bets in last ${lookbackDays}d for ${obs.country ?? "unknown country"}/${obs.league} (actual_wins=${obs.actualWins}, expected_wins=${obs.expectedWins.toFixed(2)}). ${obs.breaching ? "BREACHING |z|>1.5" : "Within tolerance"}.`;
 
     if (!dryRun) {
       await db.insert(modelDecisionAuditLogTable).values({
         decisionType: "settlement_bias_observation",
-        subject: `league:${obs.league}`,
+        subject: biasSubject(obs.league, obs.country),
         priorState: { universe_tier: currentTier ?? "unknown" } as any,
         newState: { universe_tier: currentTier ?? "unknown", bias_z: obs.biasZ } as any,
         reasoning,
@@ -213,11 +228,13 @@ export async function runOngoingAudit(opts: OngoingAuditOpts = {}): Promise<Ongo
         expectedImpact: obs.biasZ,
         reviewStatus: "automatic",
       });
-      // Also persist the latest bias on competition_config (single-source-of-truth column).
+      // Persist the latest bias on competition_config — partition by country
+      // so same-named leagues across countries don't overwrite each other.
       await db.execute(sql`
         UPDATE competition_config
         SET settlement_bias_index = ${obs.biasZ}
         WHERE LOWER(REPLACE(name, '-', ' ')) = LOWER(REPLACE(${obs.league}, '-', ' '))
+          AND (${obs.country}::text IS NULL OR LOWER(REPLACE(country, '-', ' ')) = LOWER(REPLACE(${obs.country}, '-', ' ')))
       `);
       observationsWritten++;
     }
@@ -225,7 +242,7 @@ export async function runOngoingAudit(opts: OngoingAuditOpts = {}): Promise<Ongo
     // Demotion check — independent of dryRun for the PLAN; gated by flag for ACTION.
     if (!obs.breaching) continue;
 
-    const prior = await findPriorBreach(obs.league, observationStartedAt);
+    const prior = await findPriorBreach(obs.league, obs.country, observationStartedAt);
     if (!prior) continue;
 
     if (!currentTier) continue;
@@ -234,6 +251,7 @@ export async function runOngoingAudit(opts: OngoingAuditOpts = {}): Promise<Ongo
 
     const plan: DemotionPlan = {
       league: obs.league,
+      country: obs.country,
       fromTier: currentTier,
       toTier,
       currentBiasZ: obs.biasZ,
@@ -246,25 +264,27 @@ export async function runOngoingAudit(opts: OngoingAuditOpts = {}): Promise<Ongo
       continue;
     }
 
-    // Apply demotion: tier change + audit row.
+    // Apply demotion: tier change + audit row — partitioned by country.
     await db.execute(sql`
       UPDATE competition_config
       SET universe_tier = ${toTier},
           universe_tier_decided_at = NOW()
       WHERE LOWER(REPLACE(name, '-', ' ')) = LOWER(REPLACE(${obs.league}, '-', ' '))
+        AND (${obs.country}::text IS NULL OR LOWER(REPLACE(country, '-', ' ')) = LOWER(REPLACE(${obs.country}, '-', ' ')))
         AND universe_tier = ${currentTier}
     `);
     await db.insert(modelDecisionAuditLogTable).values({
       decisionType: "league_auto_demoted",
-      subject: `league:${obs.league}`,
+      subject: biasSubject(obs.league, obs.country),
       priorState: { universe_tier: currentTier } as any,
       newState: { universe_tier: toTier, demotion_reason: "consecutive_bias_breach" } as any,
-      reasoning: `Two consecutive weekly observations with |bias_z| > ${BIAS_THRESHOLD} — auto-demoted ${currentTier} → ${toTier}. Current z=${obs.biasZ.toFixed(3)}, prior z=${prior.biasZ.toFixed(3)} on ${prior.observedAt.toISOString()}.`,
+      reasoning: `Two consecutive weekly observations with |bias_z| > ${BIAS_THRESHOLD} — auto-demoted ${currentTier} → ${toTier} for ${obs.country ?? "unknown country"}/${obs.league}. Current z=${obs.biasZ.toFixed(3)}, prior z=${prior.biasZ.toFixed(3)} on ${prior.observedAt.toISOString()}.`,
       supportingMetrics: {
         current_bias_z: obs.biasZ,
         prior_bias_z: prior.biasZ,
         prior_observed_at: prior.observedAt.toISOString(),
         bias_threshold: BIAS_THRESHOLD,
+        country: obs.country,
       } as any,
       expectedImpact: null,
       reviewStatus: "automatic",
