@@ -1999,6 +1999,32 @@ router.post("/leagues/tier-e-reevaluate/run", async (_req, res) => {
   }
 });
 
+// Z4 (2026-05-07): manual trigger for autonomous tier-ladder.
+// Computes per-scope Kelly-growth-rate proxy and promotes/demotes
+// universe_tier autonomously. Full audit log written per transition.
+router.post("/admin/run-tier-ladder", async (_req, res) => {
+  try {
+    const { runAutonomousTierLadder } = await import("../services/autonomousTierLadder");
+    const result = await runAutonomousTierLadder();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual tier-ladder run failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Z6 (2026-05-07): manual trigger for feature predictive-power scoring.
+router.post("/admin/run-feature-scoring", async (_req, res) => {
+  try {
+    const { runFeaturePredictivePowerScoring } = await import("../services/featurePredictivePower");
+    const result = await runFeaturePredictivePowerScoring();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual feature predictive-power scoring failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // ─────────────────────────────────────────────
 // Experiment Pipeline API
 // ─────────────────────────────────────────────

@@ -2615,6 +2615,45 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Anomaly detection active — daily 04:30 UTC");
 
+  // Z4 (2026-05-07): autonomous bidirectional universe_tier ladder — daily
+  // 03:45 UTC, after model self-audit at 03:30. For each (league × archetype)
+  // scope with n≥10 settled bets in last 30d, computes log-bankroll-growth
+  // per bet. Promotes E→C / D→C / C→B and demotes A→B / B→C / C→D / D→E
+  // when growth crosses thresholds. All transitions audit-logged.
+  cron.schedule("45 3 * * *", () => {
+    logger.info("Autonomous tier-ladder triggered (daily 03:45 UTC)");
+    void (async () => {
+      try {
+        const { runAutonomousTierLadder } = await import("./autonomousTierLadder");
+        const r = await runAutonomousTierLadder();
+        logger.info(r, "Autonomous tier-ladder complete");
+      } catch (err) {
+        logger.error({ err }, "Autonomous tier-ladder failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Autonomous tier-ladder scheduler active — daily 03:45 UTC");
+
+  // Z6 (2026-05-07): feature predictive-power scoring — weekly Sunday 11:00
+  // UTC. Computes per-feature point-biserial correlation + p-value vs
+  // settled-bet outcomes. Identifies which stored-but-not-active features
+  // have measurable predictive signal. Logs scores to audit log; future
+  // commit auto-extends FEATURE_NAMES + triggers retrain when threshold
+  // criteria sustain over 4 weeks.
+  cron.schedule("0 11 * * 0", () => {
+    logger.info("Feature predictive-power scoring triggered (weekly Sunday 11:00 UTC)");
+    void (async () => {
+      try {
+        const { runFeaturePredictivePowerScoring } = await import("./featurePredictivePower");
+        const r = await runFeaturePredictivePowerScoring();
+        logger.info(r, "Feature predictive-power scoring complete");
+      } catch (err) {
+        logger.error({ err }, "Feature predictive-power scoring failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Feature predictive-power scoring scheduler active — Sunday 11:00 UTC");
+
   // Y1 (2026-05-07): weekly Tier E re-evaluation pass — Sunday 06:00 UTC.
   // Re-runs assignTier on Tier E rows with category-aware Y2 rules. Auto-
   // promotes women's, youth, internationals, friendlies that were stuck at
