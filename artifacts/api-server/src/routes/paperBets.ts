@@ -1,19 +1,25 @@
 import { Router } from "express";
 import { db, paperBetsTable, insertPaperBetSchema } from "@workspace/db";
-import { eq, desc } from "drizzle-orm";
+import { and, eq, desc, type SQL } from "drizzle-orm";
 
 const router = Router();
 
+// Cost-control fix (2026-05-07): push filters to SQL + cap result set. Same
+// pattern as the other list routes — was filtering full-table fetch in JS.
 router.get("/paper-bets", async (req, res) => {
-  const { status, matchId } = req.query;
-  let rows = await db.select().from(paperBetsTable).orderBy(desc(paperBetsTable.placedAt));
+  const { status, matchId, limit } = req.query;
+  const cap = Math.min(Math.max(Number(limit ?? 500), 1), 5000);
 
-  if (status) {
-    rows = rows.filter((b) => b.status === String(status));
-  }
-  if (matchId) {
-    rows = rows.filter((b) => b.matchId === Number(matchId));
-  }
+  const conditions: SQL[] = [];
+  if (status) conditions.push(eq(paperBetsTable.status, String(status)));
+  if (matchId) conditions.push(eq(paperBetsTable.matchId, Number(matchId)));
+
+  const rows = await db
+    .select()
+    .from(paperBetsTable)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(paperBetsTable.placedAt))
+    .limit(cap);
 
   res.json(rows);
 });

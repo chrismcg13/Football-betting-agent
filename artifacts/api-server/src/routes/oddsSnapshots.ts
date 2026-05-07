@@ -1,19 +1,27 @@
 import { Router } from "express";
 import { db, oddsSnapshotsTable, insertOddsSnapshotSchema } from "@workspace/db";
-import { eq, desc } from "drizzle-orm";
+import { and, eq, desc, type SQL } from "drizzle-orm";
 
 const router = Router();
 
+// Cost-control fix (2026-05-07): odds_snapshots is 2.2 GB / 17M rows. The
+// previous unbounded `.from(...).orderBy(...)` then JS filter pulled the
+// whole table on every request — likely the dominant Neon egress driver.
+// Filters now push to SQL WHERE; default LIMIT 200 caps the result-set.
 router.get("/odds-snapshots", async (req, res) => {
-  const { matchId, marketType } = req.query;
-  let rows = await db.select().from(oddsSnapshotsTable).orderBy(desc(oddsSnapshotsTable.snapshotTime));
+  const { matchId, marketType, limit } = req.query;
+  const cap = Math.min(Math.max(Number(limit ?? 200), 1), 1000);
 
-  if (matchId) {
-    rows = rows.filter((s) => s.matchId === Number(matchId));
-  }
-  if (marketType) {
-    rows = rows.filter((s) => s.marketType === String(marketType));
-  }
+  const conditions: SQL[] = [];
+  if (matchId) conditions.push(eq(oddsSnapshotsTable.matchId, Number(matchId)));
+  if (marketType) conditions.push(eq(oddsSnapshotsTable.marketType, String(marketType)));
+
+  const rows = await db
+    .select()
+    .from(oddsSnapshotsTable)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+    .limit(cap);
 
   res.json(rows);
 });

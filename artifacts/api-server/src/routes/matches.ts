@@ -4,12 +4,24 @@ import { eq, desc } from "drizzle-orm";
 
 const router = Router();
 
+// Cost-control fix (2026-05-07): default LIMIT 500 to bound result-set.
 router.get("/matches", async (req, res) => {
-  const { status } = req.query;
-  let query = db.select().from(matchesTable).orderBy(desc(matchesTable.kickoffTime));
+  const { status, limit } = req.query;
+  const cap = Math.min(Math.max(Number(limit ?? 500), 1), 5000);
+
   const rows = status
-    ? await db.select().from(matchesTable).where(eq(matchesTable.status, String(status))).orderBy(desc(matchesTable.kickoffTime))
-    : await query;
+    ? await db
+        .select()
+        .from(matchesTable)
+        .where(eq(matchesTable.status, String(status)))
+        .orderBy(desc(matchesTable.kickoffTime))
+        .limit(cap)
+    : await db
+        .select()
+        .from(matchesTable)
+        .orderBy(desc(matchesTable.kickoffTime))
+        .limit(cap);
+
   res.json(rows);
 });
 
