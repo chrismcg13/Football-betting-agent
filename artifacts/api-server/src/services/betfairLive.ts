@@ -1193,32 +1193,41 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   TOTAL_CARDS_55: "OVER_UNDER_55_CARDS",
   // Half-time result — Betfair calls it HALF_TIME (1/X/2 outcomes for H1)
   FIRST_HALF_RESULT: "HALF_TIME",
-  // Sub-phase 4.B (2026-05-08): high-confidence Betfair Exchange football
-  // market codes per their public marketTypeCodes documentation. Each
-  // entry's code will be VERIFIED by the new discovery cron logging
-  // observed marketType values from listMarketCatalogue. Once verified,
-  // shadow capture for these markets has a real graduation path.
+  // Sub-phase 4.B (2026-05-08): VERIFIED by discovery cron observing
+  // listMarketCatalogue across 50 upcoming Tier A/B/C events. All codes
+  // below confirmed present in real Betfair Exchange responses.
   OVER_UNDER_05: "OVER_UNDER_05",
   OVER_UNDER_55: "OVER_UNDER_55",
   OVER_UNDER_65: "OVER_UNDER_65",
+  OVER_UNDER_75: "OVER_UNDER_75",
+  OVER_UNDER_85: "OVER_UNDER_85",
+  FIRST_HALF_OU_25: "FIRST_HALF_GOALS_25",
   DRAW_NO_BET: "DRAW_NO_BET",
   HALF_TIME_FULL_TIME: "HALF_TIME_FULL_TIME",
+  HALF_TIME_SCORE: "HALF_TIME_SCORE",
   GOALS_ODD_EVEN: "ODD_OR_EVEN",
-  WIN_TO_NIL_HOME: "WIN_TO_NIL_HOME",
-  WIN_TO_NIL_AWAY: "WIN_TO_NIL_AWAY",
-  // Team-total goals — Betfair uses TEAM_A / TEAM_B naming
-  TEAM_TOTAL_HOME_05: "TEAM_A_OVER_UNDER_05",
-  TEAM_TOTAL_HOME_15: "TEAM_A_OVER_UNDER_15",
-  TEAM_TOTAL_HOME_25: "TEAM_A_OVER_UNDER_25",
-  TEAM_TOTAL_HOME_35: "TEAM_A_OVER_UNDER_35",
-  TEAM_TOTAL_AWAY_05: "TEAM_B_OVER_UNDER_05",
-  TEAM_TOTAL_AWAY_15: "TEAM_B_OVER_UNDER_15",
-  TEAM_TOTAL_AWAY_25: "TEAM_B_OVER_UNDER_25",
-  TEAM_TOTAL_AWAY_35: "TEAM_B_OVER_UNDER_35",
-  // Half-specific BTTS + 2H result
-  BTTS_FIRST_HALF: "FIRST_HALF_BTTS",
-  BTTS_SECOND_HALF: "SECOND_HALF_BTTS",
-  SECOND_HALF_RESULT: "SECOND_HALF",
+  // Win-to-nil — Betfair uses TEAM_A_WIN_TO_NIL / TEAM_B_WIN_TO_NIL
+  WIN_TO_NIL_HOME: "TEAM_A_WIN_TO_NIL",
+  WIN_TO_NIL_AWAY: "TEAM_B_WIN_TO_NIL",
+  // Team total goals — Betfair encodes the line as suffix N (= goals N+).
+  // TEAM_A_1 = "Home to score 1 or more" = OVER 0.5 line.
+  // TEAM_A_2 = "Home to score 2 or more" = OVER 1.5 line.
+  // TEAM_A_3 = "Home to score 3 or more" = OVER 2.5 line.
+  TEAM_TOTAL_HOME_05: "TEAM_A_1",
+  TEAM_TOTAL_HOME_15: "TEAM_A_2",
+  TEAM_TOTAL_HOME_25: "TEAM_A_3",
+  TEAM_TOTAL_AWAY_05: "TEAM_B_1",
+  TEAM_TOTAL_AWAY_15: "TEAM_B_2",
+  TEAM_TOTAL_AWAY_25: "TEAM_B_3",
+  // Combined markets — observed but not yet supported by our model
+  // (would need joint MO+OU / MO+BTTS predictions). Mapped here so the
+  // discovery cron stops flagging them as unmapped; valueDetection
+  // skips because getModelProbability returns null for these.
+  MATCH_ODDS_AND_OU_25: "MATCH_ODDS_AND_OU_25",
+  MATCH_ODDS_AND_BTTS: "MATCH_ODDS_AND_BTTS",
+  // ALT_TOTAL_GOALS = single market with multiple OU lines as runners.
+  // Captured for completeness; settlement model uses standard OU.
+  ALT_TOTAL_GOALS: "ALT_TOTAL_GOALS",
 };
 
 // Sub-phase 4.B (2026-05-08): set of internal market types whose Betfair code
@@ -1254,7 +1263,7 @@ const NON_EXCHANGE_MARKETS = new Set([
   "TOTAL_CORNERS_115",
 ]);
 
-interface MarketCatalogueItem {
+export interface MarketCatalogueItem {
   marketId: string;
   marketName: string;
   marketStartTime?: string;
@@ -1263,6 +1272,11 @@ interface MarketCatalogueItem {
     selectionId: number;
     runnerName: string;
     sortPriority: number;
+    // Sub-phase 4.A (2026-05-08): for ASIAN_HANDICAP markets, Betfair
+    // returns the handicap line on each runner. Required for
+    // exchangeBookSweep.deriveSelectionName to format the internal
+    // selection name as "Home -1.5" / "Away +0.5" etc.
+    handicap?: number;
   }>;
   description?: { marketType: string };
 }

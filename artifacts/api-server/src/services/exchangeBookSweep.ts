@@ -18,50 +18,144 @@ const BETFAIR_EVENT_ID_RE = /^\d+$/;
 // for those markets the picker continues to rely on derived/synthetic odds.
 // CORRECT_SCORE and ASIAN_HANDICAP returned by the catalogue are intentionally
 // skipped — the picker does not price them.
+// Sub-phase 4.A + 4.B (2026-05-08): expanded set of Betfair Exchange market
+// types we capture odds for. Verified by betfairMarketDiscovery cron output
+// against real listMarketCatalogue responses. Each adds graduation potential
+// for shadow bets in that market.
 const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   "MATCH_ODDS",
+  "BOTH_TEAMS_TO_SCORE",
+  "OVER_UNDER_05",
   "OVER_UNDER_15",
   "OVER_UNDER_25",
   "OVER_UNDER_35",
-  "BOTH_TEAMS_TO_SCORE",
+  "OVER_UNDER_45",
+  "OVER_UNDER_55",
+  "OVER_UNDER_65",
+  "OVER_UNDER_75",
+  "OVER_UNDER_85",
+  "DRAW_NO_BET",
+  "HALF_TIME",
+  "HALF_TIME_FULL_TIME",
+  "ODD_OR_EVEN",
+  "DOUBLE_CHANCE",
+  "ASIAN_HANDICAP",         // Sub-phase 4.A — was previously skipped
+  "FIRST_HALF_GOALS_05",
+  "FIRST_HALF_GOALS_15",
+  "FIRST_HALF_GOALS_25",
+  "TEAM_A_WIN_TO_NIL",
+  "TEAM_B_WIN_TO_NIL",
+  "TEAM_A_1",
+  "TEAM_A_2",
+  "TEAM_A_3",
+  "TEAM_B_1",
+  "TEAM_B_2",
+  "TEAM_B_3",
 ]);
 
 function toInternalMarketType(bfMarketType: string): string {
-  // Picker uses "BTTS" internally; Betfair calls it "BOTH_TEAMS_TO_SCORE".
-  if (bfMarketType === "BOTH_TEAMS_TO_SCORE") return "BTTS";
-  return bfMarketType;
+  // Picker uses internal codes that don't always match Betfair codes 1:1.
+  // Mappings here are the inverse of MARKET_TYPE_MAP in betfairLive.ts.
+  switch (bfMarketType) {
+    case "BOTH_TEAMS_TO_SCORE": return "BTTS";
+    case "ODD_OR_EVEN": return "GOALS_ODD_EVEN";
+    case "TEAM_A_WIN_TO_NIL": return "WIN_TO_NIL_HOME";
+    case "TEAM_B_WIN_TO_NIL": return "WIN_TO_NIL_AWAY";
+    case "TEAM_A_1": return "TEAM_TOTAL_HOME_05";
+    case "TEAM_A_2": return "TEAM_TOTAL_HOME_15";
+    case "TEAM_A_3": return "TEAM_TOTAL_HOME_25";
+    case "TEAM_B_1": return "TEAM_TOTAL_AWAY_05";
+    case "TEAM_B_2": return "TEAM_TOTAL_AWAY_15";
+    case "TEAM_B_3": return "TEAM_TOTAL_AWAY_25";
+    case "HALF_TIME": return "FIRST_HALF_RESULT";
+    case "FIRST_HALF_GOALS_05": return "FIRST_HALF_OU_05";
+    case "FIRST_HALF_GOALS_15": return "FIRST_HALF_OU_15";
+    case "FIRST_HALF_GOALS_25": return "FIRST_HALF_OU_25";
+    default: return bfMarketType; // OVER_UNDER_*, DRAW_NO_BET, HALF_TIME_FULL_TIME,
+                                  // DOUBLE_CHANCE, ASIAN_HANDICAP map 1:1
+  }
 }
 
 function deriveSelectionName(
   bfMarketType: string,
-  runner: { selectionId: number; runnerName: string; sortPriority: number },
+  runner: { selectionId: number; runnerName: string; sortPriority: number; handicap?: number | null },
   homeTeam: string,
   awayTeam: string,
 ): string | null {
   const name = runner.runnerName.trim();
   const lower = name.toLowerCase();
 
-  if (bfMarketType === "MATCH_ODDS") {
+  if (bfMarketType === "MATCH_ODDS" || bfMarketType === "HALF_TIME") {
     if (lower === "the draw" || lower === "draw") return "Draw";
     if (lower === homeTeam.toLowerCase()) return "Home";
     if (lower === awayTeam.toLowerCase()) return "Away";
-    // Fallback to sortPriority (1=Home, 2=Away, 3=Draw on Betfair MATCH_ODDS)
     if (runner.sortPriority === 1) return "Home";
     if (runner.sortPriority === 2) return "Away";
     if (runner.sortPriority === 3) return "Draw";
     return null;
   }
 
-  if (bfMarketType === "BOTH_TEAMS_TO_SCORE") {
+  if (
+    bfMarketType === "BOTH_TEAMS_TO_SCORE" ||
+    bfMarketType === "TEAM_A_WIN_TO_NIL" ||
+    bfMarketType === "TEAM_B_WIN_TO_NIL" ||
+    bfMarketType === "TEAM_A_1" || bfMarketType === "TEAM_A_2" || bfMarketType === "TEAM_A_3" ||
+    bfMarketType === "TEAM_B_1" || bfMarketType === "TEAM_B_2" || bfMarketType === "TEAM_B_3"
+  ) {
     if (lower === "yes") return "Yes";
     if (lower === "no") return "No";
     return null;
   }
 
-  if (bfMarketType.startsWith("OVER_UNDER_")) {
-    // Betfair runnerName: "Over 2.5 Goals" / "Under 2.5 Goals" — pass through,
-    // matches the picker's stored selection_name format from API-Football.
+  if (bfMarketType === "ODD_OR_EVEN") {
+    if (lower === "odd") return "Odd";
+    if (lower === "even") return "Even";
+    return null;
+  }
+
+  if (bfMarketType === "DOUBLE_CHANCE") {
+    // Betfair runners: "<Home>/Draw", "Draw/<Away>", "<Home>/<Away>"
+    if (lower.includes("draw") && lower.startsWith(homeTeam.toLowerCase())) return "1X";
+    if (lower.includes("draw") && lower.endsWith(awayTeam.toLowerCase())) return "X2";
+    if (lower.startsWith(homeTeam.toLowerCase()) && lower.endsWith(awayTeam.toLowerCase())) return "12";
+    return null;
+  }
+
+  if (bfMarketType === "DRAW_NO_BET") {
+    if (lower === homeTeam.toLowerCase()) return "Home";
+    if (lower === awayTeam.toLowerCase()) return "Away";
+    if (runner.sortPriority === 1) return "Home";
+    if (runner.sortPriority === 2) return "Away";
+    return null;
+  }
+
+  if (bfMarketType === "HALF_TIME_FULL_TIME") {
+    // Betfair runner: "Home/Home", "Home/Draw", ..., "Away/Away" — pass through
+    // matches our internal HALF_TIME_FULL_TIME selection names.
+    if (/^(Home|Draw|Away)\/(Home|Draw|Away)$/i.test(name)) {
+      return name.replace(/\b\w/g, (c) => c.toUpperCase()); // Title-case
+    }
+    return null;
+  }
+
+  if (bfMarketType.startsWith("OVER_UNDER_") || bfMarketType.startsWith("FIRST_HALF_GOALS_")) {
     if (lower.startsWith("over") || lower.startsWith("under")) return name;
+    return null;
+  }
+
+  if (bfMarketType === "ASIAN_HANDICAP") {
+    // Sub-phase 4.A (2026-05-08): runnerName is the team name; the handicap
+    // line is in runner.handicap. Selection format mirrors what AF returns
+    // and what valueDetection's predictAsianHandicap parser expects:
+    //   "Home -1.5" / "Away +0.5" etc.
+    const handicap = runner.handicap;
+    if (handicap == null) return null;
+    const sign = handicap > 0 ? "+" : "";
+    const lineStr = `${sign}${handicap}`;
+    if (lower === homeTeam.toLowerCase()) return `Home ${lineStr}`;
+    if (lower === awayTeam.toLowerCase()) return `Away ${lineStr}`;
+    if (runner.sortPriority === 1) return `Home ${lineStr}`;
+    if (runner.sortPriority === 2) return `Away ${lineStr}`;
     return null;
   }
 
