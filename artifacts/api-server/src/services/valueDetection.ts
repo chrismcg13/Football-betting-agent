@@ -799,24 +799,35 @@ import { BANNED_MARKETS } from "./paperTrading";
 
 type PriceQuote = { backOdds: number; source: string };
 type FairValueSource = "oddspapi_pinnacle" | "api_football_real:Pinnacle" | "betfair_exchange";
-type RejectReason = "no_betfair_exchange" | "no_fair_value_source";
+type ActionableSource = "betfair_exchange" | "oddspapi_pinnacle" | "api_football_real:Pinnacle" | "api_football_real:other" | "shadow_synthetic";
+type RejectReason = "no_actionable_source" | "no_fair_value_source";
 type PricingResult =
   | {
       ok: true;
       actionablePrice: number;
-      actionableSource: "betfair_exchange";
+      actionableSource: ActionableSource;
       fairValueOdds: number;
       fairValueSource: FairValueSource;
+      shadowOnly: boolean; // true when actionable is non-exchange — bet must route to shadow
     }
   | { ok: false; reason: RejectReason };
 
+// Firehose-leak fix (2026-05-08): previously required betfair_exchange as
+// actionable price, which dropped 290k+ snapshots/4hr for new markets
+// (AH sub-lines, GOALS_ODD_EVEN, TEAM_TOTAL, HTFT, SECOND_HALF_RESULT,
+// WIN_TO_NIL, OU 5.5/6.5, ASIAN_GOALS) since Betfair Exchange doesn't
+// quote those markets. Fix: fall through to sharp-consensus actionable
+// (Pinnacle preferred) when exchange unavailable; mark shadowOnly=true
+// so paperTrading routes the bet to shadow capture (£0 stake, £0 capital
+// risk — fine to use Pinnacle as reference price since we never
+// actually place on exchange anyway).
 function selectPricingSources(
   rows: Array<{ source?: string | null; backOdds: string | number | null }>,
 ): PricingResult {
-  let actionable: PriceQuote | null = null;
+  let exchange: PriceQuote | null = null;
   let oddspapiPinnacle: PriceQuote | null = null;
   let afPinnacle: PriceQuote | null = null;
-  let exchangeForFv: PriceQuote | null = null;
+  let afOther: PriceQuote | null = null;
 
   for (const r of rows) {
     if (r.backOdds == null) continue;
@@ -824,25 +835,46 @@ function selectPricingSources(
     if (!(bo > 1.01)) continue;
     const src = r.source ?? "";
     if (src === "betfair_exchange") {
-      if (!actionable) actionable = { backOdds: bo, source: "betfair_exchange" };
-      if (!exchangeForFv) exchangeForFv = { backOdds: bo, source: "betfair_exchange" };
+      if (!exchange) exchange = { backOdds: bo, source: "betfair_exchange" };
     } else if (src === "oddspapi_pinnacle") {
       if (!oddspapiPinnacle) oddspapiPinnacle = { backOdds: bo, source: "oddspapi_pinnacle" };
     } else if (src === "api_football_real:Pinnacle") {
       if (!afPinnacle) afPinnacle = { backOdds: bo, source: "api_football_real:Pinnacle" };
+    } else if (src.startsWith("api_football_real:")) {
+      if (!afOther) afOther = { backOdds: bo, source: "api_football_real:other" };
     }
   }
 
-  if (!actionable) return { ok: false, reason: "no_betfair_exchange" };
-  const fv = oddspapiPinnacle ?? afPinnacle ?? exchangeForFv;
+  // Fair-value preference: Pinnacle (any source) > Exchange. If only soft
+  // bookmaker is available (afOther), use it as best-available for the
+  // shadow-only case.
+  const fv = oddspapiPinnacle ?? afPinnacle ?? exchange;
   if (!fv) return { ok: false, reason: "no_fair_value_source" };
 
+  // Actionable preference: Exchange (real-stake placeable) > Pinnacle >
+  // soft bookmaker. shadowOnly=true when not Exchange.
+  if (exchange) {
+    return {
+      ok: true,
+      actionablePrice: exchange.backOdds,
+      actionableSource: "betfair_exchange",
+      fairValueOdds: fv.backOdds,
+      fairValueSource: fv.source as FairValueSource,
+      shadowOnly: false,
+    };
+  }
+  // No exchange — shadow-only path. Use sharp consensus as actionable
+  // reference (Pinnacle preferred). Soft bookmaker afOther only as last
+  // resort.
+  const actionable = oddspapiPinnacle ?? afPinnacle ?? afOther;
+  if (!actionable) return { ok: false, reason: "no_actionable_source" };
   return {
     ok: true,
     actionablePrice: actionable.backOdds,
-    actionableSource: "betfair_exchange",
+    actionableSource: actionable.source as ActionableSource,
     fairValueOdds: fv.backOdds,
     fairValueSource: fv.source as FairValueSource,
+    shadowOnly: true,
   };
 }
 
@@ -1197,14 +1229,14 @@ export async function detectValueBets(options?: {
 
       const pricing = selectPricingSources(groupRows);
       if (!pricing.ok) {
-        if (pricing.reason === "no_betfair_exchange") {
-          pricingRejectNoBetfairExchange++;
+        if (pricing.reason === "no_actionable_source") {
+          pricingRejectNoBetfairExchange++; // legacy counter — repurposed
         } else {
           pricingRejectNoFairValueSource++;
         }
         continue;
       }
-      const { actionablePrice, actionableSource, fairValueOdds, fairValueSource } = pricing;
+      const { actionablePrice, actionableSource, fairValueOdds, fairValueSource, shadowOnly } = pricing;
 
       // Minimum odds floor on the actionable (placed) price
       if (actionablePrice < minOddsThreshold) continue;
@@ -1358,8 +1390,14 @@ export async function detectValueBets(options?: {
       // tier-ladder gets continuous learning evidence.
       // Z1+Z5 (2026-05-07): use scoped threshold (per-league > per-market >
       // global). Auto-tuned by Z3 weekly retrospective cron.
+      // Pricing-leak fix (2026-05-08): shadowOnly=true means actionable
+      // price is non-exchange (Pinnacle/AF). Real-stake placement requires
+      // Betfair Exchange order, so force placementTrack=shadow regardless
+      // of meetsProduction. The bet still gets captured for learning —
+      // just at £0 with shadow_stake recorded.
       const effectiveMinScore = resolveScoped("min_opportunity_score", match.league ?? "", oddsRow.marketType, minOppScore);
       const meetsProduction =
+        !shadowOnly &&
         matchUniverseTier === "A" &&
         opportunityScore >= effectiveMinScore &&
         edge >= effectiveMinEdge;
