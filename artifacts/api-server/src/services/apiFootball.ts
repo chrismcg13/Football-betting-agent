@@ -382,6 +382,17 @@ const GOALS_OU_LINES: Record<string, string> = {
   "2.5": "OVER_UNDER_25",
   "3.5": "OVER_UNDER_35",
   "4.5": "OVER_UNDER_45",
+  // C1 (2026-05-07): high-line goals for shadow capture
+  "5.5": "OVER_UNDER_55",
+  "6.5": "OVER_UNDER_65",
+};
+
+// C1 (2026-05-07): team-total goal lines (per-side O/U)
+const TEAM_TOTAL_LINES: Record<string, string> = {
+  "0.5": "_05",
+  "1.5": "_15",
+  "2.5": "_25",
+  "3.5": "_35",
 };
 
 const CORNERS_LINES: Record<string, string> = {
@@ -476,6 +487,56 @@ function mapOddsToMarket(
     const line = v.replace("Home", "").replace("Away", "").trim();
     if (v.startsWith("Home")) return { marketType: "ASIAN_HANDICAP", selectionName: `Home ${line}`, backOdds: o };
     if (v.startsWith("Away")) return { marketType: "ASIAN_HANDICAP", selectionName: `Away ${line}`, backOdds: o };
+  }
+
+  // C1 (2026-05-07): Draw No Bet — derived from MATCH_ODDS but quoted
+  // separately on most bookmakers. Selections "Home" / "Away".
+  if (norm.includes("draw no bet") || norm === "dnb") {
+    if (v === "Home") return { marketType: "DRAW_NO_BET", selectionName: "Home", backOdds: o };
+    if (v === "Away") return { marketType: "DRAW_NO_BET", selectionName: "Away", backOdds: o };
+  }
+
+  // C1 (2026-05-07): Win to Nil — team wins AND opposition fails to score.
+  // AF returns names like "Win to Nil - Home" / "Win to Nil - Away".
+  if (norm.includes("win to nil")) {
+    if (v === "Yes" || v === "yes") {
+      if (norm.includes("home")) return { marketType: "WIN_TO_NIL_HOME", selectionName: "Yes", backOdds: o };
+      if (norm.includes("away")) return { marketType: "WIN_TO_NIL_AWAY", selectionName: "Yes", backOdds: o };
+    }
+    if (v === "No" || v === "no") {
+      if (norm.includes("home")) return { marketType: "WIN_TO_NIL_HOME", selectionName: "No", backOdds: o };
+      if (norm.includes("away")) return { marketType: "WIN_TO_NIL_AWAY", selectionName: "No", backOdds: o };
+    }
+    // Some AF responses encode side in the value rather than the bet name.
+    if (v === "Home") return { marketType: "WIN_TO_NIL_HOME", selectionName: "Yes", backOdds: o };
+    if (v === "Away") return { marketType: "WIN_TO_NIL_AWAY", selectionName: "Yes", backOdds: o };
+  }
+
+  // C1 (2026-05-07): Odd/Even total goals.
+  if ((norm.includes("odd") && norm.includes("even")) || norm.includes("goals odd/even") || norm === "odd/even") {
+    if (v === "Odd" || v === "odd") return { marketType: "GOALS_ODD_EVEN", selectionName: "Odd", backOdds: o };
+    if (v === "Even" || v === "even") return { marketType: "GOALS_ODD_EVEN", selectionName: "Even", backOdds: o };
+  }
+
+  // C1 (2026-05-07): Team-total goals — per-side over/under. AF bet names
+  // include "Total - Home" / "Goals Over/Under (Home)" / "Home Team Total" etc.
+  if (norm.includes("home") && (norm.includes("team total") || norm.includes("total - home") || (norm.includes("goals") && norm.includes("home") && norm.includes("over")))) {
+    const line = v.replace("Over", "").replace("Under", "").trim();
+    const lineSuffix = TEAM_TOTAL_LINES[line];
+    if (lineSuffix) {
+      const market = `TEAM_TOTAL_HOME${lineSuffix}`;
+      const sel = v.startsWith("Over") ? `Over ${line}` : `Under ${line}`;
+      return { marketType: market, selectionName: sel, backOdds: o };
+    }
+  }
+  if (norm.includes("away") && (norm.includes("team total") || norm.includes("total - away") || (norm.includes("goals") && norm.includes("away") && norm.includes("over")))) {
+    const line = v.replace("Over", "").replace("Under", "").trim();
+    const lineSuffix = TEAM_TOTAL_LINES[line];
+    if (lineSuffix) {
+      const market = `TEAM_TOTAL_AWAY${lineSuffix}`;
+      const sel = v.startsWith("Over") ? `Over ${line}` : `Under ${line}`;
+      return { marketType: market, selectionName: sel, backOdds: o };
+    }
   }
 
   return null;

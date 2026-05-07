@@ -20,6 +20,11 @@ import {
   predictOverUnder,
   predictCards,
   predictCorners,
+  predictDrawNoBet,
+  predictTeamTotalGoals,
+  predictWinToNil,
+  predictOddEven,
+  predictAsianHandicap,
   getModelVersion,
 } from "./predictionEngine";
 import { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } from "./tournamentMode";
@@ -584,6 +589,69 @@ function getModelProbability(
     const under55 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 5)));
     if (selectionName.startsWith("Over")) return 1 - under55;
     if (selectionName.startsWith("Under")) return under55;
+  }
+  // ─── C1 (2026-05-07): TIER S free markets — derived from existing models ───
+  // Draw No Bet — pure renormalisation of MATCH_ODDS over (home, away).
+  if (marketType === "DRAW_NO_BET") {
+    const dnb = predictDrawNoBet(enriched);
+    if (!dnb) return null;
+    if (selectionName === "Home") return dnb.home;
+    if (selectionName === "Away") return dnb.away;
+  }
+  // Win-to-Nil (each side) — joint Poisson scoreline.
+  if (marketType === "WIN_TO_NIL_HOME") {
+    const p = predictWinToNil(enriched, "home");
+    if (p == null) return null;
+    if (selectionName === "Yes") return p;
+    if (selectionName === "No") return 1 - p;
+  }
+  if (marketType === "WIN_TO_NIL_AWAY") {
+    const p = predictWinToNil(enriched, "away");
+    if (p == null) return null;
+    if (selectionName === "Yes") return p;
+    if (selectionName === "No") return 1 - p;
+  }
+  // Goals odd/even — closed-form Poisson identity.
+  if (marketType === "GOALS_ODD_EVEN") {
+    const oe = predictOddEven(enriched);
+    if (!oe) return null;
+    if (selectionName === "Odd") return oe.odd;
+    if (selectionName === "Even") return oe.even;
+  }
+  // Over/Under high lines — Poisson over total scoring rate.
+  if (marketType === "OVER_UNDER_55" || marketType === "OVER_UNDER_65") {
+    const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
+    const awayGoals = enriched["away_goals_scored_avg"] ?? 1.1;
+    const lambda = homeGoals + awayGoals;
+    const k = marketType === "OVER_UNDER_55" ? 5 : 6;
+    const under = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, k)));
+    if (selectionName.startsWith("Over")) return 1 - under;
+    if (selectionName.startsWith("Under")) return under;
+  }
+  // Team-total goals — per-side Poisson.
+  if (marketType.startsWith("TEAM_TOTAL_HOME_") || marketType.startsWith("TEAM_TOTAL_AWAY_")) {
+    const side = marketType.startsWith("TEAM_TOTAL_HOME_") ? "home" : "away";
+    const lineSuffix = marketType.split("_").pop()!;        // "05" | "15" | "25" | "35"
+    const t = lineSuffix === "05" ? 0.5
+            : lineSuffix === "15" ? 1.5
+            : lineSuffix === "25" ? 2.5
+            : lineSuffix === "35" ? 3.5
+            : null;
+    if (t == null) return null;
+    const tt = predictTeamTotalGoals(enriched, side, t);
+    if (!tt) return null;
+    if (selectionName.startsWith("Over")) return tt.over;
+    if (selectionName.startsWith("Under")) return tt.under;
+  }
+  // ─── C2 (2026-05-07): Asian Handicap — Poisson scoreline ───────────────────
+  // Selection format: "Home -1.5", "Away +0.25", etc. Parse line from name.
+  if (marketType === "ASIAN_HANDICAP") {
+    const m = selectionName.match(/^(Home|Away)\s+([-+]?[\d.]+)$/);
+    if (!m) return null;
+    const side = m[1].toLowerCase() as "home" | "away";
+    const line = parseFloat(m[2]);
+    if (!Number.isFinite(line)) return null;
+    return predictAsianHandicap(enriched, side, line);
   }
   return null;
 }

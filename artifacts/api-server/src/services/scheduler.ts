@@ -738,10 +738,15 @@ export async function runTradingCycle(options?: {
       ? Number(cfg.max_daily_bets_paper ?? "50")
       : Number(cfg.max_daily_bets_live ?? "15");
 
+    // C1+C2 (2026-05-07): daily cap counts only REAL-STAKE bets. Shadow
+    // bets (£0 stake, no capital risk) are unlimited per Chris's directive
+    // — if the model thinks there's an opportunity, capture it. This
+    // prevents the 5000/day cap from choking the firehose when shadow
+    // volume scales 5-10× with new markets.
     const todayBetRows = await db
       .select({ count: sql<number>`count(*)` })
       .from(paperBetsTable)
-      .where(sql`date_trunc('day', ${paperBetsTable.placedAt} AT TIME ZONE 'UTC') = current_date AND status != 'void' AND deleted_at IS NULL`);
+      .where(sql`date_trunc('day', ${paperBetsTable.placedAt} AT TIME ZONE 'UTC') = current_date AND status != 'void' AND deleted_at IS NULL AND ${paperBetsTable.stake}::numeric > 0`);
     const todayCountRaw = Number(todayBetRows[0]?.count ?? 0);
     // Apr 17 2026: optional same-day offset to "reset" the daily counter after
     // a mid-day bankroll change. Only applied if `daily_bets_used_offset_date`
@@ -2573,6 +2578,46 @@ export function startScheduler(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Alert cleanup active — Sunday 06:00 UTC (90-day retention)");
+
+  // C1 (2026-05-07): odds_snapshots retention — daily 02:30 UTC.
+  // Without TTL the table grew to ~18M rows / 3.3 GB. Pre-kickoff snapshots
+  // for SETTLED matches are redundant once paper_bets has copied snapshot_a/
+  // b/c columns at settlement time. Delete in batches to avoid long locks.
+  // Match grace period: 7 days post-kickoff to allow for delayed settlements
+  // and CLV backfills. Matches still in 'scheduled'/'in_play' status are
+  // never touched.
+  cron.schedule("30 2 * * *", () => {
+    void (async () => {
+      try {
+        const t0 = Date.now();
+        let totalDeleted = 0;
+        // Delete in 100k-row batches to keep transaction sizes bounded.
+        for (let i = 0; i < 50; i++) {
+          const result = await db.execute(sql`
+            WITH victims AS (
+              SELECT os.id
+              FROM odds_snapshots os
+              JOIN matches m ON m.id = os.match_id
+              WHERE m.status IN ('completed', 'cancelled', 'postponed', 'abandoned')
+                AND m.kickoff_time < NOW() - INTERVAL '7 days'
+                AND os.snapshot_time < NOW() - INTERVAL '7 days'
+              LIMIT 100000
+            )
+            DELETE FROM odds_snapshots
+            WHERE id IN (SELECT id FROM victims)
+            RETURNING 1
+          `);
+          const rowCount = (result as any).rowCount ?? 0;
+          totalDeleted += rowCount;
+          if (rowCount < 100000) break;
+        }
+        logger.info({ totalDeleted, durationMs: Date.now() - t0 }, "odds_snapshots retention sweep complete");
+      } catch (err) {
+        logger.error({ err }, "odds_snapshots retention sweep failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("odds_snapshots retention scheduler active — daily 02:30 UTC (7-day post-kickoff retention)");
 
   setTimeout(async () => {
     try {

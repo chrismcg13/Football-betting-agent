@@ -639,6 +639,158 @@ function poissonOver(lambda: number, threshold: number): number {
   return Math.max(0.01, Math.min(0.99, 1 - poissonProb(lambda, k)));
 }
 
+// C1 (2026-05-07): single-point Poisson PMF (P(X = k)) — used for scoreline
+// matrix and odd/even goal-count derivations.
+function poissonPmf(lambda: number, k: number): number {
+  if (k === 0) return Math.exp(-lambda);
+  let logP = -lambda + k * Math.log(lambda);
+  for (let i = 1; i <= k; i++) logP -= Math.log(i);
+  return Math.exp(logP);
+}
+
+// C1 (2026-05-07): joint goal-scoreline matrix from independent home/away
+// Poisson assumption. matrix[h][a] = P(home_goals = h AND away_goals = a).
+// Truncated at maxGoals=8; remaining mass folded into [maxGoals][*] / [*][maxGoals]
+// so distributions sum to 1.0 within numerical precision. This is the engine
+// powering Asian Handicap, Win-to-Nil, Team-Total, Odd/Even, and (in C4)
+// Half-Time/Full-Time + Winning-Margin predictions.
+export function scorelineMatrix(
+  homeLambda: number,
+  awayLambda: number,
+  maxGoals = 8,
+): number[][] {
+  const ph: number[] = [];
+  const pa: number[] = [];
+  let homeAcc = 0;
+  let awayAcc = 0;
+  for (let k = 0; k <= maxGoals; k++) {
+    const ppH = poissonPmf(homeLambda, k);
+    const ppA = poissonPmf(awayLambda, k);
+    ph.push(ppH);
+    pa.push(ppA);
+    homeAcc += ppH;
+    awayAcc += ppA;
+  }
+  // Tail mass — fold into bucket [maxGoals]
+  ph[maxGoals] += Math.max(0, 1 - homeAcc);
+  pa[maxGoals] += Math.max(0, 1 - awayAcc);
+  const matrix: number[][] = [];
+  for (let h = 0; h <= maxGoals; h++) {
+    const row: number[] = new Array(maxGoals + 1);
+    for (let a = 0; a <= maxGoals; a++) row[a] = ph[h] * pa[a];
+    matrix.push(row);
+  }
+  return matrix;
+}
+
+// C2 (2026-05-07): Asian Handicap probability for one side at a given line.
+// Settlement convention: "Home L" pays out on (home_goals - away_goals + L) > 0;
+// pushes (margin = 0) refund the stake (treated as 0.5 win for EV purposes).
+// Quarter handicaps (e.g. -0.25, -0.75) split between two adjacent half/whole
+// lines per Betfair rules — recurse and average.
+export function predictAsianHandicap(
+  featureMap: Record<string, number>,
+  side: "home" | "away",
+  line: number,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null) return null;
+  if (homeLambda <= 0 || awayLambda <= 0) return null;
+
+  // Quarter-line split — Betfair settles half stake on each adjacent line.
+  // Detect by checking if 4*line is an odd integer.
+  const quarterCheck = Math.round(line * 4);
+  if (Math.abs(quarterCheck - line * 4) < 1e-6 && Math.abs(quarterCheck % 2) === 1) {
+    const lower = predictAsianHandicap(featureMap, side, line - 0.25);
+    const upper = predictAsianHandicap(featureMap, side, line + 0.25);
+    if (lower == null || upper == null) return null;
+    return (lower + upper) / 2;
+  }
+
+  const matrix = scorelineMatrix(homeLambda, awayLambda);
+  let pWin = 0;
+  let pPush = 0;
+  for (let h = 0; h < matrix.length; h++) {
+    for (let a = 0; a < matrix[h].length; a++) {
+      const margin = side === "home" ? h - a + line : a - h + line;
+      if (margin > 1e-9) pWin += matrix[h][a];
+      else if (margin > -1e-9) pPush += matrix[h][a];
+    }
+  }
+  // Push outcomes refund stake — for EV equivalent, a push is identical to
+  // staking on a 1/back_odds payout, so contributes 1/(net_odds) to win prob.
+  // For modelProb purposes (the model's own probability the bet "lands") we
+  // count push as 0.5 to reflect 50/50 capital outcome. valueDetection then
+  // computes edge against the quoted price as usual.
+  return Math.max(0.01, Math.min(0.99, pWin + pPush * 0.5));
+}
+
+// C1 (2026-05-07): Draw-No-Bet — pure derivation from existing 1X2 model.
+// Stake refunded on draw; EV equivalent to renormalising over (home, away).
+export function predictDrawNoBet(
+  featureMap: Record<string, number>,
+): { home: number; away: number } | null {
+  const o = predictOutcome(featureMap);
+  if (!o) return null;
+  const denom = o.home + o.away;
+  if (denom <= 0) return null;
+  return {
+    home: Math.max(0.01, Math.min(0.99, o.home / denom)),
+    away: Math.max(0.01, Math.min(0.99, o.away / denom)),
+  };
+}
+
+// C1 (2026-05-07): Per-side team-total goals — Poisson over the team's own
+// scoring lambda. Independent of opposition.
+export function predictTeamTotalGoals(
+  featureMap: Record<string, number>,
+  side: "home" | "away",
+  threshold: number,
+): { over: number; under: number } | null {
+  const lambda = side === "home"
+    ? featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"]
+    : featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (lambda == null || lambda <= 0) return null;
+  const over = poissonOver(lambda, threshold);
+  return { over, under: 1 - over };
+}
+
+// C1 (2026-05-07): Win-to-nil — joint probability that side wins AND
+// opposition scores zero. Uses the scoreline matrix to capture the
+// home/away lambda interaction.
+export function predictWinToNil(
+  featureMap: Record<string, number>,
+  side: "home" | "away",
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null) return null;
+  if (homeLambda <= 0 || awayLambda <= 0) return null;
+  const matrix = scorelineMatrix(homeLambda, awayLambda);
+  let p = 0;
+  if (side === "home") {
+    for (let h = 1; h < matrix.length; h++) p += matrix[h][0];
+  } else {
+    for (let a = 1; a < matrix[0].length; a++) p += matrix[0][a];
+  }
+  return Math.max(0.01, Math.min(0.99, p));
+}
+
+// C1 (2026-05-07): Odd/Even total goals — closed-form Poisson identity.
+// P(even total) = (1 + e^{-2λ}) / 2 where λ = home + away scoring rate.
+export function predictOddEven(
+  featureMap: Record<string, number>,
+): { odd: number; even: number } | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null) return null;
+  if (homeLambda < 0 || awayLambda < 0) return null;
+  const lambda = homeLambda + awayLambda;
+  const even = Math.max(0.05, Math.min(0.95, (1 + Math.exp(-2 * lambda)) / 2));
+  return { even, odd: 1 - even };
+}
+
 export function predictCards(featureMap: Record<string, number>): {
   over35: number; under35: number;
   over45: number; under45: number;
