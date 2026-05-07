@@ -1999,6 +1999,18 @@ router.post("/leagues/tier-e-reevaluate/run", async (_req, res) => {
   }
 });
 
+// Y3 (2026-05-07): manual trigger for WC participant coverage audit.
+router.post("/leagues/wc-audit/run", async (_req, res) => {
+  try {
+    const { auditWorldCupParticipantCoverage } = await import("../services/betfairFirstUniverse");
+    const result = await auditWorldCupParticipantCoverage();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual WC audit failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Z4 (2026-05-07): manual trigger for autonomous tier-ladder.
 // Computes per-scope Kelly-growth-rate proxy and promotes/demotes
 // universe_tier autonomously. Full audit log written per transition.

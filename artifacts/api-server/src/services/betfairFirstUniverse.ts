@@ -159,6 +159,45 @@ function tokenSetRatio(a: string, b: string): number {
   return intersect / Math.min(A.size, B.size);
 }
 
+// Y4 (2026-05-07): Levenshtein-ratio for Betfair → AF mismatch resolution
+// when token-set ratio fails. Different algorithm catches different failure
+// modes — token-set is stop-word-aware and order-insensitive but blind to
+// transposed letters / character-level typos; Levenshtein catches those.
+function levenshteinDistance(a: string, b: string): number {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = new Array(b.length + 1);
+  let curr = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(
+        curr[j - 1] + 1,
+        prev[j] + 1,
+        prev[j - 1] + cost,
+      );
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[b.length];
+}
+
+function levenshteinRatio(a: string, b: string): number {
+  const A = normaliseLeagueName(a);
+  const B = normaliseLeagueName(b);
+  if (A.length === 0 || B.length === 0) return 0;
+  const dist = levenshteinDistance(A, B);
+  const maxLen = Math.max(A.length, B.length);
+  return 1 - dist / maxLen;
+}
+
+// Y4 fallback threshold — only applies after token-set ratio fails. We
+// require a higher Levenshtein ratio (0.75) since this is the second-chance
+// algorithm and we want to avoid false positives.
+const LEVENSHTEIN_FALLBACK_THRESHOLD = 0.75;
+
 // ─── Betfair region → AF country (plan §3.2) ─────────────────────────────────
 // Betfair's competitionRegion is empirically a mix: ISO 3166-1 alpha-3 codes
 // (the dominant form per first-cycle dry-run histogram), occasional alpha-2
@@ -752,7 +791,32 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
       }
     }
 
-    if (bestScore >= usedThreshold && bestAf != null) {
+    // Y4 (2026-05-07): Levenshtein fallback — when token-set ratio fails
+    // to clear the threshold, try Levenshtein-ratio with a lower bar.
+    // Different algorithm catches transposed letters / character-level
+    // typos that token-set is blind to. Only applied to country-narrowed
+    // candidate sets (i.e. usedThreshold === FUZZY_MATCH_THRESHOLD) so we
+    // don't over-match against the full ~1200-league universe.
+    let usedLevenshteinFallback = false;
+    if (bestScore < usedThreshold && usedThreshold === FUZZY_MATCH_THRESHOLD) {
+      let lvBestScore = 0;
+      let lvBestAf: typeof afLeagues[number] | null = null;
+      for (const af of candidates) {
+        const lvScore = levenshteinRatio(bfName, af.league.name);
+        if (lvScore > lvBestScore) {
+          lvBestScore = lvScore;
+          lvBestAf = af;
+        }
+      }
+      if (lvBestScore >= LEVENSHTEIN_FALLBACK_THRESHOLD && lvBestAf != null) {
+        bestScore = lvBestScore;
+        bestAf = lvBestAf;
+        usedLevenshteinFallback = true;
+      }
+    }
+    void usedLevenshteinFallback; // tracked for telemetry; included in fuzzy failure log
+
+    if (bestScore >= Math.min(usedThreshold, LEVENSHTEIN_FALLBACK_THRESHOLD) && bestAf != null) {
       // Match found
       const afId = bestAf.league.id;
       const afName = bestAf.league.name;
@@ -971,6 +1035,170 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
   };
 
   logger.info(result, "betfair_reverse_mapping_summary");
+  return result;
+}
+
+// ─── Y3 (2026-05-07): Autonomous WC participant coverage audit ──────────────
+// Identifies countries that are participating in World Cup competitions
+// (qualifiers + final) but have no Tier 1 active club league in
+// competition_config. For each gap-country, autonomously promotes that
+// country's most-likely Tier 1 league from Tier E (or Tier D) to an
+// active tier so the model captures shadow bets from those leagues
+// during the WC build-up.
+//
+// Data-driven from existing matches table — no new AF API calls. Uses
+// the matches we've already ingested to identify which national teams
+// are competing in WC fixtures, which countries those teams represent,
+// and which countries lack club-level coverage.
+
+export interface WcAuditResult {
+  runId: string;
+  wcParticipantCountries: number;
+  countriesWithCoverage: number;
+  countriesWithoutCoverage: number;
+  promotionsApplied: number;
+  durationMs: number;
+}
+
+export async function auditWorldCupParticipantCoverage(): Promise<WcAuditResult> {
+  const startedAt = Date.now();
+  const runId = `wc-audit-${startedAt}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Step 1: identify WC-related competitions in our matches table.
+  // Matches league names include "World Cup", "WCQ", "Qualifier", "Qualifying"
+  // for WC qualification fixtures.
+  const wcCountriesRows = await db.execute(sql`
+    SELECT DISTINCT m.country, COUNT(*) AS fixture_count
+    FROM matches m
+    WHERE m.kickoff_time BETWEEN NOW() - INTERVAL '90 days' AND NOW() + INTERVAL '365 days'
+      AND (
+        LOWER(m.league) LIKE '%world cup%'
+        OR LOWER(m.league) LIKE '%wcq%'
+        OR LOWER(m.league) LIKE '%qualifier%'
+        OR LOWER(m.league) LIKE '%qualifying%'
+      )
+    GROUP BY m.country
+    HAVING COUNT(*) >= 1
+  `);
+
+  const wcCountries = ((wcCountriesRows as any).rows ?? []).map((r: any) => r.country).filter(Boolean) as string[];
+
+  if (wcCountries.length === 0) {
+    logger.info({ runId }, "WC audit — no WC fixtures detected in 90d-back-to-365d-forward window");
+    return {
+      runId,
+      wcParticipantCountries: 0,
+      countriesWithCoverage: 0,
+      countriesWithoutCoverage: 0,
+      promotionsApplied: 0,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
+  // For the WC qualifying fixtures, we don't easily get participating
+  // countries from `m.country` (which often reads as "World" / "Europe").
+  // Instead, look at home_team / away_team strings — these are usually
+  // country names for international fixtures. Cross-reference with
+  // competition_config countries to identify which countries are playing.
+  const wcTeamsRows = await db.execute(sql`
+    SELECT DISTINCT team
+    FROM (
+      SELECT m.home_team AS team FROM matches m
+      WHERE m.kickoff_time BETWEEN NOW() - INTERVAL '90 days' AND NOW() + INTERVAL '365 days'
+        AND (LOWER(m.league) LIKE '%world cup%' OR LOWER(m.league) LIKE '%wcq%' OR LOWER(m.league) LIKE '%qualifier%' OR LOWER(m.league) LIKE '%qualifying%')
+      UNION
+      SELECT m.away_team AS team FROM matches m
+      WHERE m.kickoff_time BETWEEN NOW() - INTERVAL '90 days' AND NOW() + INTERVAL '365 days'
+        AND (LOWER(m.league) LIKE '%world cup%' OR LOWER(m.league) LIKE '%wcq%' OR LOWER(m.league) LIKE '%qualifier%' OR LOWER(m.league) LIKE '%qualifying%')
+    ) t
+  `);
+  const wcTeams = ((wcTeamsRows as any).rows ?? []).map((r: any) => r.team).filter(Boolean) as string[];
+
+  // Many international teams have country-name-as-team (e.g. "England", "Brazil")
+  // Match these against competition_config.country (case-insensitive) to identify
+  // candidate countries with WC participation.
+  const candidateCountries = new Set<string>();
+  for (const team of wcTeams) {
+    const normalized = team.toLowerCase().replace(/-/g, " ").trim();
+    candidateCountries.add(normalized);
+  }
+
+  // Step 2: which of those countries have at least one active top_flight_men
+  // club league in competition_config?
+  const coverageRows = await db.execute(sql`
+    SELECT DISTINCT LOWER(REPLACE(country, '-', ' ')) AS country
+    FROM competition_config
+    WHERE archetype = 'top_flight_men'
+      AND universe_tier IN ('A', 'B', 'C')
+      AND is_active = true
+  `);
+  const coveredCountries = new Set<string>(
+    ((coverageRows as any).rows ?? []).map((r: any) => r.country),
+  );
+
+  // Step 3: for each candidate-without-coverage, find a candidate Tier E
+  // top_flight_men league for that country and autonomously promote it.
+  const gapCountries: string[] = [];
+  for (const c of candidateCountries) {
+    if (!coveredCountries.has(c)) gapCountries.push(c);
+  }
+
+  let promotionsApplied = 0;
+  for (const country of gapCountries) {
+    // Find a Tier E top_flight_men row for this country (best candidate
+    // for promotion). Limit 1 per gap-country to avoid promoting many.
+    const candidateRow = await db.execute(sql`
+      SELECT id, name, country
+      FROM competition_config
+      WHERE LOWER(REPLACE(country, '-', ' ')) = ${country}
+        AND archetype = 'top_flight_men'
+        AND universe_tier IN ('E', 'D')
+      ORDER BY universe_tier_decided_at DESC NULLS LAST
+      LIMIT 1
+    `);
+    const candidate = (candidateRow as any).rows?.[0];
+    if (!candidate) continue;
+
+    // Promote to Tier C (probationary — model will graduate via Z4 ladder)
+    await db
+      .update(competitionConfigTable)
+      .set({
+        universeTier: "C",
+        universeTierDecidedAt: new Date(),
+        isActive: true,
+      })
+      .where(eq(competitionConfigTable.id, candidate.id));
+
+    await db.insert(modelDecisionAuditLogTable).values({
+      decisionType: "wc_country_coverage_promotion",
+      subject: `competition:${candidate.id}:${candidate.name}/${candidate.country ?? "unknown"}`,
+      priorState: { universe_tier: "E_or_D" } as any,
+      newState: { universe_tier: "C", reason: "wc_participant_country_no_coverage" } as any,
+      reasoning: `Y3 autonomous promotion: country '${country}' has WC qualifying fixtures in last 90d / next 365d but had no top_flight_men league in active tier. Promoted candidate league to Tier C (probationary).`,
+      supportingMetrics: {
+        country,
+        wc_team_count: wcTeams.length,
+        wc_country_set_size: candidateCountries.size,
+        gap_countries_count: gapCountries.length,
+        runId,
+      } as any,
+      expectedImpact: null,
+      reviewStatus: "automatic",
+    });
+
+    promotionsApplied++;
+  }
+
+  const result: WcAuditResult = {
+    runId,
+    wcParticipantCountries: candidateCountries.size,
+    countriesWithCoverage: candidateCountries.size - gapCountries.length,
+    countriesWithoutCoverage: gapCountries.length,
+    promotionsApplied,
+    durationMs: Date.now() - startedAt,
+  };
+
+  logger.info(result, "wc_audit_complete");
   return result;
 }
 

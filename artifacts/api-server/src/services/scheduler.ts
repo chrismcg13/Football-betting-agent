@@ -2654,6 +2654,24 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Feature predictive-power scoring scheduler active — Sunday 11:00 UTC");
 
+  // Y3 (2026-05-07): weekly autonomous WC participant coverage audit —
+  // Sunday 05:30 UTC. Identifies countries playing in WC qualifying
+  // fixtures that lack a Tier 1 active club league + auto-promotes a
+  // candidate league from Tier E/D to C. Runs before Y1 Tier E re-eval.
+  cron.schedule("30 5 * * 0", () => {
+    logger.info("WC participant audit triggered (weekly Sunday 05:30 UTC)");
+    void (async () => {
+      try {
+        const { auditWorldCupParticipantCoverage } = await import("./betfairFirstUniverse");
+        const r = await auditWorldCupParticipantCoverage();
+        logger.info(r, "WC participant audit complete");
+      } catch (err) {
+        logger.error({ err }, "WC participant audit failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("WC participant audit scheduler active — Sunday 05:30 UTC");
+
   // Y1 (2026-05-07): weekly Tier E re-evaluation pass — Sunday 06:00 UTC.
   // Re-runs assignTier on Tier E rows with category-aware Y2 rules. Auto-
   // promotes women's, youth, internationals, friendlies that were stuck at
