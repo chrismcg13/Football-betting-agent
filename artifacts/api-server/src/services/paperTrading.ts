@@ -949,13 +949,42 @@ export async function placePaperBet(
   }
   // ──────────────────────────────────────────────────────────────────────────
 
+  // Wave 1.5 (Phase 2 closeout): the next three gates are global circuit-
+  // breakers that protect real-money operations (admin pause, Betfair API
+  // rate limiter, consecutive-loss / floor-breach kill switch). Shadow bets
+  // carry stake=0 and capture learning data — they bypass all three but
+  // STILL fire any state-mutating side effects (e.g. circuit breaker still
+  // sets agent_status='paused' when it triggers; we just don't reject the
+  // shadow bet that observed the trigger).
   const status = await getAgentStatus();
   if (status !== "running") {
-    return logReject(`Agent is not running (status: ${status})`);
+    if (isShadowBet) {
+      await logShadowGateExemption(
+        "agent_status_paused",
+        experimentTag ?? null,
+        `Agent is not running (status: ${status})`,
+        null,
+        universeTier,
+      );
+    } else {
+      return logReject(`Agent is not running (status: ${status})`);
+    }
   }
 
   if (isLiveMode() && isBetfairApiPaused()) {
-    return logReject("Betfair API error rate pause active — skipping bet placement");
+    if (isShadowBet) {
+      // Shadow bets don't transmit to the Betfair Exchange (stake=0 is a
+      // local paper_bets row), so a Betfair API pause is irrelevant.
+      await logShadowGateExemption(
+        "betfair_api_paused",
+        experimentTag ?? null,
+        "Betfair API error rate pause active",
+        null,
+        universeTier,
+      );
+    } else {
+      return logReject("Betfair API error rate pause active — skipping bet placement");
+    }
   }
 
   const liveCircuitBreaker = await checkLiveCircuitBreakers();
@@ -970,7 +999,21 @@ export async function placePaperBet(
       await setConfigValue("pause_reason", action);
       await setConfigValue("paused_at", new Date().toISOString());
     }
-    return logReject(`Live circuit breaker: ${liveCircuitBreaker.reason}`);
+    if (isShadowBet) {
+      // Consecutive losses / floor breach are pure capital-protection
+      // signals. Shadow bets are £0 — explicitly architecturally allowed
+      // to fire during these states (and especially valuable for learning
+      // when the model is in a distressed regime).
+      await logShadowGateExemption(
+        "live_circuit_breaker",
+        experimentTag ?? null,
+        liveCircuitBreaker.reason ?? "live circuit breaker triggered",
+        null,
+        universeTier,
+      );
+    } else {
+      return logReject(`Live circuit breaker: ${liveCircuitBreaker.reason}`);
+    }
   }
 
   const bankroll = await getBankroll();
@@ -1270,7 +1313,20 @@ export async function placePaperBet(
   if (isLiveMode()) {
     const slippageResult = checkSlippage(backOdds, backOdds);
     if (slippageResult.blocked) {
-      return logReject(`Slippage guard: ${slippageResult.reason}`);
+      if (isShadowBet) {
+        // Slippage protects real fills against bad price moves between
+        // detection and placement. Shadow bets don't fill anywhere, so
+        // there's no fill price to protect.
+        await logShadowGateExemption(
+          "slippage_guard",
+          experimentTag ?? null,
+          slippageResult.reason ?? "slippage guard blocked",
+          null,
+          universeTier,
+        );
+      } else {
+        return logReject(`Slippage guard: ${slippageResult.reason}`);
+      }
     }
   }
 
