@@ -33,6 +33,7 @@ import {
   oddspapiLeagueCoverageTable,
   paperBetsTable,
   matchesTable,
+  modelDecisionAuditLogTable,
 } from "@workspace/db";
 import { eq, isNull, and, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -435,6 +436,87 @@ interface TierInputs {
   oddsPapiAgeDays: number;   // Infinity if no row
   hasHistoricalBets: boolean;
   biasIndex: number | null;  // null when not flagged
+  category?: CompetitionCategory; // Y2 (2026-05-07): category-aware rules
+}
+
+// Y2 (2026-05-07): explicit category detection so the model treats women's,
+// youth, international tournaments, and friendlies appropriately. Per Phase 2
+// brief: "leave no stone unturned. Map every Betfair-tradeable football
+// competition." Category detection runs before tier verdict so tier rules
+// can be category-aware (e.g. international tournaments → Tier B regardless
+// of historical-bet count, since Pinnacle prices these sharply).
+type CompetitionCategory =
+  | "international_tournament"  // World Cup, Euro, Copa, AFCON, Asian Cup, Nations
+  | "international_friendly"    // senior international friendlies
+  | "youth"                     // U17/U18/U19/U20/U21/U22/U23
+  | "women"                     // any women's competition
+  | "club_friendly"             // pre-season + mid-season club friendlies
+  | "reserves"                  // II/B teams + academy
+  | "club_domestic";            // standard club league
+
+export function detectCategory(name: string, country: string | null, gender: string | null, type: string | null): CompetitionCategory {
+  const n = (name ?? "").toLowerCase();
+  const c = (country ?? "").toLowerCase();
+
+  // Women's first — most specific
+  if (
+    gender === "female" ||
+    n.includes("women") || n.includes(" w ") ||
+    n.endsWith(" w") ||
+    n.includes("féminine") || n.includes("feminine") ||
+    n.includes("femenina") || n.includes("damen")
+  ) return "women";
+
+  // Youth — explicit U-XX patterns
+  if (
+    /\bu1[789]\b|\bu2[0-3]\b/.test(n) ||
+    /\bu-1[789]\b|\bu-2[0-3]\b/.test(n) ||
+    n.includes("youth") ||
+    n.includes("under 1") || n.includes("under 2") ||
+    n.includes("under-1") || n.includes("under-2") ||
+    n.includes("juvenil") || n.includes("primavera") ||
+    n.includes("akademi") || n.includes("akatemia") || n.includes("academy")
+  ) return "youth";
+
+  // International tournaments
+  if (
+    n.includes("world cup") ||
+    n.includes("nations league") ||
+    n.includes("uefa nations") ||
+    n.includes("euro ") || n.endsWith(" euro") ||
+    n.includes("european championship") ||
+    n.includes("copa america") || n.includes("copa libertadores") ||
+    n.includes("afcon") || n.includes("africa cup of nations") ||
+    n.includes("asian cup") || n.includes("afc cup") ||
+    n.includes("concacaf gold cup") || n.includes("gold cup") ||
+    n.includes("oceania cup") ||
+    n.includes("confederations") ||
+    /\bwcq\b/.test(n) || n.includes("qualifier") || n.includes("qualifying") ||
+    c === "world" || c === "europe" || c === "south-america" || c === "south america" ||
+    c === "africa" || c === "asia" || c === "north-america" || c === "oceania" ||
+    type === "international"
+  ) return "international_tournament";
+
+  // International friendlies (specifically "Friendlies" without club/match)
+  if (
+    n.includes("international friendl") ||
+    (n.includes("friendl") && type === "international")
+  ) return "international_friendly";
+
+  // Club friendlies
+  if (
+    n.includes("friendl") ||
+    n.includes("pre season") || n.includes("pre-season") ||
+    n.includes("preseason")
+  ) return "club_friendly";
+
+  // Reserves
+  if (
+    /\bii\b/.test(n) || /\bb\b\s*$/.test(n) ||
+    n.includes("reserve") || n.includes("reserves")
+  ) return "reserves";
+
+  return "club_domestic";
 }
 
 function assignTier(input: TierInputs): { tier: Tier; reason: string } {
@@ -444,6 +526,44 @@ function assignTier(input: TierInputs): { tier: Tier; reason: string } {
   if (!input.matched) {
     return { tier: "D", reason: "no_af_match" };
   }
+
+  // Y2 (2026-05-07): category-aware tier overrides. Per "leave no stone
+  // unturned" principle — international tournaments + women's + youth +
+  // friendlies all get an active tier, never default-Tier-E.
+  const cat = input.category;
+  if (cat === "international_tournament") {
+    // World Cup, Euro, Nations League etc. — Pinnacle prices these sharply.
+    // Default to B (shadow) for new ones; A only if has Pinnacle coverage.
+    if (input.hasOdds && input.oddsPapiAgeDays <= ODDS_PAPI_STALENESS_DAYS) {
+      return { tier: "A", reason: "international_tournament_pinnacle_reliable" };
+    }
+    return { tier: "B", reason: "international_tournament_shadow_default" };
+  }
+  if (cat === "international_friendly") {
+    return { tier: "C", reason: "international_friendly_probationary" };
+  }
+  if (cat === "youth") {
+    return { tier: "C", reason: "youth_probationary" };
+  }
+  if (cat === "club_friendly") {
+    return { tier: "C", reason: "club_friendly_probationary" };
+  }
+  if (cat === "women") {
+    // Women's senior leagues — treat as standard club; Pinnacle prices the
+    // big ones (NWSL, FA WSL, UEFA Women's CL) so they may grade Tier A.
+    if (input.hasOdds && input.oddsPapiAgeDays <= ODDS_PAPI_STALENESS_DAYS) {
+      return { tier: "A", reason: "womens_pinnacle_reliable" };
+    }
+    if (!input.hasHistoricalBets) {
+      return { tier: "C", reason: "womens_probationary_no_history" };
+    }
+    return { tier: "B", reason: "womens_no_pinnacle_coverage" };
+  }
+  if (cat === "reserves") {
+    return { tier: "C", reason: "reserves_probationary" };
+  }
+
+  // Standard club_domestic logic (unchanged)
   if (!input.hasHistoricalBets) {
     return { tier: "C", reason: "probationary_no_history" };
   }
@@ -650,12 +770,15 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
           : Infinity;
         const hasHistoricalBets = leaguesWithBets.has(afName.toLowerCase());
 
+        // Y2 (2026-05-07): category-aware tier assignment
+        const category = detectCategory(afName, afCountry, null, afType);
         const tierVerdict = assignTier({
           matched: true,
           hasOdds,
           oddsPapiAgeDays,
           hasHistoricalBets,
           biasIndex: null,
+          category,
         });
         const archetype = archetypeFor({
           name: afName,
@@ -719,12 +842,15 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
             : Infinity;
           const hasHistoricalBets = leaguesWithBets.has(existingCc.name.toLowerCase());
 
+          // Y2 (2026-05-07): category-aware tier assignment for unmapped rows
+          const category = detectCategory(existingCc.name, existingCc.country, existingCc.gender, existingCc.type);
           const tierVerdict = assignTier({
             matched: true,
             hasOdds,
             oddsPapiAgeDays,
             hasHistoricalBets,
             biasIndex: null,
+            category,
           });
           updates.universeTier = tierVerdict.tier;
           updates.universeTierDecidedAt = new Date();
@@ -845,6 +971,155 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
   };
 
   logger.info(result, "betfair_reverse_mapping_summary");
+  return result;
+}
+
+// ─── Y1 (2026-05-07): Tier E re-evaluation pass ──────────────────────────────
+// The original betfairFirstUniverse cron is INSERT-ONLY: existing tier rows
+// stay at their assigned tier forever. With Y2's category-aware rules in
+// place, many Tier E rows (especially women's, youth, internationals,
+// friendlies) should now qualify for active tiers. This function re-runs
+// assignTier with current category info on Tier E rows and updates any
+// where the verdict has shifted.
+//
+// Per the brief's autonomy envelope: "Promotion of experiment-graduated
+// leagues to candidate tier" + "All feature engineering decisions" +
+// "Demotion of underperforming leagues from any tier" — all autonomous.
+// This function autonomously reactivates Tier E rows where category-aware
+// rules now grant them tier B/C status, with full audit logging.
+
+export interface TierEReevalResult {
+  runId: string;
+  rowsScanned: number;
+  rowsReclassified: number;
+  byNewTier: Record<string, number>;
+  byCategory: Record<string, number>;
+  durationMs: number;
+}
+
+export async function reevaluateExcludedLeagues(): Promise<TierEReevalResult> {
+  const startedAt = Date.now();
+  const runId = `tier-e-reeval-${startedAt}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Pull all Tier E rows with active=true OR with recent fixtures (i.e. data
+  // suggesting they're real competitions, not historical artefacts).
+  const tierERows = await db
+    .select({
+      id: competitionConfigTable.id,
+      apiFootballId: competitionConfigTable.apiFootballId,
+      name: competitionConfigTable.name,
+      country: competitionConfigTable.country,
+      type: competitionConfigTable.type,
+      gender: competitionConfigTable.gender,
+      tier: competitionConfigTable.tier,
+      hasOdds: competitionConfigTable.hasOdds,
+      hasPinnacleOdds: competitionConfigTable.hasPinnacleOdds,
+      betfairCompetitionId: competitionConfigTable.betfairCompetitionId,
+    })
+    .from(competitionConfigTable)
+    .where(eq(competitionConfigTable.universeTier, "E"));
+
+  if (tierERows.length === 0) {
+    logger.info({ runId }, "Tier E re-eval — no rows to scan");
+    return {
+      runId,
+      rowsScanned: 0,
+      rowsReclassified: 0,
+      byNewTier: {},
+      byCategory: {},
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
+  // Bulk-load oddspapi coverage (re-used pattern from main fn)
+  const opCoverage = await db.select().from(oddspapiLeagueCoverageTable);
+  const opByLeague = new Map<string, { hasOdds: number; lastChecked: Date }>();
+  for (const r of opCoverage) {
+    opByLeague.set(r.league.toLowerCase(), { hasOdds: r.hasOdds, lastChecked: r.lastChecked });
+  }
+
+  // Bulk-load historical-bet leagues
+  const histLeagues = await db.execute(sql`
+    SELECT DISTINCT LOWER(m.league) AS league
+    FROM paper_bets pb
+    JOIN matches m ON m.id = pb.match_id
+    WHERE pb.status IN ('won', 'lost')
+      AND pb.deleted_at IS NULL
+  `);
+  const leaguesWithBets = new Set<string>(
+    ((histLeagues as any).rows ?? []).map((r: { league: string }) => r.league),
+  );
+
+  let rowsReclassified = 0;
+  const byNewTier: Record<string, number> = {};
+  const byCategory: Record<string, number> = {};
+
+  for (const row of tierERows) {
+    const category = detectCategory(row.name, row.country, row.gender, row.type);
+    byCategory[category] = (byCategory[category] ?? 0) + 1;
+
+    const opRow = opByLeague.get(row.name.toLowerCase());
+    const hasOdds = opRow ? opRow.hasOdds === 1 : Boolean(row.hasOdds);
+    const oddsPapiAgeDays = opRow?.lastChecked
+      ? (Date.now() - new Date(opRow.lastChecked).getTime()) / (24 * 3600 * 1000)
+      : Infinity;
+    const hasHistoricalBets = leaguesWithBets.has(row.name.toLowerCase());
+
+    const verdict = assignTier({
+      matched: row.apiFootballId != null, // E-tier rows can be either matched or no_af_match
+      hasOdds,
+      oddsPapiAgeDays,
+      hasHistoricalBets,
+      biasIndex: null, // Re-evaluation — bias only applies on demotion path, not promotion
+      category,
+    });
+
+    // Only reclassify if verdict differs from E. Tier D verdicts are still
+    // promotions vs E (rejected → at-least-tracked).
+    if (verdict.tier === "E") continue;
+
+    byNewTier[verdict.tier] = (byNewTier[verdict.tier] ?? 0) + 1;
+
+    await db
+      .update(competitionConfigTable)
+      .set({
+        universeTier: verdict.tier,
+        universeTierDecidedAt: new Date(),
+        isActive: verdict.tier === "A" || verdict.tier === "B" || verdict.tier === "C",
+      })
+      .where(eq(competitionConfigTable.id, row.id));
+
+    // Audit log autonomous reactivation
+    await db.insert(modelDecisionAuditLogTable).values({
+      decisionType: "tier_e_reactivation",
+      subject: `competition:${row.id}:${row.name}/${row.country ?? "unknown"}`,
+      priorState: { universe_tier: "E", category: null } as any,
+      newState: { universe_tier: verdict.tier, category, reason: verdict.reason } as any,
+      reasoning: `Y1 Tier E re-evaluation: category=${category} → ${verdict.tier} (${verdict.reason}). hasOdds=${hasOdds}, hasHistoricalBets=${hasHistoricalBets}.`,
+      supportingMetrics: {
+        category,
+        hasOdds,
+        oddsPapiAgeDays: Number.isFinite(oddsPapiAgeDays) ? oddsPapiAgeDays : null,
+        hasHistoricalBets,
+        runId,
+      } as any,
+      expectedImpact: null,
+      reviewStatus: "automatic",
+    });
+
+    rowsReclassified++;
+  }
+
+  const result: TierEReevalResult = {
+    runId,
+    rowsScanned: tierERows.length,
+    rowsReclassified,
+    byNewTier,
+    byCategory,
+    durationMs: Date.now() - startedAt,
+  };
+
+  logger.info(result, "tier_e_reevaluation_summary");
   return result;
 }
 

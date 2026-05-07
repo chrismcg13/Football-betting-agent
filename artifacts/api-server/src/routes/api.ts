@@ -1984,6 +1984,21 @@ router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
   }
 });
 
+// Y1 (2026-05-07): manual trigger for Tier E re-evaluation pass.
+// Re-runs assignTier with category-aware Y2 rules on Tier E rows;
+// auto-promotes women's/youth/internationals/friendlies that should now
+// qualify for active tiers. Full audit log written.
+router.post("/leagues/tier-e-reevaluate/run", async (_req, res) => {
+  try {
+    const { reevaluateExcludedLeagues } = await import("../services/betfairFirstUniverse");
+    const result = await reevaluateExcludedLeagues();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual Tier E re-evaluation failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // ─────────────────────────────────────────────
 // Experiment Pipeline API
 // ─────────────────────────────────────────────

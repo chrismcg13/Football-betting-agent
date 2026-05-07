@@ -2615,6 +2615,24 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Anomaly detection active — daily 04:30 UTC");
 
+  // Y1 (2026-05-07): weekly Tier E re-evaluation pass — Sunday 06:00 UTC.
+  // Re-runs assignTier on Tier E rows with category-aware Y2 rules. Auto-
+  // promotes women's, youth, internationals, friendlies that were stuck at
+  // E into active tiers. Full audit log per autonomous reactivation.
+  cron.schedule("0 6 * * 0", () => {
+    logger.info("Tier E re-evaluation triggered (weekly Sunday 06:00 UTC)");
+    void (async () => {
+      try {
+        const { reevaluateExcludedLeagues } = await import("./betfairFirstUniverse");
+        const r = await reevaluateExcludedLeagues();
+        logger.info(r, "Tier E re-evaluation complete");
+      } catch (err) {
+        logger.error({ err }, "Tier E re-evaluation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Tier E re-evaluation scheduler active — Sunday 06:00 UTC");
+
   // Alert cleanup: weekly Sunday 06:00 — remove alerts older than 90 days
   cron.schedule("0 6 * * 0", () => {
     void (async () => {
