@@ -2694,6 +2694,27 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Autonomous tier-ladder scheduler active — daily 03:45 UTC");
 
+  // Z3 (2026-05-07): autonomous threshold revision — weekly Sunday 10:00
+  // UTC, after Sun 09:30 Kelly optimiser. Per (league, market) scope with
+  // n≥30 settled bets in last 30d, simulates Kelly-growth at delta-grid
+  // alternative thresholds, auto-applies the best (subject to ≥30%
+  // sample-retention safety floor). Per Chris's no-manual directive +
+  // brief autonomy clause "Internal confidence thresholds for value
+  // detection" — both tighter and looser auto-apply, audit-logged.
+  cron.schedule("0 10 * * 0", () => {
+    logger.info("Autonomous threshold revision triggered (weekly Sunday 10:00 UTC)");
+    void (async () => {
+      try {
+        const { runThresholdRevisionProposer } = await import("./autonomousThresholdRevision");
+        const r = await runThresholdRevisionProposer();
+        logger.info(r, "Autonomous threshold revision complete");
+      } catch (err) {
+        logger.error({ err }, "Autonomous threshold revision failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Autonomous threshold revision scheduler active — Sunday 10:00 UTC");
+
   // Z6 (2026-05-07): feature predictive-power scoring — weekly Sunday 11:00
   // UTC. Computes per-feature point-biserial correlation + p-value vs
   // settled-bet outcomes. Identifies which stored-but-not-active features

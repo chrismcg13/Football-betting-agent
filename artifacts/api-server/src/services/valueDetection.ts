@@ -860,6 +860,31 @@ export async function detectValueBets(options?: {
 
   const minEdge = Number(cfg.min_edge_threshold ?? "0.03");
   const minOppScore = Number(cfg.min_opportunity_score ?? "58");
+
+  // Z1+Z5 (2026-05-07): pre-load all scoped threshold overrides into
+  // in-memory maps. Auto-tuned weekly by autonomousThresholdRevision Z3
+  // cron. Lookup precedence: per_league > per_market > per_archetype >
+  // global. Single DB query at function start; per-bet lookup is O(1)
+  // map access.
+  const scopedScoreMap = new Map<string, number>();
+  const scopedEdgeMap = new Map<string, number>();
+  for (const r of configRows) {
+    if (!r.key.startsWith("min_opportunity_score:") && !r.key.startsWith("min_edge_threshold:")) continue;
+    const n = parseFloat(r.value);
+    if (!Number.isFinite(n)) continue;
+    if (r.key.startsWith("min_opportunity_score:")) scopedScoreMap.set(r.key, n);
+    else scopedEdgeMap.set(r.key, n);
+  }
+  const resolveScoped = (base: string, league: string, market: string, fallback: number): number => {
+    const map = base === "min_opportunity_score" ? scopedScoreMap : scopedEdgeMap;
+    const leagueKey = `${base}:per_league:${league.toLowerCase().replace(/[^a-z0-9_]/g, "_")}`;
+    if (map.has(leagueKey)) return map.get(leagueKey)!;
+    const marketKey = `${base}:per_market:${market.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}`;
+    if (map.has(marketKey)) return map.get(marketKey)!;
+    const globalKey = `${base}:global`;
+    if (map.has(globalKey)) return map.get(globalKey)!;
+    return fallback;
+  };
   // B1+B2 shadow-track floors: positive-EV near-misses below the production
   // thresholds still flow through as £0 shadow bets (learning data). The
   // shadow floors prevent pure noise — anything below these is dropped, but
@@ -1331,7 +1356,9 @@ export async function detectValueBets(options?: {
       // thresholds; everything else (Tier A near-misses + any Tier B/C bet
       // that cleared the shadow floor) routes to £0 shadow capture so the
       // tier-ladder gets continuous learning evidence.
-      const effectiveMinScore = minOppScore;
+      // Z1+Z5 (2026-05-07): use scoped threshold (per-league > per-market >
+      // global). Auto-tuned by Z3 weekly retrospective cron.
+      const effectiveMinScore = resolveScoped("min_opportunity_score", match.league ?? "", oddsRow.marketType, minOppScore);
       const meetsProduction =
         matchUniverseTier === "A" &&
         opportunityScore >= effectiveMinScore &&

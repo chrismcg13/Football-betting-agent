@@ -2025,6 +2025,18 @@ router.post("/admin/run-tier-ladder", async (_req, res) => {
   }
 });
 
+// Z3 (2026-05-07): manual trigger for autonomous threshold revision.
+router.post("/admin/run-threshold-revision", async (_req, res) => {
+  try {
+    const { runThresholdRevisionProposer } = await import("../services/autonomousThresholdRevision");
+    const result = await runThresholdRevisionProposer();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual threshold revision failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Z6 (2026-05-07): manual trigger for feature predictive-power scoring.
 router.post("/admin/run-feature-scoring", async (_req, res) => {
   try {
