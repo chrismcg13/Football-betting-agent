@@ -37,6 +37,12 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   // after commission (enforced separately in valueDetection).
   { key: "shadow_min_edge_threshold", value: "0.005" },
   { key: "shadow_min_opportunity_score", value: "0" },
+  // D1 (2026-05-07): adaptive sample-size gates. When TRUE, promotion
+  // gates accept an alternative path: n>=10 + p<=0.001 + positive Kelly
+  // growth. Default FALSE — Chris's autonomy envelope reserves looser
+  // graduation thresholds for explicit user approval. Flip to "true" to
+  // enable.
+  { key: "adaptive_sample_size_gates_enabled", value: "false" },
 ];
 
 export async function runMigrations() {

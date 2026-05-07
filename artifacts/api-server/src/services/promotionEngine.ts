@@ -12,6 +12,15 @@ import { eq, and, sql, inArray, desc, gt } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import crypto from "crypto";
 
+// D1 (2026-05-07): standalone agent_config reader — avoids circular import
+// with paperTrading.ts (which itself imports CANDIDATE_STAKE_MULTIPLIER from
+// this module).
+async function readAgentConfig(key: string): Promise<string | null> {
+  const { agentConfigTable } = await import("@workspace/db");
+  const rows = await db.select().from(agentConfigTable).where(eq(agentConfigTable.key, key)).limit(1);
+  return rows[0]?.value ?? null;
+}
+
 const THRESHOLDS = {
   experimentToCandidate: {
     minSampleSize: parseInt(process.env.PROMO_MIN_SAMPLE_SIZE ?? "25"),
@@ -88,6 +97,33 @@ const KELLY_OPTIMIZER_CI_Z = parseFloat(
 // Within this window, repeat calls on the same tag with non-transition outcomes
 // are skipped. Transitions always re-evaluate (state changed; new gates apply).
 const EVAL_DEDUPE_WINDOW_MS = 15_000;
+
+// D1 (2026-05-07): adaptive sample-size gates. Adds a strict-evidence
+// alternative path through the graduation gates: if a tag's metrics show
+// overwhelming statistical significance (p ≤ 0.001) on a smaller sample
+// (n ≥ 10), promote regardless of the standard minSampleSize floor.
+// The standard threshold gates are user-money territory and stay user-
+// approval-gated (per Phase 2 autonomy envelope). The adaptive path
+// respects that — it does not LOOSEN the existing gates, it adds an
+// ALTERNATIVE strict path that requires far stronger statistical
+// evidence (p≤0.001 vs default p≤0.10) at lower n. Off by default
+// behind agent_config.adaptive_sample_size_gates_enabled — Chris
+// flips on when ready.
+const D1_ADAPTIVE_MIN_SAMPLE = parseInt(process.env.D1_ADAPTIVE_MIN_SAMPLE ?? "10");
+const D1_ADAPTIVE_MAX_PVALUE = parseFloat(process.env.D1_ADAPTIVE_MAX_PVALUE ?? "0.001");
+
+function passesAdaptiveGate(
+  metrics: { sampleSize: number; pValue: number; roi: number; realisedKellyGrowthRate: number },
+): boolean {
+  // All three required:
+  //   1. Sufficient n for statistical inference (≥10 default)
+  //   2. p-value ≤ 0.001 (overwhelming evidence vs null)
+  //   3. Positive realised Kelly-growth (the optimisation target)
+  if (metrics.sampleSize < D1_ADAPTIVE_MIN_SAMPLE) return false;
+  if (metrics.pValue > D1_ADAPTIVE_MAX_PVALUE) return false;
+  if (metrics.realisedKellyGrowthRate <= 0) return false;
+  return true;
+}
 
 // Distribution-shift A(archetype) computation cache. Per-archetype, 5-min TTL.
 const DISTRIBUTION_SHIFT_CACHE_MS = 5 * 60 * 1000;
@@ -538,7 +574,12 @@ export async function evaluateExperimentTag(
   // ─── experiment → candidate / abandoned ─────────────────────────────────
   if (exp.data_tier === "experiment") {
     const thresh = t.experimentToCandidate;
-    if (
+
+    // D1 (2026-05-07): adaptive-gate alternative path — overwhelming statistical
+    // evidence at lower n. Off by default; Chris flips on via agent_config.
+    const adaptiveFlagRaw = (await readAgentConfig("adaptive_sample_size_gates_enabled")) ?? "false";
+    const adaptiveEnabled = adaptiveFlagRaw.toLowerCase() === "true";
+    const passesStandard = (
       metrics.sampleSize >= thresh.minSampleSize &&
       metrics.roi >= thresh.minRoi &&
       metrics.clv >= thresh.minClv &&
@@ -546,8 +587,14 @@ export async function evaluateExperimentTag(
       metrics.pValue <= thresh.maxPValue &&
       metrics.weeksActive >= thresh.minWeeksActive &&
       metrics.edge >= thresh.minEdge
-    ) {
-      const reason = `Met all experiment→candidate thresholds: sample=${metrics.sampleSize}/${thresh.minSampleSize}, realised_roi=${metrics.roi.toFixed(1)}%/${thresh.minRoi}%, kelly_growth=${metrics.realisedKellyGrowthRate.toFixed(4)}/bet, CLV=${metrics.clv.toFixed(2)}/${thresh.minClv}, winRate=${metrics.winRate.toFixed(1)}%/${thresh.minWinRate}%, p=${metrics.pValue.toFixed(3)}/${thresh.maxPValue}, weeks=${metrics.weeksActive}/${thresh.minWeeksActive}, edge=${metrics.edge.toFixed(1)}%/${thresh.minEdge}%`;
+    );
+    const passesAdaptive = adaptiveEnabled && passesAdaptiveGate(metrics) &&
+      metrics.clv >= thresh.minClv && // CLV still required — protects against false positives
+      metrics.weeksActive >= 1; // At least 1 week of data so we're not promoting a 1-day spike
+
+    if (passesStandard || passesAdaptive) {
+      const path = passesStandard ? "standard" : "adaptive";
+      const reason = `Met ${path} experiment→candidate gate: sample=${metrics.sampleSize}/${thresh.minSampleSize}, realised_roi=${metrics.roi.toFixed(1)}%/${thresh.minRoi}%, kelly_growth=${metrics.realisedKellyGrowthRate.toFixed(4)}/bet, CLV=${metrics.clv.toFixed(2)}/${thresh.minClv}, winRate=${metrics.winRate.toFixed(1)}%/${thresh.minWinRate}%, p=${metrics.pValue.toFixed(4)}/${path === "adaptive" ? D1_ADAPTIVE_MAX_PVALUE : thresh.maxPValue}, weeks=${metrics.weeksActive}/${thresh.minWeeksActive}, edge=${metrics.edge.toFixed(1)}%/${thresh.minEdge}%`;
       await logPromotion(tag, "experiment", "candidate", reason, metrics, thresh as any);
       await writeAuditLogForTransition(tag, "experiment", "candidate", reason, metrics);
       await db.update(experimentRegistryTable).set({
@@ -585,14 +632,28 @@ export async function evaluateExperimentTag(
   if (exp.data_tier === "candidate") {
     const candidateMetrics = await computeMetricsForExperiment(tag, "candidate");
     const thresh = t.candidateToPromoted;
-    if (
+
+    // D1 (2026-05-07): adaptive-gate alternative path — same flag, same
+    // strict-evidence criteria. The candidate→promoted transition gates
+    // entry to FULL Kelly real-money so adaptive path is even more
+    // conservative: requires CLV >= minClv AND weeksActive >= 2 in addition
+    // to passesAdaptiveGate (n≥10, p≤0.001, growth>0).
+    const adaptiveFlagRaw = (await readAgentConfig("adaptive_sample_size_gates_enabled")) ?? "false";
+    const adaptiveEnabled = adaptiveFlagRaw.toLowerCase() === "true";
+    const passesStandardCP = (
       candidateMetrics.sampleSize >= thresh.minSampleSize &&
       candidateMetrics.roi >= thresh.minRoi &&
       candidateMetrics.clv >= thresh.minClv &&
       candidateMetrics.pValue <= thresh.maxPValue &&
       candidateMetrics.weeksActive >= thresh.minWeeksActive
-    ) {
-      const reason = `Met all candidate→promoted thresholds: candidateSample=${candidateMetrics.sampleSize}/${thresh.minSampleSize}, realised_roi=${candidateMetrics.roi.toFixed(1)}%/${thresh.minRoi}%, kelly_growth=${candidateMetrics.realisedKellyGrowthRate.toFixed(4)}/bet, CLV=${candidateMetrics.clv.toFixed(2)}/${thresh.minClv}, p=${candidateMetrics.pValue.toFixed(3)}/${thresh.maxPValue}`;
+    );
+    const passesAdaptiveCP = adaptiveEnabled && passesAdaptiveGate(candidateMetrics) &&
+      candidateMetrics.clv >= thresh.minClv &&
+      candidateMetrics.weeksActive >= 2; // 2 weeks for promoted-tier promotion
+
+    if (passesStandardCP || passesAdaptiveCP) {
+      const path = passesStandardCP ? "standard" : "adaptive";
+      const reason = `Met ${path} candidate→promoted gate: candidateSample=${candidateMetrics.sampleSize}/${thresh.minSampleSize}, realised_roi=${candidateMetrics.roi.toFixed(1)}%/${thresh.minRoi}%, kelly_growth=${candidateMetrics.realisedKellyGrowthRate.toFixed(4)}/bet, CLV=${candidateMetrics.clv.toFixed(2)}/${thresh.minClv}, p=${candidateMetrics.pValue.toFixed(4)}/${path === "adaptive" ? D1_ADAPTIVE_MAX_PVALUE : thresh.maxPValue}`;
       const auditId = await logPromotion(tag, "candidate", "promoted", reason, candidateMetrics, thresh as any);
       await writeAuditLogForTransition(tag, "candidate", "promoted", reason, candidateMetrics);
       // Sub-phase 9: new promotions start at probationary kelly_fraction
