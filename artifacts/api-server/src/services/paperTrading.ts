@@ -6,6 +6,7 @@ import {
   complianceLogsTable,
   oddsSnapshotsTable,
   competitionConfigTable,
+  modelDecisionAuditLogTable,
 } from "@workspace/db";
 import { eq, and, gte, lt, lte, inArray, desc, sql, isNull, or } from "drizzle-orm";
 import { logger } from "../lib/logger";
@@ -501,6 +502,80 @@ async function getTierKellyFractionForTag(experimentTag: string | null | undefin
   }
 }
 
+// Wave 1 (Phase 2 closeout): shadow-bet gate exemption audit log.
+// Each Tier B/C bet that bypasses a production-track risk gate writes a row
+// to model_decision_audit_log. Bucket-batched at one row per
+// (gate, experimentTag, hour) to keep volume manageable: subsequent fires
+// within the bucket increment supportingMetrics.exemptionsInBucket.
+//
+// Failures are swallowed (warn-log only) so audit-log unavailability never
+// blocks a bet from placing. The compliance_logs trail is unaffected.
+async function logShadowGateExemption(
+  gateName: string,
+  experimentTag: string | null,
+  reason: string,
+  shadowStake: number | null,
+  universeTier: string | null,
+): Promise<void> {
+  const tag = experimentTag ?? "untagged";
+  const hourBucket = new Date()
+    .toISOString()
+    .slice(0, 13)
+    .replace("T", "_")
+    .replace(/-/g, ""); // e.g. "20260507_11"
+  const subject = `gate:${gateName}:tag:${tag}:hour:${hourBucket}`;
+  try {
+    const existing = await db
+      .select({
+        id: modelDecisionAuditLogTable.id,
+        supportingMetrics: modelDecisionAuditLogTable.supportingMetrics,
+      })
+      .from(modelDecisionAuditLogTable)
+      .where(
+        and(
+          eq(modelDecisionAuditLogTable.subject, subject),
+          eq(modelDecisionAuditLogTable.decisionType, "shadow_bet_gate_exempted"),
+        ),
+      )
+      .limit(1);
+
+    if (existing[0]) {
+      const oldMetrics = (existing[0].supportingMetrics as Record<string, unknown> | null) ?? {};
+      const oldCount = Number(oldMetrics["exemptionsInBucket"] ?? 1);
+      await db
+        .update(modelDecisionAuditLogTable)
+        .set({
+          supportingMetrics: {
+            ...oldMetrics,
+            exemptionsInBucket: oldCount + 1,
+          } as any,
+        })
+        .where(eq(modelDecisionAuditLogTable.id, existing[0].id));
+      return;
+    }
+
+    await db.insert(modelDecisionAuditLogTable).values({
+      decisionType: "shadow_bet_gate_exempted",
+      subject,
+      priorState: { gate_would_have_blocked: true, reason } as any,
+      newState: { admitted: true, stake: 0, shadow_stake: shadowStake } as any,
+      reasoning:
+        "Tier B/C bet exempted from production-track risk control per architectural guarantee — £0 stake cannot affect bankroll",
+      supportingMetrics: {
+        universeTier,
+        kellyGrowthImpactExpected: 0,
+        exemptionsInBucket: 1,
+      } as any,
+      reviewStatus: "automatic",
+    });
+  } catch (err) {
+    logger.warn(
+      { err, gateName, experimentTag: tag },
+      "Failed to write shadow_bet_gate_exempted audit row",
+    );
+  }
+}
+
 function calculateDynamicKellyStake(
   bankroll: number,
   edge: number,
@@ -724,14 +799,31 @@ export async function placePaperBet(
   }
 
   // ── Edge concentration gates ─────────────────────────────────────────────
+  // Wave 1 (Phase 2 closeout): production track keeps the gate; experiment
+  // track (Tier B/C, £0 stake) is exempted because the gate exists to bound
+  // capital concentration risk and shadow bets carry no capital.
   {
     const blockCheck = shouldBlockBet(marketType, backOdds, options.liveTier ?? null);
     if (blockCheck.blocked) {
-      logger.warn(
-        { matchId, marketType, selectionName, backOdds, reason: blockCheck.reason },
-        "EDGE CONCENTRATION: bet blocked",
-      );
-      return logReject(blockCheck.reason!);
+      if (isShadowBet) {
+        logger.info(
+          { matchId, marketType, selectionName, backOdds, reason: blockCheck.reason, universeTier },
+          "Edge-concentration gate exempted for shadow bet",
+        );
+        await logShadowGateExemption(
+          "edge_concentration",
+          experimentTag ?? null,
+          blockCheck.reason ?? "edge concentration block",
+          null,
+          universeTier,
+        );
+      } else {
+        logger.warn(
+          { matchId, marketType, selectionName, backOdds, reason: blockCheck.reason },
+          "EDGE CONCENTRATION: bet blocked",
+        );
+        return logReject(blockCheck.reason!);
+      }
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -894,9 +986,20 @@ export async function placePaperBet(
     if (!liveLimits) {
       const bankrollFloor = Number((await getConfigValue("bankroll_floor")) ?? "200");
       if (effectiveBankroll <= bankrollFloor) {
-        return logReject(
-          `Bankroll £${effectiveBankroll.toFixed(2)} at or below paper floor £${bankrollFloor}`,
-        );
+        const reason = `Bankroll £${effectiveBankroll.toFixed(2)} at or below paper floor £${bankrollFloor}`;
+        if (isShadowBet) {
+          // Wave 1: shadow bets carry stake=0 and cannot affect bankroll, so
+          // the paper floor doesn't apply. Audit-log the exemption.
+          await logShadowGateExemption(
+            "paper_bankroll_floor",
+            experimentTag ?? null,
+            reason,
+            null,
+            universeTier,
+          );
+        } else {
+          return logReject(reason);
+        }
       }
     }
 
@@ -913,9 +1016,20 @@ export async function placePaperBet(
     const dailyLoss = await getTodaysLoss();
     const dailyLossLimit = effectiveBankroll * dailyLossLimitPct;
     if (dailyLoss >= dailyLossLimit) {
-      return logReject(
-        `Daily loss limit hit: £${dailyLoss.toFixed(2)} >= £${dailyLossLimit.toFixed(2)} (${(dailyLossLimitPct * 100).toFixed(0)}% of ${liveLimits ? "live" : "paper"} balance)`,
-      );
+      const reason = `Daily loss limit hit: £${dailyLoss.toFixed(2)} >= £${dailyLossLimit.toFixed(2)} (${(dailyLossLimitPct * 100).toFixed(0)}% of ${liveLimits ? "live" : "paper"} balance)`;
+      if (isShadowBet) {
+        // Wave 1: shadow bets cannot move the loss counter (stake=0), so the
+        // daily-loss circuit-breaker is exempted. Audit-log the exemption.
+        await logShadowGateExemption(
+          "daily_loss_limit",
+          experimentTag ?? null,
+          reason,
+          null,
+          universeTier,
+        );
+      } else {
+        return logReject(reason);
+      }
     }
 
     const weeklyOverrideStr = stratActive ? await getConfigValue("strategy_max_weekly_loss_pct") : null;
@@ -927,9 +1041,19 @@ export async function placePaperBet(
     const weeklyLoss = await getWeeklyLoss();
     const weeklyLossLimit = effectiveBankroll * weeklyLossLimitPct;
     if (weeklyLoss >= weeklyLossLimit) {
-      return logReject(
-        `Weekly loss limit hit: £${weeklyLoss.toFixed(2)} >= £${weeklyLossLimit.toFixed(2)} (${(weeklyLossLimitPct * 100).toFixed(0)}% of ${liveLimits ? "live" : "paper"} balance)`,
-      );
+      const reason = `Weekly loss limit hit: £${weeklyLoss.toFixed(2)} >= £${weeklyLossLimit.toFixed(2)} (${(weeklyLossLimitPct * 100).toFixed(0)}% of ${liveLimits ? "live" : "paper"} balance)`;
+      if (isShadowBet) {
+        // Wave 1: same architectural rationale as daily_loss_limit.
+        await logShadowGateExemption(
+          "weekly_loss_limit",
+          experimentTag ?? null,
+          reason,
+          null,
+          universeTier,
+        );
+      } else {
+        return logReject(reason);
+      }
     }
   }
 

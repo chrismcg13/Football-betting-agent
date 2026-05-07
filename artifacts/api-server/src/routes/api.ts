@@ -1993,6 +1993,67 @@ import { runOngoingAudit } from "../services/auditCron";
 import { runClvTimeBucketRetrospective } from "../services/oddsPapiRetrospective";
 import { syncDevToProd, getSyncStatus } from "../services/syncDevToProd";
 
+// Wave 1 (Phase 2 closeout): shadow-bet firehose monitor.
+// Three views in one response so "trickle vs firehose" is measurable without
+// raw SQL access:
+//   1. Daily shadow-vs-real bet counts per universe tier, last 14 days
+//   2. Last 24h compliance_logs rejections grouped by reason (catches gates
+//      that ARE rejecting shadow candidates — should trend toward zero
+//      after Wave 1 deploy except for legitimate non-shadow rejections)
+//   3. Last 24h shadow_bet_gate_exempted audit rows by gate (proves the
+//      exemption helper is firing correctly)
+router.get("/admin/shadow-bet-volume", async (_req, res) => {
+  try {
+    const dailyByTier = await db.execute(sql`
+      SELECT
+        DATE(placed_at AT TIME ZONE 'UTC') AS day,
+        COALESCE(universe_tier_at_placement, 'null') AS tier,
+        COUNT(*) FILTER (WHERE shadow_stake > 0) AS shadow,
+        COUNT(*) FILTER (WHERE shadow_stake IS NULL OR shadow_stake = 0) AS real,
+        ROUND(AVG(shadow_stake)::numeric FILTER (WHERE shadow_stake > 0), 4) AS avg_shadow_kelly_units
+      FROM paper_bets
+      WHERE placed_at > NOW() - INTERVAL '14 days' AND deleted_at IS NULL
+      GROUP BY 1, 2
+      ORDER BY 1 DESC, 2
+    `);
+
+    const rejectionReasons = await db.execute(sql`
+      SELECT
+        details->>'reason' AS reason,
+        COUNT(*) AS count
+      FROM compliance_logs
+      WHERE action_type = 'bet_rejected'
+        AND timestamp > NOW() - INTERVAL '24 hours'
+      GROUP BY 1
+      ORDER BY 2 DESC
+      LIMIT 20
+    `);
+
+    const exemptionsByGate = await db.execute(sql`
+      SELECT
+        SPLIT_PART(subject, ':', 2) AS gate,
+        COUNT(*) AS bucket_rows,
+        COALESCE(SUM((supporting_metrics->>'exemptionsInBucket')::int), 0) AS total_exemptions
+      FROM model_decision_audit_log
+      WHERE decision_type = 'shadow_bet_gate_exempted'
+        AND decision_at > NOW() - INTERVAL '24 hours'
+      GROUP BY 1
+      ORDER BY 3 DESC
+    `);
+
+    res.json({
+      success: true,
+      windowDays: 14,
+      dailyByTier: (dailyByTier as any).rows ?? [],
+      last24hRejections: (rejectionReasons as any).rows ?? [],
+      last24hExemptionsByGate: (exemptionsByGate as any).rows ?? [],
+    });
+  } catch (err) {
+    logger.error({ err }, "Failed to compute shadow-bet-volume diagnostic");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.get("/admin/experiments", async (_req, res) => {
   try {
     const experiments = await getExperimentsSummary();
