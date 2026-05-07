@@ -28,6 +28,15 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   { key: "hot_streak_weeks", value: "3" },
   { key: "hot_streak_min_bets_per_week", value: "5" },
   { key: "hot_streak_bonus", value: "15" },
+  // B1+B2 (2026-05-07): shadow-track noise floor. Set very low so almost
+  // every positive-EV opportunity flows through as £0 shadow learning data.
+  // shadow_min_edge_threshold is the absolute minimum edge required for a
+  // candidate to be retained as shadow (anything below is treated as noise
+  // / numerical-precision junk). shadow_min_opportunity_score is set to 0
+  // to capture every score level — the only true floor is positive net EV
+  // after commission (enforced separately in valueDetection).
+  { key: "shadow_min_edge_threshold", value: "0.005" },
+  { key: "shadow_min_opportunity_score", value: "0" },
 ];
 
 export async function runMigrations() {

@@ -843,7 +843,14 @@ export async function runTradingCycle(options?: {
 
       const isContrarian = validation?.isContrarian ?? false;
 
-      if (effectiveScore < minScore) {
+      // B1+B2 (2026-05-07): production score gate only applies to bets that
+      // valueDetection routed to the production track. Shadow-track candidates
+      // (Tier A near-misses + any Tier B/C bet that cleared the shadow floor)
+      // bypass this gate so they reach the dispatcher and become £0 learning
+      // bets. The gate is preserved for production-track bets to keep the
+      // real-stake rail's selectivity unchanged.
+      const candidatePlacementTrack = (bet as { placementTrack?: "production" | "shadow" }).placementTrack;
+      if (candidatePlacementTrack !== "shadow" && effectiveScore < minScore) {
         funnelScoreSkip++;
         logger.debug(
           { matchId: bet.matchId, score: effectiveScore, threshold: minScore, isContrarian },
@@ -1203,6 +1210,13 @@ export async function runTradingCycle(options?: {
         };
         const before = selectedBets.length;
         const kept = selectedBets.filter((c) => {
+          // B1+B2: shadow bets bypass capital-risk per-market floors. The
+          // OVER_UNDER_25 6% floor exists to limit stake exposure on a
+          // chronically-poor market, but £0 shadow capture has no capital
+          // risk and is exactly how the model relearns whether the market
+          // has recovered.
+          const ct = (c as { placementTrack?: "production" | "shadow" }).placementTrack;
+          if (ct === "shadow") return true;
           const floor = floors[c.marketType.toUpperCase()];
           if (floor === undefined) return true;
           const edge = Number(c.edge ?? 0);
@@ -1323,6 +1337,8 @@ export async function runTradingCycle(options?: {
       fairValueOdds: number;
       fairValueSource: string;
       validatorBestOdds: number | null;
+      universeTier?: string | null;
+      placementTrack: "production" | "shadow";
     }
 
     const betOrders: BetOrder[] = [];
@@ -1336,10 +1352,18 @@ export async function runTradingCycle(options?: {
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
-      // Phase 2.B.2: Tier B/C shadow bets bypass the Pinnacle pre-bet filter
-      // because, by definition, they're for leagues without reliable Pinnacle
-      // pricing. Tier A bets continue through the filter unchanged.
-      const isShadowBet = candidate.universeTier === "B" || candidate.universeTier === "C";
+      // Phase 2.B.2 + B1/B2 (2026-05-07): shadow bets bypass the Pinnacle
+      // pre-bet filter. Tier B/C lack reliable Pinnacle pricing by definition,
+      // and Tier A near-miss shadow bets are exactly the case where Pinnacle
+      // disagreement IS the learning signal — we want those captured at £0
+      // so the tier-ladder accumulates evidence on whether the model or
+      // Pinnacle is correct on borderline calls. Production-track Tier A bets
+      // continue through the filter unchanged.
+      const candidateTrack = (candidate as { placementTrack?: "production" | "shadow" }).placementTrack;
+      const isShadowBet =
+        candidateTrack === "shadow" ||
+        candidate.universeTier === "B" ||
+        candidate.universeTier === "C";
 
       let filterPassed = true;
       let filterEdgeCategory: string | null = null;
@@ -1380,8 +1404,13 @@ export async function runTradingCycle(options?: {
         }
       } else {
         logger.info(
-          { matchId: candidate.matchId, universeTier: candidate.universeTier, market: candidate.marketType },
-          "Phase 2.B.2 shadow bet — bypassing Pinnacle pre-bet filter (no Pinnacle line for Tier B/C leagues by design)",
+          {
+            matchId: candidate.matchId,
+            universeTier: candidate.universeTier,
+            placementTrack: candidateTrack,
+            market: candidate.marketType,
+          },
+          "Shadow bet — bypassing Pinnacle pre-bet filter (Tier B/C lacks Pinnacle, or Tier A near-miss where Pinnacle disagreement is the learning signal)",
         );
       }
 
@@ -1420,6 +1449,12 @@ export async function runTradingCycle(options?: {
         // Phase 2.B.2: tier carried through to placePaperBet for the
         // shadow-stake branch.
         universeTier: candidate.universeTier ?? null,
+        // B1+B2 (2026-05-07): placement-track signal from valueDetection.
+        // 'production' → real stake on Tier A; 'shadow' → £0 learning bet
+        // (Tier A near-miss OR any Tier B/C bet).
+        placementTrack: (candidate as { placementTrack?: "production" | "shadow" }).placementTrack ?? (
+          candidate.universeTier === "A" ? "production" : "shadow"
+        ),
       });
     }
 
@@ -1476,7 +1511,11 @@ export async function runTradingCycle(options?: {
           // Phase 2.B.2: tier propagated through so placePaperBet's shadow
           // -stake branch fires for Tier B/C bets (stake=0, shadow_stake=
           // full_Kelly × 0.25).
-          universeTier: order.universeTier,
+          universeTier: order.universeTier as "A" | "B" | "C" | null | undefined,
+          // B1+B2 (2026-05-07): placement-track is the authoritative shadow
+          // signal — covers Tier A near-misses (which would otherwise fall
+          // through the universeTier='A' check and become real-stake bets).
+          placementTrack: order.placementTrack,
         },
       );
 

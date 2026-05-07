@@ -714,6 +714,12 @@ export interface PaperBetOptions {
   // concentration gates are bypassed for shadow bets. 'A' (or null/
   // undefined) leaves the existing production-stake flow untouched.
   universeTier?: "A" | "B" | "C" | null;
+  // B1+B2 (2026-05-07): authoritative placement-track signal from
+  // valueDetection. When set to 'shadow', placement enters £0 shadow-stake
+  // mode regardless of universeTier — captures Tier A near-misses (bets
+  // below production threshold but above shadow floor) as learning data.
+  // When undefined, falls back to the universeTier-based check.
+  placementTrack?: "production" | "shadow" | null;
 }
 
 export async function placePaperBet(
@@ -748,10 +754,16 @@ export async function placePaperBet(
     fairValueSource = null,
     validatorBestOdds = null,
     universeTier = null,
+    placementTrack = null,
   } = options;
-  // Phase 2.B.2: shadow-bet flag. When set, placement bypasses min-stake /
-  // exposure / live-concentration gates and writes stake=0 + shadow_stake.
-  const isShadowBet = universeTier === "B" || universeTier === "C";
+  // Phase 2.B.2 + B1/B2 (2026-05-07): shadow-bet flag. Tier B/C are always
+  // shadow (no Pinnacle anchor by definition). Additionally, valueDetection
+  // can set placementTrack='shadow' for Tier A near-misses (positive-EV
+  // candidates below production threshold) — those are captured as £0
+  // learning bets too. When either trigger fires, placement bypasses
+  // min-stake / exposure / live-concentration gates and writes stake=0 +
+  // shadow_stake.
+  const isShadowBet = placementTrack === "shadow" || universeTier === "B" || universeTier === "C";
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;
   // Mutable: boosted bets that pre-qualify for Tier 1B get tagged "1B_boosted"

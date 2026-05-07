@@ -57,6 +57,12 @@ export interface ValueBet {
   actionableSource: string;
   fairValueOdds: number;
   fairValueSource: string;
+  // B1+B2 (2026-05-07): every positive-EV opportunity is captured. Tier A bets
+  // meeting full production thresholds (min_opportunity_score / min_edge_threshold)
+  // route to the real-stake rail; everything else (Tier A near-misses + any Tier
+  // B/C bet) routes to shadow at £0 stake. The placement track is decided here
+  // so paperTrading.ts can branch deterministically.
+  placementTrack: "production" | "shadow";
 }
 
 export interface EvaluationSummary {
@@ -744,6 +750,12 @@ export async function detectValueBets(options?: {
 
   const minEdge = Number(cfg.min_edge_threshold ?? "0.03");
   const minOppScore = Number(cfg.min_opportunity_score ?? "58");
+  // B1+B2 shadow-track floors: positive-EV near-misses below the production
+  // thresholds still flow through as £0 shadow bets (learning data). The
+  // shadow floors prevent pure noise — anything below these is dropped, but
+  // they're set low enough that almost every identified opportunity passes.
+  const shadowMinEdge = Number(cfg.shadow_min_edge_threshold ?? "0.005");
+  const shadowMinOppScore = Number(cfg.shadow_min_opportunity_score ?? "0");
   const minOddsThreshold = Number(cfg.min_odds_threshold ?? "1.40");
   const coldThreshold = Number(cfg.cold_market_threshold ?? "-10");
   const coldMinBets = Number(cfg.cold_market_min_bets ?? "10");
@@ -1101,7 +1113,13 @@ export async function detectValueBets(options?: {
       const effectiveMinEdge = DERIVED_MARKETS.has(oddsRow.marketType)
         ? Math.max(minEdge, 0.08)
         : minEdge;
-      if (edge < effectiveMinEdge) continue;
+      // B1+B2: drop only below the absolute shadow floor. Above-floor but
+      // below-production candidates fall through to the placement-track
+      // decision below and route to £0 shadow capture.
+      const effectiveShadowMinEdge = DERIVED_MARKETS.has(oddsRow.marketType)
+        ? Math.max(shadowMinEdge, 0.02)
+        : shadowMinEdge;
+      if (edge < effectiveShadowMinEdge) continue;
 
       const evCheck = commissionAdjustedEV(modelProb, backOdds, commRate);
       if (evCheck.netEV <= 0) {
@@ -1115,7 +1133,14 @@ export async function detectValueBets(options?: {
       const segKey = `${match.league}::${oddsRow.marketType}`;
       const segmentStats = segmentStatsMap.get(segKey) ?? { betCount: 0, wins: 0, losses: 0, totalPnl: 0, roi: 0 };
 
-      if (coldMarkets.has(segKey)) continue;
+      // B1+B2 (2026-05-07): cold-market cooldown moved to AFTER the
+      // placement-track decision below. The cooldown is a capital-risk
+      // gate (avoid stake on chronically-losing segments) — production-
+      // track bets keep it, shadow-track bets (£0, learning data) bypass
+      // it because they are exactly how the model relearns whether the
+      // segment has recovered. We compute the score first so we know
+      // whether this candidate routes to production or shadow.
+      const isColdSegment = coldMarkets.has(segKey);
 
       const streakBonus = hotStreakBonusMap.get(segKey) ?? 0;
       const leagueEdgeScore = leagueEdgeMap.get(match.league ?? "") ?? 50;
@@ -1190,9 +1215,32 @@ export async function detectValueBets(options?: {
       }
       const syncEligible = dataTier === "promoted";
 
-      // Both real and synthetic odds must meet the configured min_opportunity_score floor
+      // B1+B2 (2026-05-07): tier-aware placement-track decision. Every
+      // positive-EV opportunity above the shadow floor flows through —
+      // production-rail bets must be Tier A AND meet full production
+      // thresholds; everything else (Tier A near-misses + any Tier B/C bet
+      // that cleared the shadow floor) routes to £0 shadow capture so the
+      // tier-ladder gets continuous learning evidence.
       const effectiveMinScore = minOppScore;
-      const decision = opportunityScore >= effectiveMinScore ? "value_bet" : "skip_low_score";
+      const meetsProduction =
+        matchUniverseTier === "A" &&
+        opportunityScore >= effectiveMinScore &&
+        edge >= effectiveMinEdge;
+      const meetsShadow = opportunityScore >= shadowMinOppScore;
+      // Production-track bets respect the cold-market cooldown (capital-risk
+      // gate). Shadow-track bypasses — that's how the model relearns whether
+      // a chronically-losing segment has recovered.
+      const productionAllowed = meetsProduction && !isColdSegment;
+      const placementTrack: "production" | "shadow" | null = productionAllowed
+        ? "production"
+        : meetsShadow
+          ? "shadow"
+          : null;
+      const decision = placementTrack === "production"
+        ? "value_bet"
+        : placementTrack === "shadow"
+          ? "shadow_bet"
+          : "skip_low_score";
 
       // Runtime telemetry (not audit). Was being persisted into compliance_logs
       // at ~5k rows/cycle and bloating that table; now goes to file logs only.
@@ -1209,6 +1257,9 @@ export async function detectValueBets(options?: {
           calculatedEdge: edge,
           opportunityScore,
           minOppScore: effectiveMinScore,
+          shadowMinOppScore,
+          universeTier: matchUniverseTier,
+          placementTrack,
           segmentStats,
           hotStreakBonus: streakBonus,
           decision,
@@ -1219,7 +1270,7 @@ export async function detectValueBets(options?: {
         "value_detection_evaluation",
       );
 
-      if (opportunityScore >= effectiveMinScore) {
+      if (placementTrack !== null) {
         byMarketType[oddsRow.marketType] = (byMarketType[oddsRow.marketType] ?? 0) + 1;
         valueBets.push({
           matchId: match.id,
@@ -1249,6 +1300,7 @@ export async function detectValueBets(options?: {
           actionableSource,
           fairValueOdds,
           fairValueSource,
+          placementTrack,
         });
       }
     }
