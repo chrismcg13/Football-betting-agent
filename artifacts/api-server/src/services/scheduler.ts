@@ -2386,6 +2386,66 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("AF predictions ingestion scheduler active — 08:00 + 20:00 UTC daily");
 
+  // X2 (2026-05-07): referee assignment ingestion — daily 06:45 UTC.
+  cron.schedule("45 6 * * *", () => {
+    logger.info("Referee ingestion triggered (daily 06:45 UTC)");
+    void (async () => {
+      try {
+        const { captureRefereesForUpcoming } = await import("./apiFootball");
+        const r = await captureRefereesForUpcoming();
+        logger.info(r, "Referee ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "Referee ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Referee ingestion scheduler active — daily 06:45 UTC");
+
+  // X3 (2026-05-07): H2H ingestion — daily 07:00 UTC.
+  cron.schedule("0 7 * * *", () => {
+    logger.info("H2H ingestion triggered (daily 07:00 UTC)");
+    void (async () => {
+      try {
+        const { captureH2hForUpcoming } = await import("./apiFootball");
+        const r = await captureH2hForUpcoming();
+        logger.info(r, "H2H ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "H2H ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("H2H ingestion scheduler active — daily 07:00 UTC");
+
+  // X4 (2026-05-07): post-match fixture/events ingestion — daily 02:00 UTC.
+  cron.schedule("0 2 * * *", () => {
+    logger.info("Fixture-events ingestion triggered (daily 02:00 UTC)");
+    void (async () => {
+      try {
+        const { captureFixtureEventsForRecent } = await import("./apiFootball");
+        const r = await captureFixtureEventsForRecent();
+        logger.info(r, "Fixture-events ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "Fixture-events ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Fixture-events ingestion scheduler active — daily 02:00 UTC");
+
+  // X5 (2026-05-07): post-match fixture/players ingestion — daily 02:30 UTC.
+  cron.schedule("30 2 * * *", () => {
+    logger.info("Fixture-players ingestion triggered (daily 02:30 UTC)");
+    void (async () => {
+      try {
+        const { captureFixturePlayersForRecent } = await import("./apiFootball");
+        const r = await captureFixturePlayersForRecent();
+        logger.info(r, "Fixture-players ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "Fixture-players ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Fixture-players ingestion scheduler active — daily 02:30 UTC");
+
   // C3-lineup-features (2026-05-07): expected-XI refresh — daily 04:00 UTC,
   // after settlement so the refresh sees the latest captured lineups.
   // Zero new API calls — aggregates _lineup_data history into team_expected_xi.

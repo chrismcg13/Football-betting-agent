@@ -2087,14 +2087,29 @@ export async function capturePreKickoffLineups(): Promise<{
   const in90min = new Date(now.getTime() + 90 * 60 * 1000);
   const in30min = new Date(now.getTime() + 30 * 60 * 1000);
 
+  // X1 (2026-05-07): expanded scope to ALL Tier A/B/C upcoming matches in
+  // T-30-90min window (was: only matches with pending bets). Required so
+  // the C3-lineup-features expected-XI baseline accumulates lineup history
+  // across the full firehose universe, not just bets we already placed.
+  // De-duped via UNION so any match satisfying either criterion is included.
   const matchesWithBets = await db.execute(sql`
-    SELECT DISTINCT m.id, m.home_team, m.away_team, m.league, m.api_fixture_id, m.kickoff_time
-    FROM paper_bets pb
-    JOIN matches m ON pb.match_id = m.id
-    WHERE pb.status = 'pending'
-      AND m.status = 'scheduled'
-      AND m.kickoff_time BETWEEN ${in30min} AND ${in90min}
-      AND m.api_fixture_id IS NOT NULL
+    SELECT id, home_team, away_team, league, api_fixture_id, kickoff_time FROM (
+      SELECT DISTINCT m.id, m.home_team, m.away_team, m.league, m.api_fixture_id, m.kickoff_time
+      FROM paper_bets pb
+      JOIN matches m ON pb.match_id = m.id
+      WHERE pb.status = 'pending'
+        AND m.status = 'scheduled'
+        AND m.kickoff_time BETWEEN ${in30min} AND ${in90min}
+        AND m.api_fixture_id IS NOT NULL
+      UNION
+      SELECT m.id, m.home_team, m.away_team, m.league, m.api_fixture_id, m.kickoff_time
+      FROM matches m
+      JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+      WHERE m.status = 'scheduled'
+        AND m.kickoff_time BETWEEN ${in30min} AND ${in90min}
+        AND m.api_fixture_id IS NOT NULL
+        AND cc.universe_tier IN ('A', 'B', 'C')
+    ) sub
   `);
 
   if (matchesWithBets.rows.length === 0) {
@@ -2525,6 +2540,282 @@ export async function refreshExpectedXi(): Promise<{
     "Expected-XI refresh complete",
   );
   return { blobsProcessed, teamsTouched: teamsTouched.size, upserts };
+}
+
+// ─── X2 (2026-05-07): /fixtures referee ingestion ──────────────────────────
+// AF /fixtures?id=X returns the fixture object including .fixture.referee
+// (string name). We capture the assignment per upcoming Tier A/B/C
+// fixture; the rolling card-rate / pen-rate aggregate is computed on
+// demand from settled-bet outcomes.
+export async function captureRefereesForUpcoming(): Promise<{ checked: number; captured: number; skipped: number }> {
+  const targetRows = await db.execute(sql`
+    SELECT m.id, m.api_fixture_id
+    FROM matches m
+    JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+    LEFT JOIN match_referees mr ON mr.match_id = m.id
+    WHERE m.status = 'scheduled'
+      AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '72 hours'
+      AND m.api_fixture_id IS NOT NULL
+      AND cc.universe_tier IN ('A', 'B', 'C')
+      AND mr.match_id IS NULL
+    ORDER BY m.kickoff_time ASC
+    LIMIT 750
+  `);
+  const targets = (targetRows as any).rows ?? [];
+  let captured = 0;
+  let skipped = 0;
+  for (const row of targets) {
+    const fixtureId = Number(row.api_fixture_id);
+    if (!fixtureId || !(await canMakeRequest())) {
+      skipped++;
+      break;
+    }
+    try {
+      const data = await fetchApiFootball<{ fixture: { id: number; referee?: string | null } }[]>(
+        "/fixtures",
+        { id: fixtureId },
+      );
+      const referee = data?.[0]?.fixture?.referee;
+      if (!referee) { skipped++; continue; }
+      await db.execute(sql`
+        INSERT INTO match_referees (match_id, api_fixture_id, referee_name, captured_at)
+        VALUES (${Number(row.id)}, ${fixtureId}, ${referee}, NOW())
+        ON CONFLICT (match_id) DO UPDATE SET
+          referee_name = EXCLUDED.referee_name,
+          captured_at = EXCLUDED.captured_at
+      `);
+      captured++;
+    } catch (err) {
+      logger.warn({ err, fixtureId }, "Referee capture failed");
+      skipped++;
+    }
+  }
+  logger.info({ checked: targets.length, captured, skipped }, "Referee ingestion complete");
+  return { checked: targets.length, captured, skipped };
+}
+
+// ─── X3 (2026-05-07): /h2h ingestion per upcoming Tier A/B/C match ──────────
+interface ApiH2hMatch {
+  fixture: { date: string };
+  teams: { home: { id: number; name: string; winner?: boolean | null }; away: { id: number; name: string; winner?: boolean | null } };
+  goals: { home: number | null; away: number | null };
+}
+export async function captureH2hForUpcoming(): Promise<{ checked: number; captured: number; skipped: number }> {
+  const targetRows = await db.execute(sql`
+    SELECT m.id, m.api_fixture_id, m.home_team, m.away_team
+    FROM matches m
+    JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+    LEFT JOIN match_h2h h ON h.match_id = m.id
+    WHERE m.status = 'scheduled'
+      AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '72 hours'
+      AND m.api_fixture_id IS NOT NULL
+      AND cc.universe_tier IN ('A', 'B', 'C')
+      AND h.match_id IS NULL
+    ORDER BY m.kickoff_time ASC
+    LIMIT 500
+  `);
+  const targets = (targetRows as any).rows ?? [];
+  let captured = 0;
+  let skipped = 0;
+  for (const row of targets) {
+    const fixtureId = Number(row.api_fixture_id);
+    if (!fixtureId || !(await canMakeRequest())) {
+      skipped++;
+      break;
+    }
+    try {
+      // AF /fixtures/headtohead expects h2h=team1Id-team2Id which we'd need
+      // team_api_ids for. We don't reliably have those mapped, so use the
+      // fixture-id-based H2H endpoint which AF also supports via team names
+      // pull. Fallback: skip if unable to derive team IDs.
+      const fixData = await fetchApiFootball<{ teams?: { home?: { id?: number }; away?: { id?: number } } }[]>(
+        "/fixtures",
+        { id: fixtureId },
+      );
+      const homeId = fixData?.[0]?.teams?.home?.id;
+      const awayId = fixData?.[0]?.teams?.away?.id;
+      if (!homeId || !awayId) { skipped++; continue; }
+      const h2hData = await fetchApiFootball<ApiH2hMatch[]>(
+        "/fixtures/headtohead",
+        { h2h: `${homeId}-${awayId}`, last: 10 },
+      );
+      if (!h2hData) { skipped++; continue; }
+      const matches = h2hData;
+      let homeWins = 0;
+      let awayWins = 0;
+      let draws = 0;
+      let totalGoals = 0;
+      let btts = 0;
+      let validCount = 0;
+      for (const m of matches) {
+        const hg = m.goals?.home;
+        const ag = m.goals?.away;
+        if (hg == null || ag == null) continue;
+        validCount++;
+        totalGoals += hg + ag;
+        if (hg > 0 && ag > 0) btts++;
+        if (m.teams.home.id === homeId) {
+          if (hg > ag) homeWins++;
+          else if (ag > hg) awayWins++;
+          else draws++;
+        } else {
+          // Team identity flipped — reverse the comparison
+          if (ag > hg) homeWins++;
+          else if (hg > ag) awayWins++;
+          else draws++;
+        }
+      }
+      const avgGoals = validCount > 0 ? totalGoals / validCount : null;
+      const bttsRate = validCount > 0 ? btts / validCount : null;
+      await db.execute(sql`
+        INSERT INTO match_h2h (match_id, captured_at, h2h_count, home_wins, away_wins, draws, avg_total_goals, btts_rate, raw)
+        VALUES (${Number(row.id)}, NOW(), ${validCount}, ${homeWins}, ${awayWins}, ${draws},
+                ${avgGoals}, ${bttsRate}, ${JSON.stringify(matches)}::jsonb)
+        ON CONFLICT (match_id) DO UPDATE SET
+          captured_at = EXCLUDED.captured_at,
+          h2h_count = EXCLUDED.h2h_count,
+          home_wins = EXCLUDED.home_wins,
+          away_wins = EXCLUDED.away_wins,
+          draws = EXCLUDED.draws,
+          avg_total_goals = EXCLUDED.avg_total_goals,
+          btts_rate = EXCLUDED.btts_rate,
+          raw = EXCLUDED.raw
+      `);
+      captured++;
+    } catch (err) {
+      logger.warn({ err, fixtureId }, "H2H capture failed");
+      skipped++;
+    }
+  }
+  logger.info({ checked: targets.length, captured, skipped }, "H2H ingestion complete");
+  return { checked: targets.length, captured, skipped };
+}
+
+// ─── X4 (2026-05-07): /fixtures/events post-match ───────────────────────────
+interface ApiFixtureEvent {
+  time: { elapsed: number; extra?: number | null };
+  team: { id: number; name: string };
+  player?: { id?: number | null; name?: string | null };
+  type: string;
+  detail?: string;
+}
+export async function captureFixtureEventsForRecent(): Promise<{ checked: number; captured: number; skipped: number }> {
+  const targetRows = await db.execute(sql`
+    SELECT DISTINCT m.id, m.api_fixture_id
+    FROM matches m
+    LEFT JOIN fixture_events fe ON fe.match_id = m.id
+    WHERE m.status = 'completed'
+      AND m.kickoff_time BETWEEN NOW() - INTERVAL '7 days' AND NOW()
+      AND m.api_fixture_id IS NOT NULL
+      AND fe.match_id IS NULL
+    ORDER BY m.kickoff_time DESC
+    LIMIT 300
+  `);
+  const targets = (targetRows as any).rows ?? [];
+  let captured = 0;
+  let skipped = 0;
+  for (const row of targets) {
+    const fixtureId = Number(row.api_fixture_id);
+    if (!fixtureId || !(await canMakeRequest())) {
+      skipped++;
+      break;
+    }
+    try {
+      const data = await fetchApiFootball<ApiFixtureEvent[]>(
+        "/fixtures/events",
+        { fixture: fixtureId },
+      );
+      if (!data || data.length === 0) { skipped++; continue; }
+      const matchId = Number(row.id);
+      for (const ev of data) {
+        await db.execute(sql`
+          INSERT INTO fixture_events (api_fixture_id, match_id, event_minute, event_extra_minute, event_type, event_detail, team_id, team_name, player_name, captured_at)
+          VALUES (${fixtureId}, ${matchId}, ${ev.time.elapsed}, ${ev.time.extra ?? null}, ${ev.type}, ${ev.detail ?? null},
+                  ${ev.team?.id ?? null}, ${ev.team?.name ?? null}, ${ev.player?.name ?? null}, NOW())
+        `);
+      }
+      captured++;
+    } catch (err) {
+      logger.warn({ err, fixtureId }, "Fixture-events capture failed");
+      skipped++;
+    }
+  }
+  logger.info({ checked: targets.length, captured, skipped }, "Fixture-events ingestion complete");
+  return { checked: targets.length, captured, skipped };
+}
+
+// ─── X5 (2026-05-07): /fixtures/players post-match ──────────────────────────
+interface ApiFixturePlayerTeam {
+  team: { id: number; name: string };
+  players?: Array<{
+    player: { id?: number | null; name?: string | null };
+    statistics?: Array<{
+      games?: { minutes?: number | null; rating?: string | null; substitute?: boolean | null; position?: string | null };
+      goals?: { total?: number | null; assists?: number | null };
+    }>;
+  }>;
+}
+export async function captureFixturePlayersForRecent(): Promise<{ checked: number; captured: number; skipped: number }> {
+  const targetRows = await db.execute(sql`
+    SELECT DISTINCT m.id, m.api_fixture_id
+    FROM matches m
+    LEFT JOIN fixture_player_stats fps ON fps.match_id = m.id
+    WHERE m.status = 'completed'
+      AND m.kickoff_time BETWEEN NOW() - INTERVAL '7 days' AND NOW()
+      AND m.api_fixture_id IS NOT NULL
+      AND fps.match_id IS NULL
+    ORDER BY m.kickoff_time DESC
+    LIMIT 300
+  `);
+  const targets = (targetRows as any).rows ?? [];
+  let captured = 0;
+  let skipped = 0;
+  for (const row of targets) {
+    const fixtureId = Number(row.api_fixture_id);
+    if (!fixtureId || !(await canMakeRequest())) {
+      skipped++;
+      break;
+    }
+    try {
+      const data = await fetchApiFootball<ApiFixturePlayerTeam[]>(
+        "/fixtures/players",
+        { fixture: fixtureId },
+      );
+      if (!data || data.length === 0) { skipped++; continue; }
+      const matchId = Number(row.id);
+      for (const teamBlock of data) {
+        for (const p of teamBlock.players ?? []) {
+          const stats = p.statistics?.[0] ?? {};
+          const playerName = p.player?.name ?? "(unknown)";
+          const minutes = stats.games?.minutes ?? null;
+          const rating = stats.games?.rating ? parseFloat(stats.games.rating) : null;
+          const isSub = Boolean(stats.games?.substitute);
+          const isStarter = !isSub && (minutes != null && minutes > 0);
+          const goals = stats.goals?.total ?? 0;
+          const assists = stats.goals?.assists ?? 0;
+          await db.execute(sql`
+            INSERT INTO fixture_player_stats (api_fixture_id, match_id, team_id, player_id, player_name, position, rating, minutes_played, is_starter, is_substitute, goals, assists, captured_at)
+            VALUES (${fixtureId}, ${matchId}, ${teamBlock.team.id}, ${p.player?.id ?? null}, ${playerName},
+                    ${stats.games?.position ?? null}, ${rating}, ${minutes}, ${isStarter}, ${isSub}, ${goals}, ${assists}, NOW())
+            ON CONFLICT (api_fixture_id, team_id, player_name) DO UPDATE SET
+              rating = EXCLUDED.rating,
+              minutes_played = EXCLUDED.minutes_played,
+              is_starter = EXCLUDED.is_starter,
+              is_substitute = EXCLUDED.is_substitute,
+              goals = EXCLUDED.goals,
+              assists = EXCLUDED.assists,
+              captured_at = EXCLUDED.captured_at
+          `);
+        }
+      }
+      captured++;
+    } catch (err) {
+      logger.warn({ err, fixtureId }, "Fixture-players capture failed");
+      skipped++;
+    }
+  }
+  logger.info({ checked: targets.length, captured, skipped }, "Fixture-players ingestion complete");
+  return { checked: targets.length, captured, skipped };
 }
 
 // ─── C3a (2026-05-07): /predictions ingestion ───────────────────────────────

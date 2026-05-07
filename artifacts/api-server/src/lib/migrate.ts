@@ -1535,6 +1535,99 @@ export async function runMigrations() {
         ON team_standings(api_league_id, season)
     `);
 
+    // X2 (2026-05-07): match referee assignment + per-referee aggregate stats.
+    // AF /fixtures returns referee name in the fixture object. For each
+    // upcoming Tier A/B/C match we capture the assignment; the rolling
+    // aggregate (cards/match, pens/match etc.) is computed on demand.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS match_referees (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL UNIQUE REFERENCES matches(id) ON DELETE CASCADE,
+        api_fixture_id INTEGER NOT NULL,
+        referee_name TEXT NOT NULL,
+        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS match_referees_referee_idx
+        ON match_referees(referee_name)
+    `);
+
+    // X3 (2026-05-07): head-to-head history per upcoming match. Stores last
+    // N H2H outcomes from AF. Used as feature: h2h_home_win_rate /
+    // h2h_btts_rate / h2h_avg_total_goals.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS match_h2h (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL UNIQUE REFERENCES matches(id) ON DELETE CASCADE,
+        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        h2h_count INTEGER NOT NULL,
+        home_wins INTEGER NOT NULL,
+        away_wins INTEGER NOT NULL,
+        draws INTEGER NOT NULL,
+        avg_total_goals NUMERIC(5,2),
+        btts_rate NUMERIC(4,3),
+        raw JSONB NOT NULL
+      )
+    `);
+
+    // X4 (2026-05-07): minute-by-minute fixture events for recently-settled
+    // fixtures. Refines per-archetype FH/2H scaling factors with empirical
+    // goal-timing data.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS fixture_events (
+        id SERIAL PRIMARY KEY,
+        api_fixture_id INTEGER NOT NULL,
+        match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
+        event_minute INTEGER NOT NULL,
+        event_extra_minute INTEGER,
+        event_type TEXT NOT NULL,
+        event_detail TEXT,
+        team_id INTEGER,
+        team_name TEXT,
+        player_name TEXT,
+        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS fixture_events_match_idx
+        ON fixture_events(match_id) WHERE match_id IS NOT NULL
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS fixture_events_fixture_idx
+        ON fixture_events(api_fixture_id)
+    `);
+
+    // X5 (2026-05-07): per-fixture player ratings + sub data. Feeds the
+    // expected-XI baseline (C3-lineup-features) and future goalscorer
+    // markets (deferred TIER B from C7).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS fixture_player_stats (
+        id SERIAL PRIMARY KEY,
+        api_fixture_id INTEGER NOT NULL,
+        match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
+        team_id INTEGER NOT NULL,
+        player_id INTEGER,
+        player_name TEXT NOT NULL,
+        position TEXT,
+        rating NUMERIC(4,2),
+        minutes_played INTEGER,
+        is_starter BOOLEAN NOT NULL DEFAULT FALSE,
+        is_substitute BOOLEAN NOT NULL DEFAULT FALSE,
+        goals INTEGER NOT NULL DEFAULT 0,
+        assists INTEGER NOT NULL DEFAULT 0,
+        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS fixture_player_stats_unique
+        ON fixture_player_stats(api_fixture_id, team_id, player_name)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS fixture_player_stats_match_idx
+        ON fixture_player_stats(match_id) WHERE match_id IS NOT NULL
+    `);
+
     // C3-lineup-features (2026-05-07): expected starting XI per team, derived
     // from accumulating _lineup_data history. start_count = how many of the
     // recent N lineups this player has started in. Used to compute the
