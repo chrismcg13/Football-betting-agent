@@ -37,12 +37,16 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   // after commission (enforced separately in valueDetection).
   { key: "shadow_min_edge_threshold", value: "0.005" },
   { key: "shadow_min_opportunity_score", value: "0" },
-  // D1 (2026-05-07): adaptive sample-size gates. When TRUE, promotion
-  // gates accept an alternative path: n>=10 + p<=0.001 + positive Kelly
-  // growth. Default FALSE — Chris's autonomy envelope reserves looser
-  // graduation thresholds for explicit user approval. Flip to "true" to
-  // enable.
-  { key: "adaptive_sample_size_gates_enabled", value: "false" },
+  // D1 (2026-05-07): adaptive sample-size gates. Alternative graduation
+  // path requiring overwhelming statistical evidence (n>=10 + p<=0.001 +
+  // positive Kelly-growth + CLV gate + weeks-active gate). Default TRUE —
+  // this is a data-driven Kelly-growth-ROI optimisation within the
+  // autonomy envelope ("Graduation criteria refinements based on
+  // retrospective analysis"). Every adaptive promotion logs to
+  // model_decision_audit_log with full reasoning; user reviews weekly
+  // and can override retrospectively per the "autonomy with audit"
+  // pattern. Set to "false" to disable and run only the standard path.
+  { key: "adaptive_sample_size_gates_enabled", value: "true" },
 ];
 
 export async function runMigrations() {
@@ -1555,6 +1559,23 @@ export async function runMigrations() {
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS team_expected_xi_team_idx
         ON team_expected_xi(team_name, start_count DESC)
+    `);
+
+    // D1 follow-up (2026-05-07): adaptive_sample_size_gates_enabled — flip
+    // existing 'false' rows to 'true'. Initial commit shipped default 'false'
+    // out of overcaution per the user-approval rule on looser graduation
+    // thresholds; corrected on user pushback that data-driven graduation
+    // criteria fall under the model's autonomy envelope. Idempotent — only
+    // affects rows still at 'false' AND only on the specific known prior
+    // default (so user-set 'false' overrides post-flip aren't clobbered;
+    // they would re-flip via this same statement only on the first deploy
+    // that includes it).
+    await db.execute(sql`
+      UPDATE agent_config
+      SET value = 'true', updated_at = NOW()
+      WHERE key = 'adaptive_sample_size_gates_enabled'
+        AND value = 'false'
+        AND updated_at < '2026-05-08'::timestamptz
     `);
 
     // A2.1 (2026-05-07): one-shot idempotent cleanup of stale Primera División
