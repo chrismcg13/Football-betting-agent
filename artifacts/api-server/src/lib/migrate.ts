@@ -1535,6 +1535,31 @@ export async function runMigrations() {
         ON team_standings(api_league_id, season)
     `);
 
+    // F1 (2026-05-07): bankroll snapshots — true Kelly-growth measurement.
+    // Pre-placement and post-settlement rows let us compute proper
+    // LN(bankroll_after / bankroll_before) per bet vs the current
+    // LN(1 + pnl/stake) proxy. Required for accurate Kelly-growth-rate
+    // reporting per Phase 2 brief (primary optimisation metric).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS bankroll_snapshots (
+        id SERIAL PRIMARY KEY,
+        taken_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        paper_bankroll NUMERIC(14,2) NOT NULL,
+        real_bankroll NUMERIC(14,2),
+        source TEXT NOT NULL,
+        bet_id INTEGER REFERENCES paper_bets(id) ON DELETE SET NULL,
+        notes TEXT
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS bankroll_snapshots_taken_at_idx
+        ON bankroll_snapshots(taken_at DESC)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS bankroll_snapshots_bet_idx
+        ON bankroll_snapshots(bet_id) WHERE bet_id IS NOT NULL
+    `);
+
     // X2 (2026-05-07): match referee assignment + per-referee aggregate stats.
     // AF /fixtures returns referee name in the fixture object. For each
     // upcoming Tier A/B/C match we capture the assignment; the rolling

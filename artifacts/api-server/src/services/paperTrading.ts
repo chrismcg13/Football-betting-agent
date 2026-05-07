@@ -346,12 +346,37 @@ export async function applyBatchPnl(
     },
     timestamp: new Date(),
   });
+  // F1 (2026-05-07): bankroll snapshot AFTER batch PnL applied. Together
+  // with pre-bet snapshots, lets us compute true LN(after/before) per bet
+  // for proper Kelly-growth-rate measurement (vs current proxy LN(1+pnl/stake)).
+  void db.execute(sql`
+    INSERT INTO bankroll_snapshots (paper_bankroll, source, notes, taken_at)
+    VALUES (${after}, ${reason}, ${JSON.stringify(extraDetails ?? {})}, NOW())
+  `).catch((err) => logger.warn({ err }, "F1 bankroll snapshot write failed (non-fatal)"));
   logger.info(
     { previous: before, delta, updated: after, reason },
     "Bankroll updated via applyBatchPnl",
   );
   return { before, after, delta };
 }
+
+/**
+ * F1 (2026-05-07): pre-placement bankroll snapshot. Called from
+ * placePaperBet just before INSERT so settleBets can compute true
+ * LN(bankroll_after / bankroll_before) per bet.
+ */
+async function writePrePlacementSnapshot(betId: number | null, reason: string): Promise<void> {
+  try {
+    const bankroll = await getConfigBankroll();
+    await db.execute(sql`
+      INSERT INTO bankroll_snapshots (paper_bankroll, source, bet_id, notes, taken_at)
+      VALUES (${bankroll}, ${reason}, ${betId}, NULL, NOW())
+    `);
+  } catch (err) {
+    logger.warn({ err, betId, reason }, "F1 pre-placement snapshot failed (non-fatal)");
+  }
+}
+export { writePrePlacementSnapshot };
 
 /**
  * Set bankroll to an absolute value (used for explicit resets, e.g. £100 baseline).
@@ -763,7 +788,7 @@ export async function placePaperBet(
   // learning bets too. When either trigger fires, placement bypasses
   // min-stake / exposure / live-concentration gates and writes stake=0 +
   // shadow_stake.
-  const isShadowBet = placementTrack === "shadow" || universeTier === "B" || universeTier === "C";
+  let isShadowBet = placementTrack === "shadow" || universeTier === "B" || universeTier === "C";
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;
   // Mutable: boosted bets that pre-qualify for Tier 1B get tagged "1B_boosted"
@@ -940,7 +965,18 @@ export async function placePaperBet(
       .limit(1);
     if (!config || !config.hasStatistics) {
       const isCornersMarket = marketType.startsWith("TOTAL_CORNERS");
-      return logReject(`No ${isCornersMarket ? "corners" : "cards"} stats coverage for league: ${match.league} (${match.country})`);
+      // Firehose leak fix (2026-05-07): shadow bets (£0 stake, learning data)
+      // bypass stats-coverage requirements per "shadow bypasses every capital-
+      // risk gate" durable rule. Production-track real-stake still rejected.
+      if (!isShadowBet) {
+        return logReject(`No ${isCornersMarket ? "corners" : "cards"} stats coverage for league: ${match.league} (${match.country})`);
+      }
+      await logShadowGateExemption(
+        "stats_coverage_required",
+        experimentTag ?? null,
+        `No ${isCornersMarket ? "corners" : "cards"} stats coverage for league: ${match.league}`,
+        0, // shadow_stake not yet computed at this point
+      );
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -1397,8 +1433,28 @@ export async function placePaperBet(
     );
   }
 
+  // Firehose leak fix (2026-05-07): production-track bets with Kelly-stake
+  // < £2 (Betfair Exchange minimum) used to be rejected outright. That
+  // dropped 81 opportunities in last 6h of firehose flow. Fix: fall
+  // through to shadow capture instead — the model still gets the learning
+  // data on the bet thesis even though we can't place real stake.
   if (!isShadowBet && stake < 2) {
-    return logReject(`Calculated stake £${stake} is below minimum £2`);
+    const fullKellyStake = stake;
+    const SHADOW_KELLY_FRACTION = 0.25;
+    shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+    shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+    stake = 0;
+    isShadowBet = true; // Reclassify so downstream gates treat as shadow
+    await logShadowGateExemption(
+      "min_stake_fallthrough",
+      experimentTag ?? null,
+      `Production-track Kelly-stake £${fullKellyStake} below £2 floor — captured as shadow`,
+      shadowStake,
+    );
+    logger.info(
+      { matchId, marketType, universeTier, fullKellyStake, shadowStake, shadowStakeKellyFraction },
+      "Min-stake fallthrough — converted production-track to shadow capture",
+    );
   }
 
   if (isLiveMode()) {
@@ -1618,6 +1674,13 @@ export async function placePaperBet(
       .returning();
 
     bet = betResult[0];
+
+    // F1 (2026-05-07): pre-placement bankroll snapshot. Tied to bet_id so
+    // settleBets can compute true LN(bankroll_after / bankroll_before)
+    // per bet. Fire-and-forget; placement never waits or fails on snapshot.
+    if (bet?.id) {
+      void writePrePlacementSnapshot(bet.id, "pre_placement");
+    }
 
     await db.insert(complianceLogsTable).values({
       actionType: "bet_placed",

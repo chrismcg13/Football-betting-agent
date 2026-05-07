@@ -1118,20 +1118,27 @@ export async function auditWorldCupParticipantCoverage(): Promise<WcAuditResult>
   // Many international teams have country-name-as-team (e.g. "England", "Brazil")
   // Match these against competition_config.country (case-insensitive) to identify
   // candidate countries with WC participation.
+  // Y3 fix (2026-05-07): strip gender/age-group suffixes (" W", " M", " U21",
+  // " U23", " (W)") so women's/youth WC qualifiers normalise to base country.
   const candidateCountries = new Set<string>();
+  const SUFFIX_RE = /\s*(\(?w\)?|\(?m\)?|u-?(?:1[5-9]|2[0-3]))\s*$/i;
   for (const team of wcTeams) {
-    const normalized = team.toLowerCase().replace(/-/g, " ").trim();
-    candidateCountries.add(normalized);
+    const stripped = team.replace(SUFFIX_RE, "").trim();
+    const normalized = stripped.toLowerCase().replace(/-/g, " ").replace(/\s+/g, " ").trim();
+    if (normalized) candidateCountries.add(normalized);
   }
 
-  // Step 2: which of those countries have at least one active top_flight_men
-  // club league in competition_config?
+  // Step 2: which of those countries have at least ONE active league of any
+  // archetype in competition_config? Y3 fix (2026-05-07): broadened from
+  // archetype='top_flight_men' to any-archetype because women's WC
+  // participants have women's not men's leagues, and youth WC participants
+  // have youth leagues.
   const coverageRows = await db.execute(sql`
     SELECT DISTINCT LOWER(REPLACE(country, '-', ' ')) AS country
     FROM competition_config
-    WHERE archetype = 'top_flight_men'
-      AND universe_tier IN ('A', 'B', 'C')
+    WHERE universe_tier IN ('A', 'B', 'C')
       AND is_active = true
+      AND country IS NOT NULL
   `);
   const coveredCountries = new Set<string>(
     ((coverageRows as any).rows ?? []).map((r: any) => r.country),
@@ -1147,15 +1154,17 @@ export async function auditWorldCupParticipantCoverage(): Promise<WcAuditResult>
   let promotionsApplied = 0;
   let insertsApplied = 0;
   for (const country of gapCountries) {
-    // Path A: Find a Tier E top_flight_men row for this country (best
-    // candidate for promotion).
+    // Path A: Find a Tier E/D row for this country (any archetype) —
+    // Y3 v2 broadened beyond top_flight_men to handle women's/youth WC
+    // participants.
     const candidateRow = await db.execute(sql`
       SELECT id, name, country
       FROM competition_config
       WHERE LOWER(REPLACE(country, '-', ' ')) = ${country}
-        AND archetype = 'top_flight_men'
         AND universe_tier IN ('E', 'D')
-      ORDER BY universe_tier_decided_at DESC NULLS LAST
+      ORDER BY
+        CASE archetype WHEN 'top_flight_men' THEN 1 WHEN 'lower_division' THEN 2 ELSE 3 END,
+        universe_tier_decided_at DESC NULLS LAST
       LIMIT 1
     `);
     let candidate = (candidateRow as any).rows?.[0];
