@@ -532,6 +532,68 @@ export async function computeFeaturesForMatch(
     await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
   }
 
+  // C3-lineup-features (2026-05-07): key_player_missing_count per side.
+  // Compares actual startXI (from _lineup_data) against the team's top-11
+  // expected starters in team_expected_xi. Returns null until we have
+  // ≥3 captured lineups for a team (cold-start handling). Stored only —
+  // not yet in FEATURE_NAMES; future retrain incorporates as predictor.
+  try {
+    const lineupRow = await db
+      .select({ value: featuresTable.featureValue })
+      .from(featuresTable)
+      .where(
+        and(
+          eq(featuresTable.matchId, matchId),
+          eq(featuresTable.featureName, "_lineup_data"),
+        ),
+      )
+      .limit(1);
+
+    if (lineupRow.length > 0 && lineupRow[0]?.value) {
+      const parsed = JSON.parse(lineupRow[0].value);
+      const lineups = parsed?.lineups ?? [];
+      // Match lineups to home/away by team name (lineup blob has 'team' field).
+      const homeLineupRaw = lineups.find((l: any) => l.team === homeTeam);
+      const awayLineupRaw = lineups.find((l: any) => l.team === awayTeam);
+
+      for (const [side, teamName, lineup] of [
+        ["home", homeTeam, homeLineupRaw],
+        ["away", awayTeam, awayLineupRaw],
+      ] as Array<["home" | "away", string, { startXI?: string[] } | undefined]>) {
+        if (!lineup?.startXI || lineup.startXI.length < 5) continue;
+        // Pull team's top-11 expected starters by start_count.
+        const expectedRows = await db.execute(sql`
+          SELECT player_name, start_count
+          FROM team_expected_xi
+          WHERE team_name = ${teamName}
+          ORDER BY start_count DESC
+          LIMIT 11
+        `);
+        const expected = ((expectedRows as any).rows ?? []) as Array<{
+          player_name: string;
+          start_count: number;
+        }>;
+        // Cold-start gate: need ≥3 caps on at least one player to consider
+        // the expected-XI baseline meaningful.
+        const maxCount = expected.length > 0 ? expected[0].start_count : 0;
+        if (maxCount < 3) continue;
+
+        const actualSet = new Set(lineup.startXI.map((p) => p.toLowerCase()));
+        let missingCount = 0;
+        for (const e of expected) {
+          if (!actualSet.has(e.player_name.toLowerCase())) missingCount++;
+        }
+        await upsertFeature(
+          matchId,
+          side === "home" ? "home_key_player_missing_count" : "away_key_player_missing_count",
+          missingCount,
+        );
+      }
+    }
+  } catch (err) {
+    logger.debug({ err, matchId }, "Key-player-missing feature computation failed (non-fatal)");
+  }
+
   // C3b (2026-05-07): AF predictions as stored features. Not in FEATURE_NAMES
   // yet (model retrain required to USE them); stored so future retrain can
   // incorporate as a comparator signal (model agreement / disagreement with

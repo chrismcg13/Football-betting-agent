@@ -1,7 +1,66 @@
 # C3c — Lineup-trigger cancel-and-rebet for pending real-stake bets
 
-**Status:** PROPOSAL. **No code lands until explicit user approval.**
+**Status:** ⏸ **DEFERRED** as of 2026-05-07. Reasons + future trigger rule below.
 **Authored:** 2026-05-07. **Predecessors:** C3a (predictions/standings ingestion), C3b (predictions feature wiring).
+
+---
+
+## 0. Why deferred (2026-05-07 decision)
+
+Independent verification of Betfair Exchange API rules confirmed Chris's
+understanding:
+- Unmatched LIMIT bets can be cancelled or `replaceOrders`-amended for free
+  pre-event. (`cancelOrders` already wired at `betfairLive.ts:556`.)
+- Matched portions are binding and cannot be cancelled — only laid off.
+
+But the SQL audit showed:
+- We are running in PAPER mode. Zero real bets placed on Betfair Exchange in
+  the last 14 days (`real_stake_with_betfair_bet_id = 0`).
+- When live, the cancellable surface (unmatched portions of LIMIT+LAPSE
+  bets sitting in the book pre-event) will be a small fraction of placements
+  — Tier A high-liquidity markets typically match in seconds.
+
+The bigger CLV opportunity is in **lineup-aware features** (the model gets
+smarter, the placement pipeline benefits on every bet, not just the tiny
+unmatched slice). Shipped instead as **C3-lineup-features**: expected-XI
+baseline + `key_player_missing_count` feature derivation.
+
+## 0.1 Future re-activation rule (when we go live)
+
+When real-money trading goes live on Betfair Exchange, the simplest viable
+cancel-rebet logic is:
+
+> **Per pending unmatched bet, after lineup arrival (~T-60min): re-fetch
+> latest odds + recompute model_probability with refreshed feature set
+> (incl. lineup-aware features). If the new edge would NOT have qualified
+> the bet at original placement time (i.e. recomputed
+> opportunityScore < min_opportunity_score OR edge < min_edge_threshold),
+> issue a cancelOrders call for the unmatched portion only.**
+
+Properties:
+- Conservative — only cancels when the bet wouldn't have been placed at all
+  with current information. Doesn't try to predict or hedge; just exits.
+- Bounded — only the unmatched portion. Matched portions ride to settlement.
+- Free — cancelOrders on unmatched LIMIT bets has zero exchange cost.
+- Reversible — if model prob recovers in the next cycle, a fresh placement
+  can re-enter at current price.
+
+Implementation cost when re-activated: ~2-3h (the trigger logic + a
+single `cancelOrders` call wrapped in a daily-cap guard). No
+`bet_cancel_proposals` table needed for this rule — the decision is
+deterministic, not probabilistic.
+
+## 0.2 What stays out of scope even at re-activation
+
+- Lay-off hedging on already-matched bets (locks in realized PnL — separate
+  product decision, requires explicit user approval each time)
+- `replaceOrders`-style price improvements (chasing the line — different
+  trading philosophy, not a defensive cancel)
+- Cancellations during bet-delay window (rejected by Betfair API)
+
+---
+
+## (Original proposal preserved below for archival reference)
 
 ---
 

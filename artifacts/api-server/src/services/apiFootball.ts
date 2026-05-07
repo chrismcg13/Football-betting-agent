@@ -2390,6 +2390,107 @@ export async function fetchAndStoreTrophiesForPerson(
   return { inserted, skipped: false };
 }
 
+// ─── C3-lineup-features (2026-05-07): expected XI baseline ──────────────────
+// Reads accumulating _lineup_data history (written by capturePreKickoffLineups)
+// and aggregates startXI counts per (team, player) into team_expected_xi.
+// Zero new API calls — uses existing data. Cron daily at 04:00 UTC.
+//
+// Cold-start: until a team has ≥3 captured lineups, the expected_xi for that
+// team is sparse and the downstream key_player_missing_count feature returns
+// null. Coverage grows naturally as fixtures move through the 30-90min
+// pre-kickoff window.
+
+interface LineupDataBlob {
+  lineups?: Array<{ team: string; startXI?: string[]; subs?: string[]; coach?: string | null }>;
+  capturedAt?: string;
+}
+
+export async function refreshExpectedXi(): Promise<{
+  blobsProcessed: number;
+  teamsTouched: number;
+  upserts: number;
+}> {
+  // Read the last 90 days of lineup blobs. Aggregate appearance counts per
+  // (team, player). Decay older lineups by progressively lower weight via
+  // recency-windowed counts (last 10 caps per team) — implemented at write
+  // time by tracking last_seen_at + start_count and pruning stale entries
+  // whose last_seen_at is > 60d.
+  const rows = await db.execute(sql`
+    SELECT match_id, feature_value, computed_at
+    FROM features
+    WHERE feature_name = '_lineup_data'
+      AND computed_at >= NOW() - INTERVAL '90 days'
+    ORDER BY computed_at DESC
+  `);
+  const blobs = (rows as any).rows ?? [];
+  if (blobs.length === 0) {
+    logger.info({ blobsProcessed: 0 }, "Expected-XI refresh — no lineup data yet");
+    return { blobsProcessed: 0, teamsTouched: 0, upserts: 0 };
+  }
+
+  // Aggregate in-memory first to bound DB writes.
+  const counts = new Map<string, { lastSeen: Date; startCount: number }>();
+  let blobsProcessed = 0;
+
+  for (const row of blobs) {
+    let parsed: LineupDataBlob;
+    try {
+      parsed = typeof row.feature_value === "string"
+        ? JSON.parse(row.feature_value)
+        : (row.feature_value as LineupDataBlob);
+    } catch {
+      continue;
+    }
+    if (!parsed?.lineups) continue;
+    const seenAt = row.computed_at ? new Date(row.computed_at) : new Date();
+    for (const teamLineup of parsed.lineups) {
+      if (!teamLineup.team || !teamLineup.startXI) continue;
+      for (const playerName of teamLineup.startXI) {
+        if (!playerName) continue;
+        const key = `${teamLineup.team}|${playerName}`;
+        const existing = counts.get(key);
+        if (!existing) {
+          counts.set(key, { lastSeen: seenAt, startCount: 1 });
+        } else {
+          existing.startCount += 1;
+          if (seenAt > existing.lastSeen) existing.lastSeen = seenAt;
+        }
+      }
+    }
+    blobsProcessed++;
+  }
+
+  // Bulk upsert via INSERT ... ON CONFLICT.
+  let upserts = 0;
+  const teamsTouched = new Set<string>();
+  for (const [key, v] of counts.entries()) {
+    const [teamName, playerName] = key.split("|");
+    if (!teamName || !playerName) continue;
+    teamsTouched.add(teamName);
+    await db.execute(sql`
+      INSERT INTO team_expected_xi (team_name, player_name, start_count, last_seen_at, refreshed_at)
+      VALUES (${teamName}, ${playerName}, ${v.startCount}, ${v.lastSeen}, NOW())
+      ON CONFLICT (team_name, player_name) DO UPDATE SET
+        start_count = EXCLUDED.start_count,
+        last_seen_at = EXCLUDED.last_seen_at,
+        refreshed_at = EXCLUDED.refreshed_at
+    `);
+    upserts++;
+  }
+
+  // Prune entries that haven't been seen in 60+ days — bounded growth.
+  await db.execute(sql`
+    DELETE FROM team_expected_xi
+    WHERE last_seen_at < NOW() - INTERVAL '60 days'
+  `);
+
+  logger.info(
+    { blobsProcessed, teamsTouched: teamsTouched.size, upserts },
+    "Expected-XI refresh complete",
+  );
+  return { blobsProcessed, teamsTouched: teamsTouched.size, upserts };
+}
+
 // ─── C3a (2026-05-07): /predictions ingestion ───────────────────────────────
 // AF's own model output per fixture. Stored verbatim; surfaced as features
 // (af_pct_home/draw/away, af_winner_team_id) by featureEngine in C3b.

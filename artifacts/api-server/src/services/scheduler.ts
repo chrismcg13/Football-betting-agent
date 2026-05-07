@@ -2386,6 +2386,23 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("AF predictions ingestion scheduler active — 08:00 + 20:00 UTC daily");
 
+  // C3-lineup-features (2026-05-07): expected-XI refresh — daily 04:00 UTC,
+  // after settlement so the refresh sees the latest captured lineups.
+  // Zero new API calls — aggregates _lineup_data history into team_expected_xi.
+  cron.schedule("0 4 * * *", () => {
+    logger.info("Expected-XI refresh triggered (daily 04:00 UTC)");
+    void (async () => {
+      try {
+        const { refreshExpectedXi } = await import("./apiFootball");
+        const r = await refreshExpectedXi();
+        logger.info(r, "Expected-XI refresh complete");
+      } catch (err) {
+        logger.error({ err }, "Expected-XI refresh failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Expected-XI refresh scheduler active — daily 04:00 UTC");
+
   // C3a (2026-05-07): AF /standings ingestion — daily 06:30 UTC.
   // ~240 active leagues, one call each, idempotent upsert.
   cron.schedule("30 6 * * *", () => {

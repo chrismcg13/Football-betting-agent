@@ -1525,6 +1525,32 @@ export async function runMigrations() {
         ON team_standings(api_league_id, season)
     `);
 
+    // C3-lineup-features (2026-05-07): expected starting XI per team, derived
+    // from accumulating _lineup_data history. start_count = how many of the
+    // recent N lineups this player has started in. Used to compute the
+    // key_player_missing_count feature: when a match's actual lineup is
+    // captured at T-60min, count how many of the team's top-11 expected
+    // starters are NOT in the actual startXI. High count = sharper
+    // signal that team is weakened.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS team_expected_xi (
+        id SERIAL PRIMARY KEY,
+        team_name TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        start_count INTEGER NOT NULL DEFAULT 0,
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS team_expected_xi_unique
+        ON team_expected_xi(team_name, player_name)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS team_expected_xi_team_idx
+        ON team_expected_xi(team_name, start_count DESC)
+    `);
+
     // A2.1 (2026-05-07): one-shot idempotent cleanup of stale Primera División
     // bias contamination. The country-blind bug in auditCron (fixed in
     // ece5d4f) wrote a single Bolivia bias observation (-0.5240) onto all 9
