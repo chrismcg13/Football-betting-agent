@@ -1363,6 +1363,46 @@ export async function runMigrations() {
         ON player_trophies(person_api_id, person_type)
     `);
 
+    // 2026-05-07: prevent matches-table fixture-level duplicates.
+    // Pre-this-commit, AF and Betfair ingestion paths each checked existence
+    // by their own external id (api_fixture_id / betfair_event_id), so the
+    // same real fixture sometimes ended up with multiple match_id rows. That
+    // bypassed the paper_bets canonical-selection unique index (different
+    // match_ids = different partitions) and double-counted predictions in
+    // metrics. The application code now also fixture-key-dedups before
+    // inserting; this constraint is the DB-side guarantee.
+    //
+    // Idempotent + safe: only adds the constraint if (a) it doesn't exist
+    // yet AND (b) no fixture-level dupes are present. If dupes exist, logs
+    // a warning and skips — operator runs scripts/dedup-matches-fixture-level.sql
+    // on Neon to clean up, then the constraint takes hold on next migrate.
+    await db.execute(sql`
+      DO $$
+      DECLARE
+        dupes_count INT;
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'matches_unique_fixture_key'
+        ) THEN
+          SELECT COUNT(*) INTO dupes_count
+          FROM (
+            SELECT 1 FROM matches
+            GROUP BY home_team, away_team, kickoff_time
+            HAVING COUNT(*) > 1
+          ) x;
+
+          IF dupes_count = 0 THEN
+            ALTER TABLE matches
+              ADD CONSTRAINT matches_unique_fixture_key
+              UNIQUE (home_team, away_team, kickoff_time);
+            RAISE NOTICE 'matches_unique_fixture_key constraint added';
+          ELSE
+            RAISE WARNING 'matches has % fixture-level duplicate groups — run scripts/dedup-matches-fixture-level.sql before constraint can be added', dupes_count;
+          END IF;
+        END IF;
+      END $$
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

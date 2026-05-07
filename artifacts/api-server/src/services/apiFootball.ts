@@ -1673,6 +1673,35 @@ export async function ingestFixturesForDiscoveredLeagues(): Promise<{
         const awayTeamId = f.teams?.away?.id;
 
         if (existing.length === 0) {
+          // Fixture-key dedup (2026-05-07): Betfair-driven ingestion may
+          // have already inserted this real fixture under its eventId.
+          // Re-checking by (home, away, kickoff) before inserting prevents
+          // the matches table from accumulating duplicate fixture rows.
+          const existingByFixtureKey = await db
+            .select({ id: matchesTable.id })
+            .from(matchesTable)
+            .where(and(
+              eq(matchesTable.homeTeam, homeTeamName),
+              eq(matchesTable.awayTeam, awayTeamName),
+              eq(matchesTable.kickoffTime, kickoffTime),
+            ))
+            .limit(1);
+
+          if (existingByFixtureKey.length > 0) {
+            // Link AF's afKey + fixtureId to the existing Betfair-sourced
+            // row instead of creating a duplicate fixture.
+            const mid = existingByFixtureKey[0]!.id;
+            await db.update(matchesTable)
+              .set({ betfairEventId: afKey, apiFixtureId: fixtureId, status: "scheduled" })
+              .where(eq(matchesTable.id, mid));
+            fixturesUpdated++;
+            if (homeTeamId && awayTeamId) {
+              await upsertFeature(mid, "_af_home_team_id", homeTeamId);
+              await upsertFeature(mid, "_af_away_team_id", awayTeamId);
+            }
+            continue;
+          }
+
           const inserted = await db.insert(matchesTable).values({
             homeTeam: homeTeamName,
             awayTeam: awayTeamName,

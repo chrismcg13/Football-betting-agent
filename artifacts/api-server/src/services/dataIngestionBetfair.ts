@@ -4,7 +4,7 @@ import {
   oddsSnapshotsTable,
   complianceLogsTable,
 } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
   listCompetitions,
@@ -76,12 +76,38 @@ export async function runBetfairIngestion(): Promise<void> {
 
     if (existing.length === 0) {
       const { home, away } = parseTeams(ev.event.name);
+      const kickoffTime = new Date(ev.event.openDate);
+
+      // Fixture-key dedup (2026-05-07): API-Football may have already
+      // inserted this real fixture under its own apiFixtureId. Re-checking
+      // by (home, away, kickoff) before inserting prevents the matches
+      // table from accumulating duplicate fixture rows that bypass the
+      // paper_bets canonical-selection unique index.
+      const existingByFixtureKey = await db
+        .select({ id: matchesTable.id })
+        .from(matchesTable)
+        .where(and(
+          eq(matchesTable.homeTeam, home),
+          eq(matchesTable.awayTeam, away),
+          eq(matchesTable.kickoffTime, kickoffTime),
+        ))
+        .limit(1);
+
+      if (existingByFixtureKey.length > 0) {
+        // Link Betfair's eventId to the existing AF-sourced row instead of
+        // creating a duplicate fixture.
+        await db.update(matchesTable)
+          .set({ betfairEventId: ev.event.id })
+          .where(eq(matchesTable.id, existingByFixtureKey[0]!.id));
+        continue;
+      }
+
       await db.insert(matchesTable).values({
         homeTeam: home,
         awayTeam: away,
         league: "Unknown",
         country: ev.event.countryCode ?? "Unknown",
-        kickoffTime: new Date(ev.event.openDate),
+        kickoffTime,
         status: "scheduled",
         betfairEventId: ev.event.id,
       });
