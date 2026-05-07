@@ -2169,7 +2169,7 @@ export function startScheduler(): void {
   // Betfair-first reverse-mapping: daily at 07:00 UTC (sub-phase 2 plan §3.8).
   // Reverse-maps Betfair's soccer competition list against API-Football,
   // populates Tier D for unmatched, archetype-labels every row.
-  // Dry-run by default — flip BETFAIR_REVERSE_MAPPING_DRY_RUN=false to enable
+  // Writes by default (Wave 3) — set BETFAIR_REVERSE_MAPPING_DRY_RUN=true to suppress
   // writes after reviewing 1-3 dry-run reports.
   cron.schedule("0 7 * * *", () => {
     logger.info("Betfair-first reverse-mapping triggered by scheduler");

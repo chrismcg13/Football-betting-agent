@@ -11,9 +11,11 @@
  *   - docs/phase-2-subphase-2-plan.md (sub-phase 2 plan)
  *   - docs/archetype-labelling-rules.md (archetype cascade)
  *
- * Behaviour: dry-run by default. Reads BETFAIR_REVERSE_MAPPING_DRY_RUN env;
- * defaults to "true" if unset. Flip to "false" via env var on VPS to enable
- * writes. The cron is idempotent — safe to re-run.
+ * Behaviour: writes by default (Wave 3, 2026-05-07). Reads
+ * BETFAIR_REVERSE_MAPPING_DRY_RUN env; defaults to "false" (write mode) if
+ * unset. Set BETFAIR_REVERSE_MAPPING_DRY_RUN=true to suppress writes when
+ * iterating locally. The cron is idempotent — safe to re-run. Writes are
+ * positively scoped per §3.5 below (insert-only / fill-NULL).
  *
  * Scope per the sub-phase 2 plan §3.5 insert-only contract:
  *   - May INSERT new Tier D rows (Betfair-only, api_football_id=NULL).
@@ -493,7 +495,12 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
   const startedAt = Date.now();
   const runId = `bfrm-${startedAt}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const dryRun = (process.env.BETFAIR_REVERSE_MAPPING_DRY_RUN ?? "true").toLowerCase() === "true";
+  // Wave 3 (2026-05-07): default flipped from "true" to "false". Phase 2 is
+  // out of initial-rollout and the universe-expansion writes are insert-only
+  // (new Tier D rows, fill-NULL on existing rows) per §3.5. The dry-run
+  // safety net stays available — set BETFAIR_REVERSE_MAPPING_DRY_RUN=true to
+  // re-enable diff-only mode for local iteration.
+  const dryRun = (process.env.BETFAIR_REVERSE_MAPPING_DRY_RUN ?? "false").toLowerCase() === "true";
 
   logger.info({ runId, dryRun }, "betfair_reverse_mapping_starting");
 

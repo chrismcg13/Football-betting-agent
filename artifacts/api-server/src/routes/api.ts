@@ -1972,7 +1972,7 @@ router.post("/leagues/ingest-fixtures", async (_req, res) => {
 
 // ─────────────────────────────────────────────
 // POST /api/leagues/betfair-reverse-mapping/run — sub-phase 2 cron (manual trigger).
-// Honours BETFAIR_REVERSE_MAPPING_DRY_RUN env (default 'true' — log diff, no writes).
+// Honours BETFAIR_REVERSE_MAPPING_DRY_RUN env (default 'false' since Wave 3 — set true to log diff only).
 // ─────────────────────────────────────────────
 router.post("/leagues/betfair-reverse-mapping/run", async (_req, res) => {
   try {
