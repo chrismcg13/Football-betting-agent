@@ -3716,11 +3716,53 @@ export async function pinnaclePreBetFilter(params: {
   let pinnacleImplied = params.pinnacleImplied ?? null;
 
   if (!pinnacleOdds || !pinnacleImplied) {
+    // 2026-05-07: data-coverage gate. Previously returned passed=true when
+    // Pinnacle data was absent — i.e., bets sailed through without any
+    // closing-line validation. Diagnostic showed BTTS bets (36/36 with
+    // no Pinnacle reference; -£468 over 31 settled) were the prime victim
+    // of this hole: API-Football's Pinnacle feed doesn't include BTTS,
+    // and OddsPapi's Pinnacle fetch isn't pulling BTTS either, so the
+    // model was sizing aggressively against unanchored "edge".
+    //
+    // New default: reject when Pinnacle anchor is unavailable. Tier B/C
+    // shadow bets are exempted upstream (scheduler.ts:1347 — they don't
+    // reach this filter at all by design). Override available via env
+    // ALLOW_BETS_WITHOUT_PINNACLE=true for emergency / testing only.
+    const allowOverride = process.env["ALLOW_BETS_WITHOUT_PINNACLE"] === "true";
+    if (allowOverride) {
+      return {
+        passed: true,
+        edgePct: 0,
+        edgeCategory: "standard",
+        filterReason: null,
+        pinnacleOdds: null,
+        pinnacleImplied: null,
+        lineDirection: lineDir,
+        adjustedMinEdge: 2,
+      };
+    }
+
+    await db.insert(filteredBetsTable).values({
+      matchId: params.matchId,
+      marketType: params.marketType,
+      selectionName: params.selectionName,
+      modelProb: String(params.modelProbability),
+      pinnacleImplied: null,
+      pinnacleOdds: null,
+      edgePct: null,
+      filterReason: `No Pinnacle anchor for ${params.marketType} — refusing to bet without closing-line validation`,
+      modelOdds: String(1 / params.modelProbability),
+      marketOdds: String(params.marketOdds),
+      opportunityScore: String(params.opportunityScore),
+      league: params.league,
+      createdAt: new Date(),
+    }).catch(() => {});
+
     return {
-      passed: true,
+      passed: false,
       edgePct: 0,
-      edgeCategory: "standard",
-      filterReason: null,
+      edgeCategory: "filtered",
+      filterReason: `No Pinnacle anchor for ${params.marketType} — bet rejected (set ALLOW_BETS_WITHOUT_PINNACLE=true to override)`,
       pinnacleOdds: null,
       pinnacleImplied: null,
       lineDirection: lineDir,
