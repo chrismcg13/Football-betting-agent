@@ -1999,6 +1999,21 @@ router.post("/leagues/tier-e-reevaluate/run", async (_req, res) => {
   }
 });
 
+// Sub-phase 4.A (2026-05-08): manual trigger for exchange book sweep.
+// Captures betfair_exchange odds for the 27 verified market types
+// (incl. ASIAN_HANDICAP, DRAW_NO_BET, HTFT, ODD_OR_EVEN, TEAM_A/B_*,
+// WIN_TO_NIL, OVER_UNDER 0.5/5.5/6.5/7.5/8.5, FH_GOALS_*).
+router.post("/admin/run-exchange-sweep", async (_req, res) => {
+  try {
+    const { runExchangeBookSweep } = await import("../services/exchangeBookSweep");
+    const result = await runExchangeBookSweep({ hoursAhead: 48 });
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual exchange book sweep failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Sub-phase 4.B (2026-05-08): manual trigger for Betfair market-type discovery.
 router.post("/admin/run-betfair-market-discovery", async (_req, res) => {
   try {
