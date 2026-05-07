@@ -532,6 +532,33 @@ export async function computeFeaturesForMatch(
     await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
   }
 
+  // C3b (2026-05-07): AF predictions as stored features. Not in FEATURE_NAMES
+  // yet (model retrain required to USE them); stored so future retrain can
+  // incorporate as a comparator signal (model agreement / disagreement with
+  // AF's own prediction). Null-safe: skip writes when no row exists.
+  try {
+    const afRow = await db.execute(sql`
+      SELECT af_pct_home, af_pct_draw, af_pct_away
+      FROM af_predictions
+      WHERE match_id = ${matchId}
+        OR (match_id IS NULL AND api_fixture_id = (
+          SELECT api_fixture_id FROM matches WHERE id = ${matchId}
+        ))
+      LIMIT 1
+    `);
+    const afPred = (afRow as any).rows?.[0];
+    if (afPred) {
+      const home = parseFloat(afPred.af_pct_home ?? "");
+      const draw = parseFloat(afPred.af_pct_draw ?? "");
+      const away = parseFloat(afPred.af_pct_away ?? "");
+      if (Number.isFinite(home)) await upsertFeature(matchId, "af_pct_home", home / 100);
+      if (Number.isFinite(draw)) await upsertFeature(matchId, "af_pct_draw", draw / 100);
+      if (Number.isFinite(away)) await upsertFeature(matchId, "af_pct_away", away / 100);
+    }
+  } catch (err) {
+    logger.debug({ err, matchId }, "AF predictions feature lookup failed (non-fatal)");
+  }
+
   logger.info({ matchId, featureCount: features.length }, "Features saved");
 }
 
