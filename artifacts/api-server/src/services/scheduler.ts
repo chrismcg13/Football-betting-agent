@@ -1987,6 +1987,40 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Gate monitor scheduler active — daily 04:00 UTC");
 
+  // Phase 3 A4 (2026-05-08): post-flip operational jobs. Both run every
+  // 15 min. Pre-flip (live_mode_active != 'true') they short-circuit as
+  // no-ops, so no harm in scheduling them now — they'll start working
+  // automatically when the flip-to-live transaction lands.
+  cron.schedule("*/15 * * * *", () => {
+    void (async () => {
+      try {
+        const { runStopConditionMonitor } = await import("./stopConditionMonitor");
+        const r = await runStopConditionMonitor();
+        if (r.live_mode_active) {
+          logger.info(r, "Stop condition monitor evaluation complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Stop condition monitor evaluation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Stop condition monitor scheduler active — every 15 min UTC (no-op pre-flip)");
+
+  cron.schedule("*/15 * * * *", () => {
+    void (async () => {
+      try {
+        const { runHalfKellyRamp } = await import("./halfKellyRamp");
+        const r = await runHalfKellyRamp();
+        if (r.live_mode_active) {
+          logger.info(r, "Half-Kelly ramp evaluation complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Half-Kelly ramp evaluation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Half-Kelly ramp scheduler active — every 15 min UTC (no-op pre-flip)");
+
   // 2026-05-08 (§4.2 of root-cause-analysis): cron health monitor.
   // Runs every 5 min. Compares each tracked cron's last successful run
   // against expected cadence; inserts gate-style alert rows in

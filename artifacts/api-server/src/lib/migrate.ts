@@ -1930,6 +1930,46 @@ export async function runMigrations() {
       )
     `);
 
+    // Phase 3 A4 (2026-05-08): post-flip operational tables.
+    // stop_condition_actions: append-only log of every halt/alert/graduation
+    // emitted by the stop-condition monitor, half-Kelly ramp, and continuous-
+    // graduation paths. One row per state-transition event.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS stop_condition_actions (
+        id SERIAL PRIMARY KEY,
+        evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        action_type TEXT NOT NULL,
+        scope_path TEXT,
+        market_type TEXT,
+        league TEXT,
+        reason TEXT NOT NULL,
+        metric_name TEXT,
+        metric_value NUMERIC,
+        threshold_value NUMERIC
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_stop_condition_actions_evaluated_at
+        ON stop_condition_actions(evaluated_at DESC)
+    `);
+    // live_ramp_review_required: surfaces scopes that hit the half-Kelly
+    // ramp threshold (Path P:50, Path S:100) but rolling-N net ROI ≤ 0%.
+    // Idempotent — at most one unresolved row per (market_type, league).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS live_ramp_review_required (
+        id SERIAL PRIMARY KEY,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        scope_path TEXT NOT NULL,
+        market_type TEXT NOT NULL,
+        league TEXT NOT NULL,
+        n INTEGER NOT NULL,
+        rolling_net_roi NUMERIC NOT NULL,
+        threshold INTEGER NOT NULL,
+        resolved_at TIMESTAMPTZ,
+        resolution TEXT
+      )
+    `);
+
     // Switchover-transaction whitelist snapshot.
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS live_whitelist (

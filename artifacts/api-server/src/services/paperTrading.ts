@@ -1847,13 +1847,41 @@ export async function placePaperBet(
             .set({ status: "pending" })
             .where(eq(paperBetsTable.id, bet.id));
         } else if (match?.betfairEventId) {
+          // Phase 3 §1.7 / §11.7 (2026-05-08): apply live_whitelist
+          // kelly_fraction_override per scope. New graduations sit at 0.5 so
+          // first 50 (Path P) / 100 (Path S) live bets size at half Kelly;
+          // halfKellyRamp cron ratchets to 1.0 once rolling-N net ROI > 0.
+          // Pre-flip / non-whitelisted scopes never reach this branch
+          // (checkLivePlacementGates blocks them upstream), so this is a
+          // pure multiplier on already-allowed live bets.
+          let liveStake = stake;
+          if (
+            liveGates.kellyFractionOverride != null &&
+            liveGates.kellyFractionOverride < 1.0 &&
+            liveGates.kellyFractionOverride > 0
+          ) {
+            const preMultStake = liveStake;
+            liveStake = Math.round(preMultStake * liveGates.kellyFractionOverride * 100) / 100;
+            const newPotentialProfit = Math.round(liveStake * (backOdds - 1) * 100) / 100;
+            await db.update(paperBetsTable)
+              .set({ stake: String(liveStake), potentialProfit: String(newPotentialProfit) })
+              .where(eq(paperBetsTable.id, bet.id));
+            logger.info(
+              {
+                betId: bet.id, marketType, league: match.league,
+                preMultStake, liveStake, kellyFractionOverride: liveGates.kellyFractionOverride,
+                path: liveGates.path,
+              },
+              "Live placement: live_whitelist kelly_fraction_override applied",
+            );
+          }
           const liveResult = await placeLiveBetOnBetfair({
             internalBetId: bet.id,
             betfairEventId: match.betfairEventId,
             marketType,
             selectionName,
             odds: backOdds,
-            stake,
+            stake: liveStake,
             homeTeam: match.homeTeam,
             awayTeam: match.awayTeam,
           });

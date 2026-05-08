@@ -220,6 +220,57 @@ export async function runGateMonitor(): Promise<GateMonitorResult> {
     result.diagnostic_inserted = ((insertResult as any).rows ?? []).length > 0;
   }
 
+  // ── Post-flip continuous Path P/S graduation (A4.3) ──────────────────────
+  // After live_mode_active='true', any new scope that meets Path P (n≥50,
+  // ROI>0, CLV>0) or Path S (n≥400, ROI≥5%, time-ordered split-half ≥3%)
+  // criteria gets added to live_whitelist as a new active row. Existing
+  // active rows for the same (market_type, league) are NOT re-inserted —
+  // continuous graduation is additive, not replacement.
+  const liveModeActive = (await getConfig("live_mode_active")) === "true";
+  if (liveModeActive) {
+    const newGraduates = await db.execute(sql`
+      WITH candidates AS (
+        SELECT 'P' AS path, market_type, league, n, scope_net_roi, scope_net_clv, share_of_agg_pnl
+        FROM switchover_whitelist
+        UNION ALL
+        SELECT 'S' AS path, market_type, league, n, net_roi AS scope_net_roi,
+               NULL::numeric AS scope_net_clv, NULL::numeric AS share_of_agg_pnl
+        FROM path_s_scope_status
+        WHERE path_s_pass = true
+      )
+      INSERT INTO live_whitelist (path, market_type, league, n, scope_net_roi, scope_net_clv, share_of_agg_pnl, kelly_fraction_override, active)
+      SELECT c.path, c.market_type, c.league, c.n, c.scope_net_roi, c.scope_net_clv, c.share_of_agg_pnl, 0.5, true
+      FROM candidates c
+      WHERE NOT EXISTS (
+        SELECT 1 FROM live_whitelist w
+        WHERE w.market_type = c.market_type
+          AND w.league = c.league
+          AND w.path = c.path
+          AND w.active = true
+      )
+      RETURNING id, path, market_type, league
+    `);
+    const newRows = (((newGraduates as any).rows ?? []) as Array<{
+      id: number; path: string; market_type: string; league: string;
+    }>);
+    if (newRows.length > 0) {
+      logger.info(
+        { count: newRows.length, scopes: newRows },
+        "gate_monitor: post-flip continuous graduation — new scopes added to live_whitelist",
+      );
+      for (const ng of newRows) {
+        await db.execute(sql`
+          INSERT INTO stop_condition_actions (action_type, scope_path, market_type, league, reason, metric_name, metric_value, threshold_value)
+          VALUES (
+            'continuous_graduation', ${ng.path}, ${ng.market_type}, ${ng.league},
+            ${`Path ${ng.path} scope newly cleared post-flip — added to live_whitelist at half-Kelly`},
+            NULL, NULL, NULL
+          )
+        `);
+      }
+    }
+  }
+
   logger.info(result, "gate_monitor evaluated");
   return result;
 }
