@@ -4,7 +4,7 @@
  *
  * Background: today's trading cycle hung deterministically on a vps-relay
  * HTTP call that never resolved, holding tradingCycleRunning=true and
- * blocking every subsequent */5min cron tick. The hot-patched fix put
+ * blocking every subsequent 5-min cron tick. The hot-patched fix put
  * stale-detection inside that one function. This module generalises it:
  * any in-process mutex registered here gets the same treatment.
  *
