@@ -2405,6 +2405,19 @@ router.post("/admin/run-adaptive-recommender", async (_req, res) => {
   }
 });
 
+// 2026-05-08: Z4-v2 manual trigger. Used to validate the Bayesian tier
+// ladder behaves correctly before enabling the cron via z4_v2_enabled.
+router.post("/admin/run-tier-ladder-v2", async (_req, res) => {
+  try {
+    const { runAutonomousTierLadderV2 } = await import("../services/autonomousTierLadderV2");
+    const r = await runAutonomousTierLadderV2();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual Z4-v2 tier ladder failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/run-daily-discovery-sweep", async (_req, res) => {
   try {
     const { runDailyDiscoverySweep } = await import("../services/oddsPapi");

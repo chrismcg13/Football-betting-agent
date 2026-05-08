@@ -894,8 +894,32 @@ export async function detectValueBets(options?: {
   const configRows = await db.select().from(agentConfigTable);
   const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
 
-  const minEdge = Number(cfg.min_edge_threshold ?? "0.03");
-  const minOppScore = Number(cfg.min_opportunity_score ?? "58");
+  // 2026-05-08: minEdge / minOppScore now sourced via adaptive recommender
+  // with fallback chain (tier_market → market_type → global → agent_config
+  // → hardcoded). The agent_config values become last-resort defaults; the
+  // adaptive recommender overrides them weekly based on Bayesian Kelly-
+  // growth posterior. Per-bet resolveScoped() further refines per-scope.
+  // The hardcoded "0.03" / "58" defaults are preserved as ultimate fallbacks
+  // if both adaptive_thresholds and agent_config are empty.
+  const { getActiveThreshold } = await import("./adaptiveThresholdRecommender");
+  const adaptiveMinEdge = await getActiveThreshold({
+    thresholdName: "min_edge_threshold",
+    marketType: "_global", universeTier: null,
+  });
+  const adaptiveMinOpp = await getActiveThreshold({
+    thresholdName: "min_opportunity_score",
+    marketType: "_global", universeTier: null,
+  });
+  const minEdge = Number.isFinite(adaptiveMinEdge.value) && adaptiveMinEdge.value > 0
+    ? adaptiveMinEdge.value
+    : Number(cfg.min_edge_threshold ?? "0.03");
+  const minOppScore = Number.isFinite(adaptiveMinOpp.value) && adaptiveMinOpp.value > 0
+    ? adaptiveMinOpp.value
+    : Number(cfg.min_opportunity_score ?? "58");
+  logger.info(
+    { minEdge, minOppScore, edgeSource: adaptiveMinEdge.source, oppSource: adaptiveMinOpp.source },
+    "Value detection: adaptive thresholds resolved",
+  );
 
   // Z1+Z5 (2026-05-07): pre-load all scoped threshold overrides into
   // in-memory maps. Auto-tuned weekly by autonomousThresholdRevision Z3

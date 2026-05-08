@@ -28,6 +28,8 @@ import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 // ── Configuration constants ────────────────────────────────────────────────
+// Pinnacle-edge specific (legacy — preserved for backward compat). For
+// other thresholds, see THRESHOLD_BOUNDS above.
 const THRESHOLD_FLOOR = 0.005;          // 0.5%
 const THRESHOLD_CEILING = 0.05;         // 5%
 const PER_SCOPE_SAMPLE_FLOOR = 100;     // n>=100 before per-scope overrides apply
@@ -35,7 +37,7 @@ const MAX_MOVE_PER_CYCLE = 0.005;       // ±0.5pp per week
 const MONTE_CARLO_DRAWS = 10_000;
 const POSTERIOR_LOWER_PERCENTILE = 0.05; // 5th percentile of log-growth posterior
 
-// Edge buckets, in percentage points
+// Edge buckets, in percentage points (model-vs-Pinnacle edge)
 const EDGE_BUCKETS: Array<{ name: string; lower: number; upper: number }> = [
   { name: "0-0.5",  lower: 0,    upper: 0.5  },
   { name: "0.5-1",  lower: 0.5,  upper: 1.0  },
@@ -47,6 +49,37 @@ const EDGE_BUCKETS: Array<{ name: string; lower: number; upper: number }> = [
   { name: "4-5",    lower: 4.0,  upper: 5.0  },
   { name: "5+",     lower: 5.0,  upper: Infinity },
 ];
+
+// 2026-05-08: model-vs-market edge buckets (calculated_edge fractional)
+const MARKET_EDGE_BUCKETS: Array<{ name: string; lower: number; upper: number }> = [
+  { name: "0-0.5",   lower: 0,      upper: 0.005 },
+  { name: "0.5-1",   lower: 0.005,  upper: 0.010 },
+  { name: "1-2",     lower: 0.010,  upper: 0.020 },
+  { name: "2-3",     lower: 0.020,  upper: 0.030 },
+  { name: "3-5",     lower: 0.030,  upper: 0.050 },
+  { name: "5-10",    lower: 0.050,  upper: 0.100 },
+  { name: "10+",     lower: 0.100,  upper: Infinity },
+];
+
+// 2026-05-08: opportunity score buckets
+const OPP_SCORE_BUCKETS: Array<{ name: string; lower: number; upper: number }> = [
+  { name: "0-20",   lower: 0,   upper: 20  },
+  { name: "20-30",  lower: 20,  upper: 30  },
+  { name: "30-40",  lower: 30,  upper: 40  },
+  { name: "40-50",  lower: 40,  upper: 50  },
+  { name: "50-60",  lower: 50,  upper: 60  },
+  { name: "60-70",  lower: 60,  upper: 70  },
+  { name: "70+",    lower: 70,  upper: Infinity },
+];
+
+// 2026-05-08: per-threshold safety bounds. Each threshold gets its own
+// floor/ceiling/max-move triple to prevent the recommender from suggesting
+// pathological values during low-sample regimes.
+const THRESHOLD_BOUNDS: Record<string, { floor: number; ceiling: number; maxMove: number }> = {
+  pinnacle_edge_min: { floor: 0.005, ceiling: 0.05,  maxMove: 0.005 },
+  min_edge_threshold: { floor: 0.001, ceiling: 0.05,  maxMove: 0.003 },
+  min_opportunity_score: { floor: 10, ceiling: 80,   maxMove: 5 },
+};
 
 // Soft anchor: weakly-informative prior representing the current 2%
 // hardcoded floor. Equivalent to ~30 effective bets at win rate that
@@ -69,6 +102,9 @@ interface BetData {
   odds: number;
   universe_tier: string | null;
   edge_pct: number;
+  // 2026-05-08: additional fields for in-tier threshold recommendations
+  calculated_edge: number | null;        // model-vs-market edge (fractional)
+  opportunity_score: number | null;
 }
 
 interface BucketEvidence {
@@ -178,7 +214,90 @@ async function ingestionHealthy(): Promise<{ passed: boolean; reason: string }> 
   };
 }
 
-/** Pull settled bets with computable model-vs-Pinnacle edge. */
+async function getBankrollEstimate(): Promise<number> {
+  const r = await db.execute(sql`SELECT value FROM agent_config WHERE key='bankroll' LIMIT 1`);
+  const v = (((r as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
+  return v != null ? Number(v) : 10000;
+}
+
+async function persistGenericRecommendation(
+  thresholdName: string,
+  scopeType: string,
+  scopeValue: string,
+  rec: { recommended: number; prior: number; evidence: Array<unknown>; bound_applied: string | null; applied: boolean },
+  sampleSize: number,
+): Promise<void> {
+  await db.execute(sql`
+    INSERT INTO adaptive_thresholds (
+      scope_type, scope_value, threshold_name,
+      recommended_value, prior_value,
+      evidence_bucket_data, posterior_summary,
+      sample_size, applied, reason
+    ) VALUES (
+      ${scopeType}, ${scopeValue}, ${thresholdName},
+      ${rec.recommended}, ${rec.prior},
+      ${JSON.stringify(rec.evidence)}::jsonb,
+      ${JSON.stringify({ method: "kelly_growth_bucket_lower5", evidence_buckets: rec.evidence.length })}::jsonb,
+      ${sampleSize}, ${rec.applied}, ${rec.bound_applied}
+    )
+  `);
+  await db.execute(sql`
+    INSERT INTO model_decision_audit_log (
+      decision_type, subject, prior_state, new_state, reasoning, supporting_metrics, review_status
+    ) VALUES (
+      'adaptive_threshold_recommended',
+      ${`${thresholdName}:${scopeType}:${scopeValue}`},
+      ${JSON.stringify({ value: rec.prior })}::jsonb,
+      ${JSON.stringify({ value: rec.recommended })}::jsonb,
+      ${`Sample n=${sampleSize}; bound_applied=${rec.bound_applied ?? "none"}`},
+      ${JSON.stringify({
+        sample_size: sampleSize,
+        evidence_buckets: rec.evidence.length,
+        bound_applied: rec.bound_applied,
+        method: "kelly_growth_bucket_lower5",
+      })}::jsonb,
+      'automatic'
+    )
+  `).catch(() => undefined);
+}
+
+/** Generic active-threshold lookup — same fallback chain as
+ *  getActivePinnacleEdgeMin but for any threshold_name. Used by
+ *  valueDetection.ts for min_edge_threshold and min_opportunity_score. */
+export async function getActiveThreshold(args: {
+  thresholdName: string;
+  marketType: string;
+  universeTier: string | null;
+}): Promise<{ value: number; source: string }> {
+  const candidates: Array<{ scopeType: string; scopeValue: string }> = [];
+  if (args.universeTier) {
+    candidates.push({ scopeType: "tier_market", scopeValue: `${args.universeTier}:${args.marketType}` });
+  }
+  candidates.push({ scopeType: "market_type", scopeValue: args.marketType });
+  candidates.push({ scopeType: "global", scopeValue: "_global" });
+  for (const c of candidates) {
+    const r = await db.execute(sql`
+      SELECT recommended_value::numeric AS v FROM adaptive_thresholds
+      WHERE scope_type = ${c.scopeType} AND scope_value = ${c.scopeValue}
+        AND threshold_name = ${args.thresholdName} AND applied = true
+      ORDER BY evaluated_at DESC LIMIT 1
+    `);
+    const v = (((r as any).rows ?? []) as Array<{ v: number | string }>)[0]?.v;
+    if (v != null) return { value: Number(v), source: `${c.scopeType}:${c.scopeValue}` };
+  }
+  // agent_config fallback
+  const cfg = await db.execute(sql`SELECT value FROM agent_config WHERE key = ${args.thresholdName} LIMIT 1`);
+  const cfgV = (((cfg as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
+  if (cfgV != null) return { value: Number(cfgV), source: "agent_config" };
+  // Hardcoded
+  const hardcoded = args.thresholdName === "min_edge_threshold" ? 0.005
+                  : args.thresholdName === "min_opportunity_score" ? 30
+                  : 0;
+  return { value: hardcoded, source: "hardcoded_default" };
+}
+
+/** Pull settled bets with computable model-vs-Pinnacle edge AND
+ *  model-vs-market edge AND opportunity score. */
 async function loadSettledBets(): Promise<BetData[]> {
   const rows = await db.execute(sql`
     SELECT
@@ -193,18 +312,19 @@ async function loadSettledBets(): Promise<BetData[]> {
       pb.model_probability::numeric AS model_p,
       pb.pinnacle_implied::numeric AS pinnacle_implied,
       pb.odds_at_placement::numeric AS odds,
-      pb.universe_tier_at_placement AS universe_tier
+      pb.universe_tier_at_placement AS universe_tier,
+      pb.calculated_edge::numeric AS calculated_edge,
+      pb.opportunity_score::numeric AS opportunity_score
     FROM paper_bets pb
     WHERE pb.legacy_regime = false
       AND pb.deleted_at IS NULL
       AND pb.status IN ('won','lost')
-      AND pb.pinnacle_implied IS NOT NULL
       AND pb.model_probability IS NOT NULL
       AND COALESCE(pb.clv_data_quality, 'incomplete') != 'partial_fallback'
   `);
   return (((rows as any).rows ?? []) as Array<Record<string, unknown>>).map((r) => {
     const model_p = Number(r["model_p"] ?? 0);
-    const pinnacle_implied = Number(r["pinnacle_implied"] ?? 0);
+    const pinnacle_implied = r["pinnacle_implied"] != null ? Number(r["pinnacle_implied"]) : 0;
     return {
       match_id: Number(r["match_id"] ?? 0),
       market_type: String(r["market_type"] ?? ""),
@@ -218,9 +338,132 @@ async function loadSettledBets(): Promise<BetData[]> {
       pinnacle_implied,
       odds: Number(r["odds"] ?? 0),
       universe_tier: r["universe_tier"] != null ? String(r["universe_tier"]) : null,
-      edge_pct: (model_p - pinnacle_implied) * 100,
+      edge_pct: pinnacle_implied > 0 ? (model_p - pinnacle_implied) * 100 : 0,
+      calculated_edge: r["calculated_edge"] != null ? Number(r["calculated_edge"]) : null,
+      opportunity_score: r["opportunity_score"] != null ? Number(r["opportunity_score"]) : null,
     };
   });
+}
+
+/** Compute per-bet log-bankroll-growth using the bet's actual stake +
+ *  approximate bankroll at placement (proxy: agent_config.bankroll if
+ *  unavailable per-bet). Same units as autonomousTierLadderV2. */
+function approxKellyGrowth(bet: BetData, bankrollEst: number): number {
+  const stake = bet.stake > 0 ? bet.stake : (bet.shadow_stake ?? 0);
+  const pnl = bet.stake > 0 ? bet.net_pnl : (bet.shadow_pnl ?? 0);
+  if (stake <= 0 || bankrollEst <= 0) return 0;
+  const f = stake / bankrollEst;
+  const r = pnl / stake;
+  return Math.log(Math.max(1e-12, 1 + f * r));
+}
+
+/** Compute Bayesian-shrunk posterior on per-bet log-bankroll-growth for a
+ *  bucket of bets. Same Normal-Normal shrinkage as autonomousTierLadderV2.
+ *  This replaces the Beta-Binomial-then-Monte-Carlo path for the new
+ *  in-tier thresholds (the original Pinnacle-edge path retains MC for
+ *  back-compat with existing recommendations). */
+function computeBucketGrowthPosterior(
+  bets: BetData[],
+  bankrollEst: number,
+): { n: number; mean: number; std: number; shrunk_mean: number; lower_5: number; upper_95: number } {
+  const growths = bets.map((b) => approxKellyGrowth(b, bankrollEst)).filter(Number.isFinite);
+  const n = growths.length;
+  if (n === 0) return { n: 0, mean: 0, std: 0, shrunk_mean: 0, lower_5: 0, upper_95: 0 };
+  const mean = growths.reduce((s, x) => s + x, 0) / n;
+  let varSum = 0;
+  for (const x of growths) varSum += (x - mean) ** 2;
+  const std = n > 1 ? Math.sqrt(varSum / (n - 1)) : 0;
+  const PRIOR_N = 30;
+  const shrunk_mean = (n * mean + PRIOR_N * 0) / (n + PRIOR_N);
+  const se = n > 0 ? std / Math.sqrt(n) : 0;
+  const Z = 1.645;
+  return { n, mean, std, shrunk_mean, lower_5: shrunk_mean - Z * se, upper_95: shrunk_mean + Z * se };
+}
+
+/** Recommend a "minimum X" threshold (e.g., min_edge_threshold,
+ *  min_opportunity_score) based on the smallest bucket where the lower-5
+ *  percentile of Kelly-growth posterior is positive. Same statistical
+ *  principle as the Pinnacle-edge recommender: bet only where confidently
+ *  positive expected log-growth. */
+async function recommendMinimumThreshold(args: {
+  thresholdName: "min_edge_threshold" | "min_opportunity_score";
+  scopeType: "global" | "market_type" | "tier_market";
+  scopeValue: string;
+  bets: BetData[];
+  bankrollEst: number;
+}): Promise<{
+  recommended: number;
+  prior: number;
+  evidence: Array<{ bucket: string; n: number; shrunk_mean: number; lower_5: number; upper_95: number; bucket_lower: number }>;
+  bound_applied: string | null;
+  applied: boolean;
+}> {
+  const buckets = args.thresholdName === "min_edge_threshold" ? MARKET_EDGE_BUCKETS : OPP_SCORE_BUCKETS;
+  const valueOf = args.thresholdName === "min_edge_threshold"
+    ? (b: BetData) => b.calculated_edge ?? -1
+    : (b: BetData) => b.opportunity_score ?? -1;
+
+  const prior = await getPriorValueGeneric(args.thresholdName, args.scopeType, args.scopeValue);
+
+  if (args.scopeType !== "global" && args.bets.length < PER_SCOPE_SAMPLE_FLOOR) {
+    return { recommended: prior, prior, evidence: [], bound_applied: "sample_floor_not_met", applied: false };
+  }
+
+  const evidence = buckets.map((b) => {
+    const inBucket = args.bets.filter((bet) => {
+      const v = valueOf(bet);
+      return v >= b.lower && v < b.upper;
+    });
+    const post = computeBucketGrowthPosterior(inBucket, args.bankrollEst);
+    return { bucket: b.name, n: post.n, shrunk_mean: post.shrunk_mean, lower_5: post.lower_5, upper_95: post.upper_95, bucket_lower: b.lower };
+  });
+
+  // Find smallest bucket where lower_5 > 0 (confident positive growth)
+  let recommendedRaw = prior;
+  for (const e of evidence) {
+    if (e.n >= 10 && e.lower_5 > 0) {
+      recommendedRaw = e.bucket_lower;
+      break;
+    }
+  }
+
+  const bounds = THRESHOLD_BOUNDS[args.thresholdName]!;
+  let value = recommendedRaw;
+  let boundApplied: string | null = null;
+  if (value < bounds.floor) { value = bounds.floor; boundApplied = "floor"; }
+  else if (value > bounds.ceiling) { value = bounds.ceiling; boundApplied = "ceiling"; }
+  if (Math.abs(value - prior) > bounds.maxMove) {
+    value = prior + Math.sign(value - prior) * bounds.maxMove;
+    boundApplied = boundApplied ? `${boundApplied}+max_move` : "max_move";
+  }
+
+  return { recommended: value, prior, evidence, bound_applied: boundApplied, applied: true };
+}
+
+async function getPriorValueGeneric(
+  thresholdName: string,
+  scopeType: string,
+  scopeValue: string,
+): Promise<number> {
+  const last = await db.execute(sql`
+    SELECT recommended_value::numeric AS v FROM adaptive_thresholds
+    WHERE scope_type = ${scopeType} AND scope_value = ${scopeValue}
+      AND threshold_name = ${thresholdName} AND applied = true
+    ORDER BY evaluated_at DESC LIMIT 1
+  `);
+  const v = (((last as any).rows ?? []) as Array<{ v: number | string }>)[0]?.v;
+  if (v != null) return Number(v);
+  // Fallback: agent_config
+  const cfgKey = thresholdName === "min_edge_threshold" ? "min_edge_threshold"
+              : thresholdName === "min_opportunity_score" ? "min_opportunity_score"
+              : thresholdName;
+  const cfg = await db.execute(sql`SELECT value FROM agent_config WHERE key = ${cfgKey} LIMIT 1`);
+  const cfgV = (((cfg as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
+  if (cfgV != null) return Number(cfgV);
+  // Hardcoded defaults
+  return thresholdName === "min_edge_threshold" ? 0.005
+       : thresholdName === "min_opportunity_score" ? 30
+       : 0;
 }
 
 /** Compute posterior log-growth distribution for a bucket. */
@@ -398,21 +641,59 @@ export async function runAdaptiveThresholdRecommender(): Promise<RecommenderResu
 
   const allBets = await loadSettledBets();
   const bankrollFraction = 0.02; // current max_stake_pct — Kelly clamp
+  const bankrollEst = await getBankrollEstimate();
 
-  // Global scope
+  // ── pinnacle_edge_min — only on bets with Pinnacle anchor ──
+  const pinnacleBets = allBets.filter((b) => b.pinnacle_implied > 0);
   const globalRec = await recommendForScope({
     scopeType: "global", scopeValue: "_global",
-    bets: allBets, bankrollFraction,
+    bets: pinnacleBets, bankrollFraction,
   });
-  await persistRecommendation("global", "_global", globalRec, allBets.length);
+  await persistRecommendation("global", "_global", globalRec, pinnacleBets.length);
   result.recommendations.push({
     scope_type: "global", scope_value: "_global",
     threshold_name: "pinnacle_edge_min",
-    sample_size: allBets.length,
+    sample_size: pinnacleBets.length,
     prior_value: globalRec.prior,
     recommended_value: globalRec.recommended,
     bound_applied: globalRec.bound_applied,
   });
+
+  // ── min_edge_threshold (model-vs-market) — global ──
+  const minEdgeRec = await recommendMinimumThreshold({
+    thresholdName: "min_edge_threshold",
+    scopeType: "global", scopeValue: "_global",
+    bets: allBets, bankrollEst,
+  });
+  if (minEdgeRec.applied) {
+    await persistGenericRecommendation("min_edge_threshold", "global", "_global", minEdgeRec, allBets.length);
+    result.recommendations.push({
+      scope_type: "global", scope_value: "_global",
+      threshold_name: "min_edge_threshold",
+      sample_size: allBets.length,
+      prior_value: minEdgeRec.prior,
+      recommended_value: minEdgeRec.recommended,
+      bound_applied: minEdgeRec.bound_applied,
+    });
+  }
+
+  // ── min_opportunity_score — global ──
+  const minOppRec = await recommendMinimumThreshold({
+    thresholdName: "min_opportunity_score",
+    scopeType: "global", scopeValue: "_global",
+    bets: allBets, bankrollEst,
+  });
+  if (minOppRec.applied) {
+    await persistGenericRecommendation("min_opportunity_score", "global", "_global", minOppRec, allBets.length);
+    result.recommendations.push({
+      scope_type: "global", scope_value: "_global",
+      threshold_name: "min_opportunity_score",
+      sample_size: allBets.length,
+      prior_value: minOppRec.prior,
+      recommended_value: minOppRec.recommended,
+      bound_applied: minOppRec.bound_applied,
+    });
+  }
 
   // Per market_type
   const byMarket = new Map<string, BetData[]>();

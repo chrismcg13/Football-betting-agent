@@ -2060,6 +2060,26 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Daily Pinnacle discovery sweep scheduler active — daily 11:00 UTC");
+
+  // 2026-05-08: Z4-v2 autonomous tier ladder. Daily 03:30 UTC (slot freed
+  // by Track A suspension of original modelSelfAudit). Bayesian Kelly-
+  // growth posterior with sample floors (n>=200 promotion, n>=100 demotion)
+  // and ingestion-health gate. Defaults DISABLED via agent_config.z4_v2_enabled.
+  // Operator enables when ready: UPDATE agent_config SET value='true' WHERE
+  // key='z4_v2_enabled'.
+  cron.schedule("30 3 * * *", () => {
+    logger.info("Z4-v2 tier ladder triggered (daily 03:30 UTC)");
+    void (async () => {
+      try {
+        const { runAutonomousTierLadderV2 } = await import("./autonomousTierLadderV2");
+        const r = await runAutonomousTierLadderV2();
+        logger.info(r, "Z4-v2 tier ladder complete");
+      } catch (err) {
+        logger.error({ err }, "Z4-v2 tier ladder failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Z4-v2 tier ladder scheduler active — daily 03:30 UTC (gated on z4_v2_enabled)");
 }
 
 // ===================== Scheduler =====================
