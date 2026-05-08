@@ -133,8 +133,27 @@ async function trackCronExecution(
 }
 
 // ===================== Guard flags =====================
-let ingestionRunning = false;
-let featureRunning = false;
+// 2026-05-08 (§4.5 of root-cause-analysis applied to all in-process locks):
+// previously every cron had its own module-level boolean lock with NO
+// stale-detection. If the underlying function hung (HTTP timeout that
+// never resolved, await chain blocked, etc.), the boolean stayed true
+// forever and every subsequent tick silently skipped. Today's invisible
+// outages traced to this pattern: trading cycle (5 min), ingestion (5+
+// hours since 10:30 lost). The lockManager wrapper provides stale auto-
+// release at thresholds tuned per-cron.
+//
+// Stale thresholds set to ~2× expected p99 duration based on cron_executions
+// avg_ms readings:
+//   ingestion           75 min normal → 150 min stale
+//   features             4 min normal →  20 min stale
+//   exchange_book_sweep  4 min normal →  20 min stale
+//   trading_cycle      2-3 min normal →   5 min stale (hot path; aggressive)
+//   settlement         <1 min normal →    5 min stale
+import { registerLock } from "../lib/lockManager";
+const ingestionLock = registerLock("ingestion_run", { staleAfterMs: 150 * 60 * 1000 });
+const featureLock = registerLock("feature_run", { staleAfterMs: 20 * 60 * 1000 });
+const exchangeBookSweepLock = registerLock("exchange_book_sweep", { staleAfterMs: 20 * 60 * 1000 });
+
 let tradingCycleRunning = false;
 let tradingCycleAcquiredAt: number | null = null;
 const TRADING_CYCLE_STALE_MS = 5 * 60 * 1000;
@@ -146,50 +165,46 @@ export function resetTradingCycleLock(): { wasHeld: boolean; heldFor: number | n
   tradingCycleAcquiredAt = null;
   return { wasHeld, heldFor };
 }
-let exchangeBookSweepRunning = false;
-
 // ===================== Safe wrappers =====================
 
 async function safeRunIngestion(): Promise<void> {
-  if (ingestionRunning) {
-    logger.warn("Data ingestion already in progress — skipping this run");
+  const r = await ingestionLock.withLock(async () => {
+    markStart("ingestion");
+    try {
+      await trackCronExecution("ingestion", async () => {
+        await runDataIngestion();
+      });
+      markRun("ingestion", "success");
+      void safeRunFeatures();
+    } catch (err) {
+      logger.error({ err }, "Scheduled data ingestion run failed");
+      markRun("ingestion", "error");
+      throw err;
+    }
+  });
+  if (r.skipped) {
+    logger.warn({ reason: r.reason, heldMs: r.heldMs }, "Data ingestion skipped — lock held");
     markRun("ingestion", "skipped");
-    return;
-  }
-  ingestionRunning = true;
-  markStart("ingestion");
-  try {
-    await trackCronExecution("ingestion", async () => {
-      await runDataIngestion();
-    });
-    markRun("ingestion", "success");
-    void safeRunFeatures();
-  } catch (err) {
-    logger.error({ err }, "Scheduled data ingestion run failed");
-    markRun("ingestion", "error");
-  } finally {
-    ingestionRunning = false;
   }
 }
 
 async function safeRunFeatures(): Promise<void> {
-  if (featureRunning) {
-    logger.warn("Feature computation already in progress — skipping this run");
+  const r = await featureLock.withLock(async () => {
+    markStart("features");
+    try {
+      await trackCronExecution("features", async () => {
+        await runFeatureEngineForUpcomingMatches();
+      });
+      markRun("features", "success");
+    } catch (err) {
+      logger.error({ err }, "Scheduled feature computation run failed");
+      markRun("features", "error");
+      throw err;
+    }
+  });
+  if (r.skipped) {
+    logger.warn({ reason: r.reason, heldMs: r.heldMs }, "Feature computation skipped — lock held");
     markRun("features", "skipped");
-    return;
-  }
-  featureRunning = true;
-  markStart("features");
-  try {
-    await trackCronExecution("features", async () => {
-      await runFeatureEngineForUpcomingMatches();
-    });
-    markRun("features", "success");
-  } catch (err) {
-    logger.error({ err }, "Scheduled feature computation run failed");
-    markRun("features", "error");
-  } finally {
-    featureRunning = false;
   }
 }
 
@@ -200,24 +215,23 @@ async function safeRunFeatures(): Promise<void> {
 // agent_config.data_source.
 
 async function safeRunExchangeBookSweep(opts?: { hoursAhead?: number }): Promise<void> {
-  if (exchangeBookSweepRunning) {
-    logger.warn("Exchange book sweep already in progress — skipping this run");
+  const r = await exchangeBookSweepLock.withLock(async () => {
+    markStart("exchange_book_sweep");
+    try {
+      await trackCronExecution("exchange_book_sweep", async () => {
+        const result = await runExchangeBookSweep(opts);
+        return result.snapshotsWritten;
+      });
+      markRun("exchange_book_sweep", "success");
+    } catch (err) {
+      logger.error({ err }, "Scheduled exchange book sweep failed");
+      markRun("exchange_book_sweep", "error");
+      throw err;
+    }
+  });
+  if (r.skipped) {
+    logger.warn({ reason: r.reason, heldMs: r.heldMs }, "Exchange book sweep skipped — lock held");
     markRun("exchange_book_sweep", "skipped");
-    return;
-  }
-  exchangeBookSweepRunning = true;
-  markStart("exchange_book_sweep");
-  try {
-    await trackCronExecution("exchange_book_sweep", async () => {
-      const r = await runExchangeBookSweep(opts);
-      return r.snapshotsWritten;
-    });
-    markRun("exchange_book_sweep", "success");
-  } catch (err) {
-    logger.error({ err }, "Scheduled exchange book sweep failed");
-    markRun("exchange_book_sweep", "error");
-  } finally {
-    exchangeBookSweepRunning = false;
   }
 }
 
@@ -3023,16 +3037,31 @@ export async function runXGIngestionNow(): Promise<{ inserted: number; updated: 
 export async function runFeaturesNow(): Promise<
   ReturnType<typeof runFeatureEngineForUpcomingMatches>
 > {
-  if (featureRunning) {
-    logger.warn("Feature computation already in progress");
+  // 2026-05-08: uses the same featureLock as the cron path (registered above).
+  // Manual + cron now share the same stale-detection.
+  const r = await featureLock.withLock(async () => {
+    return await runFeatureEngineForUpcomingMatches();
+  });
+  if (r.skipped) {
+    logger.warn({ reason: r.reason, heldMs: r.heldMs }, "Manual feature run skipped — lock held");
     return { processed: 0, skipped: 0, failed: 0 };
   }
-  featureRunning = true;
-  try {
-    return await runFeatureEngineForUpcomingMatches();
-  } finally {
-    featureRunning = false;
-  }
+  return r.value!;
+}
+
+// 2026-05-08: admin-endpoint convenience for releasing stuck locks
+// without restart. Mirrors resetTradingCycleLock for the new locks.
+export function resetIngestionLock(): { wasHeld: boolean; heldFor: number | null } {
+  const r = ingestionLock.forceRelease();
+  return { wasHeld: r.wasHeld, heldFor: r.heldMs };
+}
+export function resetFeatureLock(): { wasHeld: boolean; heldFor: number | null } {
+  const r = featureLock.forceRelease();
+  return { wasHeld: r.wasHeld, heldFor: r.heldMs };
+}
+export function resetExchangeBookSweepLock(): { wasHeld: boolean; heldFor: number | null } {
+  const r = exchangeBookSweepLock.forceRelease();
+  return { wasHeld: r.wasHeld, heldFor: r.heldMs };
 }
 
 export async function runOddspapiMappingNow(): Promise<

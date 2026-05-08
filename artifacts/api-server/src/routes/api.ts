@@ -2358,6 +2358,28 @@ router.post("/admin/reset-trading-lock", async (_req, res) => {
   }
 });
 
+// 2026-05-08: reset ALL in-process cron locks at once. Returns which were
+// held. Used for emergency unblock when the stale-detection threshold is
+// too long for the current incident.
+router.post("/admin/reset-all-cron-locks", async (_req, res) => {
+  try {
+    const sched = await import("../services/scheduler");
+    const lockMgr = await import("../lib/lockManager");
+    const result = {
+      trading: sched.resetTradingCycleLock(),
+      ingestion: sched.resetIngestionLock(),
+      feature: sched.resetFeatureLock(),
+      exchange_book_sweep: sched.resetExchangeBookSweepLock(),
+      all_locks_status: lockMgr.getAllLockStatus(),
+    };
+    logger.warn(result, "All in-process cron locks manually reset");
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "reset-all-cron-locks failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 URGENT: manual trigger for runTradingCycle. Used to diagnose
 // trading_near silence post-deploy. Returns the cycle result directly so
 // we can see which exit path was taken (lock skip / risk triggered /
