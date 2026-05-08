@@ -1136,31 +1136,41 @@ export async function detectValueBets(options?: {
     "Value detection bulk preload complete",
   );
 
-  // 9. Bulk pre-fetch matches' odds + features in 2 queries instead of 2N
+  // 9. Bulk pre-fetch matches' odds + features.
   //
-  // 2026-05-08 URGENT: added a 24h snapshot_time filter. Without it, this
-  // query pulls every snapshot ever taken for every upcoming-fixture match
-  // (odds_snapshots is 20M rows; 526 matches × ~4000 historical snapshots
-  // each ≈ 2M-row heap fetch). That's what was hanging the trading cycle
-  // for minutes at a time. Downstream code only needs the LATEST per
-  // (market, selection, source), so a 24h cutoff is safely conservative
-  // (covers the slowest ingestion cadence — oddspapi_pinnacle crawls
-  // every ~hour). Faster sources (betfair_exchange every 10 min) refresh
-  // many times within the window.
+  // 2026-05-08 URGENT (revision 2): tightened from 24h → 2h, AND switched
+  // to DISTINCT ON to fetch only the LATEST snapshot per (match × market
+  // × selection × source). This is what the downstream selectPricingSources
+  // logic actually needs.
+  //
+  // Numbers (Neon-billed compute):
+  //   - 24h unfiltered: 2.9M rows from a 20M-row table → 700k+ heap fetches
+  //   - 2h with DISTINCT ON: ~30k rows max (one per group)
+  //   - ~100x reduction in compute and heap traffic per cron tick
+  //
+  // Slowest ingestion source (oddspapi_pinnacle ~hourly) still refreshes
+  // within the 2h window. Faster sources (betfair_exchange every 10 min)
+  // are well within. The ORDER BY in the DISTINCT ON ensures we keep the
+  // latest snapshot per group when multiple exist within the window.
   const matchIds = matches.map((m) => m.id);
-  const ODDS_LOOKBACK_HOURS = 24;
+  const ODDS_LOOKBACK_HOURS = 2;
   const oddsCutoff = new Date(Date.now() - ODDS_LOOKBACK_HOURS * 60 * 60 * 1000);
   const allOddsRows = matchIds.length > 0
-    ? await db
-        .select()
-        .from(oddsSnapshotsTable)
-        .where(
-          and(
-            inArray(oddsSnapshotsTable.matchId, matchIds),
-            gte(oddsSnapshotsTable.snapshotTime, oddsCutoff),
-          ),
-        )
-        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+    ? (await db.execute(sql`
+        SELECT DISTINCT ON (match_id, market_type, selection_name, source)
+          id, match_id AS "matchId", market_type AS "marketType",
+          selection_name AS "selectionName",
+          back_odds AS "backOdds", lay_odds AS "layOdds",
+          snapshot_time AS "snapshotTime", source
+        FROM odds_snapshots
+        WHERE match_id = ANY(${matchIds}::int[])
+          AND snapshot_time >= ${oddsCutoff}
+        ORDER BY match_id, market_type, selection_name, source, snapshot_time DESC
+      `)).rows as unknown as Array<{
+        id: number; matchId: number; marketType: string; selectionName: string;
+        backOdds: string | null; layOdds: string | null;
+        snapshotTime: Date; source: string;
+      }>
     : [];
   const oddsByMatch = new Map<number, typeof allOddsRows>();
   for (const r of allOddsRows) {
