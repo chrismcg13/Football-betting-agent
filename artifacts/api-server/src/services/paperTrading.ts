@@ -203,8 +203,18 @@ async function captureExchangeSnapshot(args: {
     return null;
   }
 
+  // Phase 3 Track D / B-bundle (2026-05-08): map our internal marketType
+  // (e.g. BTTS, TEAM_TOTAL_HOME_15, FIRST_HALF_RESULT) to Betfair's
+  // canonical marketType (BOTH_TEAMS_TO_SCORE, TEAM_A_2, HALF_TIME)
+  // before searching the catalogue. Pre-fix, exact-string matching
+  // silently failed for any market whose Betfair name differs from our
+  // internal name — observed 0% capture rate on BTTS (126 bets/7d),
+  // TEAM_TOTAL_* (303 bets/7d across 5 sub-types), FIRST_HALF_RESULT,
+  // and any future internal code that doesn't 1:1 match Betfair.
+  const { MARKET_TYPE_MAP } = await import("./betfairLive");
+  const bfMarketType = MARKET_TYPE_MAP[marketType] ?? marketType;
   const market = catalogue.find(
-    (m) => m.description?.marketType === marketType,
+    (m) => m.description?.marketType === bfMarketType,
   );
   if (!market) {
     exchangeCaptureCounters.failed_no_market += 1;
