@@ -2343,6 +2343,35 @@ function determineBetWon(
       return null;
     }
 
+    // ─── Team-total markets (added 2026-05-08) ────────────────────────────
+    // Resolve from final scores. Naming convention:
+    //   TEAM_TOTAL_HOME_05 → home goals threshold 0.5
+    //   TEAM_TOTAL_HOME_15 → 1.5,  TEAM_TOTAL_HOME_25 → 2.5
+    //   TEAM_TOTAL_AWAY_05 → away goals threshold 0.5
+    //   TEAM_TOTAL_AWAY_15 → 1.5
+    // Selection format: "Over 0.5" / "Under 0.5".
+    //
+    // Critical: without these cases, determineBetWon returned null on
+    // 285+ pending team-total bets. Settlement retried for 13+ hours
+    // before the 72h timeout would have voided/lost them. Now resolved
+    // immediately on first settlement attempt post-finish.
+    case "TEAM_TOTAL_HOME_05":
+    case "TEAM_TOTAL_HOME_15":
+    case "TEAM_TOTAL_HOME_25":
+    case "TEAM_TOTAL_HOME_35":
+    case "TEAM_TOTAL_AWAY_05":
+    case "TEAM_TOTAL_AWAY_15":
+    case "TEAM_TOTAL_AWAY_25":
+    case "TEAM_TOTAL_AWAY_35": {
+      const isHome = marketType.startsWith("TEAM_TOTAL_HOME_");
+      const teamScore = isHome ? homeScore : awayScore;
+      const suffix = marketType.split("_").pop()!;
+      const threshold = parseInt(suffix, 10) / 10;
+      if (selectionName.startsWith("Over")) return teamScore > threshold;
+      if (selectionName.startsWith("Under")) return teamScore < threshold;
+      return null;
+    }
+
     default:
       return null; // void unknown markets rather than forcing a loss
   }
