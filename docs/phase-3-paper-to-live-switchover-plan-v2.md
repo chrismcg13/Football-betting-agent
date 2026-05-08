@@ -1010,3 +1010,65 @@ Critical path unchanged — Path S evaluator is built in parallel during the blo
 - **Time-ordered split-half is the load-bearing detail** of Path S. Random halves miss drift; time-ordered halves catch it.
 - **Path-aware Kelly ramp:** Path P 50 bets at half-Kelly; Path S 100 bets at half-Kelly (longer ramp compensates for missing CLV anchor).
 - **Tier B / Tier C / niche markets are not locked out.** Eliteserien, Jupiler Pro League, MLS, Brasileirão Women, etc. have a defined, statistical, non-negotiable path. They just have to earn it — at a higher bar than Pinnacle-anchored scopes, because no anchor means more evidence required.
+
+---
+
+## 12. Paper / live separation — load-bearing architectural rule
+
+**Added 2026-05-08 per Chris's clarification during Track B validation.**
+
+**The rule:** paper bets are simulation only. Live bets are the only thing that touches real money. The two are tracked independently and **must not cross-contaminate** any of the live operational metrics.
+
+### 12.1 What this means in practice
+
+- **Live bankroll** comes from Betfair's `getAccountFunds.balance`. It is never derived from or affected by paper bet outcomes. The `agent_config.bankroll` (£9,683.96 today) is the **paper** bankroll for simulation purposes — it's a useful realistic-bankroll-shaped number for sizing paper Kelly fractions, but it does not exist on Betfair and never will.
+- **Live ROI starts at 0 at switchover.** Cumulative live ROI / win-rate / PnL all begin counting from the first live bet, not from any paper history. The §8 "Stop conditions" thresholds (rolling 50 / 100 net ROI bands) are computed on `bet_track='live'` rows only.
+- **Commission and Expert Fee accumulators only count live bets.** When `commission_tracking` is eventually populated post-launch, the source query MUST filter `bet_track='live'`. The Expert Fee 52-week gross profit threshold (§4.1) is computed against live winnings only — paper commission is simulated and does not count toward the £25k trigger.
+- **Paper bets stay in the database with `bet_track='paper'` (or `'shadow'`).** They are not deleted; they are the calibration record that drove the switchover decision. Any historical analysis of model behaviour can still query them. They just do not appear in any "live" SQL.
+
+### 12.2 Why settlement still applies a 5%-commission deduction to paper PnL
+
+This is intentional and not a violation of §12.1. Settlement code stores `gross_pnl`, `commission_amount`, `net_pnl` on every bet, paper or shadow. The `net_pnl` value is the **forecast** of what the bet would have netted if it had been live — it's used by the gate (§4.2) to evaluate "would this strategy clear 3% net ROI?" against realistic post-commission projections.
+
+If we tracked paper bets at gross only, the gate would clear at a higher bar than the live performance it's projecting, and the §1.9 50%-degradation absorption assumption would be naïve. The commission deduction on paper PnL is a **simulation parameter**, not a real bookkeeping entry.
+
+The distinguishing rule: paper `net_pnl` is **never summed into a live operational metric**. It is only used by the gate (a forecasting tool) and historical paper-only analysis.
+
+### 12.3 SQL hygiene rules (enforced going forward)
+
+Any query/view that reports live operational state must include one of:
+
+```sql
+WHERE bet_track = 'live'
+-- or
+WHERE bet_track = 'live' AND placed_at >= <switchover_timestamp>
+```
+
+Examples of queries that MUST filter on `bet_track='live'`:
+- Live cumulative ROI / win rate / PnL
+- Commission paid (lifetime, 52-week rolling for Expert Fee)
+- Lifetime profit gate input for Expert Fee qualification
+- Stop-condition rolling-50 / rolling-100 windows
+- Bankroll-tier hysteresis upgrade tracker (uses `agent_config.bankroll` which post-flip will reflect Betfair balance)
+
+Examples of queries where `bet_track='paper'` is correct (the gate forecasts):
+- `evaluation_pool` view (Path P paper-bet anchor pool)
+- `gate_components` aggregate ROI / CLV
+- `switchover_whitelist` per-scope filters
+
+Examples of queries that should aggregate over BOTH (paper-as-history + live):
+- Calibration retrospectives ("how does live performance compare to what paper predicted?")
+- Live-vs-shadow comparisons during the §6.3 ramp window (these run on `bet_track IN ('live','shadow')`)
+
+### 12.4 Audit checklist before flip
+
+Re-confirm at flip-time that no live metric is silently summing across `bet_track`:
+```sql
+-- This query must return zero matches
+SELECT viewname, definition
+FROM pg_views
+WHERE schemaname = 'public'
+  AND definition ILIKE '%paper_bets%'
+  AND definition NOT ILIKE '%bet_track%';
+```
+Any view referencing `paper_bets` without `bet_track` filtering needs review before flip.
