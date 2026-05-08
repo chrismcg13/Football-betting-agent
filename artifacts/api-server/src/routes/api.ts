@@ -2671,7 +2671,11 @@ router.post("/admin/live-canary", async (req, res) => {
         message: `match ${matchId} kickoff in past or null — must be upcoming`,
       });
     }
-    const STAKE = 0.10; // hard-coded, ignore body.stake
+    // £2 = Betfair Exchange minimum stake. Lower stakes get rejected by
+    // Betfair before reaching our codepath, so the canary can't validate
+    // the full chain at smaller sizes. Hard-capped at £2 — operator can't
+    // accidentally place a larger bet via this endpoint.
+    const STAKE = 2.00;
     const potentialProfit = Math.round(STAKE * (odds - 1) * 100) / 100;
 
     // Insert paper_bets row tagged as canary live bet.
