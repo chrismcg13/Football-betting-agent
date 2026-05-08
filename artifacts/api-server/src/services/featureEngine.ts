@@ -532,6 +532,42 @@ export async function computeFeaturesForMatch(
     await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
   }
 
+  // 2026-05-08: referee tendency features (X2 ingestion → featureEngine).
+  // match_referees table populates daily (06:45 UTC) with referee_name per
+  // fixture. Compute that referee's historical avg total_cards from past
+  // matches.total_cards. Wired here as features for downstream prediction
+  // models to use; predictCards extension uses these directly. Cold-start:
+  // referee_match_count tracks confidence. Bayesian shrink toward league
+  // avg (~4.2) when sample size small.
+  try {
+    const refereeRow = await db.execute(sql`
+      SELECT mr.referee_name,
+             COUNT(m2.id) AS n,
+             AVG(m2.total_cards::numeric) AS avg_cards
+      FROM match_referees mr
+      LEFT JOIN match_referees mr2 ON mr2.referee_name = mr.referee_name AND mr2.match_id != mr.match_id
+      LEFT JOIN matches m2 ON m2.id = mr2.match_id AND m2.total_cards IS NOT NULL AND m2.status = 'finished'
+      WHERE mr.match_id = ${matchId}
+      GROUP BY mr.referee_name
+    `);
+    const refRow = (((refereeRow as any).rows ?? []) as Array<{
+      referee_name: string; n: number | string; avg_cards: number | string | null;
+    }>)[0];
+    if (refRow && refRow.referee_name) {
+      const n = Number(refRow.n ?? 0);
+      const avgCards = refRow.avg_cards != null ? Number(refRow.avg_cards) : null;
+      if (avgCards != null) {
+        // Bayesian shrink: blend toward league average 4.2 with prior n0=10.
+        // Effective ref n=20 → ~67% ref, 33% league. n=5 → 33% ref, 67% league.
+        const shrunk = (avgCards * n + 4.2 * 10) / (n + 10);
+        await upsertFeature(matchId, "referee_card_avg", shrunk);
+      }
+      await upsertFeature(matchId, "referee_match_count", n);
+    }
+  } catch (refErr) {
+    logger.debug({ err: refErr, matchId }, "Referee feature computation skipped (non-fatal)");
+  }
+
   // C3-lineup-features (2026-05-07): key_player_missing_count per side.
   // Compares actual startXI (from _lineup_data) against the team's top-11
   // expected starters in team_expected_xi. Returns null until we have
@@ -873,7 +909,10 @@ async function processOneMatch(
   }
 }
 
-export async function runFeatureEngineForUpcomingMatches(force = false): Promise<{
+export async function runFeatureEngineForUpcomingMatches(
+  force = false,
+  opts?: { maxHoursAhead?: number; onlyMatchesWithPendingBets?: boolean },
+): Promise<{
   processed: number;
   skipped: number;
   failed: number;
@@ -887,10 +926,13 @@ export async function runFeatureEngineForUpcomingMatches(force = false): Promise
     "Starting feature computation run for upcoming matches");
 
   const now = new Date();
-  const horizon = new Date(now.getTime() + FEATURE_MAX_HOURS_AHEAD * 60 * 60 * 1000);
+  // 2026-05-08: opts.maxHoursAhead lets pre-kickoff cron narrow the window
+  // (e.g. 1.5h) for targeted refresh. Default = full 72h.
+  const hoursAhead = opts?.maxHoursAhead ?? FEATURE_MAX_HOURS_AHEAD;
+  const horizon = new Date(now.getTime() + hoursAhead * 60 * 60 * 1000);
 
-  // Fix B: only matches kicking off in [now, now+72h], ordered by kickoff (most imminent first)
-  const upcomingMatches = await db
+  // Fix B: only matches kicking off in [now, now+window], ordered by kickoff (most imminent first)
+  let upcomingMatches = await db
     .select()
     .from(matchesTable)
     .where(and(
@@ -899,6 +941,23 @@ export async function runFeatureEngineForUpcomingMatches(force = false): Promise
       lte(matchesTable.kickoffTime, horizon),
     ))
     .orderBy(asc(matchesTable.kickoffTime));
+
+  // 2026-05-08: optionally restrict to matches with pending bets — used by
+  // the pre-kickoff refresh cron to avoid wasting compute on matches we
+  // aren't betting on. Filter happens in-memory after the kickoff window
+  // narrowing reduces N to a manageable size.
+  if (opts?.onlyMatchesWithPendingBets && upcomingMatches.length > 0) {
+    const matchIds = upcomingMatches.map((m) => m.id);
+    const withPendingRows = await db.execute(sql`
+      SELECT DISTINCT match_id FROM paper_bets
+      WHERE status='pending' AND deleted_at IS NULL AND legacy_regime=false
+        AND match_id IN (${sql.raw(matchIds.join(","))})
+    `);
+    const withPendingSet = new Set<number>(
+      (((withPendingRows as any).rows ?? []) as Array<{ match_id: number }>).map((r) => r.match_id),
+    );
+    upcomingMatches = upcomingMatches.filter((m) => withPendingSet.has(m.id));
+  }
 
   logger.info({ count: upcomingMatches.length, windowHours: FEATURE_MAX_HOURS_AHEAD },
     "Upcoming matches to process (filtered by kickoff window)");

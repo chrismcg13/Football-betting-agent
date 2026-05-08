@@ -909,6 +909,7 @@ export function predictOddEven(
 }
 
 export function predictCards(featureMap: Record<string, number>): {
+  over25: number; under25: number;
   over35: number; under35: number;
   over45: number; under45: number;
 } | null {
@@ -919,11 +920,27 @@ export function predictCards(featureMap: Record<string, number>): {
 
   const hCards = homeCards ?? 1.8;
   const aCards = awayCards ?? 1.6;
-  const lambda = hCards + aCards;
+  const teamLambda = hCards + aCards;
 
+  // 2026-05-08: referee blend. featureEngine populates referee_card_avg
+  // (Bayesian-shrunk to league avg 4.2) and referee_match_count. Blend
+  // weight scales with sample size — full ref signal at n=20+ caps. The
+  // referee component captures discipline tendency that pure team-stats
+  // miss (some refs avg 6+ cards/match, others 3-).
+  const refCards = featureMap["referee_card_avg"];
+  const refN = featureMap["referee_match_count"];
+  let lambda = teamLambda;
+  if (refCards !== undefined && refN !== undefined) {
+    const refWeight = Math.min(0.4, refN / 50);
+    lambda = teamLambda * (1 - refWeight) + refCards * refWeight;
+  }
+
+  const over25 = poissonOver(lambda, 2.5);
   const over35 = poissonOver(lambda, 3.5);
   const over45 = poissonOver(lambda, 4.5);
   return {
+    over25,
+    under25: 1 - over25,
     over35,
     under35: 1 - over35,
     over45,

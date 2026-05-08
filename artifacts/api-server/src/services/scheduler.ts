@@ -2043,6 +2043,34 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Lazy shadow→paper promoter active — every 5 min UTC");
 
+  // Phase 3 Path C+ (2026-05-08): pre-kickoff feature refresh. Every 15 min,
+  // force re-computation of features for matches kicking off within 90 min
+  // that have pending bets. Default features cron runs every 6h with 2h
+  // freshness — too stale for kickoff-proximity. This narrow refresh
+  // pulls in any newly-arrived signals (lineup, injury, referee data) so
+  // predictions and value-bet decisions on the next trading_near cycle use
+  // the freshest possible picture. Combined with the lazy shadow→paper
+  // promoter (5-min cron above), pending shadow bets near kickoff get
+  // re-evaluated against fresh predictions and exchange data.
+  cron.schedule("*/15 * * * *", () => {
+    logger.info("Pre-kickoff feature refresh triggered (every 15 min)");
+    void (async () => {
+      try {
+        const { runFeatureEngineForUpcomingMatches } = await import("./featureEngine");
+        const r = await runFeatureEngineForUpcomingMatches(true, {
+          maxHoursAhead: 1.5,
+          onlyMatchesWithPendingBets: true,
+        });
+        if (r.processed > 0) {
+          logger.info(r, "Pre-kickoff feature refresh complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Pre-kickoff feature refresh failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Pre-kickoff feature refresh scheduler active — every 15 min UTC (T-90min only)");
+
   // 2026-05-08 (§4.2 of root-cause-analysis): cron health monitor.
   // Runs every 5 min. Compares each tracked cron's last successful run
   // against expected cadence; inserts gate-style alert rows in
