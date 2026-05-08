@@ -2477,6 +2477,58 @@ router.post("/admin/debug-oddspapi-fetch", async (req, res) => {
   }
 });
 
+// 2026-05-08 OddsPapi maximisation bundle endpoints.
+router.post("/admin/run-sharp-move-detector", async (_req, res) => {
+  try {
+    const { runPinnacleSharpMoveDetector } = await import("../services/pinnacleSharpMoveDetector");
+    const r = await runPinnacleSharpMoveDetector();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual sharp-move detector failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/run-oddspapi-cross-check", async (_req, res) => {
+  try {
+    const { runOddsPapiCrossCheck } = await import("../services/oddsPapiCrossCheck");
+    const r = await runOddsPapiCrossCheck();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual cross-check failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.get("/admin/oddspapi-bookmaker-catalog", async (_req, res) => {
+  try {
+    const { summariseBookmakerCatalog } = await import("../services/oddsPapiBookmakerCatalog");
+    const r = await summariseBookmakerCatalog();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Bookmaker catalog summary failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/find-best-price", async (req, res) => {
+  try {
+    const matchId = Number((req.body ?? {}).matchId);
+    const marketType = String((req.body ?? {}).marketType ?? "");
+    const selectionName = String((req.body ?? {}).selectionName ?? "");
+    const restrict = (req.body ?? {}).restrictToIntegratable !== false;
+    if (!matchId || !marketType || !selectionName) {
+      return res.status(400).json({ success: false, message: "Body requires { matchId, marketType, selectionName }" });
+    }
+    const { findBestPrice } = await import("../services/bestPriceFinder");
+    const r = await findBestPrice({ matchId, marketType, selectionName, restrictToIntegratable: restrict });
+    return res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "find-best-price failed");
+    return res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 (Lever 2): manual trigger for dead-letter sweep + registry
 // completeness check. Auto-voids bets stuck >7d post-kickoff with >50
 // attempts and raises data_quality_alerts for any unregistered market types.

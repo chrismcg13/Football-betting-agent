@@ -204,6 +204,87 @@ export async function runMigrations() {
       ON CONFLICT (key) DO NOTHING
     `);
 
+    // ── 2026-05-08 OddsPapi maximisation bundle ─────────────────────────
+    // Catalogs every bookmaker OddsPapi returns + flags those with public
+    // APIs. Powers future scaling: when we exceed Betfair-only capacity,
+    // bet-spreading to Smarkets (1-2% commission) and Matchbook (1-1.5%)
+    // halves slippage costs vs Betfair's 5%. Catalog populated by the
+    // oddsPapiBookmakerCatalog service from real API responses; api_*
+    // columns seeded with known integrations; rows updated via cron.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS oddspapi_bookmaker_catalog (
+        slug TEXT PRIMARY KEY,
+        display_name TEXT,
+        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        sample_count INTEGER NOT NULL DEFAULT 0,
+        markets_seen TEXT[] DEFAULT '{}',
+        api_integratable BOOLEAN NOT NULL DEFAULT false,
+        api_doc_url TEXT,
+        commission_rate NUMERIC,
+        notes TEXT
+      )
+    `);
+    // Seed known API-integratable exchanges (lower commission than Betfair
+    // for bet-spreading at scale). UK-blocked or partner-only bookmakers
+    // are intentionally NOT marked api_integratable=true even if they have
+    // public APIs (Pinnacle UK-block, Marathon affiliate-only).
+    await db.execute(sql`
+      INSERT INTO oddspapi_bookmaker_catalog (slug, display_name, api_integratable, api_doc_url, commission_rate, notes)
+      VALUES
+        ('betfair', 'Betfair Exchange', true, 'https://docs.developer.betfair.com', 0.05, 'Already integrated. 5% standard commission, scales down with discount rate.'),
+        ('smarkets', 'Smarkets', true, 'https://docs.smarkets.com', 0.02, 'UK exchange. 2% commission standard, 1% on Pro tier (>£1k/month volume). API allows place/cancel/list orders.'),
+        ('matchbook', 'Matchbook', true, 'https://help.matchbook.com/hc/en-gb/sections/115001120347', 0.015, 'UK exchange. 1.5% standard, 1% on volume tier. Lowest commission in UK market. REST API for orders.'),
+        ('pinnacle', 'Pinnacle', false, 'https://pinnacleapi.github.io', NULL, 'Public API exists but UK-blocked. Cannot be used as execution venue without geo-bypass (compliance risk).'),
+        ('1xbet', '1xBet', false, NULL, NULL, 'Affiliate API only. UK regulatory uncertainty.'),
+        ('marathon', 'Marathon', false, NULL, NULL, 'Partner-only API.')
+      ON CONFLICT (slug) DO NOTHING
+    `);
+
+    // Pinnacle line-move tracker: every detected move >= MIN_MOVE_PCT% on
+    // Pinnacle for an upcoming Tier-A candidate is logged here so the
+    // model can boost (or skip) bets aligned with sharp money. Used by
+    // pinnacleSharpMoveDetector cron every 5 min in T-30 to T-0 window.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS pinnacle_line_moves (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL,
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        prev_odds NUMERIC NOT NULL,
+        new_odds NUMERIC NOT NULL,
+        move_pct NUMERIC NOT NULL,
+        move_type TEXT NOT NULL CHECK (move_type IN ('steam','reverse','drift','dead')),
+        prev_snapshot_at TIMESTAMPTZ NOT NULL,
+        new_snapshot_at TIMESTAMPTZ NOT NULL,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        minutes_to_kickoff INTEGER
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS pinnacle_line_moves_match_market_idx
+        ON pinnacle_line_moves (match_id, market_type, detected_at DESC)
+    `);
+
+    // Source cross-check: when AF Pinnacle and OddsPapi Pinnacle disagree
+    // on the same (match,market,selection) by more than 5% within the
+    // same 30-min window, log the discrepancy. Either source can be stale;
+    // the disagreement is the data-quality signal worth surfacing.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS pinnacle_source_disagreements (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL,
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        af_odds NUMERIC NOT NULL,
+        oddspapi_odds NUMERIC NOT NULL,
+        diff_pct NUMERIC NOT NULL,
+        af_snapshot_at TIMESTAMPTZ NOT NULL,
+        oddspapi_snapshot_at TIMESTAMPTZ NOT NULL,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     // ── xG data layer tables (additive — do not modify existing tables)
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS xg_match_data (

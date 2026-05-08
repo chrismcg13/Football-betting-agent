@@ -1913,6 +1913,13 @@ interface RawOddsSelection {
   price?: number;
   line?: string | number;
   handicap?: string | number;
+  // 2026-05-08 maximisation bundle: preserve API structure for markets
+  // where bookmakerOutcomeId is numeric (BTTS/DC/FH/TEAM_TOTAL). The
+  // marketKey is the parent dict key (matches MARKET_IDS values) and
+  // outcomeKey is the inner dict key — typically a readable string
+  // like "yes"/"no"/"1x" even when bookmakerOutcomeId is opaque.
+  marketKey?: string;
+  outcomeKey?: string;
 }
 
 interface RawOddsResponse {
@@ -1967,6 +1974,42 @@ function getSelectionOdds(
   const teamTotal = TEAM_TOTAL_LINES[marketType];
   const fhOuLine = FIRST_HALF_OU_LINES[marketType];
   const selLower = selectionName.toLowerCase();
+
+  // 2026-05-08 maximisation bundle: outcomeKey-first matcher for markets
+  // where bookmakerOutcomeId is numeric. Tries the parent-dict outcome
+  // key (preserved by the updated extractSelections) BEFORE falling
+  // through to the legacy bookmakerOutcomeId / label matchers below.
+  // This unlocks BTTS/DC/FH/TEAM_TOTAL where the outcome key IS readable
+  // even when bookmakerOutcomeId is opaque.
+  const wantedMarketId = MARKET_IDS[marketType];
+  for (const sel of selections) {
+    if (sel.marketKey == null || sel.outcomeKey == null) continue;
+    if (wantedMarketId && sel.marketKey !== String(wantedMarketId)) continue;
+    const oc = sel.outcomeKey.toLowerCase();
+    const odds = sel.odds ?? sel.value ?? sel.price;
+    if (!odds || odds <= 1) continue;
+
+    if (marketType === "BTTS") {
+      if (selLower.startsWith("yes") && (oc === "yes" || oc === "gg")) return odds;
+      if (selLower.startsWith("no") && (oc === "no" || oc === "ng")) return odds;
+    } else if (marketType === "DOUBLE_CHANCE") {
+      const wanted = selLower === "1x" || selLower.includes("home or draw") ? "1x"
+        : selLower === "x2" || selLower.includes("away or draw") ? "x2"
+        : selLower === "12" || selLower.includes("home or away") ? "12"
+        : null;
+      if (wanted && oc === wanted) return odds;
+    } else if (marketType === "FIRST_HALF_RESULT") {
+      if (selLower === "home" && oc === "home") return odds;
+      if (selLower === "draw" && oc === "draw") return odds;
+      if (selLower === "away" && oc === "away") return odds;
+    } else if (marketType === "MATCH_ODDS") {
+      if (selLower === "home" && oc === "home") return odds;
+      if (selLower === "draw" && oc === "draw") return odds;
+      if (selLower === "away" && oc === "away") return odds;
+    }
+    // OU/AH/TEAM_TOTAL: outcome key alone isn't sufficient (line is part
+    // of the spec) — fall through to the slash-format matcher below.
+  }
 
   for (const sel of selections) {
     const label = (sel.selection ?? sel.label ?? sel.name ?? sel.outcome ?? "").toLowerCase();
@@ -2116,16 +2159,25 @@ function extractSelections(bm: RawBookmakerOdds): RawOddsSelection[] {
   const markets = bm.markets;
 
   // ── New OddsPapi format: markets is Record<marketId, RawMarket> ──
+  // 2026-05-08 maximisation bundle: switched from Object.values to
+  // Object.entries so we preserve marketKey + outcomeKey. Previously
+  // the parser used only player.bookmakerOutcomeId as the label —
+  // works for MATCH_ODDS (where the ID happens to be readable strings
+  // like "home"/"draw"/"away") but fails for BTTS/DC/FH/TEAM_TOTAL
+  // where the ID is numeric (e.g. "1629824099"). The outcome key in
+  // the parent dict is typically the readable form ("yes"/"no"/"1x").
   if (markets && !Array.isArray(markets) && typeof markets === "object") {
     const result: RawOddsSelection[] = [];
-    for (const market of Object.values(markets as Record<string, RawMarket>)) {
+    for (const [marketKey, market] of Object.entries(markets as Record<string, RawMarket>)) {
       if (!market?.outcomes) continue;
-      for (const outcome of Object.values(market.outcomes)) {
+      for (const [outcomeKey, outcome] of Object.entries(market.outcomes)) {
         for (const player of Object.values(outcome.players ?? {})) {
           if (player.active === false) continue;
           if (!player.price || player.price <= 1) continue;
           result.push({
-            label: String(player.bookmakerOutcomeId ?? ""),
+            label: String(player.bookmakerOutcomeId ?? outcomeKey ?? ""),
+            outcomeKey,
+            marketKey,
             price: player.price,
           });
         }
@@ -3225,6 +3277,44 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
             const bookmakers = extractBookmakers(rawData as RawOddsResponse);
             oddspapiPinnacleBookmaker =
               bookmakers.find((b) => getBookmakerSlug(b).includes("pinnacle")) ?? null;
+
+            // 2026-05-08 maximisation bundle: record every bookmaker we
+            // saw in the catalog. Powers future bet-spreading to lower-
+            // commission venues (Smarkets/Matchbook) and best-price
+            // execution. Fire-and-forget — never blocks closing-line.
+            try {
+              const { recordBookmakerObservations } = await import("./oddsPapiBookmakerCatalog");
+              await recordBookmakerObservations({
+                matchId,
+                marketType,
+                bookmakerSlugs: bookmakers.map((b) => getBookmakerSlug(b)),
+              });
+
+              // Also persist non-Pinnacle bookmakers' odds so the
+              // bestPriceFinder can compare across venues. We capture
+              // the first matching selection per bookmaker for each
+              // generic key in this market.
+              for (const bm of bookmakers) {
+                const slug = getBookmakerSlug(bm);
+                if (!slug || slug.includes("pinnacle")) continue;
+                const sels = extractSelections(bm);
+                for (const bet of bets) {
+                  const odds = getSelectionOdds(sels, marketType, bet.selectionName);
+                  if (!odds || odds <= 1) continue;
+                  await db.execute(sql`
+                    INSERT INTO odds_snapshots (
+                      match_id, market_type, selection_name, source,
+                      back_odds, snapshot_time
+                    ) VALUES (
+                      ${matchId}, ${marketType}, ${bet.selectionName}, ${`oddspapi_${slug}`},
+                      ${odds}, NOW()
+                    )
+                  `);
+                }
+              }
+            } catch (catErr) {
+              logger.debug({ catErr }, "Bookmaker catalog / multi-book capture skipped (non-fatal)");
+            }
           }
         }
       }

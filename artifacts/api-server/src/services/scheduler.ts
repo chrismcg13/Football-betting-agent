@@ -2099,6 +2099,60 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Dead-letter sweep scheduler active — daily 04:15 UTC");
+
+  // 2026-05-08 OddsPapi maximisation bundle: three new crons.
+  //
+  // (1) Pinnacle sharp-move detector — every 5 minutes. Detects steam /
+  // reverse-line-movement / drift on Tier-A candidate matches in T-30
+  // to T-0 window. Logs to pinnacle_line_moves. Read-only signal layer
+  // for now; future commit consumes it in the opportunity-score path.
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const { runPinnacleSharpMoveDetector } = await import("./pinnacleSharpMoveDetector");
+        const r = await runPinnacleSharpMoveDetector();
+        if (r.movesDetected > 0) {
+          logger.info(r, "Pinnacle sharp-move detector complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Pinnacle sharp-move detector failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Pinnacle sharp-move detector scheduler active — every 5 minutes");
+
+  // (2) AF-vs-OddsPapi Pinnacle cross-check — hourly at :07. Catches
+  // disagreements >5% between independent Pinnacle sources. Aberrant
+  // disagreements (>15%) raise data_quality_alerts.
+  cron.schedule("7 * * * *", () => {
+    logger.info("OddsPapi cross-check triggered (hourly :07)");
+    void (async () => {
+      try {
+        const { runOddsPapiCrossCheck } = await import("./oddsPapiCrossCheck");
+        const r = await runOddsPapiCrossCheck();
+        logger.info(r, "OddsPapi cross-check complete");
+      } catch (err) {
+        logger.error({ err }, "OddsPapi cross-check failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("OddsPapi cross-check scheduler active — hourly at :07");
+
+  // (3) Bookmaker catalog health log — daily at 04:45 UTC. Summarises
+  // which OddsPapi bookmakers have appeared, focuses on api-integratable
+  // venues for future bet-spreading.
+  cron.schedule("45 4 * * *", () => {
+    logger.info("OddsPapi bookmaker catalog health triggered (daily 04:45 UTC)");
+    void (async () => {
+      try {
+        const { logCatalogHealth } = await import("./oddsPapiBookmakerCatalog");
+        await logCatalogHealth();
+      } catch (err) {
+        logger.error({ err }, "Bookmaker catalog health log failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("OddsPapi bookmaker catalog health scheduler active — daily 04:45 UTC");
 }
 
 // ===================== Scheduler =====================
