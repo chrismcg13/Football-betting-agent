@@ -2341,6 +2341,83 @@ router.post("/admin/phase3-track-b-backfill", async (_req, res) => {
   }
 });
 
+// Phase 3 (2026-05-08): set evaluation_start_at — the timestamp that
+// activates the gate-monitoring pool filters. Once set, both Path P
+// (evaluation_pool view) and Path S (shadow_evaluation_pool view) start
+// admitting rows whose placed_at >= this timestamp. The daily 04:00 UTC
+// gateMonitor cron then begins evaluating Path P + Path S aggregate
+// triggers and writing gate_status / gate_clear_pending_review rows.
+//
+// Set-once semantics: refuses to overwrite an existing value unless
+// {"force": true} is in the body. Body shape:
+//   {"timestamp": "now" | "<ISO 8601>", "force"?: true}
+router.post("/admin/set-evaluation-start", async (req, res) => {
+  try {
+    const { db, agentConfigTable } = await import("@workspace/db");
+    const { eq } = await import("drizzle-orm");
+
+    const body = (req.body ?? {}) as { timestamp?: string; force?: boolean };
+    const force = body.force === true;
+    const tsRaw = body.timestamp ?? "now";
+    const ts = tsRaw === "now"
+      ? new Date()
+      : new Date(tsRaw);
+    if (Number.isNaN(ts.getTime())) {
+      res.status(400).json({ success: false, message: `Invalid timestamp: ${tsRaw}` });
+      return;
+    }
+
+    const existing = await db
+      .select({ value: agentConfigTable.value, updatedAt: agentConfigTable.updatedAt })
+      .from(agentConfigTable)
+      .where(eq(agentConfigTable.key, "evaluation_start_at"));
+
+    if (existing.length > 0 && existing[0]!.value && !force) {
+      res.status(409).json({
+        success: false,
+        message: "evaluation_start_at already set; pass {\"force\": true} to overwrite",
+        existing: existing[0],
+      });
+      return;
+    }
+
+    const isoStr = ts.toISOString();
+    if (existing.length === 0) {
+      await db.insert(agentConfigTable).values({ key: "evaluation_start_at", value: isoStr });
+    } else {
+      await db.update(agentConfigTable)
+        .set({ value: isoStr, updatedAt: new Date() })
+        .where(eq(agentConfigTable.key, "evaluation_start_at"));
+    }
+
+    // Also stamp blockers_validated_at to the same moment so the gate
+    // monitor manifest can show "blockers passed → evaluation begins".
+    const blockersExisting = await db
+      .select().from(agentConfigTable)
+      .where(eq(agentConfigTable.key, "blockers_validated_at"));
+    if (blockersExisting.length === 0) {
+      await db.insert(agentConfigTable).values({ key: "blockers_validated_at", value: isoStr });
+    } else {
+      await db.update(agentConfigTable)
+        .set({ value: isoStr, updatedAt: new Date() })
+        .where(eq(agentConfigTable.key, "blockers_validated_at"));
+    }
+
+    res.json({
+      success: true,
+      result: {
+        evaluation_start_at: isoStr,
+        blockers_validated_at: isoStr,
+        previous_value: existing[0]?.value ?? null,
+        forced: force,
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, "set-evaluation-start failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Phase 3 (2026-05-08): manual trigger for bankrollTierCaps. Cron runs
 // daily 03:00 UTC; this lets us produce a pending_caps row immediately
 // after deploy for blocker validation.

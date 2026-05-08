@@ -2052,6 +2052,21 @@ export async function runMigrations() {
         SELECT * FROM paper_bets WHERE legacy_regime = false
     `);
 
+    // ────────────────────────────────────────────────────────────────────
+    // URGENT (2026-05-08): missing index on features.match_id was causing
+    // trading_near cron failures every ~15 min. Postgres FK references
+    // don't auto-index. With ~156k rows in features, every
+    // `WHERE match_id IN (hundreds-of-ids)` query did a full table scan
+    // that took 500-900s and timed out. Adding the composite index
+    // (match_id, feature_name) covers both single-feature lookups and
+    // bulk-by-match scans. The plain (match_id) index is also a leading
+    // prefix, so a separate index isn't needed.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS features_match_id_feature_name_idx
+        ON features(match_id, feature_name)
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
