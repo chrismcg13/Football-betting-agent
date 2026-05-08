@@ -123,28 +123,85 @@ async function getEffectiveDailyCap(): Promise<number> {
 
 // ─── Market ID mapping ─────────────────────────────────────────────────────────
 
+// 2026-05-08: All MARKET_IDS the /odds endpoint understands. Note: per
+// oddsPapi.ts:2051 comment, the /odds endpoint returns ALL markets in
+// one response regardless of marketId — adding entries here is purely
+// for explicit per-market fallback fetches (e.g., when validation
+// queries one market specifically). The single P1 prefetch call that
+// drives PREFETCH_TARGETS persistence costs the same regardless of
+// market count.
+//
+// Reverse-engineered from oddspapi public docs:
+//   101 = 1x2 / Match Winner
+//   102 = Goals Over/Under (all lines)
+//   103 = Both Teams To Score
+//   104 = Asian Handicap (all lines)
+//   105 = Double Chance
+//   106 = Team Totals (all teams, all lines)
+//   107 = First Half Result
+//   108 = First Half Over/Under (all lines)
+//   112 = Cards Over/Under
+//   113 = Corners Over/Under
 const MARKET_IDS: Record<string, number> = {
   MATCH_ODDS: 101,
-  OVER_UNDER_25: 102,
+  OVER_UNDER_05: 102,
   OVER_UNDER_15: 102,
+  OVER_UNDER_25: 102,
   OVER_UNDER_35: 102,
+  OVER_UNDER_45: 102,
   BTTS: 103,
   ASIAN_HANDICAP: 104,
+  DOUBLE_CHANCE: 105,
+  TEAM_TOTAL_HOME_05: 106,
+  TEAM_TOTAL_HOME_15: 106,
+  TEAM_TOTAL_HOME_25: 106,
+  TEAM_TOTAL_AWAY_05: 106,
+  TEAM_TOTAL_AWAY_15: 106,
+  TEAM_TOTAL_AWAY_25: 106,
+  FIRST_HALF_RESULT: 107,
+  FIRST_HALF_OU_05: 108,
+  FIRST_HALF_OU_15: 108,
   TOTAL_CARDS_35: 112,
   TOTAL_CARDS_45: 112,
+  TOTAL_CARDS_55: 112,
   TOTAL_CORNERS_95: 113,
   TOTAL_CORNERS_105: 113,
 };
 
-// OU line to target for each market type
+// OU line to target for each market type. 2026-05-08: added OVER_UNDER_05,
+// OVER_UNDER_45, TOTAL_CARDS_55. Without these, the slash-format selection
+// matcher (1920-1937) silently rejected these markets — a 3-week silent
+// parser failure that contributed to BTTS/DC/OU_45 producing 0 oddspapi_pinnacle
+// rows. Phase A1 of the coverage-expansion bundle.
 const OU_LINES: Record<string, string> = {
+  OVER_UNDER_05: "0.5",
   OVER_UNDER_15: "1.5",
   OVER_UNDER_25: "2.5",
   OVER_UNDER_35: "3.5",
+  OVER_UNDER_45: "4.5",
   TOTAL_CARDS_35: "3.5",
   TOTAL_CARDS_45: "4.5",
+  TOTAL_CARDS_55: "5.5",
   TOTAL_CORNERS_95: "9.5",
   TOTAL_CORNERS_105: "10.5",
+};
+
+// 2026-05-08 Phase B: team-total OU lines. Selection names are
+// "Over X.X" / "Under X.X" plus the team encoded in the market_type
+// (TEAM_TOTAL_HOME_05 → home goals threshold 0.5).
+const TEAM_TOTAL_LINES: Record<string, { side: "home" | "away"; line: string }> = {
+  TEAM_TOTAL_HOME_05: { side: "home", line: "0.5" },
+  TEAM_TOTAL_HOME_15: { side: "home", line: "1.5" },
+  TEAM_TOTAL_HOME_25: { side: "home", line: "2.5" },
+  TEAM_TOTAL_AWAY_05: { side: "away", line: "0.5" },
+  TEAM_TOTAL_AWAY_15: { side: "away", line: "1.5" },
+  TEAM_TOTAL_AWAY_25: { side: "away", line: "2.5" },
+};
+
+// 2026-05-08 Phase B: first-half OU lines.
+const FIRST_HALF_OU_LINES: Record<string, string> = {
+  FIRST_HALF_OU_05: "0.5",
+  FIRST_HALF_OU_15: "1.5",
 };
 
 // Sharp bookmakers (consensus-setting)
@@ -1907,6 +1964,8 @@ function getSelectionOdds(
   selectionName: string,
 ): number | null {
   const ouLine = OU_LINES[marketType];
+  const teamTotal = TEAM_TOTAL_LINES[marketType];
+  const fhOuLine = FIRST_HALF_OU_LINES[marketType];
   const selLower = selectionName.toLowerCase();
 
   for (const sel of selections) {
@@ -1916,24 +1975,85 @@ function getSelectionOdds(
     const legacyLine = String(sel.line ?? sel.handicap ?? "");
 
     // ── New OddsPapi format: bookmakerOutcomeId encodes line+direction ──
-    // e.g. "home", "draw", "away", "2.5/over", "9.5/under", "10.5/over"
+    // e.g. "home", "draw", "away", "2.5/over", "9.5/under", "10.5/over",
+    // "-1.0/home" (AH), "yes"/"no" (BTTS), "1x"/"x2"/"12" (DC).
+    // 2026-05-08 Phase A1+A2+B: extended to handle ASIAN_HANDICAP,
+    // FIRST_HALF_*, TEAM_TOTAL_*, and broader BTTS/DC label variants
+    // (previously only the legacy non-slash branch handled BTTS/DC).
     if (label.includes("/")) {
       const slashIdx = label.lastIndexOf("/");
       const linePart = label.slice(0, slashIdx);
       const dirPart = label.slice(slashIdx + 1);
 
-      // Match Winner with Asian handicap labels like "-1.0/home" — skip for MATCH_ODDS
+      // ── ASIAN_HANDICAP (Phase A2): "-1.5/home", "+0.5/away", "0/home" ──
+      // Selection name format: "Home -1.5" / "Away +0.5" / "Home 0".
+      if ((dirPart === "home" || dirPart === "away") && marketType === "ASIAN_HANDICAP") {
+        const handicap = parseFloat(linePart);
+        if (Number.isFinite(handicap)) {
+          const parts = selectionName.split(/\s+/);
+          if (parts.length >= 2) {
+            const sideName = parts[0]?.toLowerCase();
+            const sideHandicap = parseFloat(parts[1] ?? "0");
+            if (sideName === dirPart && Math.abs(handicap - sideHandicap) < 0.01) return odds;
+          }
+        }
+        continue;
+      }
+
+      // Match Winner with AH labels — skip for MATCH_ODDS
       if ((dirPart === "home" || dirPart === "away") && marketType === "MATCH_ODDS") {
         continue;
       }
 
-      // Over/Under: "2.5/over", "9.5/under", "10.5/over" etc.
+      // ── Over/Under (full match): "2.5/over", "9.5/under", "10.5/over" etc. ──
       if ((dirPart === "over" || dirPart === "under") && ouLine) {
         if (Math.abs(parseFloat(linePart) - parseFloat(ouLine)) < 0.01) {
           if (selLower.includes("over") && dirPart === "over") return odds;
           if (selLower.includes("under") && dirPart === "under") return odds;
         }
       }
+
+      // ── First-half OU (Phase B): "ht_0.5/over", "ht-0.5/under", "1h/0.5/over" ──
+      // Allow either prefixed or composite label; line-part may include "ht_" or "1h"
+      if (fhOuLine && (dirPart === "over" || dirPart === "under")) {
+        const linePartClean = linePart.replace(/^(ht_?|1h_?|fh_?)/, "");
+        if (Math.abs(parseFloat(linePartClean) - parseFloat(fhOuLine)) < 0.01
+            && (linePart.startsWith("ht") || linePart.startsWith("1h") || linePart.startsWith("fh"))) {
+          if (selLower.includes("over") && dirPart === "over") return odds;
+          if (selLower.includes("under") && dirPart === "under") return odds;
+        }
+      }
+
+      // ── Team-total OU (Phase B): "home_0.5/over", "away_1.5/under" ──
+      if (teamTotal && (dirPart === "over" || dirPart === "under")) {
+        // linePart is e.g. "home_0.5" or "away_1.5" or "home/0.5"
+        const ttMatch = /^(home|away)[_/](\d(?:\.\d)?)$/.exec(linePart);
+        if (ttMatch && ttMatch[1] === teamTotal.side
+            && Math.abs(parseFloat(ttMatch[2]!) - parseFloat(teamTotal.line)) < 0.01) {
+          if (selLower.includes("over") && dirPart === "over") return odds;
+          if (selLower.includes("under") && dirPart === "under") return odds;
+        }
+      }
+
+      // ── BTTS (Phase A1): handle slash-format encoding if the API emits one ──
+      // Possible formats: "btts/yes", "yes/yes", "yes/no". Be permissive.
+      if (marketType === "BTTS") {
+        if (selectionName === "Yes" && (dirPart === "yes" || linePart === "yes")) return odds;
+        if (selectionName === "No" && (dirPart === "no" || linePart === "no")) return odds;
+      }
+
+      // ── DOUBLE_CHANCE (Phase A1): handle slash-format if API emits one ──
+      if (marketType === "DOUBLE_CHANCE") {
+        if (selectionName === "1X" && (label === "1x" || label === "1/x" || dirPart === "1x")) return odds;
+        if (selectionName === "X2" && (label === "x2" || label === "x/2" || dirPart === "x2")) return odds;
+        if (selectionName === "12" && (label === "12" || label === "1/2" || dirPart === "12")) return odds;
+      }
+
+      // 2026-05-08 diagnostic: log unrecognised labels for the first few
+      // unknown patterns of each market_type per process. Helps surface
+      // the actual API format if it differs from our assumptions. Limited
+      // to avoid log spam.
+      logUnknownLabel(marketType, label, selectionName);
       continue; // handled slash-format; don't fall through to legacy logic
     }
 
@@ -1944,10 +2064,18 @@ function getSelectionOdds(
       if (selectionName === "Away" && (label === "away" || label === "2")) return odds;
     }
 
+    // ── First-half result (Phase B): "ht_home", "1h_home", "ht-draw", "fh_away" ──
+    if (marketType === "FIRST_HALF_RESULT") {
+      const stripped = label.replace(/^(ht_?|1h_?|fh_?)/, "");
+      if (selectionName === "Home" && (stripped === "home" || stripped === "1")) return odds;
+      if (selectionName === "Draw" && (stripped === "draw" || stripped === "x")) return odds;
+      if (selectionName === "Away" && (stripped === "away" || stripped === "2")) return odds;
+    }
+
     // ── BTTS ──
     if (marketType === "BTTS") {
-      if (selectionName === "Yes" && (label === "yes" || label === "gg")) return odds;
-      if (selectionName === "No" && (label === "no" || label === "ng")) return odds;
+      if (selectionName === "Yes" && (label === "yes" || label === "gg" || label === "btts_yes")) return odds;
+      if (selectionName === "No" && (label === "no" || label === "ng" || label === "btts_no")) return odds;
     }
 
     // ── Double Chance ──
@@ -1966,6 +2094,22 @@ function getSelectionOdds(
     }
   }
   return null;
+}
+
+// 2026-05-08 diagnostic for Phase A1: track first 5 unknown labels per
+// market_type per process so the actual API format becomes visible
+// without log spam. Reset on process restart.
+const unknownLabelsLogged = new Map<string, number>();
+function logUnknownLabel(marketType: string, label: string, selectionName: string): void {
+  const key = `${marketType}:${label}`;
+  const count = unknownLabelsLogged.get(key) ?? 0;
+  if (count < 3) {
+    logger.debug(
+      { marketType, label, selectionName },
+      "oddspapi parser: unrecognised slash-format label (first 3 per market_type:label combination)",
+    );
+    unknownLabelsLogged.set(key, count + 1);
+  }
 }
 
 function extractSelections(bm: RawBookmakerOdds): RawOddsSelection[] {
@@ -2170,14 +2314,18 @@ const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   { marketType: "MATCH_ODDS",       selectionName: "Home" },
   { marketType: "MATCH_ODDS",       selectionName: "Draw" },
   { marketType: "MATCH_ODDS",       selectionName: "Away" },
-  // Goals O/U — OVER_UNDER_05 and OVER_UNDER_15 are banned, excluded
+  // Goals O/U — OVER_UNDER_05 and OVER_UNDER_15 added 2026-05-08 (Phase B)
+  { marketType: "OVER_UNDER_05",    selectionName: "Over 0.5" },
+  { marketType: "OVER_UNDER_05",    selectionName: "Under 0.5" },
+  { marketType: "OVER_UNDER_15",    selectionName: "Over 1.5" },
+  { marketType: "OVER_UNDER_15",    selectionName: "Under 1.5" },
   { marketType: "OVER_UNDER_25",    selectionName: "Over 2.5" },
   { marketType: "OVER_UNDER_25",    selectionName: "Under 2.5" },
   { marketType: "OVER_UNDER_35",    selectionName: "Over 3.5" },
   { marketType: "OVER_UNDER_35",    selectionName: "Under 3.5" },
   { marketType: "OVER_UNDER_45",    selectionName: "Over 4.5" },
   { marketType: "OVER_UNDER_45",    selectionName: "Under 4.5" },
-  // Corners O/U — only 9.5 and 10.5 are active; 8.5 and 11.5 are banned
+  // Corners O/U
   { marketType: "TOTAL_CORNERS_95",  selectionName: "Over 9.5 Corners" },
   { marketType: "TOTAL_CORNERS_95",  selectionName: "Under 9.5 Corners" },
   { marketType: "TOTAL_CORNERS_105", selectionName: "Over 10.5 Corners" },
@@ -2189,6 +2337,49 @@ const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   { marketType: "DOUBLE_CHANCE",     selectionName: "1X" },
   { marketType: "DOUBLE_CHANCE",     selectionName: "X2" },
   { marketType: "DOUBLE_CHANCE",     selectionName: "12" },
+  // ── 2026-05-08 Phase A2: Asian Handicap, common lines (-2..+2 in 0.5 steps) ──
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -2" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -2" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -1.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -1.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -1" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -1" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -0.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -0.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home 0" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away 0" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +0.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +0.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +1" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +1" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +1.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +1.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +2" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +2" },
+  // ── 2026-05-08 Phase B: Team-total Over/Under, common lines ──
+  { marketType: "TEAM_TOTAL_HOME_05", selectionName: "Over 0.5" },
+  { marketType: "TEAM_TOTAL_HOME_05", selectionName: "Under 0.5" },
+  { marketType: "TEAM_TOTAL_HOME_15", selectionName: "Over 1.5" },
+  { marketType: "TEAM_TOTAL_HOME_15", selectionName: "Under 1.5" },
+  { marketType: "TEAM_TOTAL_HOME_25", selectionName: "Over 2.5" },
+  { marketType: "TEAM_TOTAL_HOME_25", selectionName: "Under 2.5" },
+  { marketType: "TEAM_TOTAL_AWAY_05", selectionName: "Over 0.5" },
+  { marketType: "TEAM_TOTAL_AWAY_05", selectionName: "Under 0.5" },
+  { marketType: "TEAM_TOTAL_AWAY_15", selectionName: "Over 1.5" },
+  { marketType: "TEAM_TOTAL_AWAY_15", selectionName: "Under 1.5" },
+  { marketType: "TEAM_TOTAL_AWAY_25", selectionName: "Over 2.5" },
+  { marketType: "TEAM_TOTAL_AWAY_25", selectionName: "Under 2.5" },
+  // ── 2026-05-08 Phase B: First-half markets ──
+  { marketType: "FIRST_HALF_RESULT",  selectionName: "Home" },
+  { marketType: "FIRST_HALF_RESULT",  selectionName: "Draw" },
+  { marketType: "FIRST_HALF_RESULT",  selectionName: "Away" },
+  { marketType: "FIRST_HALF_OU_05",   selectionName: "Over 0.5" },
+  { marketType: "FIRST_HALF_OU_05",   selectionName: "Under 0.5" },
+  { marketType: "FIRST_HALF_OU_15",   selectionName: "Over 1.5" },
+  { marketType: "FIRST_HALF_OU_15",   selectionName: "Under 1.5" },
+  // ── 2026-05-08 Phase B: TOTAL_CARDS_55 (35 + 45 already supported) ──
+  { marketType: "TOTAL_CARDS_55",     selectionName: "Over 5.5 Cards" },
+  { marketType: "TOTAL_CARDS_55",     selectionName: "Under 5.5 Cards" },
 ];
 
 export async function prefetchAndStoreOddsPapiOdds(
@@ -2835,9 +3026,17 @@ export async function logDailyBudgetSummary(): Promise<void> {
 
 // ─── Closing-line CLV fetch ───────────────────────────────────────────────────
 // Called by the pre-kickoff cron every 30 min.
-// For each pending bet kicking off in the next 90 minutes, fetch the current
-// Pinnacle odds as the TRUE closing line and store it in closing_pinnacle_odds.
-// This enables professional-grade CLV: (placement_odds - closing_odds) / closing_odds × 100.
+// For each pending bet kicking off in the next 4 hours (was 90 min;
+// widened 2026-05-08 Phase D — P3 budget was 5% utilised, expansion has
+// huge headroom), fetch the current Pinnacle odds as the TRUE closing
+// line and store in closing_pinnacle_odds. This enables professional-
+// grade CLV: (placement_odds - closing_odds) / closing_odds × 100.
+//
+// Why 4h: the 30-min cron means bets in the next 4h get 8 chances to
+// have a closing line captured before kickoff (every 30 min), and a
+// "near-final" capture at T-30min becomes the de-facto closing line
+// for filter / gate-pool inclusion. P3 budget headroom (~19,000 calls/
+// month unused) easily supports this.
 
 export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
   checked: number;
@@ -2848,9 +3047,9 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
   if (!key) return { checked: 0, updated: 0, skipped: 0 };
 
   const now = new Date();
-  const in90min = new Date(now.getTime() + 90 * 60 * 1000);
+  const in4h = new Date(now.getTime() + 4 * 60 * 60 * 1000);
 
-  // Find pending bets for fixtures kicking off in the next 90 minutes
+  // Find pending bets for fixtures kicking off in the next 4 hours
   // that don't already have a closing line stored
   const pendingBets = await db
     .select({
@@ -2867,13 +3066,13 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
       and(
         eq(paperBetsTable.status, "pending"),
         sql`${matchesTable.kickoffTime} >= ${now}`,
-        sql`${matchesTable.kickoffTime} <= ${in90min}`,
+        sql`${matchesTable.kickoffTime} <= ${in4h}`,
         sql`${paperBetsTable.closingPinnacleOdds} IS NULL`,
       ),
     );
 
   if (pendingBets.length === 0) {
-    logger.debug("Pre-kickoff CLV cron: no pending bets kicking off in next 90min");
+    logger.debug("Pre-kickoff CLV cron: no pending bets kicking off in next 4h");
     return { checked: 0, updated: 0, skipped: 0 };
   }
 

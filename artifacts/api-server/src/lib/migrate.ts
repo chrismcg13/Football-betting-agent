@@ -2150,6 +2150,28 @@ export async function runMigrations() {
     `);
 
     // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 Phase C1: Tier-B league coverage refresh.
+    //
+    // Background: oddspapi_league_coverage tracks per-league results from
+    // the fixture-mapping cron. Leagues marked hasOdds=0 with recent
+    // last_checked (< 7d ago) are EXCLUDED from prefetch. Many Tier-B
+    // leagues have been silently in this state since the league-universe
+    // expansion (Phase 2.A, 2026-05-03). Resetting last_checked forces
+    // the next prefetch + mapping cycle to give them a fair retry.
+    //
+    // Idempotent: only resets where last_checked is recent. Doesn't
+    // disrupt currently-mapped leagues.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      UPDATE oddspapi_league_coverage
+      SET last_checked = '2025-01-01'::timestamptz
+      WHERE league IN (
+        SELECT name FROM competition_config
+        WHERE universe_tier = 'B' AND is_active = true
+      ) AND last_checked > NOW() - INTERVAL '7 days'
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
     // 2026-05-08 (post-RCA): clv_data_quality='partial_fallback' backfill.
     // Phase 2.A prefetch refocus + Pinnacle-required filter compounded on
     // 2026-05-04. Paper bets settled May 4 → fix-deploy that used the
