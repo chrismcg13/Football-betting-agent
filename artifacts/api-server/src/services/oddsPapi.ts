@@ -3035,8 +3035,14 @@ export async function logDailyBudgetSummary(): Promise<void> {
 // Why 4h: the 30-min cron means bets in the next 4h get 8 chances to
 // have a closing line captured before kickoff (every 30 min), and a
 // "near-final" capture at T-30min becomes the de-facto closing line
-// for filter / gate-pool inclusion. P3 budget headroom (~19,000 calls/
-// month unused) easily supports this.
+// for filter / gate-pool inclusion.
+//
+// 2026-05-08 (Lever 1 fix): grouping was originally by matchId only — the
+// code picked ONE market per fixture (preferring MATCH_ODDS), so any
+// BTTS/DC/AH/TEAM_TOTAL bet that shared a fixture with a MATCH_ODDS bet
+// got silently skipped. Audit showed 0% pinnacle-close coverage on those
+// market types vs 75-95% on MATCH_ODDS. Now groups by (matchId, marketType)
+// so every market gets its own fetch + Pinnacle extraction.
 
 export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
   checked: number;
@@ -3081,32 +3087,49 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
   let updated = 0;
   let skipped = 0;
 
-  // Group by matchId to deduplicate OddsPapi requests (one request per fixture per market)
-  const byMatch = new Map<number, typeof pendingBets>();
+  // Group by (matchId, marketType) so every market gets its own OddsPapi fetch.
+  // Cache fixtureId per matchId — one DB lookup per fixture, not per (fixture,market).
+  const byMatchMarket = new Map<string, { matchId: number; marketType: string; bets: typeof pendingBets }>();
   for (const bet of pendingBets) {
-    const group = byMatch.get(bet.matchId) ?? [];
-    group.push(bet);
-    byMatch.set(bet.matchId, group);
+    const k = `${bet.matchId}|${bet.marketType}`;
+    let group = byMatchMarket.get(k);
+    if (!group) {
+      group = { matchId: bet.matchId, marketType: bet.marketType, bets: [] };
+      byMatchMarket.set(k, group);
+    }
+    group.bets.push(bet);
   }
 
-  for (const [matchId, bets] of byMatch) {
-    const oddspapiId = await getOddspapiFixtureId(matchId);
+  // Pre-resolve oddspapi fixture IDs (one lookup per match, cached for all its markets)
+  const fixtureIdCache = new Map<number, number | null>();
+  for (const { matchId } of byMatchMarket.values()) {
+    if (!fixtureIdCache.has(matchId)) {
+      fixtureIdCache.set(matchId, await getOddspapiFixtureId(matchId));
+    }
+  }
+
+  for (const { matchId, marketType, bets } of byMatchMarket.values()) {
+    const oddspapiId = fixtureIdCache.get(matchId);
     if (!oddspapiId) {
       skipped += bets.length;
       continue;
     }
 
-    // Fetch MATCH_ODDS closing line (covers Home/Draw/Away bets)
-    const matchOddsMarket = bets.some((b) => b.marketType === "MATCH_ODDS") ? "MATCH_ODDS" : bets[0]?.marketType;
-    if (!matchOddsMarket) { skipped += bets.length; continue; }
+    // Skip markets we don't have an OddsPapi market-id mapping for. Without
+    // this, MARKET_IDS[marketType] would be undefined and we'd fetch the
+    // wrong endpoint for the market.
+    const marketId = MARKET_IDS[marketType];
+    if (!marketId) {
+      logger.debug({ matchId, marketType, count: bets.length }, "Pre-kickoff CLV: no MARKET_IDS mapping — skipping");
+      skipped += bets.length;
+      continue;
+    }
 
     if (!(await canMakeOddspapiRequest(1, "P3"))) {
       logger.warn("Pre-kickoff CLV cron: P3 budget exhausted — stopping");
       skipped += bets.length;
       break;
     }
-
-    const marketId = MARKET_IDS[matchOddsMarket] ?? 101;
 
     // Rate-limit guard
     await new Promise((r) => setTimeout(r, 2400));
@@ -3123,23 +3146,41 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
     const bookmakers = extractBookmakers(rawData as RawOddsResponse);
     if (!bookmakers.length) { skipped += bets.length; continue; }
 
-    // Extract Pinnacle odds for each selection
+    // Extract Pinnacle odds for each generic selection in THIS market.
+    // Generic keys differ per market — MATCH_ODDS = Home/Draw/Away, BTTS = Yes/No,
+    // OU/AH/TEAM_TOTAL = Over/Under, DC = 1X/X2/12. getGenericSelectionKeys
+    // returns the right set; getSelectionOdds matches selection labels with
+    // OU/AH/TEAM_TOTAL line/handicap encoding.
     const pinnacleBySelection: Record<string, number | null> = {};
     for (const bm of bookmakers) {
       const slug = getBookmakerSlug(bm);
       if (!slug.includes("pinnacle")) continue;
       const selections = extractSelections(bm);
-      for (const selName of getGenericSelectionKeys(matchOddsMarket)) {
-        const odds = getSelectionOdds(selections, matchOddsMarket, selName);
+      for (const selName of getGenericSelectionKeys(marketType)) {
+        const odds = getSelectionOdds(selections, marketType, selName);
         if (odds) pinnacleBySelection[selName] = odds;
       }
+      // Also try matching by the actual bet's selectionName for AH/TEAM_TOTAL
+      // where the generic key is "Over"/"Under" but the encoding includes the
+      // line ("Home -1.5", "Over 2.5 [home]"). Fall through to per-bet match below.
     }
 
     // Store closing odds for each matching bet and compute CLV
     for (const bet of bets) {
       try {
-        const genericKey = normaliseSelectionToGenericKey(bet.selectionName, matchOddsMarket);
-        const closingOdds = pinnacleBySelection[genericKey] ?? null;
+        // First try generic-key lookup, then fall back to direct selection
+        // match (handles AH/TEAM_TOTAL where line is encoded in the name).
+        const genericKey = normaliseSelectionToGenericKey(bet.selectionName, marketType);
+        let closingOdds: number | null = pinnacleBySelection[genericKey] ?? null;
+        if (!closingOdds) {
+          for (const bm of bookmakers) {
+            const slug = getBookmakerSlug(bm);
+            if (!slug.includes("pinnacle")) continue;
+            const selections = extractSelections(bm);
+            const direct = getSelectionOdds(selections, marketType, bet.selectionName);
+            if (direct) { closingOdds = direct; break; }
+          }
+        }
         if (!closingOdds) { skipped++; continue; }
 
         const placementOdds = Number(bet.oddsAtPlacement);
@@ -3152,6 +3193,8 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
           .set({
             closingPinnacleOdds: String(closingOdds),
             ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
+            clvSource: "pinnacle",
+            clvDataQuality: "complete",
           })
           .where(eq(paperBetsTable.id, bet.id));
 
@@ -3165,18 +3208,21 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
         });
 
         logger.info(
-          { betId: bet.id, matchId, selection: bet.selectionName, placementOdds, closingOdds, clvPct },
+          { betId: bet.id, matchId, marketType, selection: bet.selectionName, placementOdds, closingOdds, clvPct },
           "Pre-kickoff CLV stored (Pinnacle closing line) + snapshot C",
         );
         updated++;
       } catch (err) {
-        logger.error({ err, betId: bet.id, matchId }, "Closing line snapshot error — skipping bet");
+        logger.error({ err, betId: bet.id, matchId, marketType }, "Closing line snapshot error — skipping bet");
         skipped++;
       }
     }
   }
 
-  logger.info({ checked: pendingBets.length, updated, skipped }, "Pre-kickoff CLV cron complete");
+  logger.info(
+    { checked: pendingBets.length, updated, skipped, fixtures: fixtureIdCache.size, marketGroups: byMatchMarket.size },
+    "Pre-kickoff CLV cron complete",
+  );
   return { checked: pendingBets.length, updated, skipped };
 }
 

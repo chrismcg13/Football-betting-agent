@@ -2418,6 +2418,20 @@ router.post("/admin/run-tier-ladder-v2", async (_req, res) => {
   }
 });
 
+// 2026-05-08 (Lever 2): manual trigger for dead-letter sweep + registry
+// completeness check. Auto-voids bets stuck >7d post-kickoff with >50
+// attempts and raises data_quality_alerts for any unregistered market types.
+router.post("/admin/run-dead-letter-sweep", async (_req, res) => {
+  try {
+    const { runDeadLetterSweep } = await import("../services/deadLetterSweep");
+    const r = await runDeadLetterSweep();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual dead-letter sweep failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/run-daily-discovery-sweep", async (_req, res) => {
   try {
     const { runDailyDiscoverySweep } = await import("../services/oddsPapi");

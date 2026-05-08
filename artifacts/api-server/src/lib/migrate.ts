@@ -193,6 +193,17 @@ export async function runMigrations() {
       ON CONFLICT (key) DO NOTHING
     `);
 
+    // 2026-05-08 (Lever 4): live-placement kill switch. Seeded as 'false'
+    // so live placement stays off until the operator explicitly flips it,
+    // even after a fresh deploy with TRADING_MODE=LIVE. Independent of
+    // env-mode so the operator can pause live placement without changing
+    // environment variables or restarting.
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value, updated_at)
+      VALUES ('live_placement_enabled', 'false', NOW())
+      ON CONFLICT (key) DO NOTHING
+    `);
+
     // ── xG data layer tables (additive — do not modify existing tables)
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS xg_match_data (

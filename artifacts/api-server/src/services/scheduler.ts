@@ -2080,6 +2080,25 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Z4-v2 tier ladder scheduler active — daily 03:30 UTC (gated on z4_v2_enabled)");
+
+  // 2026-05-08 (Lever 2): dead-letter sweep + registry-completeness check.
+  // Daily 04:15 UTC — runs after Z4-v2 (03:30) so any DLQ alerts are
+  // visible before the gate evaluation cron at 04:30. Two functions:
+  // (1) flag market types in paper_bets that the registry doesn't recognise,
+  // (2) auto-void bets stuck >7d post-kickoff with >50 settlement attempts.
+  cron.schedule("15 4 * * *", () => {
+    logger.info("Dead-letter sweep triggered (daily 04:15 UTC)");
+    void (async () => {
+      try {
+        const { runDeadLetterSweep } = await import("./deadLetterSweep");
+        const r = await runDeadLetterSweep();
+        logger.info(r, "Dead-letter sweep complete");
+      } catch (err) {
+        logger.error({ err }, "Dead-letter sweep failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Dead-letter sweep scheduler active — daily 04:15 UTC");
 }
 
 // ===================== Scheduler =====================

@@ -44,6 +44,7 @@ import {
   isBetfairApiPaused,
 } from "./liveRiskManager";
 import { detectCurrentRegime } from "./marketRegime";
+import { checkLivePlacementGates } from "./livePlacementGate";
 
 // ===================== C1: Exchange-book capture (delayed app key) ========
 // Captured at placement time via listMarketCatalogue + listMarketBook on the
@@ -1793,17 +1794,29 @@ export async function placePaperBet(
 
     const match = matchData[0];
 
-    const tier1Check = await qualifiesForTier1({
-      opportunityScore: score,
-      dataTier,
+    // 2026-05-08 (Lever 4): live-placement gates run BEFORE qualifiesForTier1.
+    // If kill switch is off, or the (market_type, league) scope isn't in
+    // live_whitelist with active=true, this is paper-only regardless of how
+    // good the bet looks. Defence-in-depth: tier1 still has to pass after.
+    const liveGates = await checkLivePlacementGates({
       marketType,
       league: match?.league ?? "",
-      country: match?.country ?? "",
-      pinnacleOdds: pinnacleOdds ?? null,
-      pinnacleImplied: pinnacleImplied ?? null,
-      modelProbability,
-      backOdds,
+      betId: bet.id,
     });
+
+    const tier1Check = liveGates.allowed
+      ? await qualifiesForTier1({
+          opportunityScore: score,
+          dataTier,
+          marketType,
+          league: match?.league ?? "",
+          country: match?.country ?? "",
+          pinnacleOdds: pinnacleOdds ?? null,
+          pinnacleImplied: pinnacleImplied ?? null,
+          modelProbability,
+          backOdds,
+        })
+      : ({ qualifies: false, reason: liveGates.reason } satisfies Tier1CheckResult);
 
     const liveTier = tier1Check.qualifies ? "tier1" : "tier2";
     let qualificationPath: string = tier1Check.qualifies ? (tier1Check.path ?? "1B") : "paper";

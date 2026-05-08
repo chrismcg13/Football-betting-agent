@@ -1,0 +1,164 @@
+import { db } from "@workspace/db";
+import { sql } from "drizzle-orm";
+import { logger } from "../lib/logger";
+
+/**
+ * Live-placement gating (Lever 4 of 2026-05-08 maximisation bundle).
+ *
+ * Adds two gates between the autonomous decision layer and Betfair
+ * placement that the original `isLiveMode() + qualifiesForTier1()` flow
+ * lacks:
+ *
+ *   1. Kill switch — agent_config.live_placement_enabled (default 'false').
+ *      Independent of TRADING_MODE env. Allows the operator to flip live
+ *      placement off per-incident without touching environment variables
+ *      or restarting the process. Defaults closed: a fresh deploy with
+ *      TRADING_MODE=LIVE still won't place live bets until this is
+ *      explicitly set to 'true'.
+ *
+ *   2. Scope whitelist — only scopes (market_type × league) that are
+ *      present in live_whitelist with active=true are allowed through.
+ *      The flip-to-live CLI populates this table from Path P / Path S
+ *      gate-clearance, so even after switchover, live placement is
+ *      restricted to the markets that actually proved themselves.
+ *
+ * This is in front of `qualifiesForTier1`, which remains as defence-in-
+ * depth (data-tier checks, opp-score floor, Pinnacle-edge floor). The
+ * order: env-mode check → kill-switch → whitelist → tier1 → place.
+ *
+ * Z4-v2 stake sizing already flows through the existing
+ * `pauseCheck.kellyFractionOverride` path in paperTrading.ts:896, so
+ * Z4-v2 tier movements automatically scale live stake without further
+ * wiring here.
+ */
+
+let cachedFlag: { value: boolean; fetchedAt: number } | null = null;
+const FLAG_CACHE_TTL_MS = 30_000; // 30s — short enough to react to operator flip, long enough to amortise lookups
+
+export async function isLivePlacementEnabled(): Promise<boolean> {
+  const now = Date.now();
+  if (cachedFlag && now - cachedFlag.fetchedAt < FLAG_CACHE_TTL_MS) {
+    return cachedFlag.value;
+  }
+
+  const rows = (await db.execute(sql`
+    SELECT value FROM agent_config WHERE key = 'live_placement_enabled' LIMIT 1
+  `)) as unknown as { rows: Array<{ value: string }> };
+  const raw = rows.rows[0]?.value?.toLowerCase()?.trim() ?? "false";
+  const value = raw === "true" || raw === "1";
+  cachedFlag = { value, fetchedAt: now };
+  return value;
+}
+
+export function invalidateLivePlacementFlagCache(): void {
+  cachedFlag = null;
+}
+
+export interface ScopeWhitelistResult {
+  whitelisted: boolean;
+  path: "P" | "S" | null;
+  kellyFractionOverride: number | null;
+  reason: string;
+}
+
+/**
+ * Look up live_whitelist for (market_type, league). League is matched
+ * exactly; the flip-to-live CLI normalises both at insert time so
+ * casing should already align. If multiple paths cover the same scope
+ * (P preferred), P wins.
+ */
+export async function isScopeWhitelisted(
+  marketType: string,
+  league: string,
+): Promise<ScopeWhitelistResult> {
+  if (!league) {
+    return { whitelisted: false, path: null, kellyFractionOverride: null, reason: "league missing" };
+  }
+
+  const rows = (await db.execute(sql`
+    SELECT path, kelly_fraction_override::float8 AS k
+    FROM live_whitelist
+    WHERE active = true
+      AND market_type = ${marketType}
+      AND league = ${league}
+    ORDER BY path ASC, snapshotted_at DESC
+    LIMIT 1
+  `)) as unknown as { rows: Array<{ path: "P" | "S"; k: number }> };
+
+  const row = rows.rows[0];
+  if (!row) {
+    return {
+      whitelisted: false,
+      path: null,
+      kellyFractionOverride: null,
+      reason: `no active live_whitelist row for ${marketType} × ${league}`,
+    };
+  }
+  return {
+    whitelisted: true,
+    path: row.path,
+    kellyFractionOverride: row.k,
+    reason: `whitelisted via path ${row.path} with kelly_fraction_override=${row.k}`,
+  };
+}
+
+export interface LivePlacementCheck {
+  allowed: boolean;
+  reason: string;
+  path: "P" | "S" | null;
+  kellyFractionOverride: number | null;
+}
+
+/**
+ * Composite gate: kill-switch + scope-whitelist. Caller still has to
+ * pass qualifiesForTier1() afterwards (defence-in-depth on opportunity
+ * score, Pinnacle edge, data tier).
+ *
+ * Logs at info when blocking — if a bet was supposed to go live but
+ * didn't, the operator needs the reason to diagnose. No logging on the
+ * happy path to avoid noise from every paper-mode placement.
+ */
+export async function checkLivePlacementGates(args: {
+  marketType: string;
+  league: string;
+  betId?: number;
+}): Promise<LivePlacementCheck> {
+  const enabled = await isLivePlacementEnabled();
+  if (!enabled) {
+    if (args.betId) {
+      logger.info(
+        { betId: args.betId, marketType: args.marketType, league: args.league },
+        "Live placement gate: kill switch closed (live_placement_enabled=false) — paper only",
+      );
+    }
+    return {
+      allowed: false,
+      reason: "live_placement_enabled=false (operator kill switch)",
+      path: null,
+      kellyFractionOverride: null,
+    };
+  }
+
+  const wl = await isScopeWhitelisted(args.marketType, args.league);
+  if (!wl.whitelisted) {
+    if (args.betId) {
+      logger.info(
+        { betId: args.betId, marketType: args.marketType, league: args.league, reason: wl.reason },
+        "Live placement gate: scope not whitelisted — paper only",
+      );
+    }
+    return {
+      allowed: false,
+      reason: wl.reason,
+      path: null,
+      kellyFractionOverride: null,
+    };
+  }
+
+  return {
+    allowed: true,
+    reason: wl.reason,
+    path: wl.path,
+    kellyFractionOverride: wl.kellyFractionOverride,
+  };
+}
