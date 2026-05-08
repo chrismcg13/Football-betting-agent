@@ -2341,6 +2341,21 @@ router.post("/admin/phase3-track-b-backfill", async (_req, res) => {
   }
 });
 
+// 2026-05-08 URGENT: manual trigger for runTradingCycle. Used to diagnose
+// trading_near silence post-deploy. Returns the cycle result directly so
+// we can see which exit path was taken (lock skip / risk triggered /
+// agent paused / actual completion).
+router.post("/admin/run-trading-near", async (_req, res) => {
+  try {
+    const { runTradingCycle } = await import("../services/scheduler");
+    const result = await runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 });
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual run-trading-near failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Phase 3 §5 (2026-05-08): atomic paper→live switchover. Called by
 // scripts/src/flip-to-live.ts after Chris confirms the manifest hash.
 // Body shape:
