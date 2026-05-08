@@ -2214,13 +2214,20 @@ router.post("/admin/phase3-track-b-backfill", async (_req, res) => {
     // ── B5 backfill: tag clv_source on settled rows. 'pinnacle' if
     //    closing_pinnacle_odds is set, 'none' otherwise. Only updates
     //    rows where clv_source is currently null/empty.
+    // Tag any settled row with closing_pinnacle_odds as 'pinnacle', regardless
+    // of any prior tag. Rationale: Path P evaluation pool is filtered on
+    // clv_source='pinnacle' AND clv_pct IS NOT NULL — rows previously tagged
+    // 'market_proxy' but which DO have a Pinnacle close should count, because
+    // the Pinnacle anchor IS the stronger signal whenever it exists. The
+    // market_proxy tag was set by an older code path (paperTrading.ts pre-fix)
+    // that never re-promoted to pinnacle even when close was captured.
     const b5Pinn = await db.execute(sql`
       UPDATE paper_bets
       SET clv_source = 'pinnacle'
       WHERE legacy_regime = false AND deleted_at IS NULL
         AND status IN ('won','lost')
         AND closing_pinnacle_odds IS NOT NULL
-        AND (clv_source IS NULL OR clv_source = '' OR clv_source = 'none')
+        AND (clv_source IS NULL OR clv_source != 'pinnacle')
       RETURNING id
     `);
     result.b5_clv_pinnacle_backfilled = (((b5Pinn as any).rows ?? []) as unknown[]).length;
@@ -2330,6 +2337,35 @@ router.post("/admin/phase3-track-b-backfill", async (_req, res) => {
     res.json({ success: true, result });
   } catch (err) {
     logger.error({ err }, "Phase 3 Track B backfill failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Phase 3 (2026-05-08): manual trigger for bankrollTierCaps. Cron runs
+// daily 03:00 UTC; this lets us produce a pending_caps row immediately
+// after deploy for blocker validation.
+router.post("/admin/run-bankroll-tier-caps", async (_req, res) => {
+  try {
+    const { runBankrollTierCaps } = await import("../services/bankrollTierCaps");
+    const r = await runBankrollTierCaps();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual bankrollTierCaps trigger failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Phase 3 B9 (2026-05-08): manual trigger for gateMonitor. Cron runs
+// daily 04:00 UTC; this lets us produce a gate_status row immediately
+// after deploy for blocker validation. Pre-evaluation_start_at this
+// returns a heartbeat-only result.
+router.post("/admin/run-gate-monitor", async (_req, res) => {
+  try {
+    const { runGateMonitor } = await import("../services/gateMonitor");
+    const r = await runGateMonitor();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual gateMonitor trigger failed");
     res.status(500).json({ success: false, message: String(err) });
   }
 });
