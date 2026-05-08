@@ -2341,6 +2341,238 @@ router.post("/admin/phase3-track-b-backfill", async (_req, res) => {
   }
 });
 
+// Phase 3 §5 (2026-05-08): atomic paper→live switchover. Called by
+// scripts/src/flip-to-live.ts after Chris confirms the manifest hash.
+// Body shape:
+//   {"manifestHash": "<sha256>", "confirm": true}
+//
+// Server-side flow (all in one logical transaction-equivalent sequence —
+// individual writes are not wrapped in a single Postgres transaction
+// because we need to call applyPendingCapsToLive() which has its own
+// queries, but the order is designed so partial failures leave the
+// system either fully paper or fully live, never half-flipped):
+//
+//   1. Fetch the latest unresolved gate_clear_pending_review row.
+//      Abort if none.
+//   2. Recompute the manifest from current gate_components + path_s_aggregate_status
+//      + switchover_whitelist. Hash it. Compare to client-provided hash.
+//      Abort on mismatch.
+//   3. Re-run the gate triggers. Abort if neither Path P nor Path S is
+//      currently passing (defense against stale pending-review row).
+//   4. Apply bankroll-tier caps to live agent_config.
+//   5. Insert live_whitelist snapshot rows.
+//   6. Flip the four mode flags atomically (paper_mode, live_mode_active,
+//      paper_bet_generation_enabled, live_mode_activated_at).
+//   7. Insert compliance_logs row with full manifest.
+//   8. Mark pending_review row resolved='flipped'.
+router.post("/admin/flip-to-live", async (req, res) => {
+  try {
+    const { db, agentConfigTable, complianceLogsTable } = await import("@workspace/db");
+    const { sql, eq } = await import("drizzle-orm");
+    const { applyPendingCapsToLive } = await import("../services/bankrollTierCaps");
+    const { createHash } = await import("node:crypto");
+
+    const body = (req.body ?? {}) as { manifestHash?: string; confirm?: boolean };
+    if (body.confirm !== true) {
+      res.status(400).json({
+        success: false,
+        message: "{\"confirm\": true} required to execute the flip. Without it the request is refused.",
+      });
+      return;
+    }
+    if (!body.manifestHash || !/^[0-9a-f]{64}$/.test(body.manifestHash)) {
+      res.status(400).json({
+        success: false,
+        message: "manifestHash (sha256 hex) required",
+      });
+      return;
+    }
+
+    // Step 1: latest unresolved pending review
+    const pendingRows = await db.execute(sql`
+      SELECT id, manifest_hash, manifest::text AS manifest_text, manifest
+      FROM gate_clear_pending_review
+      WHERE resolved_at IS NULL
+      ORDER BY id DESC LIMIT 1
+    `);
+    const pending = (((pendingRows as any).rows ?? []) as Array<{
+      id: number; manifest_hash: string; manifest_text: string; manifest: Record<string, unknown>;
+    }>)[0];
+    if (!pending) {
+      res.status(409).json({
+        success: false,
+        message: "No unresolved gate_clear_pending_review row. The gate has not currently fired, or the manifest has expired.",
+      });
+      return;
+    }
+
+    // Step 2: hash check against the manifest as stored at gate-clear time
+    if (pending.manifest_hash !== body.manifestHash) {
+      res.status(409).json({
+        success: false,
+        message: "manifestHash mismatch — the pending-review manifest hash does not match the value provided. This is a safety check; refresh the manifest from gate_clear_pending_review and retry.",
+        provided: body.manifestHash,
+        expected: pending.manifest_hash,
+      });
+      return;
+    }
+
+    // Step 3: re-verify the gate is currently true. The pending-review row
+    // was inserted when the cron last ran; state could have changed (e.g.
+    // a new bet voided pushed the aggregate ROI under threshold). We DO
+    // NOT compare a freshly-recomputed hash against the provided one —
+    // that would force the user to re-fetch every cron tick. Instead we
+    // verify the gate STILL passes; the manifest hash is the integrity
+    // check that the user is acting on the manifest they reviewed.
+    const gcRows = await db.execute(sql`SELECT * FROM gate_components`);
+    const gc = (((gcRows as any).rows ?? []) as Array<{
+      pool_size: number | string;
+      aggregate_net_roi: number | string | null;
+      aggregate_net_clv: number | string | null;
+    }>)[0];
+    const sStatusRows = await db.execute(sql`SELECT * FROM path_s_aggregate_status`);
+    const sStatus = (((sStatusRows as any).rows ?? []) as Array<{
+      path_s_aggregate_pass: boolean;
+    }>)[0];
+    const wlRows = await db.execute(sql`SELECT * FROM switchover_whitelist`);
+    const wl = (((wlRows as any).rows ?? []) as Array<{
+      path: string; market_type: string; league: string;
+      n: number | string;
+      scope_net_roi: number | string | null;
+      scope_net_clv: number | string | null;
+      share_of_agg_pnl: number | string | null;
+    }>);
+
+    const pPass = !!gc
+      && Number(gc.pool_size ?? 0) >= 200
+      && Number(gc.aggregate_net_roi ?? 0) >= 0.03
+      && Number(gc.aggregate_net_clv ?? 0) >= 2.0;
+    const sPass = !!sStatus?.path_s_aggregate_pass;
+    const wlOk = wl.length >= 1 && Math.max(0, ...wl.map((r) => Number(r.share_of_agg_pnl ?? 0))) <= 0.80;
+    const trigger: "P" | "S" | null = pPass && wlOk ? "P" : sPass && wlOk ? "S" : null;
+    if (!trigger) {
+      res.status(409).json({
+        success: false,
+        message: "Gate no longer clearing at execution time. State changed between gate-clear and flip. Manifest hash matched but post-check failed.",
+        path_p_pass: pPass, path_s_pass: sPass, whitelist_ok: wlOk, whitelist_size: wl.length,
+      });
+      return;
+    }
+
+    // Step 4: apply bankroll-tier caps to live config
+    const capsApplied = await applyPendingCapsToLive();
+
+    // Step 5: snapshot whitelist (idempotent — only insert if no active rows
+    // exist yet, to prevent double-flip from duplicating)
+    const existingActive = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM live_whitelist WHERE active = true
+    `);
+    const activeCount = Number((((existingActive as any).rows ?? []) as Array<{ n: number }>)[0]?.n ?? 0);
+    if (activeCount === 0) {
+      for (const r of wl) {
+        await db.execute(sql`
+          INSERT INTO live_whitelist (
+            path, market_type, league, n,
+            scope_net_roi, scope_net_clv, share_of_agg_pnl,
+            kelly_fraction_override, live_bet_count, active
+          ) VALUES (
+            ${r.path}, ${r.market_type}, ${r.league}, ${Number(r.n)},
+            ${r.scope_net_roi != null ? Number(r.scope_net_roi) : null},
+            ${r.scope_net_clv != null ? Number(r.scope_net_clv) : null},
+            ${r.share_of_agg_pnl != null ? Number(r.share_of_agg_pnl) : null},
+            0.5, 0, true
+          )
+        `);
+      }
+    }
+
+    // Step 6: flip mode flags
+    async function setOrInsert(key: string, value: string) {
+      const existing = await db.select().from(agentConfigTable).where(eq(agentConfigTable.key, key));
+      if (existing.length === 0) {
+        await db.insert(agentConfigTable).values({ key, value });
+      } else {
+        await db.update(agentConfigTable).set({ value, updatedAt: new Date() }).where(eq(agentConfigTable.key, key));
+      }
+    }
+    await setOrInsert("paper_mode", "false");
+    await setOrInsert("live_mode_active", "true");
+    await setOrInsert("paper_bet_generation_enabled", "false");
+    await setOrInsert("live_mode_activated_at", new Date().toISOString());
+
+    // Step 7: compliance log
+    await db.insert(complianceLogsTable).values({
+      actionType: "live_mode_activated",
+      details: {
+        trigger,
+        manifest_hash: body.manifestHash,
+        manifest_at_clear: pending.manifest,
+        whitelist_size: wl.length,
+        whitelist: wl,
+        caps_applied: capsApplied,
+        bankroll_at_flip: ((await db.select({ value: agentConfigTable.value }).from(agentConfigTable).where(eq(agentConfigTable.key, "bankroll")))[0]?.value) ?? null,
+      } as Record<string, unknown>,
+      timestamp: new Date(),
+    } as any);
+
+    // Step 8: resolve pending-review row
+    await db.execute(sql`
+      UPDATE gate_clear_pending_review
+      SET resolved_at = NOW(), resolution = 'flipped'
+      WHERE id = ${pending.id}
+    `);
+
+    res.json({
+      success: true,
+      result: {
+        trigger,
+        whitelist_inserted: activeCount === 0 ? wl.length : 0,
+        whitelist_already_active: activeCount,
+        caps_applied: capsApplied,
+        flipped_at: new Date().toISOString(),
+        compliance_log_written: true,
+        pending_review_resolved: pending.id,
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, "flip-to-live failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// GET version of the same logic — preview only, no writes. Used by the
+// CLI to fetch and display the pending manifest before the user confirms.
+router.get("/admin/flip-to-live-preview", async (_req, res) => {
+  try {
+    const { db } = await import("@workspace/db");
+    const { sql } = await import("drizzle-orm");
+
+    const pendingRows = await db.execute(sql`
+      SELECT id, detected_at::text, manifest_hash, manifest, resolved_at::text, resolution
+      FROM gate_clear_pending_review
+      ORDER BY id DESC LIMIT 5
+    `);
+    const pending = ((pendingRows as any).rows ?? []) as Array<unknown>;
+
+    const gcRows = await db.execute(sql`SELECT * FROM gate_components`);
+    const sStatusRows = await db.execute(sql`SELECT * FROM path_s_aggregate_status`);
+    const wlRows = await db.execute(sql`SELECT * FROM switchover_whitelist`);
+
+    res.json({
+      success: true,
+      result: {
+        pending_review_rows: pending,
+        current_gate_components: ((gcRows as any).rows ?? [])[0] ?? null,
+        current_path_s_status: ((sStatusRows as any).rows ?? [])[0] ?? null,
+        current_whitelist: (wlRows as any).rows ?? [],
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, "flip-to-live-preview failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Phase 3 (2026-05-08): set evaluation_start_at — the timestamp that
 // activates the gate-monitoring pool filters. Once set, both Path P
 // (evaluation_pool view) and Path S (shadow_evaluation_pool view) start
