@@ -988,8 +988,17 @@ export async function detectValueBets(options?: {
   // has_betfair_exchange exists in prod DB but isn't declared on the Drizzle
   // competitionConfigTable schema (legacy column added via direct DML — see
   // docs/phase-2-current-state.md §1.3). Use raw SQL to read it.
+  //
+  // 2026-05-08 (post-deploy fix): competition_config has duplicate rows by
+  // name (e.g. "Premier League" has 31 rows — different countries' Premier
+  // Leagues, different has_betfair_exchange values). The filter must drop
+  // a league name ONLY when EVERY row for that name is explicitly FALSE.
+  // If ANY row says TRUE or NULL (uncertain), keep — benefit of doubt
+  // beats accidentally dropping a hot league because of a stale dup row.
   const nonTradeableRows = await db.execute(sql`
-    SELECT name FROM competition_config WHERE has_betfair_exchange = FALSE
+    SELECT name FROM competition_config
+    GROUP BY name
+    HAVING NOT BOOL_OR(COALESCE(has_betfair_exchange, TRUE))
   `);
   const nonTradeableLeagues = new Set<string>(
     (((nonTradeableRows as any).rows ?? (nonTradeableRows as any) ?? []) as Array<{ name: string }>)
