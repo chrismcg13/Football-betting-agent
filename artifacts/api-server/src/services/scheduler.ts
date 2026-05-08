@@ -2021,6 +2021,28 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Half-Kelly ramp scheduler active — every 15 min UTC (no-op pre-flip)");
 
+  // Phase 3 Path C+ (2026-05-08): lazy shadow→paper promotion. Every 5 min,
+  // scans pending Tier A shadow bets where kickoff is within 6h and fresh
+  // (≤30 min) betfair_exchange data exists for the specific selection.
+  // Promotes in place to paper rail with fresh Kelly stake. Pre-fix the
+  // valueDetection routing was permanent — once shadow, always shadow.
+  // This catches the case where exchange data appears AFTER the bet was
+  // emitted, which is the dominant 87% routing-to-shadow cause on Tier A.
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const { runLazyPromoteShadowToPaper } = await import("./lazyPromoteShadowToPaper");
+        const r = await runLazyPromoteShadowToPaper();
+        if (r.promoted > 0 || r.pending_shadow_count > 0) {
+          logger.info(r, "Lazy shadow→paper promotion evaluated");
+        }
+      } catch (err) {
+        logger.error({ err }, "Lazy shadow→paper promotion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Lazy shadow→paper promoter active — every 5 min UTC");
+
   // 2026-05-08 (§4.2 of root-cause-analysis): cron health monitor.
   // Runs every 5 min. Compares each tracked cron's last successful run
   // against expected cadence; inserts gate-style alert rows in

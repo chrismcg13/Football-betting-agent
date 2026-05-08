@@ -1261,7 +1261,17 @@ export async function detectValueBets(options?: {
   // are well within. The ORDER BY in the DISTINCT ON ensures we keep the
   // latest snapshot per group when multiple exist within the window.
   const matchIds = matches.map((m) => m.id);
-  const ODDS_LOOKBACK_HOURS = 2;
+  // Phase 3 Path C+ (2026-05-08): widened from 2h → 6h. Pre-fix the 2h
+  // window forced 87% of Tier A bets to shadow rail because betfair_exchange
+  // snapshots for the specific (match, market, selection) tuple weren't
+  // always fresh within 2h — even though the match was tradeable on Betfair.
+  // 6h still well within the slowest ingestion cadence (oddspapi_pinnacle
+  // ~hourly) and lets paper-track candidates qualify against slightly-stale
+  // exchange prices. The lazy shadow→paper promoter (lazyPromoteShadowToPaper.ts)
+  // re-evaluates with fresh data every 5 min, so any bet that was paper-
+  // eligible at evaluation time but had a stale 6h-window price will be
+  // refreshed automatically before kickoff.
+  const ODDS_LOOKBACK_HOURS = 6;
   const oddsCutoff = new Date(Date.now() - ODDS_LOOKBACK_HOURS * 60 * 60 * 1000);
   // 2026-05-08 (§4.4 of root-cause-analysis): use the sqlIntList helper.
   // The helper validates that all elements are integers and renders a
