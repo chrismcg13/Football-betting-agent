@@ -1155,6 +1155,13 @@ export async function detectValueBets(options?: {
   const matchIds = matches.map((m) => m.id);
   const ODDS_LOOKBACK_HOURS = 2;
   const oddsCutoff = new Date(Date.now() - ODDS_LOOKBACK_HOURS * 60 * 60 * 1000);
+  // 2026-05-08 follow-up: drizzle's sql tag binds JS arrays as separate
+  // ($1,$2,$3,...) parameters — `match_id = ANY(${matchIds}::int[])`
+  // produced `ANY(($1,$2,...)::int[])` which Postgres rejects as a
+  // row-to-array cast. Workaround: interpolate a literal IN-list via
+  // sql.raw. Safe because matchIds is an int[] already validated by
+  // the matches-table SELECT above (drizzle returns typed numbers).
+  const matchIdsLiteral = sql.raw(matchIds.join(","));
   const allOddsRows = matchIds.length > 0
     ? (await db.execute(sql`
         SELECT DISTINCT ON (match_id, market_type, selection_name, source)
@@ -1163,7 +1170,7 @@ export async function detectValueBets(options?: {
           back_odds AS "backOdds", lay_odds AS "layOdds",
           snapshot_time AS "snapshotTime", source
         FROM odds_snapshots
-        WHERE match_id = ANY(${matchIds}::int[])
+        WHERE match_id IN (${matchIdsLiteral})
           AND snapshot_time >= ${oddsCutoff}
         ORDER BY match_id, market_type, selection_name, source, snapshot_time DESC
       `)).rows as unknown as Array<{
