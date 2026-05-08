@@ -2434,6 +2434,28 @@ router.post("/admin/backfill-closing-pinnacle", async (req, res) => {
   }
 });
 
+// 2026-05-08 (CLV diagnostic v2): exposes the raw market->outcome->player
+// KEY structure that the production parser flattens away. Used to verify
+// whether OddsPapi's outcome KEYS for BTTS/DC/FH/TEAM_TOTAL are readable
+// (e.g. "yes"/"no"/"1x") even when the bookmakerOutcomeId is a numeric
+// internal ID. If keys ARE readable we can fix the parser to use
+// Object.entries over Object.values and unlock OddsPapi for ALL markets.
+router.post("/admin/debug-oddspapi-raw", async (req, res) => {
+  try {
+    const matchId = Number((req.body ?? {}).matchId);
+    const marketType = String((req.body ?? {}).marketType ?? "");
+    if (!matchId || !marketType) {
+      return res.status(400).json({ success: false, message: "Body requires { matchId: number, marketType: string }" });
+    }
+    const { debugOddsPapiRawStructure } = await import("../services/oddsPapi");
+    const r = await debugOddsPapiRawStructure({ matchId, marketType });
+    return res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "debug-oddspapi-raw failed");
+    return res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 (CLV diagnostic): inspect raw OddsPapi response for a specific
 // (matchId, marketType). Used to diagnose why BTTS/DC/FH/TEAM_TOTAL show
 // zero oddspapi_pinnacle snapshots — reveals whether the API genuinely

@@ -3386,6 +3386,138 @@ export async function backfillClosingPinnacleFromMultiSource(opts: {
   return { scanned: settledBets.length, updated, skipped, bySource };
 }
 
+// ─── DIAGNOSTIC v2: dump the raw market→outcome→player KEY structure for the
+// Pinnacle bookmaker. The previous diagnostic flattened via extractSelections
+// (lines 2115-2144) which discards both the marketId KEY (101, 102, 103, ...)
+// and the outcomeKey ("home"/"yes"/"1x"/etc) before returning. That's why
+// we saw numeric outcome IDs for BTTS — the parser used `bookmakerOutcomeId`
+// (which IS numeric for BTTS) instead of the outcome KEY (which should be
+// "yes"/"no" — readable). This v2 endpoint preserves the full tree so we
+// can verify whether the outcome keys for BTTS/DC/FH are decodable.
+//
+// Truncated to first 8 markets, first 6 outcomes per market, first 2 players
+// per outcome — enough structure to draw conclusions without overflowing.
+
+export async function debugOddsPapiRawStructure(args: {
+  matchId: number;
+  marketType: string;
+}): Promise<{
+  matchId: number;
+  marketType: string;
+  oddspapiFixtureId: number | null;
+  oddspapiMarketId: number | null;
+  pinnacleFound: boolean;
+  marketKeys: string[];
+  marketsTree: Record<string, {
+    bookmakerMarketId?: string;
+    outcomes: Record<string, {
+      playerSamples: Array<{ playerKey: string; bookmakerOutcomeId?: string; price?: number; active?: boolean }>;
+    }>;
+  }>;
+  notes: string[];
+}> {
+  const notes: string[] = [];
+
+  const oddspapiFixtureId = await getOddspapiFixtureId(args.matchId);
+  if (!oddspapiFixtureId) {
+    notes.push("getOddspapiFixtureId returned null");
+    return {
+      matchId: args.matchId, marketType: args.marketType,
+      oddspapiFixtureId: null, oddspapiMarketId: null,
+      pinnacleFound: false, marketKeys: [], marketsTree: {}, notes,
+    };
+  }
+
+  const oddspapiMarketId = MARKET_IDS[args.marketType] ?? null;
+
+  const rawData = await fetchOddsPapi<RawOddsResponse>(
+    "/odds",
+    oddspapiMarketId
+      ? { fixtureId: oddspapiFixtureId, marketId: oddspapiMarketId }
+      : { fixtureId: oddspapiFixtureId },
+    "diagnostic_v2",
+    "P3",
+  );
+  if (!rawData) {
+    notes.push("fetchOddsPapi returned null");
+    return {
+      matchId: args.matchId, marketType: args.marketType,
+      oddspapiFixtureId, oddspapiMarketId,
+      pinnacleFound: false, marketKeys: [], marketsTree: {}, notes,
+    };
+  }
+
+  const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+  const pinnacleBm = bookmakers.find((b) => getBookmakerSlug(b).includes("pinnacle"));
+  if (!pinnacleBm) {
+    notes.push(`Pinnacle bookmaker not in response (${bookmakers.length} bookmakers)`);
+    return {
+      matchId: args.matchId, marketType: args.marketType,
+      oddspapiFixtureId, oddspapiMarketId,
+      pinnacleFound: false, marketKeys: [], marketsTree: {}, notes,
+    };
+  }
+
+  // Walk the raw structure with Object.entries so we preserve KEYS (the
+  // current production parser uses Object.values and discards them).
+  const rawMarkets = pinnacleBm.markets;
+  if (!rawMarkets || Array.isArray(rawMarkets) || typeof rawMarkets !== "object") {
+    notes.push("Pinnacle.markets is not the new-format Record — see legacy fallback in extractSelections");
+    return {
+      matchId: args.matchId, marketType: args.marketType,
+      oddspapiFixtureId, oddspapiMarketId,
+      pinnacleFound: true, marketKeys: [], marketsTree: {}, notes,
+    };
+  }
+
+  const marketKeys = Object.keys(rawMarkets as Record<string, RawMarket>);
+  const marketsTree: Record<string, {
+    bookmakerMarketId?: string;
+    outcomes: Record<string, {
+      playerSamples: Array<{ playerKey: string; bookmakerOutcomeId?: string; price?: number; active?: boolean }>;
+    }>;
+  }> = {};
+
+  const marketEntries = Object.entries(rawMarkets as Record<string, RawMarket>).slice(0, 8);
+  for (const [marketKey, market] of marketEntries) {
+    const outcomes: typeof marketsTree[string]["outcomes"] = {};
+    const outcomeEntries = Object.entries(market?.outcomes ?? {}).slice(0, 6);
+    for (const [outcomeKey, outcome] of outcomeEntries) {
+      const playerEntries = Object.entries(outcome?.players ?? {}).slice(0, 2);
+      outcomes[outcomeKey] = {
+        playerSamples: playerEntries.map(([pk, p]) => ({
+          playerKey: pk,
+          bookmakerOutcomeId: (p as any)?.bookmakerOutcomeId,
+          price: (p as any)?.price,
+          active: (p as any)?.active,
+        })),
+      };
+    }
+    marketsTree[marketKey] = {
+      bookmakerMarketId: market?.bookmakerMarketId,
+      outcomes,
+    };
+  }
+
+  notes.push(
+    `Found ${marketKeys.length} market keys; sampled ${marketEntries.length}. Compare market keys to MARKET_IDS values to confirm market routing.`,
+  );
+  notes.push(
+    "Inspect each market's `outcomes` keys — if they are readable ('yes'/'no'/'1x'/'home'/'over') we can fix the parser. If they are also numeric, the API genuinely doesn't expose decodable labels and AF Pinnacle is the only path.",
+  );
+
+  return {
+    matchId: args.matchId,
+    marketType: args.marketType,
+    oddspapiFixtureId,
+    oddspapiMarketId,
+    pinnacleFound: true,
+    marketKeys,
+    marketsTree,
+    notes,
+  };
+}
+
 // ─── DIAGNOSTIC: dump raw OddsPapi response for a (match, market) pair ─────
 // 2026-05-08 (post-Lever-1): used to drill into BTTS/DC/FH/TEAM_TOTAL parser
 // or coverage gaps. After Lever 1 deploy the closing-line cron is correctly
