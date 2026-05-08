@@ -225,6 +225,22 @@ async function main() {
   // 1. Database migrations (will throw and abort if DB is unreachable)
   await runMigrations();
 
+  // 1.5 Market-type registry coverage check (§4.3 of root-cause-analysis).
+  // Logs a warning if any market_type appearing in paper_bets is missing
+  // from the registry. Doesn't refuse to start — older retired types may
+  // legitimately exist in historical data.
+  try {
+    const { verifyMarketTypeRegistryCoverage } = await import("./lib/startupChecks");
+    const coverage = await verifyMarketTypeRegistryCoverage();
+    if (coverage.level === "warn") {
+      logger.warn({ missing: coverage.missing }, coverage.message);
+    } else {
+      logger.info(coverage.message);
+    }
+  } catch (err) {
+    logger.warn({ err }, "Market-type registry coverage check failed (non-fatal)");
+  }
+
   // 2. Connection checks — non-fatal (warn + continue)
   const [dbOk, betfairOk, footballDataOk] = await Promise.all([
     testDatabase(),

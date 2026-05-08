@@ -2096,6 +2096,62 @@ export async function runMigrations() {
     `);
 
     // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 (§4.1 of root-cause-analysis): role-level Postgres
+    // timeouts. Without these, a runaway query hangs indefinitely on
+    // Neon, billing continuous compute and starving other crons.
+    // Per-connection SETs are issued by lib/db/src/index.ts on every
+    // pool connect; the role-level defaults below apply to any new
+    // session that misses the pool init (e.g., direct psql).
+    //
+    // Limits:
+    //   statement_timeout       60s — single query upper bound
+    //   lock_timeout             5s — table/row lock acquisition
+    //   idle_in_tx_timeout       2 min — leaked transaction cleanup
+    //
+    // Genuinely long jobs (migrations, full ingestion) override per-
+    // session via withExtendedTimeout() in lib/db.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql.raw(`
+      ALTER ROLE neondb_owner SET statement_timeout = '60s';
+    `)).catch((err) => {
+      logger.warn({ err }, "ALTER ROLE statement_timeout failed (non-fatal — relies on per-connection SETs)");
+    });
+    await db.execute(sql.raw(`
+      ALTER ROLE neondb_owner SET lock_timeout = '5s';
+    `)).catch((err) => {
+      logger.warn({ err }, "ALTER ROLE lock_timeout failed");
+    });
+    await db.execute(sql.raw(`
+      ALTER ROLE neondb_owner SET idle_in_transaction_session_timeout = '120s';
+    `)).catch((err) => {
+      logger.warn({ err }, "ALTER ROLE idle_in_transaction_session_timeout failed");
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 (§4.2 of root-cause-analysis): cron stale-alert table.
+    // Populated by services/cronHealthMonitor.ts (runs every 5 min).
+    // Operator query: SELECT * FROM cron_stale_alert WHERE acknowledged_at IS NULL.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS cron_stale_alert (
+        id SERIAL PRIMARY KEY,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        job_name TEXT NOT NULL,
+        last_success_at TIMESTAMPTZ,
+        expected_cadence_ms INTEGER NOT NULL,
+        alert_after_ms INTEGER NOT NULL,
+        stale_ms BIGINT NOT NULL,
+        manifest JSONB,
+        acknowledged_at TIMESTAMPTZ,
+        acknowledged_note TEXT
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS cron_stale_alert_unack_idx
+        ON cron_stale_alert(detected_at DESC) WHERE acknowledged_at IS NULL
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
     // 2026-05-08 Neon-cost cleanup: compliance_logs was bloated with
     // ~508k rows from action_types that were demoted on 2026-04-17 and
     // are no longer written. ~218 MB of dead data. One-shot delete; the

@@ -75,6 +75,51 @@ export function verifyDbHostForEnvironment(
     message: `Unknown ENVIRONMENT value "${environment}" — skipping DB host check` };
 }
 
+/**
+ * 2026-05-08 (§4.3 of root-cause-analysis): market-type registry coverage
+ * invariant. At startup, fetch the distinct market_types ever appearing
+ * in paper_bets and assert every one has a registry entry. Drift detected
+ * at boot rather than 13 hours into a settlement outage.
+ *
+ * Result is logged at startup; does not refuse to start (some legacy
+ * market types may be intentionally retired). Operator query for ongoing
+ * monitoring:
+ *   SELECT DISTINCT market_type FROM paper_bets
+ *   WHERE legacy_regime=false AND deleted_at IS NULL;
+ *   compare against listRegisteredMarketTypes().
+ */
+export async function verifyMarketTypeRegistryCoverage(): Promise<{
+  level: "info" | "warn";
+  message: string;
+  missing: string[];
+}> {
+  const { db } = await import("@workspace/db");
+  const { sql } = await import("drizzle-orm");
+  const { listRegisteredMarketTypes } = await import("./marketTypes");
+
+  const rows = await db.execute(sql`
+    SELECT DISTINCT market_type FROM paper_bets
+    WHERE deleted_at IS NULL AND legacy_regime = false
+  `);
+  const dbTypes = (((rows as any).rows ?? []) as Array<{ market_type: string }>)
+    .map((r) => r.market_type);
+  const registered = new Set(listRegisteredMarketTypes());
+  const missing = dbTypes.filter((t) => !registered.has(t));
+
+  if (missing.length === 0) {
+    return {
+      level: "info",
+      message: `Market-type registry coverage PASSED — ${dbTypes.length}/${dbTypes.length} types registered`,
+      missing: [],
+    };
+  }
+  return {
+    level: "warn",
+    message: `Market-type registry coverage GAP — ${missing.length} types in paper_bets but not in registry: ${missing.join(", ")}`,
+    missing,
+  };
+}
+
 export function verifyTradingModeForEnvironment(
   environment: string,
   tradingMode: string | undefined,

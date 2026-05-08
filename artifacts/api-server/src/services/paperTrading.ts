@@ -2206,6 +2206,18 @@ export async function reconcileStalePending(): Promise<StalePendingResult> {
 // ===================== Determine bet outcome from match result =====================
 
 // Returns true (won), false (lost), or null (void — data unavailable, stake refunded)
+// 2026-05-08 (§4.3 of root-cause-analysis): determineBetWon now dispatches
+// to lib/marketTypes.ts which holds the single source of truth for every
+// supported market type. The switch below is preserved as a fallback for
+// any market type the registry hasn't yet adopted, but new market types
+// MUST be added to the registry rather than this switch.
+//
+// Long-term: this switch can be deleted entirely once we verify every
+// historical market_type appears in MARKET_TYPES. The startup invariant
+// in services/startupChecks.ts will refuse to boot if a paper_bets row
+// references a market type that's not in the registry.
+import { resolveOutcome as resolveViaRegistry, isMarketTypeRegistered } from "../lib/marketTypes";
+
 function determineBetWon(
   marketType: string,
   selectionName: string,
@@ -2218,6 +2230,23 @@ function determineBetWon(
     awayScoreHt?: number | null;
   } | null,
 ): boolean | null {
+  // Registry path — preferred for any market type it knows about.
+  if (isMarketTypeRegistered(marketType)) {
+    return resolveViaRegistry(marketType, selectionName, {
+      homeScore,
+      awayScore,
+      totalCorners: matchStats?.totalCorners ?? null,
+      totalCards: matchStats?.totalCards ?? null,
+      homeScoreHt: matchStats?.homeScoreHt ?? null,
+      awayScoreHt: matchStats?.awayScoreHt ?? null,
+    });
+  }
+
+  // Legacy switch — only reached if the registry is missing a type.
+  // Logs a warning so the gap is visible.
+  // eslint-disable-next-line no-console
+  console.warn(`[determineBetWon] market type "${marketType}" not in registry — falling through to legacy switch`);
+
   const totalGoals = homeScore + awayScore;
 
   switch (marketType) {

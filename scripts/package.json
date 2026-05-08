@@ -6,6 +6,8 @@
   "scripts": {
     "hello": "tsx ./src/hello.ts",
     "flip-to-live": "tsx ./src/flip-to-live.ts",
+    "lint:no-raw-array-bind": "tsx ./src/lint-no-raw-array-bind.ts",
+    "query-budget-test": "tsx ./src/query-budget-test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

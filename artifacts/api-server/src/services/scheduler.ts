@@ -137,7 +137,7 @@ let ingestionRunning = false;
 let featureRunning = false;
 let tradingCycleRunning = false;
 let tradingCycleAcquiredAt: number | null = null;
-const TRADING_CYCLE_STALE_MS = 5 * 60 * 1000; // 5 min — forcibly release after this
+const TRADING_CYCLE_STALE_MS = 5 * 60 * 1000;
 
 export function resetTradingCycleLock(): { wasHeld: boolean; heldFor: number | null } {
   const wasHeld = tradingCycleRunning;
@@ -363,11 +363,6 @@ export async function runTradingCycle(options?: {
   const cycleStartedAt = Date.now();
 
   if (tradingCycleRunning) {
-    // 2026-05-08 stale-lock detection: if the lock has been held longer than
-    // TRADING_CYCLE_STALE_MS (5 min), it almost certainly belongs to a hung
-    // prior invocation (e.g. vps-relay HTTP call that never resolved).
-    // Force-release and proceed. Without this, a single hang at startup
-    // permanently locks all subsequent cron ticks.
     const heldMs = tradingCycleAcquiredAt != null ? Date.now() - tradingCycleAcquiredAt : 0;
     if (heldMs > TRADING_CYCLE_STALE_MS) {
       logger.warn(
@@ -1976,6 +1971,23 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Gate monitor scheduler active — daily 04:00 UTC");
+
+  // 2026-05-08 (§4.2 of root-cause-analysis): cron health monitor.
+  // Runs every 5 min. Compares each tracked cron's last successful run
+  // against expected cadence; inserts gate-style alert rows in
+  // cron_stale_alert when a cron is overdue. Operator queries
+  // cron_stale_alert WHERE acknowledged_at IS NULL. No UI required.
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const { runCronHealthMonitor } = await import("./cronHealthMonitor");
+        await runCronHealthMonitor();
+      } catch (err) {
+        logger.error({ err }, "Cron health monitor failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Cron health monitor scheduler active — every 5 minutes");
 }
 
 // ===================== Scheduler =====================
