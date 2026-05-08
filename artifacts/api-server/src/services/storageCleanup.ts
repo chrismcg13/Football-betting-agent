@@ -58,60 +58,115 @@ interface CleanupResult {
 }
 
 export async function runStorageCleanup(opts: {
-  // Safety knob: cap each delete batch to prevent a single run from
-  // locking the table for too long. Defaults are aggressive enough to
-  // clear current backlog in 2-3 runs.
-  oddsSnapshotsBatchLimit?: number;
-  oddsHistoryBatchLimit?: number;
+  // Per-source batch size (small enough to fit in 60s statement_timeout
+  // even before the partial index is built / before autovacuum updates
+  // statistics). Default 10K rows per DELETE, up to 50 iterations per
+  // source per call.
+  oddsSnapshotsBatchSize?: number;
+  oddsSnapshotsMaxIterations?: number;
+  oddsHistoryBatchSize?: number;
+  oddsHistoryMaxIterations?: number;
 } = {}): Promise<CleanupResult> {
   const evaluatedAt = new Date().toISOString();
   const notes: string[] = [];
-  const oddsSnapshotsBatchLimit = opts.oddsSnapshotsBatchLimit ?? 500_000;
-  const oddsHistoryBatchLimit = opts.oddsHistoryBatchLimit ?? 200_000;
+  const oddsSnapshotsBatchSize = opts.oddsSnapshotsBatchSize ?? 10_000;
+  const oddsSnapshotsMaxIterations = opts.oddsSnapshotsMaxIterations ?? 50;
+  const oddsHistoryBatchSize = opts.oddsHistoryBatchSize ?? 10_000;
+  const oddsHistoryMaxIterations = opts.oddsHistoryMaxIterations ?? 50;
 
-  // ─── (1) odds_snapshots non-essential bookmakers ──────────────────────────
-  // Use ctid-based batched delete to avoid large transaction. Postgres holds
-  // row-level locks for the whole transaction, so a 14M-row single DELETE
-  // would lock the table. Batched approach is gentler.
-  const snapshotsResult = (await db.execute(sql`
-    WITH deletable AS (
-      SELECT ctid
-      FROM odds_snapshots
-      WHERE source = ANY(${NON_ESSENTIAL_AF_BOOKMAKERS}::text[])
-        AND snapshot_time < NOW() - INTERVAL '14 days'
-      LIMIT ${oddsSnapshotsBatchLimit}
-    )
-    DELETE FROM odds_snapshots WHERE ctid IN (SELECT ctid FROM deletable)
-  `)) as unknown as { rowCount?: number };
-  const oddsSnapshotsDeleted = snapshotsResult.rowCount ?? 0;
-  if (oddsSnapshotsDeleted > 0) {
-    notes.push(`odds_snapshots: deleted ${oddsSnapshotsDeleted} non-essential rows >14d old`);
-    if (oddsSnapshotsDeleted >= oddsSnapshotsBatchLimit) {
-      notes.push(`odds_snapshots: reached batch limit — re-run to continue draining`);
-    }
+  // ─── (0) Idempotent index build for the cleanup hot path ─────────────────
+  // Without this, the source-filtered DELETE is a sequential scan over
+  // 21M+ rows and breaches the 60s statement_timeout. The partial index
+  // is small (covers only non-essential rows) and serves only the cleanup
+  // path. CREATE INDEX IF NOT EXISTS is idempotent so safe to retry.
+  // CONCURRENTLY skipped — it can't run inside a transaction and the
+  // table is busy enough that a brief AccessExclusive lock during build
+  // is acceptable for a one-shot.
+  try {
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS odds_snapshots_cleanup_idx
+        ON odds_snapshots (source, snapshot_time)
+    `);
+    notes.push("odds_snapshots_cleanup_idx ensured (idempotent)");
+  } catch (err) {
+    notes.push(`Index build skipped: ${String(err)}`);
   }
 
-  // ─── (2) compliance_logs ─────────────────────────────────────────────────
-  const lineMovementResult = (await db.execute(sql`
-    DELETE FROM compliance_logs WHERE action_type = 'line_movement'
-  `)) as unknown as { rowCount?: number };
+  // ─── (1) odds_snapshots non-essential bookmakers — per-source loop ───────
+  // Iterate one source at a time with small batches so each DELETE is
+  // O(log n) via the new index and well within statement_timeout. The
+  // per-source loop stops early when a batch returns 0 rows.
+  let oddsSnapshotsDeleted = 0;
+  for (const source of NON_ESSENTIAL_AF_BOOKMAKERS) {
+    let perSource = 0;
+    for (let i = 0; i < oddsSnapshotsMaxIterations; i++) {
+      const result = (await db.execute(sql`
+        WITH deletable AS (
+          SELECT ctid
+          FROM odds_snapshots
+          WHERE source = ${source}
+            AND snapshot_time < NOW() - INTERVAL '14 days'
+          LIMIT ${oddsSnapshotsBatchSize}
+        )
+        DELETE FROM odds_snapshots WHERE ctid IN (SELECT ctid FROM deletable)
+      `)) as unknown as { rowCount?: number };
+      const deleted = result.rowCount ?? 0;
+      perSource += deleted;
+      if (deleted < oddsSnapshotsBatchSize) break;
+    }
+    if (perSource > 0) {
+      notes.push(`odds_snapshots[${source}]: ${perSource} rows deleted`);
+    }
+    oddsSnapshotsDeleted += perSource;
+  }
 
-  const betRejectedResult = (await db.execute(sql`
-    DELETE FROM compliance_logs
-    WHERE action_type = 'bet_rejected'
-      AND timestamp < NOW() - INTERVAL '24 hours'
-  `)) as unknown as { rowCount?: number };
+  // ─── (2) compliance_logs — batched with index ───────────────────────────
+  try {
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS compliance_logs_cleanup_idx
+        ON compliance_logs (action_type, timestamp)
+    `);
+    notes.push("compliance_logs_cleanup_idx ensured");
+  } catch (err) {
+    notes.push(`compliance_logs index build skipped: ${String(err)}`);
+  }
 
-  const correlationResult = (await db.execute(sql`
-    DELETE FROM compliance_logs
-    WHERE action_type = 'correlation_detection'
-      AND timestamp < NOW() - INTERVAL '7 days'
-  `)) as unknown as { rowCount?: number };
+  async function deleteComplianceBatched(
+    actionType: string,
+    minAge: string | null,
+  ): Promise<number> {
+    let total = 0;
+    const batchSize = 5000;
+    for (let i = 0; i < 50; i++) {
+      const result = minAge
+        ? (await db.execute(sql`
+            WITH deletable AS (
+              SELECT ctid FROM compliance_logs
+              WHERE action_type = ${actionType}
+                AND timestamp < NOW() - ${sql.raw(`INTERVAL '${minAge}'`)}
+              LIMIT ${batchSize}
+            )
+            DELETE FROM compliance_logs WHERE ctid IN (SELECT ctid FROM deletable)
+          `)) as unknown as { rowCount?: number }
+        : (await db.execute(sql`
+            WITH deletable AS (
+              SELECT ctid FROM compliance_logs
+              WHERE action_type = ${actionType}
+              LIMIT ${batchSize}
+            )
+            DELETE FROM compliance_logs WHERE ctid IN (SELECT ctid FROM deletable)
+          `)) as unknown as { rowCount?: number };
+      const deleted = result.rowCount ?? 0;
+      total += deleted;
+      if (deleted < batchSize) break;
+    }
+    return total;
+  }
 
   const complianceLogsDeleted = {
-    line_movement: lineMovementResult.rowCount ?? 0,
-    bet_rejected: betRejectedResult.rowCount ?? 0,
-    correlation_detection: correlationResult.rowCount ?? 0,
+    line_movement: await deleteComplianceBatched("line_movement", null),
+    bet_rejected: await deleteComplianceBatched("bet_rejected", "24 hours"),
+    correlation_detection: await deleteComplianceBatched("correlation_detection", "7 days"),
   };
   const complianceTotal =
     complianceLogsDeleted.line_movement +
@@ -121,21 +176,26 @@ export async function runStorageCleanup(opts: {
     notes.push(`compliance_logs: deleted ${complianceTotal} rows (${JSON.stringify(complianceLogsDeleted)})`);
   }
 
-  // ─── (3) odds_history retention 30 days ──────────────────────────────────
-  const historyResult = (await db.execute(sql`
-    WITH deletable AS (
-      SELECT ctid FROM odds_history
-      WHERE snapshot_time < NOW() - INTERVAL '30 days'
-      LIMIT ${oddsHistoryBatchLimit}
-    )
-    DELETE FROM odds_history WHERE ctid IN (SELECT ctid FROM deletable)
-  `)) as unknown as { rowCount?: number };
-  const oddsHistoryDeleted = historyResult.rowCount ?? 0;
+  // ─── (3) odds_history retention 30 days — small-batch loop ──────────────
+  // Same pattern as odds_snapshots: small batches that fit in statement_
+  // timeout, looped within the call until empty or iteration cap.
+  // odds_history_time_idx already exists so this is index-driven.
+  let oddsHistoryDeleted = 0;
+  for (let i = 0; i < oddsHistoryMaxIterations; i++) {
+    const result = (await db.execute(sql`
+      WITH deletable AS (
+        SELECT ctid FROM odds_history
+        WHERE snapshot_time < NOW() - INTERVAL '30 days'
+        LIMIT ${oddsHistoryBatchSize}
+      )
+      DELETE FROM odds_history WHERE ctid IN (SELECT ctid FROM deletable)
+    `)) as unknown as { rowCount?: number };
+    const deleted = result.rowCount ?? 0;
+    oddsHistoryDeleted += deleted;
+    if (deleted < oddsHistoryBatchSize) break;
+  }
   if (oddsHistoryDeleted > 0) {
-    notes.push(`odds_history: deleted ${oddsHistoryDeleted} rows >30d old`);
-    if (oddsHistoryDeleted >= oddsHistoryBatchLimit) {
-      notes.push(`odds_history: reached batch limit — re-run to continue draining`);
-    }
+    notes.push(`odds_history: ${oddsHistoryDeleted} rows >30d deleted`);
   }
 
   const totalRowsDeleted = oddsSnapshotsDeleted + oddsHistoryDeleted + complianceTotal;
