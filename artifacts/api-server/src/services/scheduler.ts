@@ -2329,8 +2329,18 @@ export function startScheduler(): void {
   // Betfair event mapping: every 6 hours (offset by 15 min to spread API load)
   // Populates matches.betfair_event_id for upcoming fixtures so the precheck
   // can skip genuinely unlisted events instead of failing at placement time.
-  cron.schedule("20 */6 * * *", () => {
-    logger.info("Betfair event mapping triggered by scheduler");
+  // 2026-05-08 (Phase 3 paper-rate fix): cadence raised from 6h → 30min.
+  // The original 6h schedule meant a fixture inserted by api-football
+  // discovery (with af_-placeholder eventId) might wait up to 6h before the
+  // reverse-mapper recovered its real Betfair numeric eventId. During that
+  // window, exchange_book_sweep skips the match (regex ^[0-9]+$ filter),
+  // valueDetection sees no betfair_exchange snapshot, and the bet routes to
+  // shadow rail even when the league IS Betfair-tradeable. 30-min cadence
+  // shrinks that window 12× and is cheap (function only updates matches
+  // still on af_ prefix; once mapped, subsequent runs are near-noop on those
+  // rows). Horizon stays at 72h to align with the firehose's planning window.
+  cron.schedule("*/30 * * * *", () => {
+    logger.info("Betfair event mapping triggered by scheduler (30-min cadence)");
     void trackCronExecution("betfair_event_map", async () => {
       const { mapBetfairEventsToFixtures } = await import("./betfairEventMapping");
       const stats = await mapBetfairEventsToFixtures(72);
@@ -2338,7 +2348,7 @@ export function startScheduler(): void {
       return stats.fixturesUpdated;
     }).catch((err) => logger.error({ err }, "Betfair event mapping failed"));
   }, { timezone: "UTC" });
-  logger.info("Betfair event mapping scheduler active — every 6 hours UTC");
+  logger.info("Betfair event mapping scheduler active — every 30 min UTC");
 
   // Run once on startup (after a short delay so other warmup jobs settle first)
   setTimeout(() => {

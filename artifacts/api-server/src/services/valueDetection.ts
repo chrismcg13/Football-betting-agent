@@ -969,12 +969,40 @@ export async function detectValueBets(options?: {
     conditions.push(lte(matchesTable.kickoffTime, options.latestKickoff));
   }
 
-  const matches = await db
+  // 2026-05-08 (Phase 3 paper-rate fix): scope-tradeability filter. Both rails
+  // (paper + shadow) only emit on leagues with a Betfair Exchange graduation
+  // pathway. Shadow stays £0 perpetually but its SCOPE (league × market_type)
+  // must be Betfair-tradeable — Path P/S graduation promotes successful scopes
+  // to live placement, so non-tradeable scopes are dead weight (no live
+  // pathway, just Neon storage burn).
+  //
+  // Drop matches whose league has has_betfair_exchange=FALSE explicitly.
+  // KEEP NULL/no-row (benefit of doubt: betfairFirstUniverse may not have
+  // categorised the league yet, and the cron runs daily — eventual consistency
+  // beats over-aggressive dropping).
+  const allMatches = await db
     .select()
     .from(matchesTable)
     .where(and(...conditions));
 
-  logger.info({ matchCount: matches.length, earliest: options?.earliestKickoff, latest: options?.latestKickoff }, "Value detection: matches to evaluate");
+  // has_betfair_exchange exists in prod DB but isn't declared on the Drizzle
+  // competitionConfigTable schema (legacy column added via direct DML — see
+  // docs/phase-2-current-state.md §1.3). Use raw SQL to read it.
+  const nonTradeableRows = await db.execute(sql`
+    SELECT name FROM competition_config WHERE has_betfair_exchange = FALSE
+  `);
+  const nonTradeableLeagues = new Set<string>(
+    (((nonTradeableRows as any).rows ?? (nonTradeableRows as any) ?? []) as Array<{ name: string }>)
+      .map((r) => r.name),
+  );
+
+  const matches = allMatches.filter((m) => !m.league || !nonTradeableLeagues.has(m.league));
+  const droppedNonTradeable = allMatches.length - matches.length;
+
+  logger.info(
+    { matchCount: matches.length, droppedNonTradeable, earliest: options?.earliestKickoff, latest: options?.latestKickoff },
+    "Value detection: matches to evaluate (post-tradeability filter)",
+  );
 
   const valueBets: ValueBet[] = [];
   let selectionsEvaluated = 0;
