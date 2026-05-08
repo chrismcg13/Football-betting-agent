@@ -34,7 +34,7 @@
  * pattern.
  */
 
-import { db, competitionConfigTable, paperBetsTable, matchesTable, modelDecisionAuditLogTable } from "@workspace/db";
+import { db, competitionConfigTable, paperBetsTable, matchesTable, modelDecisionAuditLogTable, agentConfigTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
@@ -91,6 +91,26 @@ export interface TierLadderResult {
 export async function runAutonomousTierLadder(): Promise<TierLadderResult> {
   const startedAt = Date.now();
   const runId = `tier-ladder-${startedAt}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Phase 3 Track A kill switch (2026-05-08): Z4 suspended pending Kelly-growth
+  // metric replacement. The proxy LN(1+pnl/stake) is unit-stake-of-bankroll
+  // arithmetic with thresholds calibrated to true bankroll-fraction Kelly —
+  // off by ~3 orders of magnitude. Caused 4 wrongful demotions on 2026-05-08
+  // including 3 profitable scopes. Re-enable only after metric is rebuilt on
+  // bankroll_snapshots and re-validated. See docs/phase-3-paper-to-live-
+  // switchover-plan-v2.md §1.4.
+  const z4Enabled = await readEnabledFlag("z4_enabled");
+  if (!z4Enabled) {
+    logger.info({ runId }, "Z4 autonomous tier-ladder skipped (z4_enabled=false)");
+    return {
+      runId,
+      scopesEvaluated: 0,
+      promotions: 0,
+      demotions: 0,
+      byTransition: {},
+      durationMs: Date.now() - startedAt,
+    };
+  }
 
   // Compute per-(league, country) realised log-bankroll-growth-rate proxy
   // over last WINDOW_DAYS. Kelly-growth proper requires bankroll_snapshots
@@ -199,4 +219,11 @@ export async function runAutonomousTierLadder(): Promise<TierLadderResult> {
 
   logger.info(result, "autonomous_tier_ladder_complete");
   return result;
+}
+
+async function readEnabledFlag(key: string): Promise<boolean> {
+  const rows = await db.select({ value: agentConfigTable.value }).from(agentConfigTable).where(eq(agentConfigTable.key, key));
+  const v = rows[0]?.value;
+  if (v == null) return true; // default-on if flag absent
+  return v.toLowerCase() !== "false";
 }

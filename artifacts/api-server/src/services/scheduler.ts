@@ -2485,19 +2485,25 @@ export function startScheduler(): void {
   // via the autonomous_pauses registry. Shadow bets bypass pauses (capital-
   // protective only). Auto-resume after pause window with trial-mode 50%
   // Kelly fraction.
-  cron.schedule("30 3 * * *", () => {
-    logger.info("Model self-audit triggered (daily 03:30 UTC)");
-    void (async () => {
-      try {
-        const { runModelSelfAudit } = await import("./modelSelfAudit");
-        const result = await runModelSelfAudit();
-        logger.info(result, "Model self-audit complete");
-      } catch (err) {
-        logger.error({ err }, "Model self-audit failed");
-      }
-    })();
-  }, { timezone: "UTC" });
-  logger.info("Model self-audit scheduler active — daily 03:30 UTC");
+  //
+  // Phase 3 Track A (2026-05-08): SUSPENDED. Cron disabled at scheduler level
+  // (belt-and-braces alongside model_self_audit_enabled='false' kill switch
+  // inside runModelSelfAudit). Re-enable only after Kelly-growth proxy is
+  // replaced with bankroll_snapshots-based metric. See docs/phase-3-paper-
+  // to-live-switchover-plan-v2.md §1.4 + §3 Track A.
+  // cron.schedule("30 3 * * *", () => {
+  //   logger.info("Model self-audit triggered (daily 03:30 UTC)");
+  //   void (async () => {
+  //     try {
+  //       const { runModelSelfAudit } = await import("./modelSelfAudit");
+  //       const result = await runModelSelfAudit();
+  //       logger.info(result, "Model self-audit complete");
+  //     } catch (err) {
+  //       logger.error({ err }, "Model self-audit failed");
+  //     }
+  //   })();
+  // }, { timezone: "UTC" });
+  logger.info("Model self-audit SUSPENDED (Phase 3 Track A, 2026-05-08)");
 
   // Sub-phase 10: weekly ongoing audit (settlement-bias + auto-demote).
   // Sits at Sunday 09:00 UTC, after threshold proposal generator (08:00).
@@ -2680,19 +2686,23 @@ export function startScheduler(): void {
   // scope with n≥10 settled bets in last 30d, computes log-bankroll-growth
   // per bet. Promotes E→C / D→C / C→B and demotes A→B / B→C / C→D / D→E
   // when growth crosses thresholds. All transitions audit-logged.
-  cron.schedule("45 3 * * *", () => {
-    logger.info("Autonomous tier-ladder triggered (daily 03:45 UTC)");
-    void (async () => {
-      try {
-        const { runAutonomousTierLadder } = await import("./autonomousTierLadder");
-        const r = await runAutonomousTierLadder();
-        logger.info(r, "Autonomous tier-ladder complete");
-      } catch (err) {
-        logger.error({ err }, "Autonomous tier-ladder failed");
-      }
-    })();
-  }, { timezone: "UTC" });
-  logger.info("Autonomous tier-ladder scheduler active — daily 03:45 UTC");
+  //
+  // Phase 3 Track A (2026-05-08): SUSPENDED. Same broken Kelly-growth proxy
+  // as modelSelfAudit. Disabled at scheduler level (belt-and-braces alongside
+  // z4_enabled='false' kill switch inside runAutonomousTierLadder).
+  // cron.schedule("45 3 * * *", () => {
+  //   logger.info("Autonomous tier-ladder triggered (daily 03:45 UTC)");
+  //   void (async () => {
+  //     try {
+  //       const { runAutonomousTierLadder } = await import("./autonomousTierLadder");
+  //       const r = await runAutonomousTierLadder();
+  //       logger.info(r, "Autonomous tier-ladder complete");
+  //     } catch (err) {
+  //       logger.error({ err }, "Autonomous tier-ladder failed");
+  //     }
+  //   })();
+  // }, { timezone: "UTC" });
+  logger.info("Autonomous tier-ladder SUSPENDED (Phase 3 Track A, 2026-05-08)");
 
   // Z3 (2026-05-07): autonomous threshold revision — weekly Sunday 10:00
   // UTC, after Sun 09:30 Kelly optimiser. Per (league, market) scope with
@@ -2701,19 +2711,24 @@ export function startScheduler(): void {
   // sample-retention safety floor). Per Chris's no-manual directive +
   // brief autonomy clause "Internal confidence thresholds for value
   // detection" — both tighter and looser auto-apply, audit-logged.
-  cron.schedule("0 10 * * 0", () => {
-    logger.info("Autonomous threshold revision triggered (weekly Sunday 10:00 UTC)");
-    void (async () => {
-      try {
-        const { runThresholdRevisionProposer } = await import("./autonomousThresholdRevision");
-        const r = await runThresholdRevisionProposer();
-        logger.info(r, "Autonomous threshold revision complete");
-      } catch (err) {
-        logger.error({ err }, "Autonomous threshold revision failed");
-      }
-    })();
-  }, { timezone: "UTC" });
-  logger.info("Autonomous threshold revision scheduler active — Sunday 10:00 UTC");
+  //
+  // Phase 3 Track A (2026-05-08): SUSPENDED. Threshold loosening on the same
+  // broken Kelly-growth proxy creates a feedback loop. Disabled at scheduler
+  // level (belt-and-braces alongside z3_enabled='false' kill switch inside
+  // runThresholdRevisionProposer).
+  // cron.schedule("0 10 * * 0", () => {
+  //   logger.info("Autonomous threshold revision triggered (weekly Sunday 10:00 UTC)");
+  //   void (async () => {
+  //     try {
+  //       const { runThresholdRevisionProposer } = await import("./autonomousThresholdRevision");
+  //       const r = await runThresholdRevisionProposer();
+  //       logger.info(r, "Autonomous threshold revision complete");
+  //     } catch (err) {
+  //       logger.error({ err }, "Autonomous threshold revision failed");
+  //     }
+  //   })();
+  // }, { timezone: "UTC" });
+  logger.info("Autonomous threshold revision SUSPENDED (Phase 3 Track A, 2026-05-08)");
 
   // Z6 (2026-05-07): feature predictive-power scoring — weekly Sunday 11:00
   // UTC. Computes per-feature point-biserial correlation + p-value vs

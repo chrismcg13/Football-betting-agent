@@ -63,11 +63,19 @@ import {
   competitionConfigTable,
   modelDecisionAuditLogTable,
   complianceLogsTable,
+  agentConfigTable,
 } from "@workspace/db";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const ANALYSIS_WINDOW_DAYS = 30;
+
+async function readEnabledFlag(key: string): Promise<boolean> {
+  const rows = await db.select({ value: agentConfigTable.value }).from(agentConfigTable).where(eq(agentConfigTable.key, key));
+  const v = rows[0]?.value;
+  if (v == null) return true;
+  return v.toLowerCase() !== "false";
+}
 
 // ── Demotion thresholds ─────────────────────────────────────────────────────
 const SEVERE_ROI_THRESHOLD = -0.25;
@@ -207,6 +215,18 @@ export async function runModelSelfAudit(): Promise<SelfAuditResult> {
     unchanged: 0,
     durationMs: 0,
   };
+
+  // Phase 3 Track A kill switch (2026-05-08): modelSelfAudit suspended. This
+  // cron fired 4 wrongful demotions on 2026-05-08 03:30 (3 of which hit
+  // profitable scopes) using the same broken Kelly-growth proxy as Z4 — the
+  // AVG(LN(GREATEST(0.0001, 1 + pnl/stake))) formula on lines 240/268/296/324.
+  // Re-enable only after metric is rebuilt. See plan §1.4 / §3 Track A.
+  const enabled = await readEnabledFlag("model_self_audit_enabled");
+  if (!enabled) {
+    logger.info("Model self-audit skipped (model_self_audit_enabled=false)");
+    result.durationMs = Date.now() - startedAt;
+    return result;
+  }
 
   await analyzeMarketScope(result);
   await analyzeLeagueMarketScope(result);

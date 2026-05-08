@@ -39,6 +39,13 @@ import { db, agentConfigTable, modelDecisionAuditLogTable } from "@workspace/db"
 import { eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
+async function readEnabledFlag(key: string): Promise<boolean> {
+  const rows = await db.select({ value: agentConfigTable.value }).from(agentConfigTable).where(eq(agentConfigTable.key, key));
+  const v = rows[0]?.value;
+  if (v == null) return true;
+  return v.toLowerCase() !== "false";
+}
+
 // Z1: scope hierarchy + lookup ────────────────────────────────────────────────
 export type ThresholdScope =
   | { type: "global" }
@@ -173,6 +180,22 @@ export interface ThresholdRevisionResult {
 export async function runThresholdRevisionProposer(): Promise<ThresholdRevisionResult> {
   const startedAt = Date.now();
   const runId = `threshold-rev-${startedAt}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Phase 3 Track A kill switch (2026-05-08): Z3 suspended. Autonomous
+  // threshold loosening based on the same broken Kelly-growth proxy as Z4
+  // creates a feedback loop. Per plan §5.5 v1: re-enable only after metric
+  // is rebuilt AND a clean evaluation window confirms behaviour.
+  const z3Enabled = await readEnabledFlag("z3_enabled");
+  if (!z3Enabled) {
+    logger.info({ runId }, "Z3 threshold revision skipped (z3_enabled=false)");
+    return {
+      runId,
+      scopesEvaluated: 0,
+      revisionsApplied: 0,
+      byScopeType: {},
+      durationMs: Date.now() - startedAt,
+    };
+  }
 
   const globalScore = await readGlobalDefault("min_opportunity_score", 50);
 

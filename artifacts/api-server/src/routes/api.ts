@@ -2014,6 +2014,129 @@ router.post("/admin/run-exchange-sweep", async (_req, res) => {
   }
 });
 
+// Phase 3 Track A (2026-05-08): one-shot disable + revert.
+//
+// Sets z3_enabled, z4_enabled, model_self_audit_enabled = 'false' in
+// agent_config (belt-and-braces alongside scheduler.ts comment-outs in
+// case the next deploy reverts the file edits, and to also block manual
+// triggers via /admin/run-tier-ladder etc.).
+//
+// Reverts the 4 demotions from 2026-05-08 03:30:
+//   id=1 market:BTTS              audit_log_id=1241  (was DEFAULT → SHADOW_ONLY)
+//   id=2 market:MATCH_ODDS        audit_log_id=1242  (was DEFAULT → STANDARD_REDUCED)
+//   id=3 archetype:top_flight_men audit_log_id=1251  (was DEFAULT → STANDARD_REDUCED)
+//   id=4 archetype:lower_division audit_log_id=1252  (was DEFAULT → STANDARD_REDUCED)
+//
+// Three of four demotions hit profitable scopes (lower_division ROI +18.21%
+// on n=385; top_flight_men ROI +12.75% on n=41; BTTS ROI +69.72% on n=8)
+// because the underlying Kelly-growth proxy is unit-stake-of-bankroll
+// arithmetic with thresholds calibrated to true bankroll-fraction Kelly.
+// See docs/phase-3-paper-to-live-switchover-plan-v2.md §1.4.
+//
+// Idempotent: running twice has no additional effect. Each step checks
+// current state before acting.
+router.post("/admin/phase3-track-a-execute", async (_req, res) => {
+  try {
+    const { db, agentConfigTable, modelDecisionAuditLogTable } = await import("@workspace/db");
+    const { sql, eq } = await import("drizzle-orm");
+
+    const result = {
+      flags_set: [] as string[],
+      flags_already_set: [] as string[],
+      pauses_resolved: [] as Array<{ id: number; scope_type: string; scope_value: string }>,
+      pauses_already_resolved: [] as number[],
+      reversals_logged: [] as number[],
+    };
+
+    // 1. Set kill-switch flags (idempotent UPSERT)
+    const flagKeys = ["z3_enabled", "z4_enabled", "model_self_audit_enabled"];
+    for (const key of flagKeys) {
+      const existing = await db
+        .select({ value: agentConfigTable.value })
+        .from(agentConfigTable)
+        .where(eq(agentConfigTable.key, key));
+      const current = existing[0]?.value ?? null;
+      if (current === "false") {
+        result.flags_already_set.push(key);
+        continue;
+      }
+      if (existing.length === 0) {
+        await db.insert(agentConfigTable).values({ key, value: "false" });
+      } else {
+        await db
+          .update(agentConfigTable)
+          .set({ value: "false", updatedAt: new Date() })
+          .where(eq(agentConfigTable.key, key));
+      }
+      result.flags_set.push(key);
+    }
+
+    // 2. Revert the 4 specific autonomous_pauses rows from 2026-05-08 03:30
+    const TARGET_PAUSE_IDS = [1, 2, 3, 4];
+    const targetRows = await db.execute(sql`
+      SELECT id, scope_type, scope_value, resumed_at, audit_log_id, kelly_fraction_override::text AS override
+      FROM autonomous_pauses
+      WHERE id = ANY(${TARGET_PAUSE_IDS}::int[])
+        AND paused_at >= '2026-05-08 03:30:00'::timestamptz
+        AND paused_at <= '2026-05-08 03:31:00'::timestamptz
+    `);
+    const rows = ((targetRows as any).rows ?? []) as Array<{
+      id: number;
+      scope_type: string;
+      scope_value: string;
+      resumed_at: string | null;
+      audit_log_id: number | null;
+      override: string | null;
+    }>;
+
+    for (const r of rows) {
+      if (r.resumed_at != null) {
+        result.pauses_already_resolved.push(r.id);
+        continue;
+      }
+      // Resolve the pause
+      await db.execute(sql`
+        UPDATE autonomous_pauses
+        SET resumed_at = NOW(),
+            notes = COALESCE(notes, '') || ' | Phase 3 Track A revert 2026-05-08: demotion fired on broken Kelly-growth proxy'
+        WHERE id = ${r.id} AND resumed_at IS NULL
+      `);
+      result.pauses_resolved.push({ id: r.id, scope_type: r.scope_type, scope_value: r.scope_value });
+
+      // Log reversal in model_decision_audit_log
+      const insertedRows = await db
+        .insert(modelDecisionAuditLogTable)
+        .values({
+          decisionType: "tier_demotion_reverted",
+          subject: `${r.scope_type}:${r.scope_value}`,
+          priorState: { tier_after_demotion_kelly_fraction: r.override } as any,
+          newState: { tier: "DEFAULT", kelly_fraction_override: null } as any,
+          reasoning:
+            `Phase 3 Track A revert (2026-05-08): demotion fired on broken Kelly-growth proxy ` +
+            `(unit-stake arithmetic with bankroll-fraction-calibrated threshold). ` +
+            `Reversal restores scope to DEFAULT pending Kelly-growth metric replacement on bankroll_snapshots. ` +
+            `Original autonomous_pauses row id=${r.id}; original audit_log_id=${r.audit_log_id ?? "null"}.`,
+          supportingMetrics: {
+            track: "phase3_track_a",
+            reverted_pause_id: r.id,
+            reverted_audit_log_id: r.audit_log_id,
+            scope_type: r.scope_type,
+            scope_value: r.scope_value,
+          } as any,
+          reviewStatus: "manual",
+        })
+        .returning({ id: modelDecisionAuditLogTable.id });
+      const newId = insertedRows[0]?.id;
+      if (newId != null) result.reversals_logged.push(newId);
+    }
+
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Phase 3 Track A execute failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Sub-phase 4.B (2026-05-08): manual trigger for Betfair market-type discovery.
 router.post("/admin/run-betfair-market-discovery", async (_req, res) => {
   try {
