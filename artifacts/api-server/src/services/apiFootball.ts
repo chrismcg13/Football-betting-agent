@@ -1142,8 +1142,27 @@ export async function fetchAndStoreOddsForFixture(
   // Track odds per market+selection across all bookmakers for consensus calc
   const marketOddsMap = new Map<string, number[]>();
 
+  // 2026-05-08 Neon cost-audit: only persist bookmakers we actually consume.
+  //
+  //   Pinnacle    — fair-value reference, multi-source CLV resolver primary.
+  //   Bet365      — soft-consensus input for sharp-move RLM detection.
+  //   Unibet      — soft-consensus input for sharp-move RLM detection.
+  //   Marathonbet — soft-consensus input for sharp-move RLM detection.
+  //   Betano      — soft-consensus input for sharp-move RLM detection.
+  //   Betfair     — duplicate of betfair_exchange (kept temporarily; redundant).
+  //
+  // 1xBet, 10Bet, BetVictor, William Hill, 888Sport, SBO, Dafabet, 188Bet,
+  // and any other bookmaker name returned by the API are dropped at write
+  // time. Pre-cleanup we had ~17.5M of 21.9M (80%) odds_snapshots rows in
+  // sources never read by any analysis path. Going forward we only persist
+  // ~6 sources per snapshot batch.
+  const ESSENTIAL_AF_BOOKMAKERS = new Set([
+    "Pinnacle", "Bet365", "Unibet", "Marathonbet", "Betano", "Betfair",
+  ]);
+
   for (const bm of fixture.bookmakers) {
     const bookmakerName = bm.name ?? `bm_${bm.id}`;
+    const isEssential = ESSENTIAL_AF_BOOKMAKERS.has(bookmakerName);
 
     for (const bet of bm.bets) {
       for (const val of bet.values) {
@@ -1154,6 +1173,12 @@ export async function fetchAndStoreOddsForFixture(
         const existing = marketOddsMap.get(key) ?? [];
         existing.push(mapped.backOdds);
         marketOddsMap.set(key, existing);
+
+        // Always feed the consensus map (in-memory only, not persisted),
+        // but only persist essential bookmakers' rows. Soft books still
+        // contribute to the in-memory consensus calc on this fixture
+        // even if their per-row rows aren't stored.
+        if (!isEssential) continue;
 
         await db.insert(oddsSnapshotsTable).values({
           matchId,

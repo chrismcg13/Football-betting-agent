@@ -2511,6 +2511,26 @@ router.get("/admin/oddspapi-bookmaker-catalog", async (_req, res) => {
   }
 });
 
+// 2026-05-08 Neon cost audit: manual trigger for storage cleanup. Returns
+// row counts deleted by category. Body optional: { oddsSnapshotsBatchLimit?,
+// oddsHistoryBatchLimit? } — defaults are 500K / 200K rows per run.
+router.post("/admin/run-storage-cleanup", async (req, res) => {
+  try {
+    const oddsSnapshotsBatchLimit = (req.body ?? {}).oddsSnapshotsBatchLimit;
+    const oddsHistoryBatchLimit = (req.body ?? {}).oddsHistoryBatchLimit;
+    const { runStorageCleanup, vacuumCleanedTables } = await import("../services/storageCleanup");
+    const cleanup = await runStorageCleanup({
+      oddsSnapshotsBatchLimit: oddsSnapshotsBatchLimit ? Number(oddsSnapshotsBatchLimit) : undefined,
+      oddsHistoryBatchLimit: oddsHistoryBatchLimit ? Number(oddsHistoryBatchLimit) : undefined,
+    });
+    const vacuum = await vacuumCleanedTables();
+    res.json({ success: true, cleanup, vacuum });
+  } catch (err) {
+    logger.error({ err }, "Manual storage cleanup failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/find-best-price", async (req, res) => {
   try {
     const matchId = Number((req.body ?? {}).matchId);

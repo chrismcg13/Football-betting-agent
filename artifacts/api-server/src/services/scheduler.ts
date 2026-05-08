@@ -2153,6 +2153,28 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("OddsPapi bookmaker catalog health scheduler active — daily 04:45 UTC");
+
+  // 2026-05-08 Neon cost audit: storage cleanup cron — daily 05:00 UTC.
+  // Deletes non-essential bookmaker odds_snapshots >14d old, line_movement
+  // legacy compliance logs (entire), bet_rejected >24h, correlation
+  // detections >7d, and odds_history >30d. VACUUM ANALYZE runs at the
+  // end so Postgres reclaims disk space rather than just marking dead.
+  // Pre-cleanup target: free ~3GB across these three tables.
+  cron.schedule("0 5 * * *", () => {
+    logger.info("Storage cleanup cron triggered (daily 05:00 UTC)");
+    void (async () => {
+      try {
+        const { runStorageCleanup, vacuumCleanedTables } = await import("./storageCleanup");
+        const r = await runStorageCleanup();
+        logger.info(r, "Storage cleanup complete");
+        const v = await vacuumCleanedTables();
+        logger.info(v, "Storage VACUUM complete");
+      } catch (err) {
+        logger.error({ err }, "Storage cleanup failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Storage cleanup scheduler active — daily 05:00 UTC");
 }
 
 // ===================== Scheduler =====================
