@@ -1062,8 +1062,14 @@ async function detectAndLogLineMovement(
       // (oddsChangePct + direction + previousOdds), so the dashboard reads
       // significant movements directly from there. Writing duplicates into
       // compliance_logs was bloating that table by ~120k rows/day.
+      //
+      // 2026-05-08: demoted from info → debug. Volume of "significant"
+      // movements (especially from volatile bookmakers like 1xBet) was
+      // saturating the event loop and causing node-cron missed-execution
+      // warnings. The data is still in odds_history (no info loss); only
+      // the synchronous JSON.stringify + log write per event is gone.
       if (Math.abs(oddsChangePct) >= 5) {
-        logger.info(
+        logger.debug(
           {
             matchId, marketType, selectionName, bookmaker,
             prevOdds, currentOdds, oddsChangePct: oddsChangePct.toFixed(1), direction, hoursToKickoff: hoursToKickoff.toFixed(1),
