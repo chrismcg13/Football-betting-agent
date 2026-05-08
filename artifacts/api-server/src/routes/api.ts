@@ -2071,12 +2071,15 @@ router.post("/admin/phase3-track-a-execute", async (_req, res) => {
       result.flags_set.push(key);
     }
 
-    // 2. Revert the 4 specific autonomous_pauses rows from 2026-05-08 03:30
-    const TARGET_PAUSE_IDS = [1, 2, 3, 4];
+    // 2. Revert the 4 specific autonomous_pauses rows from 2026-05-08 03:30.
+    // IDs are hardcoded constants (1,2,3,4 from the audit query); using a
+    // literal IN-list rather than parameterised ANY(...::int[]) because
+    // drizzle's sql tag binds JS arrays as separate params, producing a row
+    // constructor that postgres can't cast to int[].
     const targetRows = await db.execute(sql`
       SELECT id, scope_type, scope_value, resumed_at, audit_log_id, kelly_fraction_override::text AS override
       FROM autonomous_pauses
-      WHERE id = ANY(${TARGET_PAUSE_IDS}::int[])
+      WHERE id IN (1, 2, 3, 4)
         AND paused_at >= '2026-05-08 03:30:00'::timestamptz
         AND paused_at <= '2026-05-08 03:31:00'::timestamptz
     `);
