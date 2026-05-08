@@ -2613,14 +2613,23 @@ interface KoBucket {
   budgetShare: number; // fraction of remaining-budget allocated when this bucket runs
 }
 
+// 2026-05-08 Option D: rebalanced from prior 50/60/70/100 (effective
+// 50/30/14/6) to weight the trading window more heavily. The trading cycle
+// fires every 5 min and considers fixtures in T-1h..T-48h, so that's where
+// fresh Pinnacle anchors matter most for the pinnaclePreBetFilter to
+// pass legitimate edges. T-0-1h still gets adequate coverage (~5x/day per
+// match — Pinnacle moves slowly enough at this distance).
+//
+// New effective shares (assuming fresh budget):
+//   T-0-1h     = 0.20 absolute
+//   T-1-12h    = 0.50 × 0.80 = 0.40 absolute
+//   T-12-72h   = 0.70 × 0.40 = 0.28 absolute
+//   T-72h+     = 1.00 × 0.12 = 0.12 absolute
+// Trading-window coverage rises from 28% → 68% of budget.
 const KO_BUCKETS: KoBucket[] = [
-  // T-0-1h gets up to 50% of remaining budget (capped per cycle by fixture count)
-  { name: "T-0-1h",   minHrs: 0,   maxHrs: 1,   budgetShare: 0.50 },
-  // T-1-12h gets up to 60% of THEN-remaining budget
-  { name: "T-1-12h",  minHrs: 1,   maxHrs: 12,  budgetShare: 0.60 },
-  // T-12-72h gets up to 70% of remaining
+  { name: "T-0-1h",   minHrs: 0,   maxHrs: 1,   budgetShare: 0.20 },
+  { name: "T-1-12h",  minHrs: 1,   maxHrs: 12,  budgetShare: 0.50 },
   { name: "T-12-72h", minHrs: 12,  maxHrs: 72,  budgetShare: 0.70 },
-  // T-72h+ gets whatever is left
   { name: "T-72h+",   minHrs: 72,  maxHrs: 168, budgetShare: 1.00 },
 ];
 
@@ -2684,6 +2693,110 @@ export async function runKickoffProximityPrefetch(): Promise<{
     bucketsProcessed,
     budgetRemainingAtStart,
     budgetRemainingAtEnd: remaining,
+  };
+}
+
+// ─── Daily discovery sweep (Option D, 2026-05-08) ──────────────────────────
+//
+// Counterpart to runKickoffProximityPrefetch. Where the proximity prefetch
+// keeps refreshing matches in the trading window (T-1h..T-48h), this sweep
+// targets the LONG TAIL: matches in T-12h..T-168h that haven't received a
+// Pinnacle anchor in 24h+. Ensures every fixture gets at least one anchor
+// before it enters the trading window, even if proximity-prefetch budget
+// has rotated past it.
+//
+// Daily budget cap: 200 calls (~5% of 4,000 daily cap). Cron runs once
+// daily at 11:00 UTC (chosen to be after the major European league
+// fixture-discovery window and before evening kickoffs).
+//
+// Returns count of matches anchored. Logged to compliance_logs.
+export async function runDailyDiscoverySweep(): Promise<{
+  candidatesFound: number;
+  pulled: number;
+  budgetUsed: number;
+  budgetRemaining: number;
+}> {
+  if (!process.env.ODDSPAPI_KEY) {
+    return { candidatesFound: 0, pulled: 0, budgetUsed: 0, budgetRemaining: 0 };
+  }
+
+  const SWEEP_DAILY_BUDGET = 200; // ~5% of daily cap; small but meaningful long-tail coverage
+
+  const [daily, effectiveCap] = await Promise.all([
+    getOddspapiUsageToday(),
+    getEffectiveDailyCap(),
+  ]);
+  const reserveForCLV = 50;
+  const totalRemaining = Math.max(0, effectiveCap - daily - reserveForCLV);
+  const budget = Math.min(SWEEP_DAILY_BUDGET, totalRemaining);
+
+  if (budget <= 0) {
+    logger.info({ daily, cap: effectiveCap }, "Daily discovery sweep — budget exhausted, skipping");
+    return { candidatesFound: 0, pulled: 0, budgetUsed: 0, budgetRemaining: totalRemaining };
+  }
+
+  // Find T-12h..T-168h matches WITHOUT a recent oddspapi_pinnacle snapshot.
+  // "Recent" = within last 24h. Order by kickoff time so fixtures that will
+  // enter the trading window soonest get pulled first.
+  const candidatesResult = await db.execute(sql`
+    SELECT m.id, m.kickoff_time::text AS kickoff
+    FROM matches m
+    LEFT JOIN LATERAL (
+      SELECT 1 FROM odds_snapshots os
+      WHERE os.match_id = m.id
+        AND os.source = 'oddspapi_pinnacle'
+        AND os.snapshot_time >= NOW() - INTERVAL '24 hours'
+      LIMIT 1
+    ) recent_pinn ON true
+    WHERE m.kickoff_time BETWEEN NOW() + INTERVAL '12 hours' AND NOW() + INTERVAL '168 hours'
+      AND m.betfair_event_id IS NOT NULL
+      AND recent_pinn IS NULL
+    ORDER BY m.kickoff_time
+    LIMIT ${budget}
+  `);
+  const candidateRows = (((candidatesResult as any).rows ?? []) as Array<{
+    id: number; kickoff: string;
+  }>);
+
+  if (candidateRows.length === 0) {
+    logger.info({ budget, daily }, "Daily discovery sweep — no anchorless matches to pull, skipping");
+    return { candidatesFound: 0, pulled: 0, budgetUsed: 0, budgetRemaining: totalRemaining };
+  }
+
+  // Group by kickoff window for the prefetch primitive
+  const earliest = new Date(candidateRows[0]!.kickoff);
+  const latest = new Date(candidateRows[candidateRows.length - 1]!.kickoff);
+
+  const result = await prefetchAndStoreOddsPapiOdds(earliest, latest, candidateRows.length);
+  const pulled = result.size;
+
+  logger.info(
+    {
+      candidatesFound: candidateRows.length,
+      pulled,
+      budgetUsed: pulled,
+      budgetRemaining: totalRemaining - pulled,
+    },
+    "Daily discovery sweep complete",
+  );
+
+  await db.insert(complianceLogsTable).values({
+    actionType: "oddspapi_daily_discovery_sweep",
+    details: {
+      candidatesFound: candidateRows.length,
+      pulled,
+      budgetUsed: pulled,
+      windowStart: earliest.toISOString(),
+      windowEnd: latest.toISOString(),
+    },
+    timestamp: new Date(),
+  }).catch(() => undefined);
+
+  return {
+    candidatesFound: candidateRows.length,
+    pulled,
+    budgetUsed: pulled,
+    budgetRemaining: totalRemaining - pulled,
   };
 }
 
@@ -3842,6 +3955,7 @@ export async function pinnaclePreBetFilter(params: {
   league: string;
   pinnacleOdds?: number | null;
   pinnacleImplied?: number | null;
+  universeTier?: string | null;
 }): Promise<PinnacleFilterResult> {
   const lineDir = await getLineDirection(params.matchId, params.selectionName);
 
@@ -3905,9 +4019,22 @@ export async function pinnaclePreBetFilter(params: {
 
   const edgePct = (params.modelProbability - pinnacleImplied) * 100;
 
-  let minEdge = 2;
+  // 2026-05-08: threshold sourced from adaptive_thresholds (recommender
+  // writes weekly Sunday 12:00 UTC, sourced from settled-bet evidence with
+  // Bayesian posterior on Kelly log-growth). Falls back through
+  // tier_market → market_type → global → agent_config → hardcoded 2%.
+  // The hardcoded 2% remains as the final safety floor.
+  const { getActivePinnacleEdgeMin } = await import("./adaptiveThresholdRecommender");
+  const adaptive = await getActivePinnacleEdgeMin({
+    marketType: params.marketType,
+    universeTier: params.universeTier ?? null,
+  });
+  // Convert from fractional (e.g. 0.02) to percentage points (2)
+  let minEdge = adaptive.value * 100;
   if (lineDir === "away") {
-    minEdge = 3;
+    // Away-moving lines: require an additional 1 percentage point cushion
+    // (preserves the prior 2%/3% asymmetry as a relative bump).
+    minEdge += 1;
   }
 
   if (edgePct < minEdge) {

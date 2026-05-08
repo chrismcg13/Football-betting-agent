@@ -1435,6 +1435,7 @@ export async function runTradingCycle(options?: {
             league: candidate.league,
             pinnacleOdds: validation?.pinnacleOdds ?? null,
             pinnacleImplied: validation?.pinnacleImplied ?? null,
+            universeTier: candidate.universeTier ?? null,
           });
 
           filterEdgeCategory = filterResult.edgeCategory !== "filtered" ? filterResult.edgeCategory : null;
@@ -2002,6 +2003,63 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Cron health monitor scheduler active — every 5 minutes");
+
+  // 2026-05-08 (post-RCA): generalised data-quality monitor. Daily 02:00
+  // UTC. Tracks every external data source's daily volume vs 30-day
+  // baseline (excluding last 5 days). Inserts data_quality_alerts row on
+  // < 0.5x ratio. Operator queries data_quality_alerts WHERE
+  // acknowledged_at IS NULL.
+  cron.schedule("0 2 * * *", () => {
+    logger.info("Data quality monitor triggered (daily 02:00 UTC)");
+    void (async () => {
+      try {
+        const { runDataQualityMonitor } = await import("./dataQualityMonitor");
+        const r = await runDataQualityMonitor();
+        logger.info(r, "Data quality monitor complete");
+      } catch (err) {
+        logger.error({ err }, "Data quality monitor failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Data quality monitor scheduler active — daily 02:00 UTC");
+
+  // 2026-05-08 (post-RCA): adaptive threshold recommender. Weekly Sunday
+  // 12:00 UTC. Beta-Binomial posterior on Kelly log-growth per
+  // (scope × edge bucket). Recommends pinnacle_edge_min per scope based
+  // on settled-bet evidence. Pre-flight ingestion-health gate skips the
+  // cycle if oddspapi_pinnacle 24h volume is < 0.5× baseline.
+  cron.schedule("0 12 * * 0", () => {
+    logger.info("Adaptive threshold recommender triggered (Sunday 12:00 UTC)");
+    void (async () => {
+      try {
+        const { runAdaptiveThresholdRecommender } = await import("./adaptiveThresholdRecommender");
+        const r = await runAdaptiveThresholdRecommender();
+        logger.info(r, "Adaptive threshold recommender complete");
+      } catch (err) {
+        logger.error({ err }, "Adaptive threshold recommender failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Adaptive threshold recommender scheduler active — Sunday 12:00 UTC");
+
+  // 2026-05-08 Option D: daily Pinnacle discovery sweep. Runs once daily
+  // at 11:00 UTC. Targets matches in T-12h..T-168h that haven't received
+  // a Pinnacle anchor in 24h+. Fixed budget of 200 calls/day (~5% of
+  // daily cap). Counterpart to the proximity prefetch (which keeps
+  // refreshing trading-window matches).
+  cron.schedule("0 11 * * *", () => {
+    logger.info("Daily Pinnacle discovery sweep triggered (daily 11:00 UTC)");
+    void (async () => {
+      try {
+        const { runDailyDiscoverySweep } = await import("./oddsPapi");
+        const r = await runDailyDiscoverySweep();
+        logger.info(r, "Daily Pinnacle discovery sweep complete");
+      } catch (err) {
+        logger.error({ err }, "Daily Pinnacle discovery sweep failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Daily Pinnacle discovery sweep scheduler active — daily 11:00 UTC");
 }
 
 // ===================== Scheduler =====================

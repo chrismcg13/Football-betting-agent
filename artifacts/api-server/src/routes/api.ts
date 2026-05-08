@@ -2380,6 +2380,42 @@ router.post("/admin/reset-all-cron-locks", async (_req, res) => {
   }
 });
 
+// 2026-05-08 (post-RCA): manual triggers for the new data-quality and
+// recommender crons. Used to seed initial state and to validate
+// behaviour without waiting for the scheduled slot.
+router.post("/admin/run-data-quality-monitor", async (_req, res) => {
+  try {
+    const { runDataQualityMonitor } = await import("../services/dataQualityMonitor");
+    const r = await runDataQualityMonitor();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual data quality monitor failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/run-adaptive-recommender", async (_req, res) => {
+  try {
+    const { runAdaptiveThresholdRecommender } = await import("../services/adaptiveThresholdRecommender");
+    const r = await runAdaptiveThresholdRecommender();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual adaptive recommender failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/run-daily-discovery-sweep", async (_req, res) => {
+  try {
+    const { runDailyDiscoverySweep } = await import("../services/oddsPapi");
+    const r = await runDailyDiscoverySweep();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual discovery sweep failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 URGENT: manual trigger for runTradingCycle. Used to diagnose
 // trading_near silence post-deploy. Returns the cycle result directly so
 // we can see which exit path was taken (lock skip / risk triggered /

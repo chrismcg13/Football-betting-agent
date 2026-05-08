@@ -2068,6 +2068,196 @@ export async function runMigrations() {
     `);
 
     // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 (post-RCA): data_quality_alerts table.
+    // Generalised ingestion-health monitor. Populated by services/
+    // dataQualityMonitor.ts (runs daily 02:00 UTC). Operator query:
+    //   SELECT * FROM data_quality_alerts WHERE acknowledged_at IS NULL.
+    // Tracks any external data source that has a daily volume baseline.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS data_quality_alerts (
+        id SERIAL PRIMARY KEY,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        source TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        observed_value NUMERIC NOT NULL,
+        baseline_value NUMERIC NOT NULL,
+        baseline_window_start DATE NOT NULL,
+        baseline_window_end DATE NOT NULL,
+        ratio NUMERIC NOT NULL,
+        threshold_ratio NUMERIC NOT NULL DEFAULT 0.5,
+        severity TEXT NOT NULL,
+        manifest JSONB,
+        acknowledged_at TIMESTAMPTZ,
+        acknowledged_note TEXT
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'data_quality_alerts_severity_check'
+        ) THEN
+          ALTER TABLE data_quality_alerts
+            ADD CONSTRAINT data_quality_alerts_severity_check
+            CHECK (severity IN ('warn','critical'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS data_quality_alerts_unack_idx
+        ON data_quality_alerts(detected_at DESC) WHERE acknowledged_at IS NULL
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 (post-RCA): adaptive_thresholds table.
+    // Bayesian recommender (services/adaptiveThresholdRecommender.ts) writes
+    // recommendations here weekly Sunday 12:00 UTC. pinnaclePreBetFilter
+    // and other future threshold consumers read with fallback chain
+    // (tier_market → market_type → global → agent_config → hardcoded floor).
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS adaptive_thresholds (
+        id SERIAL PRIMARY KEY,
+        evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        scope_type TEXT NOT NULL,
+        scope_value TEXT NOT NULL,
+        threshold_name TEXT NOT NULL,
+        recommended_value NUMERIC NOT NULL,
+        prior_value NUMERIC NOT NULL,
+        evidence_bucket_data JSONB NOT NULL,
+        posterior_summary JSONB NOT NULL,
+        sample_size INTEGER NOT NULL,
+        applied BOOLEAN NOT NULL DEFAULT false,
+        reason TEXT
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'adaptive_thresholds_scope_type_check'
+        ) THEN
+          ALTER TABLE adaptive_thresholds
+            ADD CONSTRAINT adaptive_thresholds_scope_type_check
+            CHECK (scope_type IN ('global','market_type','tier_market'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS adaptive_thresholds_scope_recent_idx
+        ON adaptive_thresholds(scope_type, scope_value, threshold_name, evaluated_at DESC)
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 (post-RCA): clv_data_quality='partial_fallback' backfill.
+    // Phase 2.A prefetch refocus + Pinnacle-required filter compounded on
+    // 2026-05-04. Paper bets settled May 4 → fix-deploy that used the
+    // api_football_real:Pinnacle fallback (rather than oddspapi_pinnacle)
+    // are flagged so the Path P pool excludes them. They remain valid
+    // historical learning data; just not Path-P-evaluation-grade.
+    //
+    // Heuristic: a paper bet settled in this window is flagged
+    // 'partial_fallback' if no oddspapi_pinnacle snapshot exists for its
+    // (match_id, market_type, selection_name) at any time in the 24h
+    // before placed_at. The current Path P pool view filters on
+    // clv_source='pinnacle'; this UPDATE additionally distinguishes the
+    // fallback subset for the post-fix policy.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      UPDATE paper_bets pb
+      SET clv_data_quality = 'partial_fallback'
+      WHERE pb.legacy_regime = false
+        AND pb.deleted_at IS NULL
+        AND pb.bet_track = 'paper'
+        AND pb.placed_at BETWEEN '2026-05-04 00:00:00+00'::timestamptz AND NOW()
+        AND COALESCE(pb.clv_data_quality, 'incomplete') NOT IN ('partial_fallback','none')
+        AND NOT EXISTS (
+          SELECT 1 FROM odds_snapshots os
+          WHERE os.match_id = pb.match_id
+            AND os.market_type = pb.market_type
+            AND os.selection_name = pb.selection_name
+            AND os.source = 'oddspapi_pinnacle'
+            AND os.snapshot_time BETWEEN (pb.placed_at - INTERVAL '24 hours') AND pb.placed_at
+        )
+    `);
+
+    // The evaluation_pool view (gate_components etc.) already filters
+    // clv_source='pinnacle'. Path P pool now ALSO needs to exclude
+    // partial_fallback rows. Recreate the view with the additional filter.
+    await db.execute(sql`DROP VIEW IF EXISTS switchover_whitelist`);
+    await db.execute(sql`DROP VIEW IF EXISTS gate_components`);
+    await db.execute(sql`DROP VIEW IF EXISTS evaluation_pool`);
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW evaluation_pool AS
+      SELECT pb.*
+      FROM paper_bets pb
+      WHERE pb.legacy_regime = false
+        AND pb.deleted_at IS NULL
+        AND pb.bet_track = 'paper'
+        AND pb.status IN ('won','lost')
+        AND pb.clv_source = 'pinnacle'
+        AND COALESCE(pb.clv_data_quality, 'incomplete') != 'partial_fallback'
+        AND pb.gross_pnl IS NOT NULL
+        AND pb.commission_amount IS NOT NULL
+        AND pb.net_pnl IS NOT NULL
+        AND pb.placed_at >= COALESCE(
+          (SELECT value::timestamptz FROM agent_config WHERE key = 'evaluation_start_at'),
+          'infinity'::timestamptz
+        )
+    `);
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW gate_components AS
+      WITH p AS (SELECT * FROM evaluation_pool)
+      SELECT
+        (SELECT COUNT(*) FROM p) AS pool_size,
+        (SELECT
+           CASE WHEN SUM(stake::numeric) > 0
+                THEN SUM(net_pnl::numeric) / SUM(stake::numeric)
+                ELSE NULL END
+         FROM p) AS aggregate_net_roi,
+        (SELECT AVG(clv_pct::numeric) FROM p) AS aggregate_net_clv,
+        (SELECT COALESCE(json_object_agg(market_type, json_build_object(
+           'n', n, 'roi', roi, 'clv', clv)), '{}'::json)
+         FROM (SELECT market_type, COUNT(*) AS n,
+                      ROUND(100.0 * SUM(net_pnl::numeric) / NULLIF(SUM(stake::numeric),0), 2) AS roi,
+                      ROUND(AVG(clv_pct::numeric)::numeric, 2) AS clv
+               FROM p GROUP BY market_type) x) AS by_market
+    `);
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW switchover_whitelist AS
+      WITH agg AS (SELECT SUM(net_pnl::numeric) AS agg_pnl FROM evaluation_pool),
+      path_p AS (
+        SELECT 'P'::text AS path, ep.market_type, m.league,
+               COUNT(*)::int AS n,
+               SUM(ep.net_pnl::numeric) / NULLIF(SUM(ep.stake::numeric),0) AS scope_net_roi,
+               AVG(ep.clv_pct::numeric) AS scope_net_clv,
+               SUM(ep.net_pnl::numeric) / NULLIF((SELECT agg_pnl FROM agg),0) AS share_of_agg_pnl
+        FROM evaluation_pool ep JOIN matches m ON m.id = ep.match_id
+        GROUP BY ep.market_type, m.league
+        HAVING COUNT(*) >= 50
+           AND (SUM(ep.net_pnl::numeric) / NULLIF(SUM(ep.stake::numeric),0)) > 0
+           AND AVG(ep.clv_pct::numeric) > 0
+      ),
+      path_s AS (
+        SELECT 'S'::text AS path, pss.market_type, pss.league,
+               pss.n::int AS n,
+               pss.net_roi AS scope_net_roi,
+               NULL::numeric AS scope_net_clv,
+               NULL::numeric AS share_of_agg_pnl
+        FROM path_s_scope_status pss
+        WHERE pss.path_s_pass = true
+          AND NOT EXISTS (
+            SELECT 1 FROM path_p p
+            WHERE p.market_type = pss.market_type AND p.league = pss.league
+          )
+      )
+      SELECT * FROM path_p
+      UNION ALL
+      SELECT * FROM path_s
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
     // 2026-05-08 Neon-cost optimization: api_usage had ZERO indexes despite
     // 100% sequential-scan rate (1M+ scans, 73B row reads). The hot query
     // pattern is WHERE date = $1 and WHERE date LIKE $1 (apiFootball.ts:
