@@ -3044,10 +3044,97 @@ export async function logDailyBudgetSummary(): Promise<void> {
 // market types vs 75-95% on MATCH_ODDS. Now groups by (matchId, marketType)
 // so every market gets its own fetch + Pinnacle extraction.
 
+// 2026-05-08 (CLV multi-source expansion): markets where OddsPapi successfully
+// extracts Pinnacle (slash-format labels). The diagnostic confirmed BTTS,
+// DOUBLE_CHANCE, FIRST_HALF_*, FIRST_HALF_OU_*, TEAM_TOTAL_* are encoded
+// as numeric outcome IDs in OddsPapi (e.g. `1629824099` for BTTS Yes),
+// undecodable without per-fixture outcome mapping. For those markets we
+// skip OddsPapi entirely and use api_football_real:Pinnacle (189k+ rows
+// over 26 markets) which has clean labels. This ALSO saves OddsPapi P3
+// budget that would otherwise be wasted on undecodable responses.
+const ODDSPAPI_CAPABLE_MARKETS = new Set([
+  "MATCH_ODDS", "ASIAN_HANDICAP",
+  "OVER_UNDER_05", "OVER_UNDER_15", "OVER_UNDER_25", "OVER_UNDER_35", "OVER_UNDER_45",
+  "TOTAL_CORNERS_75", "TOTAL_CORNERS_85", "TOTAL_CORNERS_95", "TOTAL_CORNERS_105", "TOTAL_CORNERS_115",
+  "TOTAL_CARDS_25", "TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_CARDS_55",
+]);
+
+interface ResolvedClosing {
+  odds: number | null;
+  source: "oddspapi_pinnacle" | "api_football_pinnacle" | "derived_from_match_odds" | null;
+  dataQuality: "complete" | "partial" | "incomplete";
+}
+
+/**
+ * Multi-source closing-line Pinnacle resolver.
+ *   1. OddsPapi (only for ODDSPAPI_CAPABLE_MARKETS, only if a pre-fetched
+ *      Pinnacle bookmaker is supplied for this fixture+market).
+ *   2. api_football_real:Pinnacle most recent within 6h.
+ *   3. derived_from_match_odds for DOUBLE_CHANCE only.
+ * Returns null odds when nothing usable is available.
+ */
+async function resolveClosingPinnacle(args: {
+  matchId: number;
+  marketType: string;
+  selectionName: string;
+  oddspapiPinnacleBookmaker?: RawBookmakerOdds | null;
+}): Promise<ResolvedClosing> {
+  // Strategy A — OddsPapi
+  if (ODDSPAPI_CAPABLE_MARKETS.has(args.marketType) && args.oddspapiPinnacleBookmaker) {
+    const sels = extractSelections(args.oddspapiPinnacleBookmaker);
+    const direct = getSelectionOdds(sels, args.marketType, args.selectionName);
+    if (direct && direct > 1) {
+      return { odds: direct, source: "oddspapi_pinnacle", dataQuality: "complete" };
+    }
+    const genericKey = normaliseSelectionToGenericKey(args.selectionName, args.marketType);
+    const generic = getSelectionOdds(sels, args.marketType, genericKey);
+    if (generic && generic > 1) {
+      return { odds: generic, source: "oddspapi_pinnacle", dataQuality: "complete" };
+    }
+  }
+
+  // Strategy B — api_football_real:Pinnacle
+  const afResult = (await db.execute(sql`
+    SELECT back_odds::float8 AS odds
+    FROM odds_snapshots
+    WHERE match_id = ${args.matchId}
+      AND market_type = ${args.marketType}
+      AND selection_name = ${args.selectionName}
+      AND source = 'api_football_real:Pinnacle'
+      AND snapshot_time > NOW() - INTERVAL '6 hours'
+    ORDER BY snapshot_time DESC LIMIT 1
+  `)) as unknown as { rows: Array<{ odds: number | null }> };
+  const afOdds = afResult.rows[0]?.odds;
+  if (afOdds && afOdds > 1) {
+    return { odds: afOdds, source: "api_football_pinnacle", dataQuality: "partial" };
+  }
+
+  // Strategy C — derived_from_match_odds (DC only)
+  if (args.marketType === "DOUBLE_CHANCE") {
+    const dResult = (await db.execute(sql`
+      SELECT back_odds::float8 AS odds
+      FROM odds_snapshots
+      WHERE match_id = ${args.matchId}
+        AND market_type = 'DOUBLE_CHANCE'
+        AND selection_name = ${args.selectionName}
+        AND source = 'derived_from_match_odds'
+        AND snapshot_time > NOW() - INTERVAL '6 hours'
+      ORDER BY snapshot_time DESC LIMIT 1
+    `)) as unknown as { rows: Array<{ odds: number | null }> };
+    const dOdds = dResult.rows[0]?.odds;
+    if (dOdds && dOdds > 1) {
+      return { odds: dOdds, source: "derived_from_match_odds", dataQuality: "partial" };
+    }
+  }
+
+  return { odds: null, source: null, dataQuality: "incomplete" };
+}
+
 export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
   checked: number;
   updated: number;
   skipped: number;
+  bySource?: Record<string, number>;
 }> {
   const key = process.env.ODDSPAPI_KEY;
   if (!key) return { checked: 0, updated: 0, skipped: 0 };
@@ -3100,101 +3187,84 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
     group.bets.push(bet);
   }
 
-  // Pre-resolve oddspapi fixture IDs (one lookup per match, cached for all its markets)
+  // Pre-resolve oddspapi fixture IDs only for capable-market groups
+  // (skips DB lookups for matches whose only pending bets are BTTS/DC/etc).
   const fixtureIdCache = new Map<number, number | null>();
-  for (const { matchId } of byMatchMarket.values()) {
+  for (const { matchId, marketType } of byMatchMarket.values()) {
+    if (!ODDSPAPI_CAPABLE_MARKETS.has(marketType)) continue;
     if (!fixtureIdCache.has(matchId)) {
       fixtureIdCache.set(matchId, await getOddspapiFixtureId(matchId));
     }
   }
 
+  const bySource: Record<string, number> = {};
+
   for (const { matchId, marketType, bets } of byMatchMarket.values()) {
-    const oddspapiId = fixtureIdCache.get(matchId);
-    if (!oddspapiId) {
-      skipped += bets.length;
-      continue;
-    }
+    let oddspapiPinnacleBookmaker: RawBookmakerOdds | null = null;
 
-    // Skip markets we don't have an OddsPapi market-id mapping for. Without
-    // this, MARKET_IDS[marketType] would be undefined and we'd fetch the
-    // wrong endpoint for the market.
-    const marketId = MARKET_IDS[marketType];
-    if (!marketId) {
-      logger.debug({ matchId, marketType, count: bets.length }, "Pre-kickoff CLV: no MARKET_IDS mapping — skipping");
-      skipped += bets.length;
-      continue;
-    }
-
-    if (!(await canMakeOddspapiRequest(1, "P3"))) {
-      logger.warn("Pre-kickoff CLV cron: P3 budget exhausted — stopping");
-      skipped += bets.length;
-      break;
-    }
-
-    // Rate-limit guard
-    await new Promise((r) => setTimeout(r, 2400));
-
-    const rawData = await fetchOddsPapi<RawOddsResponse>(
-      "/odds",
-      { fixtureId: oddspapiId, marketId },
-      "closing_line",
-      "P3",
-    );
-
-    if (!rawData) { skipped += bets.length; continue; }
-
-    const bookmakers = extractBookmakers(rawData as RawOddsResponse);
-    if (!bookmakers.length) { skipped += bets.length; continue; }
-
-    // Extract Pinnacle odds for each generic selection in THIS market.
-    // Generic keys differ per market — MATCH_ODDS = Home/Draw/Away, BTTS = Yes/No,
-    // OU/AH/TEAM_TOTAL = Over/Under, DC = 1X/X2/12. getGenericSelectionKeys
-    // returns the right set; getSelectionOdds matches selection labels with
-    // OU/AH/TEAM_TOTAL line/handicap encoding.
-    const pinnacleBySelection: Record<string, number | null> = {};
-    for (const bm of bookmakers) {
-      const slug = getBookmakerSlug(bm);
-      if (!slug.includes("pinnacle")) continue;
-      const selections = extractSelections(bm);
-      for (const selName of getGenericSelectionKeys(marketType)) {
-        const odds = getSelectionOdds(selections, marketType, selName);
-        if (odds) pinnacleBySelection[selName] = odds;
-      }
-      // Also try matching by the actual bet's selectionName for AH/TEAM_TOTAL
-      // where the generic key is "Over"/"Under" but the encoding includes the
-      // line ("Home -1.5", "Over 2.5 [home]"). Fall through to per-bet match below.
-    }
-
-    // Store closing odds for each matching bet and compute CLV
-    for (const bet of bets) {
-      try {
-        // First try generic-key lookup, then fall back to direct selection
-        // match (handles AH/TEAM_TOTAL where line is encoded in the name).
-        const genericKey = normaliseSelectionToGenericKey(bet.selectionName, marketType);
-        let closingOdds: number | null = pinnacleBySelection[genericKey] ?? null;
-        if (!closingOdds) {
-          for (const bm of bookmakers) {
-            const slug = getBookmakerSlug(bm);
-            if (!slug.includes("pinnacle")) continue;
-            const selections = extractSelections(bm);
-            const direct = getSelectionOdds(selections, marketType, bet.selectionName);
-            if (direct) { closingOdds = direct; break; }
+    // Pre-fetch OddsPapi only for capable markets. For BTTS/DC/FH/TEAM_TOTAL
+    // we bypass OddsPapi entirely (the slash-format parser cannot decode
+    // the numeric outcome IDs Pinnacle uses for those markets), going
+    // straight to api_football_real:Pinnacle via resolveClosingPinnacle.
+    if (ODDSPAPI_CAPABLE_MARKETS.has(marketType)) {
+      const oddspapiId = fixtureIdCache.get(matchId);
+      const marketId = MARKET_IDS[marketType];
+      if (oddspapiId && marketId) {
+        if (!(await canMakeOddspapiRequest(1, "P3"))) {
+          logger.warn("Pre-kickoff CLV cron: P3 budget exhausted — falling through to AF Pinnacle for remaining markets");
+        } else {
+          // Rate-limit guard
+          await new Promise((r) => setTimeout(r, 2400));
+          const rawData = await fetchOddsPapi<RawOddsResponse>(
+            "/odds",
+            { fixtureId: oddspapiId, marketId },
+            "closing_line",
+            "P3",
+          );
+          if (rawData) {
+            const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+            oddspapiPinnacleBookmaker =
+              bookmakers.find((b) => getBookmakerSlug(b).includes("pinnacle")) ?? null;
           }
         }
-        if (!closingOdds) { skipped++; continue; }
+      }
+    }
+
+    for (const bet of bets) {
+      try {
+        const resolved = await resolveClosingPinnacle({
+          matchId,
+          marketType,
+          selectionName: bet.selectionName,
+          oddspapiPinnacleBookmaker,
+        });
+
+        if (!resolved.odds || !resolved.source) {
+          skipped++;
+          continue;
+        }
 
         const placementOdds = Number(bet.oddsAtPlacement);
-        const clvPct = closingOdds > 1
-          ? Math.round(((placementOdds - closingOdds) / closingOdds) * 100 * 1000) / 1000
+        const clvPct = resolved.odds > 1
+          ? Math.round(((placementOdds - resolved.odds) / resolved.odds) * 100 * 1000) / 1000
           : null;
+
+        // Both oddspapi_pinnacle and api_football_pinnacle map to clv_source
+        // = 'pinnacle' (canonical evaluation_pool tag — both ARE Pinnacle's
+        // actual prices, just different ingestion paths). DC derived from
+        // MO maps to 'pinnacle_derived' so it counts toward Path S
+        // (shadow_evaluation_pool) but not Path P (evaluation_pool which
+        // demands real Pinnacle CLV).
+        const clvSourceTag =
+          resolved.source === "derived_from_match_odds" ? "pinnacle_derived" : "pinnacle";
 
         await db
           .update(paperBetsTable)
           .set({
-            closingPinnacleOdds: String(closingOdds),
+            closingPinnacleOdds: String(resolved.odds),
             ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
-            clvSource: "pinnacle",
-            clvDataQuality: "complete",
+            clvSource: clvSourceTag,
+            clvDataQuality: resolved.dataQuality,
           })
           .where(eq(paperBetsTable.id, bet.id));
 
@@ -3204,26 +3274,116 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
           marketType: bet.marketType,
           selectionName: bet.selectionName,
           snapshotType: "closing",
-          pinnacleOdds: closingOdds,
+          pinnacleOdds: resolved.odds,
         });
 
+        bySource[resolved.source] = (bySource[resolved.source] ?? 0) + 1;
         logger.info(
-          { betId: bet.id, matchId, marketType, selection: bet.selectionName, placementOdds, closingOdds, clvPct },
-          "Pre-kickoff CLV stored (Pinnacle closing line) + snapshot C",
+          {
+            betId: bet.id, matchId, marketType, selection: bet.selectionName,
+            placementOdds, closingOdds: resolved.odds, clvPct,
+            source: resolved.source, dataQuality: resolved.dataQuality,
+          },
+          "Pre-kickoff CLV stored (multi-source) + snapshot C",
         );
         updated++;
       } catch (err) {
-        logger.error({ err, betId: bet.id, matchId, marketType }, "Closing line snapshot error — skipping bet");
+        logger.error({ err, betId: bet.id, matchId, marketType }, "Closing line resolver error — skipping bet");
         skipped++;
       }
     }
   }
 
   logger.info(
-    { checked: pendingBets.length, updated, skipped, fixtures: fixtureIdCache.size, marketGroups: byMatchMarket.size },
-    "Pre-kickoff CLV cron complete",
+    { checked: pendingBets.length, updated, skipped, bySource, marketGroups: byMatchMarket.size, oddspapiFixtures: fixtureIdCache.size },
+    "Pre-kickoff CLV cron complete (multi-source resolver)",
   );
-  return { checked: pendingBets.length, updated, skipped };
+  return { checked: pendingBets.length, updated, skipped, bySource };
+}
+
+/**
+ * One-shot backfill: walk every settled paper bet that has no closing line
+ * yet and run the multi-source resolver. Recovers CLV for the historical
+ * BTTS/DC/FH/TEAM_TOTAL bets that were structurally locked out by the
+ * OddsPapi numeric-ID encoding bug. Idempotent — safe to re-run.
+ *
+ * Backfill cannot reach OddsPapi because kickoff has already passed, so
+ * only Strategies B (api_football_real:Pinnacle) and C (derived_from_
+ * match_odds) apply. Bumps Path P evaluation_pool size meaningfully.
+ */
+export async function backfillClosingPinnacleFromMultiSource(opts: {
+  limit?: number;
+} = {}): Promise<{
+  scanned: number; updated: number; skipped: number; bySource: Record<string, number>;
+}> {
+  const limit = opts.limit ?? 5000;
+
+  const settledBets = await db
+    .select({
+      id: paperBetsTable.id,
+      matchId: paperBetsTable.matchId,
+      marketType: paperBetsTable.marketType,
+      selectionName: paperBetsTable.selectionName,
+      oddsAtPlacement: paperBetsTable.oddsAtPlacement,
+    })
+    .from(paperBetsTable)
+    .where(
+      and(
+        inArray(paperBetsTable.status, ["won", "lost", "void", "push"]),
+        sql`${paperBetsTable.closingPinnacleOdds} IS NULL`,
+        sql`${paperBetsTable.deletedAt} IS NULL`,
+      ),
+    )
+    .limit(limit);
+
+  let updated = 0;
+  let skipped = 0;
+  const bySource: Record<string, number> = {};
+
+  for (const bet of settledBets) {
+    try {
+      const resolved = await resolveClosingPinnacle({
+        matchId: bet.matchId,
+        marketType: bet.marketType,
+        selectionName: bet.selectionName,
+        oddspapiPinnacleBookmaker: null,
+      });
+
+      if (!resolved.odds || !resolved.source) {
+        skipped++;
+        continue;
+      }
+
+      const placementOdds = Number(bet.oddsAtPlacement);
+      const clvPct = resolved.odds > 1
+        ? Math.round(((placementOdds - resolved.odds) / resolved.odds) * 100 * 1000) / 1000
+        : null;
+      const clvSourceTag =
+        resolved.source === "derived_from_match_odds" ? "pinnacle_derived" : "pinnacle";
+
+      await db
+        .update(paperBetsTable)
+        .set({
+          closingPinnacleOdds: String(resolved.odds),
+          ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
+          clvSource: clvSourceTag,
+          clvDataQuality: resolved.dataQuality,
+        })
+        .where(eq(paperBetsTable.id, bet.id));
+
+      bySource[resolved.source] = (bySource[resolved.source] ?? 0) + 1;
+      updated++;
+    } catch (err) {
+      logger.error({ err, betId: bet.id }, "Backfill: error resolving — skipping");
+      skipped++;
+    }
+  }
+
+  logger.info(
+    { scanned: settledBets.length, updated, skipped, bySource },
+    "Closing-line multi-source backfill complete",
+  );
+  return { scanned: settledBets.length, updated, skipped, bySource };
 }
 
 // ─── DIAGNOSTIC: dump raw OddsPapi response for a (match, market) pair ─────

@@ -2418,6 +2418,22 @@ router.post("/admin/run-tier-ladder-v2", async (_req, res) => {
   }
 });
 
+// 2026-05-08 (CLV multi-source): one-shot backfill that walks every settled
+// paper bet missing closing_pinnacle_odds and runs the multi-source resolver
+// (api_football_real:Pinnacle for BTTS/DC/FH/TEAM_TOTAL, derived_from_match_
+// odds for DC fallback). Idempotent. Body: { limit?: number }.
+router.post("/admin/backfill-closing-pinnacle", async (req, res) => {
+  try {
+    const limit = Number((req.body ?? {}).limit ?? 5000);
+    const { backfillClosingPinnacleFromMultiSource } = await import("../services/oddsPapi");
+    const r = await backfillClosingPinnacleFromMultiSource({ limit });
+    return res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "backfill-closing-pinnacle failed");
+    return res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 (CLV diagnostic): inspect raw OddsPapi response for a specific
 // (matchId, marketType). Used to diagnose why BTTS/DC/FH/TEAM_TOTAL show
 // zero oddspapi_pinnacle snapshots — reveals whether the API genuinely
