@@ -42,16 +42,22 @@ interface BetfairEventLite {
 function findBestFixtureMatch(
   ev: BetfairEventLite,
   fixtures: FixtureRow[],
+  opts?: { minSimilarity?: number; maxKickoffHours?: number },
 ): { fixture: FixtureRow; score: number } | null {
+  const minSim = opts?.minSimilarity ?? 0.7;
+  const maxHours = opts?.maxKickoffHours ?? 24;
   let best: { fixture: FixtureRow; score: number } | null = null;
   const evTime = ev.openDate.getTime();
   for (const f of fixtures) {
     const dtHours = Math.abs(evTime - f.kickoffTime.getTime()) / 3_600_000;
-    if (dtHours > 24) continue;
+    if (dtHours > maxHours) continue;
     const sHome = teamSimilarity(ev.home, f.homeTeam);
     const sAway = teamSimilarity(ev.away, f.awayTeam);
-    if (sHome < 0.7 || sAway < 0.7) continue;
-    const timePenalty = Math.max(0, 1 - dtHours / 24) * 0.05;
+    if (sHome < minSim || sAway < minSim) continue;
+    // Permissive-pass safety: when minSim is below 0.7, require at least one
+    // side to be ≥0.8 so we don't match two simultaneously-weak similarities.
+    if (minSim < 0.7 && Math.max(sHome, sAway) < 0.8) continue;
+    const timePenalty = Math.max(0, 1 - dtHours / maxHours) * 0.05;
     const score = (sHome + sAway) / 2 + timePenalty;
     if (!best || score > best.score) best = { fixture: f, score };
   }
@@ -141,9 +147,10 @@ export async function mapBetfairEventsToFixtures(
   }
   stats.eventsFetched = events.length;
 
-  const updates: Array<{ matchId: number; eventId: string; score: number }> = [];
+  const updates: Array<{ matchId: number; eventId: string; score: number; permissive: boolean }> = [];
   const usedFixtureIds = new Set<number>();
 
+  // Pass 1: strict (min sim 0.7, ±24h). Existing behaviour — won't regress.
   const eventsSorted = [...events];
   for (const ev of eventsSorted) {
     const candidates = fixtures.filter((f) => !usedFixtureIds.has(f.id));
@@ -156,8 +163,48 @@ export async function mapBetfairEventsToFixtures(
       usedFixtureIds.add(match.fixture.id);
       continue;
     }
-    updates.push({ matchId: match.fixture.id, eventId: ev.id, score: match.score });
+    updates.push({ matchId: match.fixture.id, eventId: ev.id, score: match.score, permissive: false });
     usedFixtureIds.add(match.fixture.id);
+  }
+
+  // Pass 2 (2026-05-08): permissive recovery for af_-placeholder matches in
+  // known-tradeable leagues. Lower min-similarity to 0.6 BUT require at
+  // least one side ≥0.8 (handled inside findBestFixtureMatch), and tighten
+  // kickoff window to 6h so we don't cross-day-match. Restricted to
+  // fixtures whose league has has_betfair_exchange=TRUE (high-confidence
+  // target — we know the league trades on Betfair, so the af_ placeholder
+  // is a fuzzy-match miss, not a genuinely-unlisted event).
+  const tradeableRows = await db.execute(sql`
+    SELECT name FROM competition_config
+    GROUP BY name HAVING BOOL_OR(has_betfair_exchange = TRUE)
+  `);
+  const tradeableLeagues = new Set<string>(
+    (((tradeableRows as any).rows ?? (tradeableRows as any) ?? []) as Array<{ name: string }>)
+      .map((r) => r.name),
+  );
+  const remainingAfFixtures = fixtures.filter((f) =>
+    !usedFixtureIds.has(f.id) &&
+    f.betfairEventId?.startsWith("af_") &&
+    f.league &&
+    tradeableLeagues.has(f.league),
+  );
+  let permissiveMatched = 0;
+  if (remainingAfFixtures.length > 0) {
+    for (const ev of eventsSorted) {
+      const candidates = remainingAfFixtures.filter((f) => !usedFixtureIds.has(f.id));
+      if (candidates.length === 0) break;
+      const match = findBestFixtureMatch(ev, candidates, { minSimilarity: 0.6, maxKickoffHours: 6 });
+      if (!match) continue;
+      const existing = match.fixture.betfairEventId;
+      if (existing && !existing.startsWith("af_") && existing === ev.id) {
+        usedFixtureIds.add(match.fixture.id);
+        continue;
+      }
+      updates.push({ matchId: match.fixture.id, eventId: ev.id, score: match.score, permissive: true });
+      usedFixtureIds.add(match.fixture.id);
+      permissiveMatched++;
+      stats.fixturesMatched++;
+    }
   }
 
   if (updates.length > 0) {
@@ -176,7 +223,10 @@ export async function mapBetfairEventsToFixtures(
 
   stats.fixturesUnmatched = stats.fixturesScanned - stats.fixturesMatched - stats.fixturesAlreadyMapped;
   stats.durationMs = Date.now() - startedAt;
-  logger.info(stats, "Betfair event mapping complete");
+  logger.info(
+    { ...stats, permissiveMatched, tradeableLeagueCount: tradeableLeagues.size },
+    "Betfair event mapping complete",
+  );
   return stats;
 }
 

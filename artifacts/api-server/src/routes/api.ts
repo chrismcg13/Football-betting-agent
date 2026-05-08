@@ -2592,6 +2592,172 @@ router.post("/admin/run-daily-discovery-sweep", async (_req, res) => {
   }
 });
 
+// Phase 3 A5 (2026-05-08): pre-flip live canary. Places ONE real Betfair
+// bet at £0.10 to validate the entire live placement chain end-to-end
+// (Betfair API, settlement, reconciliation, commission attribution) BEFORE
+// the actual switchover. De-risks doc §R7 — failed first live bet halt-
+// and-investigate cycle that could delay live operation by days.
+//
+// Bypasses live_placement_enabled kill switch + live_whitelist scope check
+// because the canary is by definition pre-flip with no whitelist yet.
+//
+// Hard-armed: requires agent_config.live_canary_enabled='true' (operator
+// must explicitly arm). One-shot: refuses if agent_config.live_canary_used
+// is already 'true' (manual reset required to re-fire).
+//
+// Stake: hard-coded £0.10 regardless of body.stake. The canary is
+// infrastructure validation, not capital deployment.
+//
+// Body: { matchId: number, marketType: string, selectionName: string, odds: number }
+//
+// Operator picks the match — the canary doesn't try to auto-select a
+// "high-liquidity Premier League fixture" because picking that
+// algorithmically is fraught (Betfair liquidity varies hourly). Operator
+// reviews available fixtures via Neon (matches WHERE betfair_event_id ~
+// '^[0-9]+$' AND kickoff_time BETWEEN NOW() AND NOW()+'24 hours') and
+// supplies the (matchId, marketType, selectionName, odds) tuple.
+router.post("/admin/live-canary", async (req, res) => {
+  try {
+    if (process.env["TRADING_MODE"] !== "LIVE") {
+      return res.status(400).json({
+        success: false,
+        message: "TRADING_MODE != LIVE — canary requires live mode env",
+      });
+    }
+    const armed = (await getConfigValue("live_canary_enabled")) === "true";
+    if (!armed) {
+      return res.status(400).json({
+        success: false,
+        message: "agent_config.live_canary_enabled != 'true' — operator must explicitly arm",
+      });
+    }
+    const used = (await getConfigValue("live_canary_used")) === "true";
+    if (used) {
+      return res.status(400).json({
+        success: false,
+        message: "Canary already fired — set agent_config.live_canary_used='false' to re-arm",
+      });
+    }
+    const { matchId, marketType, selectionName, odds } = req.body ?? {};
+    if (typeof matchId !== "number" || !marketType || !selectionName || typeof odds !== "number") {
+      return res.status(400).json({
+        success: false,
+        message: "Body required: { matchId: number, marketType: string, selectionName: string, odds: number }",
+      });
+    }
+    if (!(odds >= 1.01 && odds <= 1000)) {
+      return res.status(400).json({
+        success: false,
+        message: `odds=${odds} outside [1.01, 1000] sanity range`,
+      });
+    }
+    const match = (
+      await db.select().from(matchesTable).where(eq(matchesTable.id, matchId))
+    )[0];
+    if (!match) {
+      return res.status(404).json({ success: false, message: `match ${matchId} not found` });
+    }
+    if (!match.betfairEventId || !/^[0-9]+$/.test(match.betfairEventId)) {
+      return res.status(400).json({
+        success: false,
+        message: `match ${matchId} has betfair_event_id='${match.betfairEventId}' — must be numeric (real Betfair event)`,
+      });
+    }
+    if (!match.kickoffTime || match.kickoffTime <= new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: `match ${matchId} kickoff in past or null — must be upcoming`,
+      });
+    }
+    const STAKE = 0.10; // hard-coded, ignore body.stake
+    const potentialProfit = Math.round(STAKE * (odds - 1) * 100) / 100;
+
+    // Insert paper_bets row tagged as canary live bet.
+    const inserted = await db
+      .insert(paperBetsTable)
+      .values({
+        matchId,
+        marketType,
+        selectionName,
+        betType: "back",
+        oddsAtPlacement: String(odds),
+        stake: String(STAKE),
+        potentialProfit: String(potentialProfit),
+        modelProbability: String(1 / odds), // sentinel — canary not a model bet
+        impliedProbability: String(1 / odds),
+        edge: "0",
+        status: "pending_placement",
+        legacyRegime: false,
+        betTrack: "live",
+        universeTierAtPlacement: "A",
+      } as any)
+      .returning();
+    const bet = inserted[0];
+    if (!bet?.id) {
+      return res.status(500).json({ success: false, message: "Failed to insert canary paper_bets row" });
+    }
+
+    const { placeLiveBetOnBetfair } = await import("../services/betfairLive");
+    const result = await placeLiveBetOnBetfair({
+      internalBetId: bet.id,
+      betfairEventId: match.betfairEventId,
+      marketType,
+      selectionName,
+      odds,
+      stake: STAKE,
+      homeTeam: match.homeTeam,
+      awayTeam: match.awayTeam,
+    });
+
+    await db.insert(complianceLogsTable).values({
+      actionType: "live_canary",
+      details: {
+        canary: true,
+        betId: bet.id,
+        matchId,
+        marketType,
+        selectionName,
+        odds,
+        stake: STAKE,
+        result,
+      } as any,
+      timestamp: new Date(),
+    });
+
+    if (result.success) {
+      await setConfigValue("live_canary_used", "true");
+      await setConfigValue("live_canary_at", new Date().toISOString());
+      await db
+        .update(paperBetsTable)
+        .set({
+          status: "pending",
+          betfairBetId: result.betfairBetId ?? null,
+          betfairMarketId: result.betfairMarketId ?? null,
+          betfairStatus: result.betfairStatus ?? null,
+        } as any)
+        .where(eq(paperBetsTable.id, bet.id));
+      logger.info(
+        { betId: bet.id, betfairBetId: result.betfairBetId, matchId, marketType, selectionName, odds, stake: STAKE },
+        "Live canary placed successfully — pre-flip placement chain validated",
+      );
+      return res.json({ success: true, betId: bet.id, result });
+    } else {
+      await db
+        .update(paperBetsTable)
+        .set({ status: "placement_failed", betfairStatus: `CANARY_FAILED: ${result.error ?? "unknown"}` } as any)
+        .where(eq(paperBetsTable.id, bet.id));
+      logger.warn(
+        { betId: bet.id, error: result.error, matchId, marketType, selectionName },
+        "Live canary placement failed",
+      );
+      return res.status(500).json({ success: false, betId: bet.id, result });
+    }
+  } catch (err) {
+    logger.error({ err }, "Live canary failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 URGENT: manual trigger for runTradingCycle. Used to diagnose
 // trading_near silence post-deploy. Returns the cycle result directly so
 // we can see which exit path was taken (lock skip / risk triggered /
