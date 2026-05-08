@@ -3201,7 +3201,12 @@ export async function deduplicatePendingBets(): Promise<{
   totalAfter: number;
   removedByReason: Record<string, number>;
 }> {
-  // 1. Fetch all pending bets with their match info and scores
+  // 1. Fetch all pending bets with their match info and scores. Phase 3 A3
+  // (2026-05-08): include bet_track so Step C cap below can be bet-track-
+  // aware (paper=4, shadow=12). Pre-fix this function hardcoded 4 across
+  // both rails, retroactively voiding shadow bets that emission had
+  // legitimately allowed at the higher 12-cap. Observed 1,855 bets voided
+  // in a single 21:12 cycle on 2026-05-08 — most were shadow rail.
   const rows = await db
     .select({
       id: paperBetsTable.id,
@@ -3210,6 +3215,7 @@ export async function deduplicatePendingBets(): Promise<{
       selectionName: paperBetsTable.selectionName,
       stake: paperBetsTable.stake,
       opportunityScore: paperBetsTable.opportunityScore,
+      betTrack: paperBetsTable.betTrack,
       homeTeam: matchesTable.homeTeam,
       awayTeam: matchesTable.awayTeam,
     })
@@ -3274,18 +3280,28 @@ export async function deduplicatePendingBets(): Promise<{
       removedByReason.cross_market_dedup++;
     }
 
-    // ── Step C: Max 4 bets per match ─────────────────────────────────
+    // ── Step C: Per-match cap, bet-track-aware (Phase 3 A3, 2026-05-08).
+    // Paper rail: cap=4 (capital-discipline). Shadow rail: cap=12 (£0
+    // learning data, no capital risk; matches the emission-time check).
+    // Apply caps per track independently so paper/shadow don't compete
+    // for slots within the same match. Pre-fix this hardcoded 4 across
+    // both rails, voiding ~1,400 shadow bets per cycle that emission had
+    // legitimately allowed.
     const remainingBets = activeBetsForMatch(matchId);
-    if (remainingBets.length > 4) {
-      const sorted = [...remainingBets].sort((a, b) => (b.opportunityScore ?? 0) - (a.opportunityScore ?? 0));
-      const excess = sorted.slice(4);
-      logger.info(
-        { matchId, removedCount: excess.length },
-        `deduplicatePendingBets [max-4 cap]: removing ${excess.length} excess bets`,
-      );
-      for (const e of excess) {
-        toVoid.add(e.id);
-        removedByReason.max_per_match++;
+    for (const track of ["paper", "shadow"] as const) {
+      const cap = track === "shadow" ? 12 : 4;
+      const trackBets = remainingBets.filter((b) => (b.betTrack ?? "paper") === track);
+      if (trackBets.length > cap) {
+        const sorted = [...trackBets].sort((a, b) => (b.opportunityScore ?? 0) - (a.opportunityScore ?? 0));
+        const excess = sorted.slice(cap);
+        logger.info(
+          { matchId, track, cap, removedCount: excess.length },
+          `deduplicatePendingBets [max-per-track cap]: removing ${excess.length} excess ${track} bets (cap=${cap})`,
+        );
+        for (const e of excess) {
+          toVoid.add(e.id);
+          removedByReason.max_per_match++;
+        }
       }
     }
   }
