@@ -2511,9 +2511,27 @@ router.get("/admin/oddspapi-bookmaker-catalog", async (_req, res) => {
   }
 });
 
+// 2026-05-08 Neon cost audit follow-up: VACUUM FULL endpoint. Rewrites
+// the table to reclaim disk space — VACUUM ANALYZE alone marks dead
+// rows but doesn't return disk to Neon's storage layer, so the logical-
+// storage billing metric stays elevated. VACUUM FULL takes an
+// AccessExclusive lock per table for 1-3 minutes (3GB table). Operator-
+// triggered only. Body optional: { tables?: string[] }.
+router.post("/admin/run-vacuum-full", async (req, res) => {
+  try {
+    const tables = (req.body ?? {}).tables;
+    const { runVacuumFull } = await import("../services/storageCleanup");
+    const r = await runVacuumFull({ tables });
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "VACUUM FULL failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 Neon cost audit: manual trigger for storage cleanup. Returns
-// row counts deleted by category. Body optional: { oddsSnapshotsBatchLimit?,
-// oddsHistoryBatchLimit? } — defaults are 500K / 200K rows per run.
+// row counts deleted by category. Body optional: { oddsSnapshotsBatchSize?,
+// oddsHistoryBatchSize?, oddsSnapshotsMaxIterations?, oddsHistoryMaxIterations? }.
 router.post("/admin/run-storage-cleanup", async (req, res) => {
   try {
     const oddsSnapshotsBatchLimit = (req.body ?? {}).oddsSnapshotsBatchLimit;

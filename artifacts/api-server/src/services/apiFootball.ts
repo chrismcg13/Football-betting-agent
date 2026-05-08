@@ -1156,8 +1156,13 @@ export async function fetchAndStoreOddsForFixture(
   // time. Pre-cleanup we had ~17.5M of 21.9M (80%) odds_snapshots rows in
   // sources never read by any analysis path. Going forward we only persist
   // ~6 sources per snapshot batch.
+  // 2026-05-08 cost-audit follow-up: dropped "Betfair" — it's redundant
+  // with the betfair_exchange source which we capture directly via the
+  // exchange book sweep cron. Pinnacle = fair-value reference / CLV
+  // resolver primary. The other 4 = soft-consensus inputs for sharp-move
+  // RLM detection (only the latest 15-min window is read).
   const ESSENTIAL_AF_BOOKMAKERS = new Set([
-    "Pinnacle", "Bet365", "Unibet", "Marathonbet", "Betano", "Betfair",
+    "Pinnacle", "Bet365", "Unibet", "Marathonbet", "Betano",
   ]);
 
   for (const bm of fixture.bookmakers) {

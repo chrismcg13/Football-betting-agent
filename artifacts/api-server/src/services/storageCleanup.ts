@@ -42,7 +42,26 @@ const NON_ESSENTIAL_AF_BOOKMAKERS = [
   "api_football_real:SBO",
   "api_football_real:Dafabet",
   "api_football_real:188Bet",
+  // 2026-05-08 follow-up: api_football_real:Betfair is fully redundant
+  // with the betfair_exchange source captured via the dedicated exchange
+  // book sweep. No analysis path reads the AF Betfair version. Aggressive
+  // cleanup (no retention buffer) — drop everything.
+  "api_football_real:Betfair",
 ];
+
+// Per-essential-bookmaker retention. Set tight because each is consumed
+// from a NARROW window:
+//   Pinnacle    — multi-source CLV resolver looks at last 6h (Strategy B);
+//                 cross-check looks at last 30 min. 7 days is generous.
+//   Bet365/Unibet/Marathonbet/Betano — sharp-move RLM detector queries
+//                 last 15 minutes. 3 days is generous.
+const ESSENTIAL_AF_BOOKMAKER_RETENTION: Record<string, string> = {
+  "api_football_real:Pinnacle": "7 days",
+  "api_football_real:Bet365": "3 days",
+  "api_football_real:Unibet": "3 days",
+  "api_football_real:Marathonbet": "3 days",
+  "api_football_real:Betano": "3 days",
+};
 
 interface CleanupResult {
   evaluatedAt: string;
@@ -92,10 +111,10 @@ export async function runStorageCleanup(opts: {
     notes.push(`Index build skipped: ${String(err)}`);
   }
 
-  // ─── (1) odds_snapshots non-essential bookmakers — per-source loop ───────
-  // Iterate one source at a time with small batches so each DELETE is
-  // O(log n) via the new index and well within statement_timeout. The
-  // per-source loop stops early when a batch returns 0 rows.
+  // ─── (1a) odds_snapshots non-essential bookmakers — aggressive cleanup ──
+  // Non-essentials we no longer write at all (apiFootball.ts filter) AND
+  // never read. 14-day retention is just safety buffer for unexpected
+  // backfill. Per-source loop with small batches.
   let oddsSnapshotsDeleted = 0;
   for (const source of NON_ESSENTIAL_AF_BOOKMAKERS) {
     let perSource = 0;
@@ -116,6 +135,33 @@ export async function runStorageCleanup(opts: {
     }
     if (perSource > 0) {
       notes.push(`odds_snapshots[${source}]: ${perSource} rows deleted`);
+    }
+    oddsSnapshotsDeleted += perSource;
+  }
+
+  // ─── (1b) odds_snapshots ESSENTIAL bookmakers — tight retention ──────────
+  // Pinnacle/Bet365/Unibet/Marathonbet/Betano are kept for live use but
+  // each has a NARROW read window (Pinnacle 6h via CLV resolver, others
+  // 15 min via sharp-move detector). Old data adds nothing analytically
+  // and is the bulk of the remaining bloat.
+  for (const [source, retention] of Object.entries(ESSENTIAL_AF_BOOKMAKER_RETENTION)) {
+    let perSource = 0;
+    for (let i = 0; i < oddsSnapshotsMaxIterations; i++) {
+      const result = (await db.execute(sql`
+        WITH deletable AS (
+          SELECT ctid FROM odds_snapshots
+          WHERE source = ${source}
+            AND snapshot_time < NOW() - ${sql.raw(`INTERVAL '${retention}'`)}
+          LIMIT ${oddsSnapshotsBatchSize}
+        )
+        DELETE FROM odds_snapshots WHERE ctid IN (SELECT ctid FROM deletable)
+      `)) as unknown as { rowCount?: number };
+      const deleted = result.rowCount ?? 0;
+      perSource += deleted;
+      if (deleted < oddsSnapshotsBatchSize) break;
+    }
+    if (perSource > 0) {
+      notes.push(`odds_snapshots[${source}] (>${retention}): ${perSource} rows deleted`);
     }
     oddsSnapshotsDeleted += perSource;
   }
@@ -176,16 +222,16 @@ export async function runStorageCleanup(opts: {
     notes.push(`compliance_logs: deleted ${complianceTotal} rows (${JSON.stringify(complianceLogsDeleted)})`);
   }
 
-  // ─── (3) odds_history retention 30 days — small-batch loop ──────────────
-  // Same pattern as odds_snapshots: small batches that fit in statement_
-  // timeout, looped within the call until empty or iteration cap.
-  // odds_history_time_idx already exists so this is index-driven.
+  // ─── (3) odds_history retention 7 days — small-batch loop ──────────────
+  // Tightened from 30d to 7d (2026-05-08 follow-up). Line-movement
+  // detection only reads the last few hours; 7 days gives generous
+  // forensic backfill room. Drops 1.5GB → ~350MB once the cycle catches up.
   let oddsHistoryDeleted = 0;
   for (let i = 0; i < oddsHistoryMaxIterations; i++) {
     const result = (await db.execute(sql`
       WITH deletable AS (
         SELECT ctid FROM odds_history
-        WHERE snapshot_time < NOW() - INTERVAL '30 days'
+        WHERE snapshot_time < NOW() - INTERVAL '7 days'
         LIMIT ${oddsHistoryBatchSize}
       )
       DELETE FROM odds_history WHERE ctid IN (SELECT ctid FROM deletable)
@@ -195,7 +241,7 @@ export async function runStorageCleanup(opts: {
     if (deleted < oddsHistoryBatchSize) break;
   }
   if (oddsHistoryDeleted > 0) {
-    notes.push(`odds_history: ${oddsHistoryDeleted} rows >30d deleted`);
+    notes.push(`odds_history: ${oddsHistoryDeleted} rows >7d deleted`);
   }
 
   const totalRowsDeleted = oddsSnapshotsDeleted + oddsHistoryDeleted + complianceTotal;
@@ -227,17 +273,21 @@ export async function runStorageCleanup(opts: {
 
 /**
  * Compact + reclaim: VACUUM ANALYZE on tables that just had bulk deletes.
- * Postgres won't reclaim disk space without VACUUM, so this is critical
- * for the storage savings to actually materialise. Runs separately from
- * runStorageCleanup because VACUUM cannot run inside a transaction and
- * needs a fresh connection — the daily cron calls both in sequence.
+ * Postgres marks dead rows as reusable space but does NOT return disk
+ * to the OS / object store. For Neon this means the logical-storage
+ * billing metric stays at the high-water mark until either (a) the
+ * dead space is reused by new inserts, or (b) VACUUM FULL rewrites
+ * the table.
+ *
+ * Daily cron uses VACUUM ANALYZE (gentle, no lock). VACUUM FULL is
+ * available via runVacuumFull() — operator-triggered only because it
+ * takes an AccessExclusive lock for 1-3 minutes per table.
  */
 export async function vacuumCleanedTables(): Promise<{ tablesVacuumed: string[] }> {
   const tables = ["odds_snapshots", "odds_history", "compliance_logs"];
   const vacuumed: string[] = [];
   for (const t of tables) {
     try {
-      // VACUUM ANALYZE without FULL — gentler, doesn't lock the table.
       await db.execute(sql.raw(`VACUUM (ANALYZE) ${t}`));
       vacuumed.push(t);
     } catch (err) {
@@ -245,4 +295,94 @@ export async function vacuumCleanedTables(): Promise<{ tablesVacuumed: string[] 
     }
   }
   return { tablesVacuumed: vacuumed };
+}
+
+/**
+ * VACUUM FULL — rewrites the table to reclaim disk space. Takes an
+ * AccessExclusive lock for the duration (1-3 min for a 3GB table) so
+ * callers/inserters block. Operator-only via the admin endpoint.
+ *
+ * Runs each table sequentially. Reports per-table size before/after so
+ * the operator can see actual GB freed. Defaults to all 3 cleanup-target
+ * tables; pass `{ tables: [...] }` to limit scope.
+ *
+ * Use after a fresh runStorageCleanup pass, ideally during a low-traffic
+ * window. Each VACUUM FULL connection is its own transaction so partial
+ * progress is preserved if the call times out.
+ */
+export async function runVacuumFull(opts: {
+  tables?: string[];
+} = {}): Promise<{
+  results: Array<{
+    table: string;
+    sizeBefore: string;
+    sizeAfter: string;
+    bytesBefore: number;
+    bytesAfter: number;
+    bytesFreed: number;
+    durationMs: number;
+    success: boolean;
+    error?: string;
+  }>;
+  totalBytesFreed: number;
+}> {
+  const targetTables = opts.tables ?? ["odds_snapshots", "odds_history", "compliance_logs"];
+  const results: Array<{
+    table: string; sizeBefore: string; sizeAfter: string;
+    bytesBefore: number; bytesAfter: number; bytesFreed: number;
+    durationMs: number; success: boolean; error?: string;
+  }> = [];
+  let totalBytesFreed = 0;
+
+  for (const table of targetTables) {
+    const beforeRow = (await db.execute(sql`
+      SELECT pg_total_relation_size(${table}::regclass)::bigint AS bytes,
+             pg_size_pretty(pg_total_relation_size(${table}::regclass)) AS pretty
+    `)) as unknown as { rows: Array<{ bytes: number; pretty: string }> };
+    const bytesBefore = Number(beforeRow.rows[0]?.bytes ?? 0);
+    const sizeBefore = beforeRow.rows[0]?.pretty ?? "?";
+
+    const t0 = Date.now();
+    let success = true;
+    let error: string | undefined;
+    try {
+      // Bypass statement_timeout for this single VACUUM FULL call.
+      // Use a dedicated client + session-level SET so the timeout
+      // applies to the VACUUM FULL itself.
+      const { pool } = await import("@workspace/db");
+      const client = await pool.connect();
+      try {
+        await client.query("SET statement_timeout = 0");
+        await client.query(`VACUUM (FULL, ANALYZE) ${table}`);
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      success = false;
+      error = String(err);
+      logger.error({ err, table }, "VACUUM FULL failed");
+    }
+    const durationMs = Date.now() - t0;
+
+    const afterRow = (await db.execute(sql`
+      SELECT pg_total_relation_size(${table}::regclass)::bigint AS bytes,
+             pg_size_pretty(pg_total_relation_size(${table}::regclass)) AS pretty
+    `)) as unknown as { rows: Array<{ bytes: number; pretty: string }> };
+    const bytesAfter = Number(afterRow.rows[0]?.bytes ?? 0);
+    const sizeAfter = afterRow.rows[0]?.pretty ?? "?";
+    const bytesFreed = Math.max(0, bytesBefore - bytesAfter);
+    totalBytesFreed += bytesFreed;
+
+    results.push({
+      table, sizeBefore, sizeAfter, bytesBefore, bytesAfter,
+      bytesFreed, durationMs, success, ...(error ? { error } : {}),
+    });
+
+    logger.info(
+      { table, sizeBefore, sizeAfter, bytesFreed, durationMs, success },
+      "VACUUM FULL complete for table",
+    );
+  }
+
+  return { results, totalBytesFreed };
 }
