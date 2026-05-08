@@ -2067,6 +2067,55 @@ export async function runMigrations() {
         ON features(match_id, feature_name)
     `);
 
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 Neon-cost optimization: api_usage had ZERO indexes despite
+    // 100% sequential-scan rate (1M+ scans, 73B row reads). The hot query
+    // pattern is WHERE date = $1 and WHERE date LIKE $1 (apiFootball.ts:
+    // 594, 613). Adding a composite (date, endpoint) covers both.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS api_usage_date_endpoint_idx
+        ON api_usage(date, endpoint)
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 Neon-cost optimization: composite index on
+    // odds_snapshots(match_id, snapshot_time DESC) to support the new
+    // DISTINCT ON query in valueDetection.ts. Without it Postgres sorts
+    // 50k+ rows in memory per cycle. With it the query plan is
+    // index-only-scan + skip-scan (one row per group). Massive table
+    // (3.4 GB / 20M rows) so we use CONCURRENTLY-equivalent semantics
+    // via DROP/CREATE in a separate transaction is impractical here;
+    // CREATE INDEX with the existing match_id-only index already in place
+    // means inserts during build are slowed but not blocked. Acceptable
+    // one-time cost for ongoing efficiency.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS odds_snapshots_match_time_idx
+        ON odds_snapshots(match_id, snapshot_time DESC)
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-08 Neon-cost cleanup: compliance_logs was bloated with
+    // ~508k rows from action_types that were demoted on 2026-04-17 and
+    // are no longer written. ~218 MB of dead data. One-shot delete; the
+    // table grows back in trickle for action_types still in use.
+    //
+    // Targets identified via SQL audit (rows / approx size):
+    //   line_movement                  272,760  (117 MB)
+    //   value_detection_evaluation     182,573  ( 78 MB)
+    //   value_detection_odds_source     51,736  ( 22 MB)
+    // All three stopped being written on 2026-04-17. The deletion is
+    // bounded by timestamp < that date for safety in case any of these
+    // action_types resume writing after a future code change.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      DELETE FROM compliance_logs
+      WHERE action_type IN (
+        'line_movement', 'value_detection_evaluation', 'value_detection_odds_source'
+      ) AND timestamp < '2026-04-18'::timestamptz
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
