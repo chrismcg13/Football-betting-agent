@@ -1137,12 +1137,29 @@ export async function detectValueBets(options?: {
   );
 
   // 9. Bulk pre-fetch matches' odds + features in 2 queries instead of 2N
+  //
+  // 2026-05-08 URGENT: added a 24h snapshot_time filter. Without it, this
+  // query pulls every snapshot ever taken for every upcoming-fixture match
+  // (odds_snapshots is 20M rows; 526 matches × ~4000 historical snapshots
+  // each ≈ 2M-row heap fetch). That's what was hanging the trading cycle
+  // for minutes at a time. Downstream code only needs the LATEST per
+  // (market, selection, source), so a 24h cutoff is safely conservative
+  // (covers the slowest ingestion cadence — oddspapi_pinnacle crawls
+  // every ~hour). Faster sources (betfair_exchange every 10 min) refresh
+  // many times within the window.
   const matchIds = matches.map((m) => m.id);
+  const ODDS_LOOKBACK_HOURS = 24;
+  const oddsCutoff = new Date(Date.now() - ODDS_LOOKBACK_HOURS * 60 * 60 * 1000);
   const allOddsRows = matchIds.length > 0
     ? await db
         .select()
         .from(oddsSnapshotsTable)
-        .where(inArray(oddsSnapshotsTable.matchId, matchIds))
+        .where(
+          and(
+            inArray(oddsSnapshotsTable.matchId, matchIds),
+            gte(oddsSnapshotsTable.snapshotTime, oddsCutoff),
+          ),
+        )
         .orderBy(desc(oddsSnapshotsTable.snapshotTime))
     : [];
   const oddsByMatch = new Map<number, typeof allOddsRows>();
