@@ -2046,6 +2046,7 @@ router.post("/admin/phase3-track-a-execute", async (_req, res) => {
       pauses_resolved: [] as Array<{ id: number; scope_type: string; scope_value: string }>,
       pauses_already_resolved: [] as number[],
       reversals_logged: [] as number[],
+      reversals_already_logged: [] as number[],
     };
 
     // 1. Set kill-switch flags (idempotent UPSERT)
@@ -2093,20 +2094,35 @@ router.post("/admin/phase3-track-a-execute", async (_req, res) => {
     }>;
 
     for (const r of rows) {
-      if (r.resumed_at != null) {
+      // Step 1: resolve pause if not already (idempotent on its own).
+      // Pre-existing partial state from a prior failed run is fine — the
+      // audit-log write below is independent.
+      if (r.resumed_at == null) {
+        await db.execute(sql`
+          UPDATE autonomous_pauses
+          SET resumed_at = NOW(),
+              notes = COALESCE(notes, '') || ' | Phase 3 Track A revert 2026-05-08: demotion fired on broken Kelly-growth proxy'
+          WHERE id = ${r.id} AND resumed_at IS NULL
+        `);
+        result.pauses_resolved.push({ id: r.id, scope_type: r.scope_type, scope_value: r.scope_value });
+      } else {
         result.pauses_already_resolved.push(r.id);
+      }
+
+      // Step 2: log reversal in model_decision_audit_log if not already logged.
+      // Idempotency key: decision_type='tier_demotion_reverted' AND
+      // supporting_metrics.reverted_pause_id = r.id. Independent of step 1
+      // so partial state from a prior crashed run gets healed here.
+      const existing = await db.execute(sql`
+        SELECT id FROM model_decision_audit_log
+        WHERE decision_type = 'tier_demotion_reverted'
+          AND supporting_metrics->>'reverted_pause_id' = ${String(r.id)}
+        LIMIT 1
+      `);
+      if ((((existing as any).rows ?? []) as Array<unknown>).length > 0) {
+        result.reversals_already_logged.push(r.id);
         continue;
       }
-      // Resolve the pause
-      await db.execute(sql`
-        UPDATE autonomous_pauses
-        SET resumed_at = NOW(),
-            notes = COALESCE(notes, '') || ' | Phase 3 Track A revert 2026-05-08: demotion fired on broken Kelly-growth proxy'
-        WHERE id = ${r.id} AND resumed_at IS NULL
-      `);
-      result.pauses_resolved.push({ id: r.id, scope_type: r.scope_type, scope_value: r.scope_value });
-
-      // Log reversal in model_decision_audit_log
       const insertedRows = await db
         .insert(modelDecisionAuditLogTable)
         .values({
@@ -2126,7 +2142,7 @@ router.post("/admin/phase3-track-a-execute", async (_req, res) => {
             scope_type: r.scope_type,
             scope_value: r.scope_value,
           } as any,
-          reviewStatus: "manual",
+          reviewStatus: "user_overridden",
         })
         .returning({ id: modelDecisionAuditLogTable.id });
       const newId = insertedRows[0]?.id;
