@@ -1458,6 +1458,22 @@ export function findSelectionId(
 ): number | null {
   const sel = selectionName.toLowerCase().trim();
 
+  // Phase 3 Track D / AH selection-side strip (2026-05-08): for ASIAN_HANDICAP
+  // bets the selectionName encodes the line ("Home +0.5" / "Away -1.5"). After
+  // findAhMarketByLine has selected the line-specific market, both runners
+  // are at the right line — we just need to pick Home (sortPriority=1) or
+  // Away (sortPriority=2). Pre-fix the function fell through to the fuzzy
+  // matcher (runnerName="Manchester United" vs sel="home +0.5") and returned
+  // null → 0% AH capture. Strip the line first so the existing home/away
+  // resolution paths fire.
+  const ahMatch = sel.match(/^(home|away)\s*[+-]?\d/);
+  if (ahMatch) {
+    const side = ahMatch[1] === "home"
+      ? runners.find((r) => r.sortPriority === 1)
+      : runners.find((r) => r.sortPriority === 2);
+    if (side) return side.selectionId;
+  }
+
   if (sel === "home" || sel === homeTeam.toLowerCase()) {
     const home = runners.find((r) => r.sortPriority === 1);
     if (home) return home.selectionId;

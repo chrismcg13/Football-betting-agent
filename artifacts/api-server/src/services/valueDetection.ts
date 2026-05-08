@@ -1008,9 +1008,55 @@ export async function detectValueBets(options?: {
   const matches = allMatches.filter((m) => !m.league || !nonTradeableLeagues.has(m.league));
   const droppedNonTradeable = allMatches.length - matches.length;
 
+  // Phase 3 Track D / market-coverage filter (2026-05-08): some market types
+  // are in the betfair_market_type_map (TEAM_A_*/TEAM_B_*/HALF_TIME) but
+  // Betfair Exchange doesn't actually LIST those markets on most matches we
+  // trade. Diagnostic 2026-05-08: across all-time betfair_exchange snapshots,
+  // ZERO rows on TEAM_TOTAL_*/FIRST_HALF_RESULT/HALF_TIME variants — Betfair
+  // coverage genuinely doesn't include these on lower-tier leagues. Bets on
+  // those (match, market_type) pairs have no live-flip pathway, so per the
+  // scope-tradeability rule we drop them at emission time.
+  //
+  // This is a per-(match × market_type) check — finer than the league-level
+  // filter above. Pre-compute the set of covered pairs from odds_snapshots
+  // once (cheap single query), then membership-check in memory per-bet.
+  const coverageMatchIds = matches.map((m) => m.id);
+  const coverageRows = coverageMatchIds.length > 0
+    ? await db.execute(sql`
+        SELECT DISTINCT match_id, market_type
+        FROM odds_snapshots
+        WHERE source = 'betfair_exchange'
+          AND snapshot_time > NOW() - INTERVAL '4 hours'
+          AND match_id IN (${sqlIntList(coverageMatchIds)})
+      `)
+    : { rows: [] as Array<{ match_id: number; market_type: string }> };
+  const coveredPairs = new Set<string>(
+    (((coverageRows as any).rows ?? (coverageRows as any) ?? []) as Array<{ match_id: number; market_type: string }>)
+      .map((r) => `${r.match_id}:${r.market_type}`),
+  );
+
+  // Markets we KNOW Betfair doesn't list on most matches we trade — gated
+  // behind the coverage filter below. Other market_types pass through (their
+  // 0%-capture cases get handled by the per-pair check, but we apply the
+  // hard skip to the obvious ones to avoid wasted prediction cycles).
+  const COVERAGE_GATED_MARKETS = new Set<string>([
+    "TEAM_TOTAL_HOME_05", "TEAM_TOTAL_HOME_15", "TEAM_TOTAL_HOME_25",
+    "TEAM_TOTAL_AWAY_05", "TEAM_TOTAL_AWAY_15", "TEAM_TOTAL_AWAY_25",
+    "FIRST_HALF_RESULT",
+    "FIRST_HALF_OU_05", "FIRST_HALF_OU_15", "FIRST_HALF_OU_25",
+    "OVER_UNDER_05", "OVER_UNDER_45", "OVER_UNDER_55",
+    "OVER_UNDER_65", "OVER_UNDER_75", "OVER_UNDER_85",
+  ]);
+
   logger.info(
-    { matchCount: matches.length, droppedNonTradeable, earliest: options?.earliestKickoff, latest: options?.latestKickoff },
-    "Value detection: matches to evaluate (post-tradeability filter)",
+    {
+      matchCount: matches.length,
+      droppedNonTradeable,
+      coveredPairCount: coveredPairs.size,
+      earliest: options?.earliestKickoff,
+      latest: options?.latestKickoff,
+    },
+    "Value detection: matches to evaluate (post-tradeability + coverage)",
   );
 
   const valueBets: ValueBet[] = [];
@@ -1384,6 +1430,18 @@ export async function detectValueBets(options?: {
         ? Math.max(shadowMinEdge, 0.02)
         : shadowMinEdge;
       if (edge < effectiveShadowMinEdge) continue;
+
+      // Coverage filter (2026-05-08): for known-coverage-gated market types
+      // (TEAM_TOTAL_*, FIRST_HALF_*, OVER_UNDER_05/45+), require a recent
+      // betfair_exchange snapshot for THIS specific (match, market_type)
+      // before emitting. No coverage = no graduation pathway = wasted shadow
+      // capture. Other market types pass through unchanged.
+      if (
+        COVERAGE_GATED_MARKETS.has(oddsRow.marketType) &&
+        !coveredPairs.has(`${match.id}:${oddsRow.marketType}`)
+      ) {
+        continue;
+      }
 
       const evCheck = commissionAdjustedEV(modelProb, backOdds, commRate);
       if (evCheck.netEV <= 0) {
