@@ -2881,10 +2881,12 @@ router.post("/admin/flip-to-live", async (req, res) => {
       share_of_agg_pnl: number | string | null;
     }>);
 
+    // Phase 3 Path C (2026-05-08): CLV is no longer a gate condition. Only
+    // pool size + net ROI required for Path P clearance. CLV still recorded
+    // in the manifest for diagnostic / learning purposes.
     const pPass = !!gc
       && Number(gc.pool_size ?? 0) >= 200
-      && Number(gc.aggregate_net_roi ?? 0) >= 0.03
-      && Number(gc.aggregate_net_clv ?? 0) >= 2.0;
+      && Number(gc.aggregate_net_roi ?? 0) >= 0.03;
     const sPass = !!sStatus?.path_s_aggregate_pass;
     const wlOk = wl.length >= 1 && Math.max(0, ...wl.map((r) => Number(r.share_of_agg_pnl ?? 0))) <= 0.80;
     const trigger: "P" | "S" | null = pPass && wlOk ? "P" : sPass && wlOk ? "S" : null;

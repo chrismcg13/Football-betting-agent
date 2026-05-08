@@ -2028,6 +2028,17 @@ export async function runMigrations() {
     await db.execute(sql`DROP VIEW IF EXISTS gate_components`);
     await db.execute(sql`DROP VIEW IF EXISTS evaluation_pool`);
 
+    // Phase 3 Path C relaxation (2026-05-08, per Chris):
+    //   "P path as 2% isn't fit for purpose, no opportunities are coming
+    //    through as that, we can still validate CLV after the match to
+    //    learn edge."
+    // Path P becomes: any settled paper bet (regardless of CLV anchor),
+    // n>=200, ROI>=3%. CLV is still computed and tagged per-bet for
+    // retrospective learning, but is no longer a gate-clearance condition.
+    // Path P+ stays multi-anchor secondary review.
+    // The Pinnacle anchor requirement (clv_source='pinnacle') is dropped
+    // so unanchored paper bets enter the eval pool. CLV column stays for
+    // diagnostic use in gate_components manifest.
     await db.execute(sql`
       CREATE OR REPLACE VIEW evaluation_pool AS
       SELECT pb.*
@@ -2036,7 +2047,6 @@ export async function runMigrations() {
         AND pb.deleted_at IS NULL
         AND pb.bet_track = 'paper'
         AND pb.status IN ('won','lost')
-        AND pb.clv_source = 'pinnacle'
         AND pb.gross_pnl IS NOT NULL
         AND pb.commission_amount IS NOT NULL
         AND pb.net_pnl IS NOT NULL
@@ -2266,6 +2276,9 @@ export async function runMigrations() {
     // ────────────────────────────────────────────────────────────────────
     await db.execute(sql`
       CREATE OR REPLACE VIEW switchover_whitelist AS
+      -- Phase 3 Path C relaxation (2026-05-08): per-scope CLV>0 dropped.
+      -- Scopes admit on n>=50 + scope_net_roi>0 only. CLV is computed for
+      -- diagnostic but unanchored scopes (NULL CLV) still admit.
       WITH agg AS (SELECT SUM(net_pnl::numeric) AS agg_pnl FROM evaluation_pool),
       path_p AS (
         SELECT 'P'::text AS path, ep.market_type, m.league,
@@ -2277,7 +2290,6 @@ export async function runMigrations() {
         GROUP BY ep.market_type, m.league
         HAVING COUNT(*) >= 50
            AND (SUM(ep.net_pnl::numeric) / NULLIF(SUM(ep.stake::numeric),0)) > 0
-           AND AVG(ep.clv_pct::numeric) > 0
       ),
       path_s_pass AS (
         SELECT pss.market_type, pss.league
@@ -2506,6 +2518,9 @@ export async function runMigrations() {
     `);
     await db.execute(sql`
       CREATE OR REPLACE VIEW switchover_whitelist AS
+      -- Phase 3 Path C relaxation (2026-05-08): per-scope CLV>0 dropped.
+      -- Scopes admit on n>=50 + scope_net_roi>0 only. CLV is computed for
+      -- diagnostic but unanchored scopes (NULL CLV) still admit.
       WITH agg AS (SELECT SUM(net_pnl::numeric) AS agg_pnl FROM evaluation_pool),
       path_p AS (
         SELECT 'P'::text AS path, ep.market_type, m.league,
@@ -2517,7 +2532,6 @@ export async function runMigrations() {
         GROUP BY ep.market_type, m.league
         HAVING COUNT(*) >= 50
            AND (SUM(ep.net_pnl::numeric) / NULLIF(SUM(ep.stake::numeric),0)) > 0
-           AND AVG(ep.clv_pct::numeric) > 0
       ),
       path_s AS (
         SELECT 'S'::text AS path, pss.market_type, pss.league,

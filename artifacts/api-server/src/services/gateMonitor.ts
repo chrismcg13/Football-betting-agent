@@ -136,8 +136,14 @@ export async function runGateMonitor(): Promise<GateMonitorResult> {
     result.path_p.aggregate_net_clv = pRow.aggregate_net_clv != null ? Number(pRow.aggregate_net_clv) : null;
     result.path_p.pool_pass = result.path_p.pool_size >= 200;
     result.path_p.roi_pass = (result.path_p.aggregate_net_roi ?? 0) >= 0.03;
+    // Phase 3 Path C relaxation (2026-05-08): CLV is no longer a gate
+    // condition. clv_pass stays in the result for diagnostic visibility
+    // (manifest still shows whether the model is beating the closing line)
+    // but it does NOT participate in all_pass. Per Chris: "we can still
+    // validate CLV after the match to learn edge" — CLV is learning data
+    // post-Path-C, not a switchover gate.
     result.path_p.clv_pass = (result.path_p.aggregate_net_clv ?? 0) >= 2.0;
-    result.path_p.all_pass = result.path_p.pool_pass && result.path_p.roi_pass && result.path_p.clv_pass;
+    result.path_p.all_pass = result.path_p.pool_pass && result.path_p.roi_pass;
   }
 
   // Path P+ aggregate (Phase 3 C1, 2026-05-08): Tier-1+2 multi-anchor pool.
