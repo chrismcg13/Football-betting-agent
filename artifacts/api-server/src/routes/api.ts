@@ -2341,6 +2341,23 @@ router.post("/admin/phase3-track-b-backfill", async (_req, res) => {
   }
 });
 
+// 2026-05-08 URGENT: manually clear the in-process tradingCycleRunning
+// lock. Used when a prior cycle hung (e.g. vps-relay timeout) and left
+// the lock held. Returns whether the lock was actually held + how long.
+// Stale-lock auto-release at 5 min is the steady-state mitigation; this
+// endpoint is for immediate manual recovery.
+router.post("/admin/reset-trading-lock", async (_req, res) => {
+  try {
+    const { resetTradingCycleLock } = await import("../services/scheduler");
+    const result = resetTradingCycleLock();
+    logger.warn(result, "Trading-cycle lock manually reset");
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "reset-trading-lock failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 URGENT: manual trigger for runTradingCycle. Used to diagnose
 // trading_near silence post-deploy. Returns the cycle result directly so
 // we can see which exit path was taken (lock skip / risk triggered /

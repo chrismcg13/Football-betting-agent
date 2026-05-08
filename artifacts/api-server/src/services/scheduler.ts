@@ -136,6 +136,16 @@ async function trackCronExecution(
 let ingestionRunning = false;
 let featureRunning = false;
 let tradingCycleRunning = false;
+let tradingCycleAcquiredAt: number | null = null;
+const TRADING_CYCLE_STALE_MS = 5 * 60 * 1000; // 5 min — forcibly release after this
+
+export function resetTradingCycleLock(): { wasHeld: boolean; heldFor: number | null } {
+  const wasHeld = tradingCycleRunning;
+  const heldFor = tradingCycleAcquiredAt != null ? Date.now() - tradingCycleAcquiredAt : null;
+  tradingCycleRunning = false;
+  tradingCycleAcquiredAt = null;
+  return { wasHeld, heldFor };
+}
 let exchangeBookSweepRunning = false;
 
 // ===================== Safe wrappers =====================
@@ -353,12 +363,28 @@ export async function runTradingCycle(options?: {
   const cycleStartedAt = Date.now();
 
   if (tradingCycleRunning) {
-    logger.warn({ tier }, "Trading cycle already in progress — skipping this run");
-    markRun("trading", "skipped");
-    return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
+    // 2026-05-08 stale-lock detection: if the lock has been held longer than
+    // TRADING_CYCLE_STALE_MS (5 min), it almost certainly belongs to a hung
+    // prior invocation (e.g. vps-relay HTTP call that never resolved).
+    // Force-release and proceed. Without this, a single hang at startup
+    // permanently locks all subsequent cron ticks.
+    const heldMs = tradingCycleAcquiredAt != null ? Date.now() - tradingCycleAcquiredAt : 0;
+    if (heldMs > TRADING_CYCLE_STALE_MS) {
+      logger.warn(
+        { tier, heldMs, staleMs: TRADING_CYCLE_STALE_MS },
+        "Trading cycle lock held beyond stale threshold — force-releasing and proceeding",
+      );
+      tradingCycleRunning = false;
+      tradingCycleAcquiredAt = null;
+    } else {
+      logger.warn({ tier, heldMs }, "Trading cycle already in progress — skipping this run");
+      markRun("trading", "skipped");
+      return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
+    }
   }
 
   tradingCycleRunning = true;
+  tradingCycleAcquiredAt = Date.now();
   markStart("trading");
   resetExchangeCaptureCounters();
 
@@ -1677,6 +1703,7 @@ export async function runTradingCycle(options?: {
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   } finally {
     tradingCycleRunning = false;
+    tradingCycleAcquiredAt = null;
     // C1: emit per-cycle exchange-book capture stats on every exit path
     // (success / risk-triggered early-return / error). Counters were reset at
     // cycle start via resetExchangeCaptureCounters().
@@ -2924,16 +2951,17 @@ export function startScheduler(): void {
     } catch (err) {
       logger.warn({ err }, "Startup odds refresh failed — non-fatal, proceeding to trading cycle");
     }
-    logger.info("Startup near trading cycle triggered (post-restart warmup)");
-    void runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 })
-      .then((result) => {
-        logger.info(result, "Startup near trading cycle complete");
-      })
-      .catch((err) => {
-        logger.warn({ err }, "Startup warmup failed — non-fatal, cron will retry");
-      });
+    // 2026-05-08: startup runTradingCycle warmup DISABLED. The fire-and-
+    // forget invocation here was hanging deterministically on every
+    // restart (likely a vps-relay HTTP call that doesn't resolve), holding
+    // the tradingCycleRunning lock and blocking the */5min cron. The
+    // regular cron will fire within 5 minutes of startup anyway, so the
+    // warmup gives at most 5 min of earlier first-run; not worth the
+    // failure mode. Stale-lock detection (5 min) provides a safety net
+    // for any future deterministic hang.
+    logger.info("Startup near trading cycle warmup SKIPPED — */5min cron handles first run");
   }, 30 * 1000);
-  logger.info("Startup warmup scheduled — OddsPapi mapping + bulk prefetch + odds refresh + trading cycle in 30s");
+  logger.info("Startup warmup scheduled — OddsPapi mapping + bulk prefetch + odds refresh in 30s (trading cycle warmup disabled 2026-05-08)");
 
   // Seed baseline leagues + competition config at startup (idempotent — uses onConflictDoNothing)
   void seedBaselineLeagues().catch((err) => logger.warn({ err }, "Baseline league seed failed — non-fatal"));
