@@ -175,6 +175,55 @@ interface ExchangeSnapshot {
 // other foreign-source prefixes that may have leaked into matches.betfair_event_id.
 const BETFAIR_EVENT_ID_RE = /^\d+$/;
 
+/**
+ * Phase 3 Track D / AH line-aware (2026-05-08): pick the correct ASIAN_HANDICAP
+ * market for a bet whose selectionName encodes the line ("Home +0.5",
+ * "Away -1.5"). Each Betfair event has multiple AH markets (one per line).
+ * Each AH market has 2 runners (Home and Away) with handicap values.
+ *
+ * Selection-name convention from exchangeBookSweep.deriveSelectionName:
+ *   side = "Home" or "Away"
+ *   line = handicap given to that side (e.g. "Home +0.5" → Home gets +0.5)
+ *
+ * Match: AH market where the matching-side runner has runner.handicap == line.
+ * Falls back to NULL (caller treats as no_market — counter increments).
+ *
+ * Tolerance: handicap values are stored as numbers (Betfair) and our line
+ * encoding is decimal. We compare with epsilon 1e-6 for safety on floating-
+ * point representations of quarter-line values like 0.25 / 0.75.
+ */
+function findAhMarketByLine(
+  catalogue: MarketCatalogueItem[],
+  selectionName: string,
+  homeTeam: string,
+  awayTeam: string,
+): MarketCatalogueItem | undefined {
+  // Parse "Home +0.5" / "Away -1.25" / "Home +0" — capture side + signed line.
+  const m = selectionName.trim().match(/^(Home|Away)\s*([+-]?\d+(?:\.\d+)?)$/i);
+  if (!m) return undefined;
+  const side = m[1]!.toLowerCase() === "home" ? "home" : "away";
+  const line = parseFloat(m[2]!);
+  if (!Number.isFinite(line)) return undefined;
+
+  const ahMarkets = catalogue.filter((c) => c.description?.marketType === "ASIAN_HANDICAP");
+  for (const market of ahMarkets) {
+    const runners = market.runners ?? [];
+    if (runners.length < 2) continue;
+    // Pick the runner that matches our side. Prefer name-equality, fall back
+    // to sortPriority (1=Home, 2=Away — same convention as findSelectionId).
+    const sideRunner = runners.find((r) => {
+      const rn = r.runnerName.toLowerCase();
+      if (side === "home") return rn === homeTeam.toLowerCase() || r.sortPriority === 1;
+      return rn === awayTeam.toLowerCase() || r.sortPriority === 2;
+    });
+    if (!sideRunner) continue;
+    const handicap = sideRunner.handicap;
+    if (handicap == null) continue;
+    if (Math.abs(handicap - line) < 1e-6) return market;
+  }
+  return undefined;
+}
+
 async function captureExchangeSnapshot(args: {
   betfairEventId: string | null;
   marketType: string;
@@ -213,9 +262,22 @@ async function captureExchangeSnapshot(args: {
   // and any future internal code that doesn't 1:1 match Betfair.
   const { MARKET_TYPE_MAP } = await import("./betfairLive");
   const bfMarketType = MARKET_TYPE_MAP[marketType] ?? marketType;
-  const market = catalogue.find(
-    (m) => m.description?.marketType === bfMarketType,
-  );
+
+  // Phase 3 Track D / AH line-aware (2026-05-08): for ASIAN_HANDICAP, Betfair
+  // returns ONE market per line per event (each with 2 runners — Home and
+  // Away — and a runner.handicap value). catalogue.find by marketType alone
+  // returns the FIRST AH market, which is rarely the line our bet was on.
+  // Pre-fix observed AH capture at 44% — most captures landed on the wrong
+  // line, so the captured market_id was useless for live placement.
+  // Fix: parse line from selectionName ("Home +0.5" / "Away -1.5"), then
+  // search AH markets for the one whose matching-side runner has that
+  // handicap. For non-AH markets, exact marketType match is correct.
+  let market: MarketCatalogueItem | undefined;
+  if (bfMarketType === "ASIAN_HANDICAP") {
+    market = findAhMarketByLine(catalogue, selectionName, homeTeam, awayTeam);
+  } else {
+    market = catalogue.find((m) => m.description?.marketType === bfMarketType);
+  }
   if (!market) {
     exchangeCaptureCounters.failed_no_market += 1;
     return null;
