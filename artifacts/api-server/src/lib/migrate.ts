@@ -2065,6 +2065,42 @@ export async function runMigrations() {
                FROM p GROUP BY market_type) x) AS by_market
     `);
 
+    // Phase 3 §12.4 audit fix (2026-05-08): v_upcoming_bets is a display
+    // view (operator-facing). Pre-fix it referenced paper_bets without
+    // bet_track filtering — post-flip it would intermix paper and live
+    // pending bets confusingly. The §12.4 audit query
+    //   SELECT viewname FROM pg_views WHERE definition ILIKE '%paper_bets%'
+    //     AND definition NOT ILIKE '%bet_track%'
+    // flagged this view. Add bet_track to the SELECT and a filter so the
+    // view shows the bet's actual track explicitly. Display only — no
+    // ROI/CLV/PnL metric depends on this view, so it's not a §12.3
+    // operational-state violation, just a clarity fix.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_upcoming_bets AS
+      SELECT pb.id AS bet_id,
+             pb.placed_at,
+             m.kickoff_time,
+             m.home_team,
+             m.away_team,
+             (m.home_team || ' vs ' || m.away_team) AS fixture,
+             m.league,
+             pb.market_type,
+             pb.selection_name AS outcome,
+             pb.bet_track,
+             ROUND(pb.stake::numeric, 2) AS stake,
+             pb.odds_at_placement AS odds,
+             pb.clv_pct,
+             pb.status
+      FROM paper_bets pb
+      JOIN matches m ON pb.match_id = m.id
+      WHERE pb.deleted_at IS NULL
+        AND pb.legacy_regime = false
+        AND pb.status IN ('pending','pending_placement')
+        AND pb.bet_track IN ('paper','shadow','live')
+        AND pb.placed_at >= '2026-05-03 00:00:00+00'::timestamptz
+      ORDER BY m.kickoff_time, pb.placed_at
+    `);
+
     // ────────────────────────────────────────────────────────────────────
     // Path P+ views (Phase 3 C1, 2026-05-08): multi-anchor secondary trigger.
     // Same shape as Path P but admits Tier-1 OR Tier-2 anchored bets.

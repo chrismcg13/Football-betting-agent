@@ -2897,75 +2897,174 @@ router.post("/admin/flip-to-live", async (req, res) => {
       return;
     }
 
+    // Step 3a (Phase 3 §4.5, 2026-05-08): re-validate the 8 blockers. The
+    // pending-review manifest was generated when the cron last ran (could
+    // be hours ago); the underlying blocker conditions could have regressed
+    // since. Refuse flip if any sentinel check fails.
+    const blockerChecks = await db.execute(sql`
+      SELECT
+        -- B1: recent MATCH_ODDS bets have betfair_market_id (>=90%)
+        (
+          SELECT
+            CASE WHEN COUNT(*) = 0 THEN true
+                 ELSE (100.0 * COUNT(*) FILTER (WHERE pb.betfair_market_id IS NOT NULL)
+                       / NULLIF(COUNT(*), 0)) >= 90.0
+            END
+          FROM paper_bets pb JOIN matches m ON m.id = pb.match_id
+          WHERE pb.market_type='MATCH_ODDS' AND pb.legacy_regime=false AND pb.deleted_at IS NULL
+            AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '48 hours'
+        ) AS b1_pass,
+        -- B4: Z3/Z4/modelSelfAudit suspended
+        (
+          (SELECT value FROM agent_config WHERE key='z4_enabled') = 'false'
+          AND (SELECT value FROM agent_config WHERE key='z3_enabled') = 'false'
+          AND (SELECT value FROM agent_config WHERE key='model_self_audit_enabled') = 'false'
+        ) AS b4_pass,
+        -- B6: bet_track populated, no live rows pre-flip
+        (
+          NOT EXISTS (
+            SELECT 1 FROM paper_bets WHERE deleted_at IS NULL AND bet_track IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM paper_bets WHERE deleted_at IS NULL AND bet_track='live'
+              AND legacy_regime=false
+              AND placed_at < (SELECT value::timestamptz FROM agent_config WHERE key='evaluation_start_at')
+          )
+        ) AS b6_pass,
+        -- B5: post-eval-start settled bets with closing-line have clv_source tagged
+        (
+          NOT EXISTS (
+            SELECT 1 FROM paper_bets pb
+            WHERE pb.legacy_regime=false AND pb.deleted_at IS NULL
+              AND pb.status IN ('won','lost')
+              AND pb.closing_pinnacle_odds IS NOT NULL
+              AND (pb.clv_source IS NULL OR pb.clv_source = 'none')
+              AND pb.placed_at >= (SELECT value::timestamptz FROM agent_config WHERE key='evaluation_start_at')
+          )
+        ) AS b5_pass
+    `);
+    const bRow = (((blockerChecks as any).rows ?? []) as Array<{
+      b1_pass: boolean; b4_pass: boolean; b5_pass: boolean; b6_pass: boolean;
+    }>)[0];
+    if (!bRow || !bRow.b1_pass || !bRow.b4_pass || !bRow.b5_pass || !bRow.b6_pass) {
+      res.status(409).json({
+        success: false,
+        message: "Blocker re-validation failed at flip time. One or more of B1/B4/B5/B6 has regressed since gate-clear. Refusing flip.",
+        blockers: bRow,
+      });
+      return;
+    }
+
+    // Step 3b: refuse if any unresolved gate_status_review_required rows.
+    // 8-week diagnostic, drawdown halt, or Path P+ clear all surface here.
+    // Operator must explicitly acknowledge_at before flip can proceed.
+    const reviewRows = await db.execute(sql`
+      SELECT id, reason, detected_at FROM gate_status_review_required
+      WHERE acknowledged_at IS NULL ORDER BY id DESC LIMIT 5
+    `);
+    const unresolvedReviews = (((reviewRows as any).rows ?? []) as Array<{
+      id: number; reason: string; detected_at: string;
+    }>);
+    if (unresolvedReviews.length > 0) {
+      res.status(409).json({
+        success: false,
+        message: "Unresolved gate_status_review_required rows present. Operator must acknowledge each (UPDATE gate_status_review_required SET acknowledged_at=NOW() WHERE id=...) before the flip will proceed.",
+        unresolved: unresolvedReviews,
+      });
+      return;
+    }
+
     // Step 4: apply bankroll-tier caps to live config
     const capsApplied = await applyPendingCapsToLive();
+    const bankrollAtFlip =
+      ((await db.select({ value: agentConfigTable.value }).from(agentConfigTable).where(eq(agentConfigTable.key, "bankroll")))[0]?.value) ?? null;
 
-    // Step 5: snapshot whitelist (idempotent — only insert if no active rows
-    // exist yet, to prevent double-flip from duplicating)
-    const existingActive = await db.execute(sql`
-      SELECT COUNT(*)::int AS n FROM live_whitelist WHERE active = true
-    `);
-    const activeCount = Number((((existingActive as any).rows ?? []) as Array<{ n: number }>)[0]?.n ?? 0);
-    if (activeCount === 0) {
-      for (const r of wl) {
-        await db.execute(sql`
-          INSERT INTO live_whitelist (
-            path, market_type, league, n,
-            scope_net_roi, scope_net_clv, share_of_agg_pnl,
-            kelly_fraction_override, live_bet_count, active
-          ) VALUES (
-            ${r.path}, ${r.market_type}, ${r.league}, ${Number(r.n)},
-            ${r.scope_net_roi != null ? Number(r.scope_net_roi) : null},
-            ${r.scope_net_clv != null ? Number(r.scope_net_clv) : null},
-            ${r.share_of_agg_pnl != null ? Number(r.share_of_agg_pnl) : null},
-            0.5, 0, true
-          )
-        `);
+    // Steps 5-8 (Phase 3 §5, 2026-05-08): atomic transaction. Whitelist
+    // snapshot + mode-flag flip + compliance log + pending-review resolve
+    // either ALL commit or ALL roll back. Pre-fix these were sequential
+    // separate writes — a mid-step failure could leave the system half-
+    // flipped (e.g. whitelist inserted but mode flags not set, or vice
+    // versa). The capsApplied call above stays outside the transaction
+    // because it's reversible via the same setConfig codepath if needed.
+    let whitelistInserted = 0;
+    let activeCountReadback = 0;
+    await db.transaction(async (tx) => {
+      // Step 5: snapshot whitelist (idempotent — only insert if no active rows
+      // exist yet, to prevent double-flip from duplicating)
+      const existingActive = await tx.execute(sql`
+        SELECT COUNT(*)::int AS n FROM live_whitelist WHERE active = true
+      `);
+      const activeCount = Number((((existingActive as any).rows ?? []) as Array<{ n: number }>)[0]?.n ?? 0);
+      activeCountReadback = activeCount;
+      if (activeCount === 0) {
+        for (const r of wl) {
+          await tx.execute(sql`
+            INSERT INTO live_whitelist (
+              path, market_type, league, n,
+              scope_net_roi, scope_net_clv, share_of_agg_pnl,
+              kelly_fraction_override, live_bet_count, active
+            ) VALUES (
+              ${r.path}, ${r.market_type}, ${r.league}, ${Number(r.n)},
+              ${r.scope_net_roi != null ? Number(r.scope_net_roi) : null},
+              ${r.scope_net_clv != null ? Number(r.scope_net_clv) : null},
+              ${r.share_of_agg_pnl != null ? Number(r.share_of_agg_pnl) : null},
+              0.5, 0, true
+            )
+          `);
+          whitelistInserted++;
+        }
       }
-    }
 
-    // Step 6: flip mode flags
-    async function setOrInsert(key: string, value: string) {
-      const existing = await db.select().from(agentConfigTable).where(eq(agentConfigTable.key, key));
-      if (existing.length === 0) {
-        await db.insert(agentConfigTable).values({ key, value });
-      } else {
-        await db.update(agentConfigTable).set({ value, updatedAt: new Date() }).where(eq(agentConfigTable.key, key));
+      // Step 6: flip mode flags (in-tx)
+      async function setOrInsertTx(key: string, value: string) {
+        const existing = await tx.select().from(agentConfigTable).where(eq(agentConfigTable.key, key));
+        if (existing.length === 0) {
+          await tx.insert(agentConfigTable).values({ key, value });
+        } else {
+          await tx.update(agentConfigTable).set({ value, updatedAt: new Date() }).where(eq(agentConfigTable.key, key));
+        }
       }
-    }
-    await setOrInsert("paper_mode", "false");
-    await setOrInsert("live_mode_active", "true");
-    await setOrInsert("paper_bet_generation_enabled", "false");
-    await setOrInsert("live_mode_activated_at", new Date().toISOString());
+      await setOrInsertTx("paper_mode", "false");
+      await setOrInsertTx("live_mode_active", "true");
+      await setOrInsertTx("paper_bet_generation_enabled", "false");
+      await setOrInsertTx("live_mode_activated_at", new Date().toISOString());
+      // Phase 3 §1.8 (drawdown halt): pin bankroll_at_flip so
+      // stopConditionMonitor has a stable baseline. Without this it falls
+      // back to compliance_logs.live_mode_activated.details.bankroll_at_flip
+      // which is also written below — belt-and-braces.
+      if (bankrollAtFlip != null) {
+        await setOrInsertTx("bankroll_at_flip", String(bankrollAtFlip));
+      }
 
-    // Step 7: compliance log
-    await db.insert(complianceLogsTable).values({
-      actionType: "live_mode_activated",
-      details: {
-        trigger,
-        manifest_hash: body.manifestHash,
-        manifest_at_clear: pending.manifest,
-        whitelist_size: wl.length,
-        whitelist: wl,
-        caps_applied: capsApplied,
-        bankroll_at_flip: ((await db.select({ value: agentConfigTable.value }).from(agentConfigTable).where(eq(agentConfigTable.key, "bankroll")))[0]?.value) ?? null,
-      } as Record<string, unknown>,
-      timestamp: new Date(),
-    } as any);
+      // Step 7: compliance log (in-tx)
+      await tx.insert(complianceLogsTable).values({
+        actionType: "live_mode_activated",
+        details: {
+          trigger,
+          manifest_hash: body.manifestHash,
+          manifest_at_clear: pending.manifest,
+          whitelist_size: wl.length,
+          whitelist: wl,
+          caps_applied: capsApplied,
+          bankroll_at_flip: bankrollAtFlip,
+        } as Record<string, unknown>,
+        timestamp: new Date(),
+      } as any);
 
-    // Step 8: resolve pending-review row
-    await db.execute(sql`
-      UPDATE gate_clear_pending_review
-      SET resolved_at = NOW(), resolution = 'flipped'
-      WHERE id = ${pending.id}
-    `);
+      // Step 8: resolve pending-review row (in-tx)
+      await tx.execute(sql`
+        UPDATE gate_clear_pending_review
+        SET resolved_at = NOW(), resolution = 'flipped'
+        WHERE id = ${pending.id}
+      `);
+    });
 
     res.json({
       success: true,
       result: {
         trigger,
-        whitelist_inserted: activeCount === 0 ? wl.length : 0,
-        whitelist_already_active: activeCount,
+        whitelist_inserted: whitelistInserted,
+        whitelist_already_active: activeCountReadback,
         caps_applied: capsApplied,
         flipped_at: new Date().toISOString(),
         compliance_log_written: true,
