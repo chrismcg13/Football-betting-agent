@@ -134,6 +134,12 @@ export const paperBetsTable = pgTable("paper_bets", {
   shadowPnl: numeric("shadow_pnl", { precision: 12, scale: 2 }),
   universeTierAtPlacement: text("universe_tier_at_placement"),
   clvSource: text("clv_source"),
+  // ── Phase 3 B6 (2026-05-08): bet-track enum ────────────────────────────
+  // 'paper' | 'shadow' | 'live'. Denormalised at placement so all downstream
+  // SQL (settlement, gate-monitoring, P&L) doesn't have to re-derive from
+  // stake/shadow_stake/betfair_bet_id. Backfilled by migrate.ts on first
+  // deploy. CHECK constraint enforces the three legal values.
+  betTrack: text("bet_track"),
 }, (table) => ({
   uniquePendingBet: uniqueIndex("paper_bets_unique_pending_canonical_idx")
     .on(table.matchId, table.marketType, table.selectionCanonical)
@@ -228,4 +234,10 @@ export const paperBetsCurrentView = pgView("paper_bets_current", {
   settlementAttempts: integer("settlement_attempts").notNull(),
   lastSettlementAttemptAt: timestamp("last_settlement_attempt_at", { withTimezone: true }),
   legacyRegime: boolean("legacy_regime").notNull(),
+  shadowStake: numeric("shadow_stake", { precision: 12, scale: 2 }),
+  shadowStakeKellyFraction: real("shadow_stake_kelly_fraction"),
+  shadowPnl: numeric("shadow_pnl", { precision: 12, scale: 2 }),
+  universeTierAtPlacement: text("universe_tier_at_placement"),
+  clvSource: text("clv_source"),
+  betTrack: text("bet_track"),
 }).existing();

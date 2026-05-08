@@ -1890,13 +1890,19 @@ export function startSettlementCron(): void {
   }, 15_000);
 
   if (isLiveMode()) {
-    cron.schedule("*/30 * * * *", () => {
+    // Phase 3 B7 (2026-05-08): tightened from 30 min to 15 min per
+    // docs/phase-3-paper-to-live-switchover-plan-v2.md §6.1 +
+    // §2.7 validation requirement (≥80 successful runs in 24h, last_run
+    // within 30 min of NOW). Earlier capture of cleared orders means
+    // earlier reconciliation alerts in the case of partial-match /
+    // settlement-divergence anomalies.
+    cron.schedule("*/15 * * * *", () => {
       logger.info("Betfair settlement reconciliation triggered");
       void reconcileSettlements().catch((err) =>
         logger.warn({ err }, "Betfair reconciliation failed — non-fatal"),
       );
     }, { timezone: "UTC" });
-    logger.info("Betfair settlement reconciliation active — every 30 minutes");
+    logger.info("Betfair settlement reconciliation active — every 15 minutes");
 
     cron.schedule("*/15 * * * *", () => {
       void getAccountFunds().catch((err) =>
@@ -1905,6 +1911,44 @@ export function startSettlementCron(): void {
     }, { timezone: "UTC" });
     logger.info("Betfair balance refresh active — every 15 minutes");
   }
+
+  // Phase 3 B2 (2026-05-08): bankroll-tier cap recommendation. Daily
+  // 03:00 UTC. Writes to pending_caps table; live agent_config caps are
+  // ONLY updated at switchover transaction. Pre-flip this is inspection
+  // data only.
+  cron.schedule("0 3 * * *", () => {
+    logger.info("Bankroll-tier caps evaluation triggered (daily 03:00 UTC)");
+    void (async () => {
+      try {
+        const { runBankrollTierCaps } = await import("./bankrollTierCaps");
+        const r = await runBankrollTierCaps();
+        logger.info(r, "Bankroll-tier caps evaluation complete");
+      } catch (err) {
+        logger.error({ err }, "Bankroll-tier caps evaluation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bankroll-tier caps scheduler active — daily 03:00 UTC");
+
+  // Phase 3 B9 (2026-05-08): gate-monitoring cron. Daily 04:00 UTC (slot
+  // freed by suspending modelSelfAudit at 03:30 / Z4 at 03:45). Reads
+  // gate_components + path_s_aggregate_status views, writes a gate_status
+  // row, fires gate_clear_pending_review on aggregate trigger clear, and
+  // gate_status_review_required after 56 days without clearance. Pre-
+  // evaluation_start_at this short-circuits to a heartbeat-only row.
+  cron.schedule("0 4 * * *", () => {
+    logger.info("Gate monitor triggered (daily 04:00 UTC)");
+    void (async () => {
+      try {
+        const { runGateMonitor } = await import("./gateMonitor");
+        const r = await runGateMonitor();
+        logger.info(r, "Gate monitor evaluation complete");
+      } catch (err) {
+        logger.error({ err }, "Gate monitor evaluation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Gate monitor scheduler active — daily 04:00 UTC");
 }
 
 // ===================== Scheduler =====================

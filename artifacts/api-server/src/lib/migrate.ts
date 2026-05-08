@@ -1716,6 +1716,342 @@ export async function runMigrations() {
         AND settlement_bias_index = -0.5240
     `);
 
+    // ────────────────────────────────────────────────────────────────────
+    // Phase 3 (2026-05-08): switchover infrastructure
+    //
+    // Adds the bet_track enum column on paper_bets, plus new tables for
+    // bankroll-tier cap recommendations (B2), gate monitoring (B9), the
+    // live-bet whitelist snapshot (used at switchover transaction), and
+    // SQL views that compute Path P + Path S evaluation pools and
+    // aggregate gate components.
+    //
+    // All idempotent — safe to re-run on every deploy.
+    // ────────────────────────────────────────────────────────────────────
+
+    // B6: bet_track column. CHECK constraint + index.
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS bet_track TEXT
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'paper_bets_bet_track_check'
+        ) THEN
+          ALTER TABLE paper_bets
+            ADD CONSTRAINT paper_bets_bet_track_check
+            CHECK (bet_track IS NULL OR bet_track IN ('paper','shadow','live'));
+        END IF;
+      END $$
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_bet_track
+        ON paper_bets(bet_track)
+        WHERE bet_track IS NOT NULL
+    `);
+    // One-shot backfill for existing rows. Live = none yet (no real bets
+    // placed). Shadow = stake=0 AND shadow_stake>0. Paper = stake>0. Skips
+    // rows already populated so it's idempotent on re-deploys.
+    await db.execute(sql`
+      UPDATE paper_bets SET bet_track = 'shadow'
+      WHERE bet_track IS NULL
+        AND COALESCE(stake::numeric, 0) = 0
+        AND shadow_stake IS NOT NULL
+        AND shadow_stake::numeric > 0
+    `);
+    await db.execute(sql`
+      UPDATE paper_bets SET bet_track = 'paper'
+      WHERE bet_track IS NULL
+        AND stake::numeric > 0
+        AND betfair_bet_id IS NULL
+    `);
+    await db.execute(sql`
+      UPDATE paper_bets SET bet_track = 'live'
+      WHERE bet_track IS NULL
+        AND betfair_bet_id IS NOT NULL
+    `);
+
+    // B2: pending_caps table. One row per bankrollTierCaps cron evaluation;
+    // switchover transaction reads the LATEST row.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS pending_caps (
+        id SERIAL PRIMARY KEY,
+        evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        bankroll NUMERIC(12,2) NOT NULL,
+        natural_tier TEXT NOT NULL,
+        applied_tier TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        pending_since TIMESTAMPTZ,
+        daily_loss_limit_pct NUMERIC(6,4) NOT NULL,
+        weekly_loss_limit_pct NUMERIC(6,4) NOT NULL,
+        bankroll_floor NUMERIC(12,2) NOT NULL
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_pending_caps_evaluated_at
+        ON pending_caps(evaluated_at DESC)
+    `);
+
+    // B9: gate-monitoring tables.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS gate_status (
+        id SERIAL PRIMARY KEY,
+        evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        pool_size INTEGER NOT NULL,
+        aggregate_net_roi NUMERIC,
+        aggregate_net_clv NUMERIC,
+        threshold_roi NUMERIC NOT NULL DEFAULT 0.03,
+        threshold_clv NUMERIC NOT NULL DEFAULT 2.0,
+        threshold_n INTEGER NOT NULL DEFAULT 200,
+        pool_size_pass BOOLEAN NOT NULL,
+        roi_pass BOOLEAN NOT NULL,
+        clv_pass BOOLEAN NOT NULL,
+        all_pass BOOLEAN NOT NULL,
+        whitelist_size INTEGER,
+        whitelist_largest_share NUMERIC,
+        manifest JSONB
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_gate_status_evaluated_at
+        ON gate_status(evaluated_at DESC)
+    `);
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS gate_clear_pending_review (
+        id SERIAL PRIMARY KEY,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        manifest_hash TEXT NOT NULL,
+        manifest JSONB NOT NULL,
+        resolved_at TIMESTAMPTZ,
+        resolution TEXT
+      )
+    `);
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS gate_status_review_required (
+        id SERIAL PRIMARY KEY,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        reason TEXT NOT NULL,
+        diagnostic JSONB NOT NULL,
+        acknowledged_at TIMESTAMPTZ
+      )
+    `);
+
+    // Switchover-transaction whitelist snapshot.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS live_whitelist (
+        id SERIAL PRIMARY KEY,
+        snapshotted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        path TEXT NOT NULL,
+        market_type TEXT NOT NULL,
+        league TEXT NOT NULL,
+        n INTEGER,
+        scope_net_roi NUMERIC,
+        scope_net_clv NUMERIC,
+        share_of_agg_pnl NUMERIC,
+        kelly_fraction_override NUMERIC NOT NULL DEFAULT 0.5,
+        live_bet_count INTEGER NOT NULL DEFAULT 0,
+        active BOOLEAN NOT NULL DEFAULT true
+      )
+    `);
+    await db.execute(sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'live_whitelist_path_check'
+        ) THEN
+          ALTER TABLE live_whitelist
+            ADD CONSTRAINT live_whitelist_path_check
+            CHECK (path IN ('P','S'));
+        END IF;
+      END $$
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // Path P views
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`DROP VIEW IF EXISTS switchover_whitelist`);
+    await db.execute(sql`DROP VIEW IF EXISTS gate_components`);
+    await db.execute(sql`DROP VIEW IF EXISTS evaluation_pool`);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW evaluation_pool AS
+      SELECT pb.*
+      FROM paper_bets pb
+      WHERE pb.legacy_regime = false
+        AND pb.deleted_at IS NULL
+        AND pb.bet_track = 'paper'
+        AND pb.status IN ('won','lost')
+        AND pb.clv_source = 'pinnacle'
+        AND pb.gross_pnl IS NOT NULL
+        AND pb.commission_amount IS NOT NULL
+        AND pb.net_pnl IS NOT NULL
+        AND pb.placed_at >= COALESCE(
+          (SELECT value::timestamptz FROM agent_config WHERE key = 'evaluation_start_at'),
+          'infinity'::timestamptz
+        )
+    `);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW gate_components AS
+      WITH p AS (SELECT * FROM evaluation_pool)
+      SELECT
+        (SELECT COUNT(*) FROM p) AS pool_size,
+        (SELECT
+           CASE WHEN SUM(stake::numeric) > 0
+                THEN SUM(net_pnl::numeric) / SUM(stake::numeric)
+                ELSE NULL END
+         FROM p) AS aggregate_net_roi,
+        (SELECT AVG(clv_pct::numeric) FROM p) AS aggregate_net_clv,
+        (SELECT COALESCE(json_object_agg(market_type, json_build_object(
+           'n', n, 'roi', roi, 'clv', clv)), '{}'::json)
+         FROM (SELECT market_type, COUNT(*) AS n,
+                      ROUND(100.0 * SUM(net_pnl::numeric) / NULLIF(SUM(stake::numeric),0), 2) AS roi,
+                      ROUND(AVG(clv_pct::numeric)::numeric, 2) AS clv
+               FROM p GROUP BY market_type) x) AS by_market
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // Path S views
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`DROP VIEW IF EXISTS path_s_aggregate_status`);
+    await db.execute(sql`DROP VIEW IF EXISTS path_s_scope_status`);
+    await db.execute(sql`DROP VIEW IF EXISTS shadow_evaluation_pool`);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW shadow_evaluation_pool AS
+      SELECT pb.*
+      FROM paper_bets pb
+      WHERE pb.legacy_regime = false
+        AND pb.deleted_at IS NULL
+        AND pb.bet_track = 'shadow'
+        AND pb.status IN ('won','lost')
+        AND pb.shadow_stake IS NOT NULL
+        AND pb.shadow_stake::numeric > 0
+        AND pb.shadow_pnl IS NOT NULL
+        AND pb.placed_at >= COALESCE(
+          (SELECT value::timestamptz FROM agent_config WHERE key = 'evaluation_start_at'),
+          'infinity'::timestamptz
+        )
+    `);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW path_s_scope_status AS
+      WITH ranked AS (
+        SELECT pb.market_type, m.league,
+               pb.shadow_stake::numeric AS stk,
+               pb.shadow_pnl::numeric AS pnl,
+               ROW_NUMBER() OVER (
+                 PARTITION BY pb.market_type, m.league
+                 ORDER BY pb.placed_at
+               ) AS rn,
+               COUNT(*) OVER (PARTITION BY pb.market_type, m.league) AS n_total
+        FROM shadow_evaluation_pool pb
+        JOIN matches m ON m.id = pb.match_id
+      ),
+      scope AS (
+        SELECT market_type, league,
+               COUNT(*) AS n,
+               SUM(pnl) / NULLIF(SUM(stk), 0) AS net_roi,
+               SUM(pnl) FILTER (WHERE rn <= n_total/2) AS first_half_pnl,
+               SUM(stk) FILTER (WHERE rn <= n_total/2) AS first_half_stk,
+               SUM(pnl) FILTER (WHERE rn >  n_total/2) AS second_half_pnl,
+               SUM(stk) FILTER (WHERE rn >  n_total/2) AS second_half_stk
+        FROM ranked GROUP BY market_type, league
+      )
+      SELECT market_type, league, n, net_roi,
+             first_half_pnl / NULLIF(first_half_stk,0) AS first_half_roi,
+             second_half_pnl / NULLIF(second_half_stk,0) AS second_half_roi,
+             (n >= 400) AS n_pass,
+             (net_roi >= 0.05) AS roi_pass,
+             ((first_half_pnl / NULLIF(first_half_stk,0) >= 0.03)
+              AND (second_half_pnl / NULLIF(second_half_stk,0) >= 0.03)) AS split_half_pass,
+             (n >= 400 AND net_roi >= 0.05
+              AND (first_half_pnl / NULLIF(first_half_stk,0) >= 0.03)
+              AND (second_half_pnl / NULLIF(second_half_stk,0) >= 0.03)) AS path_s_pass
+      FROM scope
+    `);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW path_s_aggregate_status AS
+      WITH cleared AS (
+        SELECT market_type, league
+        FROM path_s_scope_status
+        WHERE path_s_pass = true
+      ),
+      cleared_bets AS (
+        SELECT pb.shadow_stake::numeric AS stk,
+               pb.shadow_pnl::numeric AS pnl,
+               pb.market_type
+        FROM shadow_evaluation_pool pb
+        JOIN matches m ON m.id = pb.match_id
+        JOIN cleared c ON c.market_type = pb.market_type AND c.league = m.league
+      )
+      SELECT
+        COUNT(*) AS pool_size_cleared,
+        COUNT(DISTINCT market_type) AS distinct_markets_cleared,
+        CASE WHEN SUM(stk) > 0 THEN SUM(pnl) / SUM(stk) ELSE NULL END AS aggregate_net_roi_cleared,
+        (COUNT(*) >= 500) AS path_s_n_pass,
+        (COUNT(DISTINCT market_type) >= 2) AS path_s_diversity_pass,
+        (CASE WHEN SUM(stk) > 0 THEN SUM(pnl) / SUM(stk) ELSE NULL END >= 0.04) AS path_s_roi_pass,
+        ((COUNT(*) >= 500)
+         AND (COUNT(DISTINCT market_type) >= 2)
+         AND (CASE WHEN SUM(stk) > 0 THEN SUM(pnl) / SUM(stk) ELSE NULL END >= 0.04)) AS path_s_aggregate_pass
+      FROM cleared_bets
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // Combined whitelist (Path P passers UNION Path S (A) passers).
+    // Per-scope filter on Path P: n >= 50 (tightened from 30 per Chris's
+    // §11 revision), positive net ROI, positive net CLV.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW switchover_whitelist AS
+      WITH agg AS (SELECT SUM(net_pnl::numeric) AS agg_pnl FROM evaluation_pool),
+      path_p AS (
+        SELECT 'P'::text AS path, ep.market_type, m.league,
+               COUNT(*)::int AS n,
+               SUM(ep.net_pnl::numeric) / NULLIF(SUM(ep.stake::numeric),0) AS scope_net_roi,
+               AVG(ep.clv_pct::numeric) AS scope_net_clv,
+               SUM(ep.net_pnl::numeric) / NULLIF((SELECT agg_pnl FROM agg),0) AS share_of_agg_pnl
+        FROM evaluation_pool ep JOIN matches m ON m.id = ep.match_id
+        GROUP BY ep.market_type, m.league
+        HAVING COUNT(*) >= 50
+           AND (SUM(ep.net_pnl::numeric) / NULLIF(SUM(ep.stake::numeric),0)) > 0
+           AND AVG(ep.clv_pct::numeric) > 0
+      ),
+      path_s_pass AS (
+        SELECT pss.market_type, pss.league
+        FROM path_s_scope_status pss
+        WHERE pss.path_s_pass = true
+      ),
+      path_s AS (
+        SELECT 'S'::text AS path, pss.market_type, pss.league,
+               pss.n::int AS n,
+               pss.net_roi AS scope_net_roi,
+               NULL::numeric AS scope_net_clv,
+               NULL::numeric AS share_of_agg_pnl
+        FROM path_s_scope_status pss
+        WHERE pss.path_s_pass = true
+          AND NOT EXISTS (
+            SELECT 1 FROM path_p p
+            WHERE p.market_type = pss.market_type AND p.league = pss.league
+          )
+      )
+      SELECT * FROM path_p
+      UNION ALL
+      SELECT * FROM path_s
+    `);
+
+    // Re-create paper_bets_current view AFTER the bet_track ALTER above
+    // (Postgres freezes view column lists at CREATE time).
+    await db.execute(sql`DROP VIEW IF EXISTS paper_bets_current`);
+    await db.execute(sql`
+      CREATE VIEW paper_bets_current AS
+        SELECT * FROM paper_bets WHERE legacy_regime = false
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

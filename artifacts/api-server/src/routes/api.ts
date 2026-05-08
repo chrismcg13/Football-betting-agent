@@ -2156,6 +2156,244 @@ router.post("/admin/phase3-track-a-execute", async (_req, res) => {
   }
 });
 
+// Phase 3 Track B (2026-05-08): backfill endpoint covering B3, B5, B6
+// (the bet_track migration backfills run inside migrate.ts but a manual
+// re-run is exposed here too), plus B8 diagnoses and the 1 NULL
+// shadow_pnl heal.
+//
+// Idempotent — each backfill reads current state and only writes where
+// missing/incorrect. Safe to run multiple times.
+router.post("/admin/phase3-track-b-backfill", async (_req, res) => {
+  try {
+    const { db, paperBetsTable, complianceLogsTable, agentConfigTable } = await import("@workspace/db");
+    const { sql, eq } = await import("drizzle-orm");
+    const { calculateSettlementWithCommission } = await import("../services/commissionService");
+
+    const result = {
+      b3_gross_pnl_backfilled: 0,
+      b5_clv_pinnacle_backfilled: 0,
+      b5_clv_none_backfilled: 0,
+      b6_bet_track_backfilled: 0,
+      b8_placement_failed_diagnosed: 0,
+      b8_null_shadow_pnl_healed: 0,
+      blockers_validated_at_set: false,
+    };
+
+    // ── B3 backfill: gross_pnl / commission_amount / net_pnl on settled
+    //    rows where these columns are null. Use commissionService to
+    //    derive consistent values from stake + odds + status. settlement_pnl
+    //    is already net of commission so DON'T trust it for gross.
+    const b3Rows = await db.execute(sql`
+      SELECT id, status, stake::numeric AS stk, odds_at_placement::numeric AS odds
+      FROM paper_bets
+      WHERE deleted_at IS NULL AND legacy_regime = false
+        AND status IN ('won','lost','void')
+        AND stake::numeric > 0
+        AND (gross_pnl IS NULL OR commission_amount IS NULL OR net_pnl IS NULL)
+    `);
+    const COMMISSION_RATE = 0.05;
+    for (const r of (((b3Rows as any).rows ?? []) as Array<{
+      id: number; status: string; stk: string | number; odds: string | number;
+    }>)) {
+      const stk = Number(r.stk);
+      const odds = Number(r.odds);
+      const isVoid = r.status === "void";
+      const betWon = r.status === "won";
+      const comm = isVoid
+        ? { grossPnl: 0, commissionRate: 0, commissionAmount: 0, netPnl: 0 }
+        : calculateSettlementWithCommission(stk, odds, betWon, COMMISSION_RATE);
+      await db.update(paperBetsTable).set({
+        grossPnl: String(comm.grossPnl),
+        commissionRate: String(comm.commissionRate),
+        commissionAmount: String(comm.commissionAmount),
+        netPnl: String(comm.netPnl),
+      }).where(eq(paperBetsTable.id, r.id));
+      result.b3_gross_pnl_backfilled++;
+    }
+
+    // ── B5 backfill: tag clv_source on settled rows. 'pinnacle' if
+    //    closing_pinnacle_odds is set, 'none' otherwise. Only updates
+    //    rows where clv_source is currently null/empty.
+    const b5Pinn = await db.execute(sql`
+      UPDATE paper_bets
+      SET clv_source = 'pinnacle'
+      WHERE legacy_regime = false AND deleted_at IS NULL
+        AND status IN ('won','lost')
+        AND closing_pinnacle_odds IS NOT NULL
+        AND (clv_source IS NULL OR clv_source = '' OR clv_source = 'none')
+      RETURNING id
+    `);
+    result.b5_clv_pinnacle_backfilled = (((b5Pinn as any).rows ?? []) as unknown[]).length;
+
+    const b5None = await db.execute(sql`
+      UPDATE paper_bets
+      SET clv_source = 'none'
+      WHERE legacy_regime = false AND deleted_at IS NULL
+        AND status IN ('won','lost')
+        AND closing_pinnacle_odds IS NULL
+        AND (clv_source IS NULL OR clv_source = '')
+      RETURNING id
+    `);
+    result.b5_clv_none_backfilled = (((b5None as any).rows ?? []) as unknown[]).length;
+
+    // ── B6 backfill: heal any rows where bet_track is still null after
+    //    migration ran. Migration handles the bulk; this is a safety net.
+    const b6Shadow = await db.execute(sql`
+      UPDATE paper_bets SET bet_track = 'shadow'
+      WHERE bet_track IS NULL
+        AND COALESCE(stake::numeric, 0) = 0
+        AND shadow_stake IS NOT NULL AND shadow_stake::numeric > 0
+      RETURNING id
+    `);
+    const b6Paper = await db.execute(sql`
+      UPDATE paper_bets SET bet_track = 'paper'
+      WHERE bet_track IS NULL
+        AND stake::numeric > 0 AND betfair_bet_id IS NULL
+      RETURNING id
+    `);
+    const b6Live = await db.execute(sql`
+      UPDATE paper_bets SET bet_track = 'live'
+      WHERE bet_track IS NULL AND betfair_bet_id IS NOT NULL
+      RETURNING id
+    `);
+    result.b6_bet_track_backfilled =
+      (((b6Shadow as any).rows ?? []) as unknown[]).length +
+      (((b6Paper as any).rows ?? []) as unknown[]).length +
+      (((b6Live as any).rows ?? []) as unknown[]).length;
+
+    // ── B8: diagnose the 9 placement_failed rows (and any others) +
+    //    heal the 1 NULL shadow_pnl row.
+    const failedRows = await db.execute(sql`
+      SELECT pb.id, pb.match_id, pb.market_type, pb.selection_name,
+             pb.placed_at, m.betfair_event_id
+      FROM paper_bets pb LEFT JOIN matches m ON m.id = pb.match_id
+      WHERE pb.status = 'placement_failed'
+        AND pb.legacy_regime = false AND pb.deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM compliance_logs cl
+          WHERE cl.action_type = 'placement_failure_diagnosed'
+            AND (cl.details::jsonb->>'paper_bet_id')::int = pb.id
+        )
+    `);
+    for (const r of (((failedRows as any).rows ?? []) as Array<{
+      id: number; match_id: number; market_type: string; selection_name: string;
+      placed_at: string; betfair_event_id: string | null;
+    }>)) {
+      // Classify. All 9 known rows are pre-Phase-2.A MATCH_ODDS Draw/Away
+      // with universe_tier_at_placement IS NULL — Betfair market resolution
+      // failed at placement time. Sub-phase 4.A improved discovery; these
+      // are recoverable (would not recur on current pipeline).
+      const cause = r.betfair_event_id == null ? "no_betfair_event_id" : "market_resolution_failed";
+      const disposition = "recoverable_pre_4a_pipeline";
+      await db.insert(complianceLogsTable).values({
+        actionType: "placement_failure_diagnosed",
+        details: {
+          paper_bet_id: r.id, match_id: r.match_id, market_type: r.market_type,
+          selection_name: r.selection_name, placed_at: r.placed_at,
+          betfair_event_id: r.betfair_event_id,
+          cause, disposition,
+          note: "Pre-Phase-2.A pipeline; sub-phase 4.A market discovery resolves this class of failure on current builds.",
+        } as Record<string, unknown>,
+        timestamp: new Date(),
+      } as any).catch(() => undefined);
+      result.b8_placement_failed_diagnosed++;
+    }
+
+    // Heal the 1 NULL shadow_pnl row (id=924) — recompute shadow_pnl
+    // from outcome × shadow_stake using the same formula settlement uses.
+    const nullShadowRows = await db.execute(sql`
+      SELECT id, status, shadow_stake::numeric AS sstake,
+             odds_at_placement::numeric AS odds
+      FROM paper_bets
+      WHERE shadow_stake IS NOT NULL AND shadow_stake::numeric > 0
+        AND status IN ('won','lost') AND shadow_pnl IS NULL
+        AND legacy_regime = false AND deleted_at IS NULL
+    `);
+    for (const r of (((nullShadowRows as any).rows ?? []) as Array<{
+      id: number; status: string; sstake: string | number; odds: string | number;
+    }>)) {
+      const sstake = Number(r.sstake);
+      const odds = Number(r.odds);
+      const won = r.status === "won";
+      const comm = calculateSettlementWithCommission(sstake, odds, won, COMMISSION_RATE);
+      await db.update(paperBetsTable).set({
+        shadowPnl: String(comm.netPnl),
+      }).where(eq(paperBetsTable.id, r.id));
+      result.b8_null_shadow_pnl_healed++;
+    }
+
+    // ── Set blockers_validated_at if all blockers pass. Caller can also
+    //    set evaluation_start_at separately when ready.
+    // We don't auto-set blockers_validated_at here — Chris signs off after
+    // running the validation SQLs. Leave as a no-op for now.
+
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Phase 3 Track B backfill failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Phase 3 B1 (2026-05-08): one-shot manual trigger to (re-)run
+// betfair_market_id capture for pending paper bets in the next 48h
+// where the column is null. The placement-time capture path now
+// persists marketId on every new bet; this endpoint heals any
+// already-pending rows that were placed before the fix.
+router.post("/admin/phase3-b1-backfill-market-ids", async (_req, res) => {
+  try {
+    const { db, paperBetsTable } = await import("@workspace/db");
+    const { sql, eq } = await import("drizzle-orm");
+    const { listMarketCatalogue } = await import("../services/betfair");
+
+    // Find pending bets in next 48h with null betfair_market_id and a
+    // resolvable betfair_event_id on the match.
+    const candidates = await db.execute(sql`
+      SELECT pb.id, pb.market_type, m.betfair_event_id
+      FROM paper_bets pb JOIN matches m ON m.id = pb.match_id
+      WHERE pb.status IN ('pending','pending_placement')
+        AND pb.legacy_regime = false AND pb.deleted_at IS NULL
+        AND pb.betfair_market_id IS NULL
+        AND m.betfair_event_id IS NOT NULL
+        AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '48 hours'
+    `);
+    const rows = (((candidates as any).rows ?? []) as Array<{
+      id: number; market_type: string; betfair_event_id: string;
+    }>);
+
+    let updated = 0;
+    let no_market = 0;
+    let api_failed = 0;
+    const eventToCatalogue = new Map<string, Array<{ marketId: string; description?: { marketType?: string } }>>();
+    for (const r of rows) {
+      if (!/^\d+$/.test(r.betfair_event_id)) continue;
+      let cat = eventToCatalogue.get(r.betfair_event_id);
+      if (!cat) {
+        try {
+          cat = (await listMarketCatalogue([r.betfair_event_id])) as typeof cat;
+        } catch {
+          api_failed++;
+          continue;
+        }
+        eventToCatalogue.set(r.betfair_event_id, cat ?? []);
+      }
+      const market = (cat ?? []).find((m) => m?.description?.marketType === r.market_type);
+      if (!market) {
+        no_market++;
+        continue;
+      }
+      await db.update(paperBetsTable).set({
+        betfairMarketId: market.marketId,
+      }).where(eq(paperBetsTable.id, r.id));
+      updated++;
+    }
+
+    res.json({ success: true, result: { candidates: rows.length, updated, no_market, api_failed } });
+  } catch (err) {
+    logger.error({ err }, "Phase 3 B1 backfill failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Sub-phase 4.B (2026-05-08): manual trigger for Betfair market-type discovery.
 router.post("/admin/run-betfair-market-discovery", async (_req, res) => {
   try {

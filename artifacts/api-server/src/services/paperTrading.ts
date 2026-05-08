@@ -160,6 +160,13 @@ interface ExchangeSnapshot {
   bestLay: number | null;
   bestLaySize: number | null;
   selectionId: number | null;
+  // Phase 3 B1 (2026-05-08): include marketId in the capture return value
+  // so placement code can persist it. The Betfair Exchange placeOrders API
+  // requires a marketId — without this the only path to live placement
+  // is unavailable. Pre-Phase-3 builds discarded the marketId after using
+  // it for listMarketBook, leaving paper_bets.betfair_market_id null on
+  // every row.
+  marketId: string | null;
   fetchedAt: Date;
 }
 
@@ -254,6 +261,7 @@ async function captureExchangeSnapshot(args: {
     bestLay: lay?.price ?? null,
     bestLaySize: lay?.size ?? null,
     selectionId,
+    marketId: market.marketId,
     fetchedAt: new Date(),
   };
 }
@@ -1655,6 +1663,8 @@ export async function placePaperBet(
         betfairBestLaySize: exchangeSnapshot?.bestLaySize != null ? String(exchangeSnapshot.bestLaySize) : null,
         exchangeFetchAt: exchangeSnapshot?.fetchedAt ?? null,
         betfairSelectionId: exchangeSnapshot?.selectionId != null ? String(exchangeSnapshot.selectionId) : null,
+        // Phase 3 B1 (2026-05-08): persist marketId for live-placement readiness.
+        betfairMarketId: exchangeSnapshot?.marketId ?? null,
         // Prompt 5 pricing-pipeline columns
         actionablePrice: actionablePrice != null ? String(actionablePrice) : null,
         actionableSource: actionableSource ?? null,
@@ -1670,6 +1680,14 @@ export async function placePaperBet(
         shadowStakeKellyFraction: shadowStakeKellyFraction,
         universeTierAtPlacement: universeTier ?? null,
         clvSource: null,
+        // Phase 3 B6 (2026-05-08): denormalised bet-track at placement.
+        // 'paper' = real-stake paper-mode bet (stake>0, no betfair_bet_id).
+        // 'shadow' = £0 stake with shadow_stake notional Kelly (Tier B/C).
+        // 'live' is set elsewhere when placeLiveBetOnBetfair fires (post-flip).
+        betTrack:
+          shadowStake != null && shadowStake > 0
+            ? "shadow"
+            : "paper",
       })
       .returning();
 
@@ -2665,17 +2683,15 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       // CLV is best-effort; don't block settlement
     }
 
-    // Phase 2.B.2: derive clv_source from the Pinnacle-source-only lookup
-    // above. clv_pct is non-null iff a Pinnacle snapshot was found, so we
-    // can use it as the source signal. When no Pinnacle close was found,
-    // we tag 'none' for shadow bets (no proxy fallback for Tier B/C — their
-    // CLV semantics differ structurally and Phase 2.C will gate threshold
-    // by source). For Tier A bets, leave clv_source null (R6 patch path
-    // already handles this).
-    const clvSourceTag: "pinnacle" | "none" | null =
-      recordedShadowStake > 0
-        ? clvPct != null ? "pinnacle" : "none"
-        : null;
+    // Phase 3 B5 (2026-05-08): tag clv_source for ALL settled bets, not just
+    // shadow. The previous logic only tagged shadow rows, leaving paper bets
+    // untagged (16.7% of Tier-A paper bets had clv_source='pinnacle' even
+    // when closing_pinnacle_odds was captured 60% of the time). Path P
+    // evaluation requires the tag — without it, evaluation_pool is starved.
+    // clvPct is non-null iff a Pinnacle snapshot was found in the lookup
+    // above, so it is the authoritative "did Pinnacle anchor exist?" signal.
+    const clvSourceTag: "pinnacle" | "none" =
+      clvPct != null ? "pinnacle" : "none";
 
     await db
       .update(paperBetsTable)
@@ -2686,7 +2702,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         closingOddsProxy: closingOddsProxy != null ? String(closingOddsProxy) : null,
         ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
         ...(shadowPnl != null ? { shadowPnl: String(shadowPnl) } : {}),
-        ...(clvSourceTag != null ? { clvSource: clvSourceTag } : {}),
+        clvSource: clvSourceTag,
         exchangeId,
         grossPnl: String(commResult.grossPnl),
         commissionRate: String(commResult.commissionRate),
