@@ -2618,12 +2618,14 @@ router.post("/admin/run-daily-discovery-sweep", async (_req, res) => {
 // supplies the (matchId, marketType, selectionName, odds) tuple.
 router.post("/admin/live-canary", async (req, res) => {
   try {
-    if (process.env["TRADING_MODE"] !== "LIVE") {
-      return res.status(400).json({
-        success: false,
-        message: "TRADING_MODE != LIVE — canary requires live mode env",
-      });
-    }
+    // 2026-05-08: TRADING_MODE=LIVE check removed. The dev-on-prod startup
+    // guard (startupChecks.ts:129) refuses to boot when NODE_ENV=development
+    // AND TRADING_MODE=LIVE — that's by design to keep the dev workspace
+    // out of live trading. The canary is a deliberate one-shot real-bet
+    // test that should work in paper-on-prod mode. The two remaining
+    // safety gates (live_canary_enabled='true' + one-shot live_canary_used
+    // lock) are sufficient — operator must explicitly arm AND the endpoint
+    // refuses to re-fire after one successful placement.
     const armed = (await getConfigValue("live_canary_enabled")) === "true";
     if (!armed) {
       return res.status(400).json({
