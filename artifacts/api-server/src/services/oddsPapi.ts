@@ -3118,6 +3118,67 @@ interface ResolvedClosing {
 }
 
 /**
+ * Phase 3 C1 (2026-05-08): Tier-2 sharp non-Pinnacle anchor resolver.
+ * Only invoked when resolveClosingPinnacle returns null (no Pinnacle
+ * available). Queries odds_snapshots for the most-recent pre-kickoff
+ * snapshot from a known sharp non-Pinnacle book.
+ *
+ * Tier-2 list (in priority order):
+ *   - oddspapi_smarkets    — Smarkets exchange (sharp money source)
+ *   - oddspapi_matchbook   — Matchbook exchange (sharp money source)
+ *   - oddspapi_betfair     — Betfair Exchange via OddsPapi feed
+ *   - oddspapi_ibcbet / sbobet / sbo — Asian sharp books (Pinnacle peers)
+ *   - oddspapi_bet365      — softest of the tier; included because Bet365
+ *                            tracks sharp money on big markets, but ranked
+ *                            lowest within Tier 2 for soft-book tendency.
+ *
+ * Diversity guard for the gate is at the SCOPE level (Path P+ view requires
+ * ≥2 distinct Tier-2 books per scope to admit). This function returns a
+ * single snapshot per bet — no diversity checking here.
+ */
+const TIER_2_SOURCE_PRIORITY = [
+  "oddspapi_smarkets",
+  "oddspapi_matchbook",
+  "oddspapi_betfair",
+  "oddspapi_ibcbet",
+  "oddspapi_sbobet",
+  "oddspapi_sbo",
+  "oddspapi_bet365",
+];
+
+async function resolveTier2Anchor(args: {
+  matchId: number;
+  marketType: string;
+  selectionName: string;
+}): Promise<{ odds: number; source: string } | null> {
+  // Pull all candidate snapshots from priority list in one query, ordered
+  // by (priority, snapshot_time DESC). Take the highest-priority+freshest.
+  const rows = await db.execute(sql`
+    SELECT source, back_odds::float8 AS odds, snapshot_time
+    FROM odds_snapshots
+    WHERE match_id = ${args.matchId}
+      AND market_type = ${args.marketType}
+      AND selection_name = ${args.selectionName}
+      AND source = ANY(${TIER_2_SOURCE_PRIORITY}::text[])
+      AND back_odds::numeric > 1.01
+      AND snapshot_time > NOW() - INTERVAL '24 hours'
+    ORDER BY snapshot_time DESC
+    LIMIT 50
+  `);
+  const list = (((rows as any).rows ?? []) as Array<{
+    source: string; odds: number; snapshot_time: string;
+  }>);
+  if (list.length === 0) return null;
+
+  // Pick best per priority — earliest in TIER_2_SOURCE_PRIORITY wins.
+  for (const preferredSource of TIER_2_SOURCE_PRIORITY) {
+    const match = list.find((r) => r.source === preferredSource);
+    if (match) return { odds: match.odds, source: match.source };
+  }
+  return null;
+}
+
+/**
  * Multi-source closing-line Pinnacle resolver.
  *   1. OddsPapi (only for ODDSPAPI_CAPABLE_MARKETS, only if a pre-fetched
  *      Pinnacle bookmaker is supplied for this fixture+market).
@@ -3329,52 +3390,83 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
           oddspapiPinnacleBookmaker,
         });
 
-        if (!resolved.odds || !resolved.source) {
+        // Phase 3 C1 (2026-05-08): if Pinnacle resolved → Tier 1 anchor.
+        // If not → fall through to Tier-2 sharp non-Pinnacle anchors via
+        // odds_snapshots. We've been recording these (Bet365, Smarkets,
+        // Matchbook, IBC, etc.) since the maximisation bundle, so the
+        // data is already in the table — just need to query and tag tier=2.
+        // Path P pool stays Tier-1-only; Path P+ admits Tier 1+2.
+        let clvSourceTag: string | null = null;
+        let clvSourceTier: number | null = null;
+        let closingOdds: number | null = null;
+        let dataQuality: string | null = null;
+
+        if (resolved.odds && resolved.source) {
+          closingOdds = resolved.odds;
+          clvSourceTag =
+            resolved.source === "derived_from_match_odds" ? "pinnacle_derived" : "pinnacle";
+          clvSourceTier = 1;
+          dataQuality = resolved.dataQuality;
+        } else {
+          // Tier-2 fallthrough: query odds_snapshots for the most-recent
+          // pre-kickoff snapshot from a known sharp non-Pinnacle book.
+          const tier2 = await resolveTier2Anchor({
+            matchId,
+            marketType,
+            selectionName: bet.selectionName,
+          });
+          if (tier2) {
+            closingOdds = tier2.odds;
+            clvSourceTag = tier2.source;
+            clvSourceTier = 2;
+            dataQuality = "tier_2_sharp_anchor";
+          }
+        }
+
+        if (closingOdds == null) {
           skipped++;
           continue;
         }
 
         const placementOdds = Number(bet.oddsAtPlacement);
-        const clvPct = resolved.odds > 1
-          ? Math.round(((placementOdds - resolved.odds) / resolved.odds) * 100 * 1000) / 1000
+        const clvPct = closingOdds > 1
+          ? Math.round(((placementOdds - closingOdds) / closingOdds) * 100 * 1000) / 1000
           : null;
-
-        // Both oddspapi_pinnacle and api_football_pinnacle map to clv_source
-        // = 'pinnacle' (canonical evaluation_pool tag — both ARE Pinnacle's
-        // actual prices, just different ingestion paths). DC derived from
-        // MO maps to 'pinnacle_derived' so it counts toward Path S
-        // (shadow_evaluation_pool) but not Path P (evaluation_pool which
-        // demands real Pinnacle CLV).
-        const clvSourceTag =
-          resolved.source === "derived_from_match_odds" ? "pinnacle_derived" : "pinnacle";
 
         await db
           .update(paperBetsTable)
           .set({
-            closingPinnacleOdds: String(resolved.odds),
+            closingPinnacleOdds: String(closingOdds),
             ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
             clvSource: clvSourceTag,
-            clvDataQuality: resolved.dataQuality,
-          })
+            clvDataQuality: dataQuality,
+            clvSourceTier: clvSourceTier as any,
+          } as any)
           .where(eq(paperBetsTable.id, bet.id));
 
-        await storePinnacleSnapshot({
-          betId: bet.id,
-          matchId,
-          marketType: bet.marketType,
-          selectionName: bet.selectionName,
-          snapshotType: "closing",
-          pinnacleOdds: resolved.odds,
-        });
+        // Only snapshot Pinnacle anchors (Tier 1) — pinnacle_odds_snapshots
+        // is the Pinnacle line-movement table; Tier-2 has its own snapshot
+        // path via odds_snapshots already.
+        if (clvSourceTier === 1) {
+          await storePinnacleSnapshot({
+            betId: bet.id,
+            matchId,
+            marketType: bet.marketType,
+            selectionName: bet.selectionName,
+            snapshotType: "closing",
+            pinnacleOdds: closingOdds,
+          });
+        }
 
-        bySource[resolved.source] = (bySource[resolved.source] ?? 0) + 1;
+        const sourceForCount = clvSourceTag ?? "unknown";
+        bySource[sourceForCount] = (bySource[sourceForCount] ?? 0) + 1;
         logger.info(
           {
             betId: bet.id, matchId, marketType, selection: bet.selectionName,
-            placementOdds, closingOdds: resolved.odds, clvPct,
-            source: resolved.source, dataQuality: resolved.dataQuality,
+            placementOdds, closingOdds, clvPct,
+            source: clvSourceTag, tier: clvSourceTier, dataQuality,
           },
-          "Pre-kickoff CLV stored (multi-source) + snapshot C",
+          "Pre-kickoff CLV stored (multi-anchor) + snapshot C",
         );
         updated++;
       } catch (err) {

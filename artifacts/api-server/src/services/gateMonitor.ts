@@ -35,6 +35,21 @@ export interface GateMonitorResult {
     clv_pass: boolean;
     all_pass: boolean;
   };
+  // Phase 3 C1 (2026-05-08): Path P+ multi-anchor secondary trigger.
+  // Same shape as Path P. Tier 1+2 admitted; thresholds n≥150, ROI≥3%,
+  // CLV≥1%. Does NOT auto-fire switchover — surfaces a manual review row
+  // when all_pass; Chris decides whether to flip on it.
+  path_p_plus: {
+    pool_size: number;
+    n_tier_1: number;
+    n_tier_2: number;
+    aggregate_net_roi: number | null;
+    aggregate_net_clv: number | null;
+    pool_pass: boolean;
+    roi_pass: boolean;
+    clv_pass: boolean;
+    all_pass: boolean;
+  };
   path_s: {
     pool_size_cleared: number;
     distinct_markets_cleared: number;
@@ -58,6 +73,17 @@ export async function runGateMonitor(): Promise<GateMonitorResult> {
     evaluation_started: !!evalStartStr,
     path_p: {
       pool_size: 0,
+      aggregate_net_roi: null,
+      aggregate_net_clv: null,
+      pool_pass: false,
+      roi_pass: false,
+      clv_pass: false,
+      all_pass: false,
+    },
+    path_p_plus: {
+      pool_size: 0,
+      n_tier_1: 0,
+      n_tier_2: 0,
       aggregate_net_roi: null,
       aggregate_net_clv: null,
       pool_pass: false,
@@ -114,6 +140,41 @@ export async function runGateMonitor(): Promise<GateMonitorResult> {
     result.path_p.all_pass = result.path_p.pool_pass && result.path_p.roi_pass && result.path_p.clv_pass;
   }
 
+  // Path P+ aggregate (Phase 3 C1, 2026-05-08): Tier-1+2 multi-anchor pool.
+  // Surfaces in manifest + writes a review row when all_pass — does NOT
+  // auto-fire switchover. Thresholds: n≥150, ROI≥3%, CLV≥1% (looser than
+  // Path P's 200/3%/2% — looser CLV because Tier-2 anchors have higher
+  // noise than Pinnacle).
+  try {
+    const pPlusComp = await db.execute(sql`SELECT * FROM gate_components_p_plus`);
+    const pPlusRow = (((pPlusComp as any).rows ?? []) as Array<{
+      pool_size: number | string;
+      aggregate_net_roi: number | string | null;
+      aggregate_net_clv: number | string | null;
+      n_tier_1: number | string;
+      n_tier_2: number | string;
+    }>)[0];
+    if (pPlusRow) {
+      result.path_p_plus.pool_size = Number(pPlusRow.pool_size ?? 0);
+      result.path_p_plus.n_tier_1 = Number(pPlusRow.n_tier_1 ?? 0);
+      result.path_p_plus.n_tier_2 = Number(pPlusRow.n_tier_2 ?? 0);
+      result.path_p_plus.aggregate_net_roi =
+        pPlusRow.aggregate_net_roi != null ? Number(pPlusRow.aggregate_net_roi) : null;
+      result.path_p_plus.aggregate_net_clv =
+        pPlusRow.aggregate_net_clv != null ? Number(pPlusRow.aggregate_net_clv) : null;
+      result.path_p_plus.pool_pass = result.path_p_plus.pool_size >= 150;
+      result.path_p_plus.roi_pass = (result.path_p_plus.aggregate_net_roi ?? 0) >= 0.03;
+      result.path_p_plus.clv_pass = (result.path_p_plus.aggregate_net_clv ?? 0) >= 1.0;
+      result.path_p_plus.all_pass =
+        result.path_p_plus.pool_pass &&
+        result.path_p_plus.roi_pass &&
+        result.path_p_plus.clv_pass;
+    }
+  } catch (err) {
+    // Path P+ views may not be migrated yet on first deploy — non-fatal.
+    logger.warn({ err }, "gate_monitor: Path P+ evaluation failed (likely pre-migration) — skipping");
+  }
+
   // Path S aggregate
   const sStatus = await db.execute(sql`SELECT * FROM path_s_aggregate_status`);
   const sRow = (((sStatus as any).rows ?? []) as Array<{
@@ -163,6 +224,7 @@ export async function runGateMonitor(): Promise<GateMonitorResult> {
   const manifest = {
     evaluated_at: result.evaluated_at,
     path_p: result.path_p,
+    path_p_plus: result.path_p_plus,
     path_s: result.path_s,
     by_market: pRow?.by_market ?? null,
     whitelist: wlRows,
@@ -173,6 +235,30 @@ export async function runGateMonitor(): Promise<GateMonitorResult> {
     blockers_validated_at: await getConfig("blockers_validated_at"),
     trigger: result.trigger,
   };
+
+  // Path P+ review row (Phase 3 C1): surfaces a manual-review signal when
+  // Path P+ all_pass but Path P hasn't fired. Idempotent — at most one
+  // unresolved row at a time. Does NOT auto-fire switchover.
+  if (result.path_p_plus.all_pass && !result.trigger) {
+    try {
+      await db.execute(sql`
+        INSERT INTO gate_status_review_required (reason, diagnostic)
+        SELECT 'path_p_plus_clear_pending_review', ${JSON.stringify({
+          path_p_plus: result.path_p_plus,
+          path_p: result.path_p,
+          path_s: result.path_s,
+          evaluated_at: result.evaluated_at,
+        })}::jsonb
+        WHERE NOT EXISTS (
+          SELECT 1 FROM gate_status_review_required
+          WHERE reason = 'path_p_plus_clear_pending_review'
+            AND acknowledged_at IS NULL
+        )
+      `);
+    } catch (err) {
+      logger.warn({ err }, "gate_monitor: failed to insert Path P+ review row");
+    }
+  }
 
   // Insert gate_status row
   await db.execute(sql`

@@ -8,6 +8,7 @@ import {
   numeric,
   boolean,
   real,
+  smallint,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
@@ -134,6 +135,11 @@ export const paperBetsTable = pgTable("paper_bets", {
   shadowPnl: numeric("shadow_pnl", { precision: 12, scale: 2 }),
   universeTierAtPlacement: text("universe_tier_at_placement"),
   clvSource: text("clv_source"),
+  // ── Phase 3 C1 (2026-05-08): multi-anchor CLV tier ─────────────────────
+  // 1=Pinnacle (canonical sharp), 2=sharp non-Pinnacle (Bet365/Smarkets/
+  // Matchbook/IBC), 3=soft books, NULL=no anchor available. Path P stays
+  // Tier-1 only; Path P+ admits Tier 1+2 with looser thresholds.
+  clvSourceTier: smallint("clv_source_tier"),
   // ── Phase 3 B6 (2026-05-08): bet-track enum ────────────────────────────
   // 'paper' | 'shadow' | 'live'. Denormalised at placement so all downstream
   // SQL (settlement, gate-monitoring, P&L) doesn't have to re-derive from
@@ -239,5 +245,6 @@ export const paperBetsCurrentView = pgView("paper_bets_current", {
   shadowPnl: numeric("shadow_pnl", { precision: 12, scale: 2 }),
   universeTierAtPlacement: text("universe_tier_at_placement"),
   clvSource: text("clv_source"),
+  clvSourceTier: smallint("clv_source_tier"),
   betTrack: text("bet_track"),
 }).existing();

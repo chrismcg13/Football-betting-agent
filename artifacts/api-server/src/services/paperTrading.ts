@@ -1252,6 +1252,7 @@ export async function placePaperBet(
         selectionName: paperBetsTable.selectionName,
         selectionCanonical: paperBetsTable.selectionCanonical,
         status: paperBetsTable.status,
+        betTrack: paperBetsTable.betTrack,
       })
       .from(paperBetsTable)
       .where(
@@ -1295,13 +1296,28 @@ export async function placePaperBet(
       }
     }
 
-    // 3. Hard cap — max 4 bets per match (pending only)
-    // Raised from 2 → 4 to allow independent edges across MATCH_ODDS /
-    // OVER_UNDER / BTTS / cards / corners on the same fixture. Threshold-
-    // category dedup above (rule #2) still prevents correlated picks.
-    if (existingPending.length >= 4) {
+    // 3. Hard cap — bet-track-aware (Phase 3 A3, 2026-05-08).
+    // Paper rail: cap=4 (capital-discipline analogue, prevents per-fixture
+    //   correlation/exposure). Threshold-category dedup above prevents
+    //   correlated picks; the 4-cap then limits independent-edge stacking.
+    // Shadow rail: cap=12. Shadow is £0 learning data with no capital risk;
+    //   the 4-cap was killing 60-80% of would-be Path S evidence on AH-rich
+    //   matches (compliance_logs showed ~98k 'max 4 pending' rejections in
+    //   3 days, dominated by AH alternatives). 12 covers a typical AH
+    //   ladder (6-9 active lines) plus 2-4 cross-market edges.
+    // Counts are same-track only — paper and shadow have independent
+    // correlation profiles (paper = real exposure, shadow = no exposure).
+    // isShadowBet is set above (line ~800) from placementTrack/universeTier.
+    // Late £2-fallthrough reclassification (line ~1456) happens after this
+    // cap check, so it's evaluated as paper here — matches original behavior.
+    const incomingTrack: "paper" | "shadow" = isShadowBet ? "shadow" : "paper";
+    const cap = incomingTrack === "shadow" ? 12 : 4;
+    const sameTrackPending = existingPending.filter(
+      (b) => (b.betTrack ?? "paper") === incomingTrack,
+    );
+    if (sameTrackPending.length >= cap) {
       return logReject(
-        `Match ${matchId} already has ${existingPending.length} pending bets (max 4) — skipping ${marketType}:${selectionName}`,
+        `Match ${matchId} already has ${sameTrackPending.length} pending ${incomingTrack} bets (max ${cap}) — skipping ${marketType}:${selectionName}`,
       );
     }
   }

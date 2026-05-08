@@ -351,6 +351,27 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS clv_pct NUMERIC(8,4)
     `);
 
+    // Phase 3 C1 (2026-05-08): multi-anchor CLV tier. SMALLINT (2 bytes,
+    // negligible storage). 1=Pinnacle (canonical sharp), 2=sharp non-Pinnacle
+    // (Bet365/Smarkets/Matchbook/IBC etc), 3=soft books (William Hill /
+    // Ladbrokes / etc), NULL=no anchor available. Path P stays Tier-1 only;
+    // Path P+ admits Tier 1+2 with a higher edge cushion. Both rails (paper
+    // + shadow) get tier-tagged identically — partial validation > omission.
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS clv_source_tier SMALLINT
+    `);
+    // One-shot backfill of existing tagged rows. Idempotent — only writes
+    // where tier is NULL. clv_source values 'pinnacle' / 'pinnacle_derived'
+    // are Tier-1 (both anchor against Pinnacle's actual sharp prices, just
+    // via different ingestion paths).
+    await db.execute(sql`
+      UPDATE paper_bets
+      SET clv_source_tier = 1
+      WHERE clv_source IN ('pinnacle','pinnacle_derived')
+        AND clv_source_tier IS NULL
+    `);
+
     // ── Pinnacle upgrade compliance log (idempotent — only logs once) ────────
     const upgradeLogged = await db.execute(sql`
       SELECT 1 FROM compliance_logs
@@ -2042,6 +2063,75 @@ export async function runMigrations() {
                       ROUND(100.0 * SUM(net_pnl::numeric) / NULLIF(SUM(stake::numeric),0), 2) AS roi,
                       ROUND(AVG(clv_pct::numeric)::numeric, 2) AS clv
                FROM p GROUP BY market_type) x) AS by_market
+    `);
+
+    // ────────────────────────────────────────────────────────────────────
+    // Path P+ views (Phase 3 C1, 2026-05-08): multi-anchor secondary trigger.
+    // Same shape as Path P but admits Tier-1 OR Tier-2 anchored bets.
+    // Path P stays Tier-1-only as the gold-standard switchover trigger.
+    // Path P+ surfaces a separate manual review row when its (looser)
+    // thresholds clear — Chris decides whether to flip on that signal.
+    // Thresholds: n≥150, net ROI≥3%, net CLV≥1% (vs Path P's 200/3%/2%).
+    // The looser CLV is justified because Tier-2 anchors have systematically
+    // higher noise than Pinnacle; the 1pp floor is "above zero with
+    // confidence" rather than "high-conviction".
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`DROP VIEW IF EXISTS switchover_whitelist_p_plus`);
+    await db.execute(sql`DROP VIEW IF EXISTS gate_components_p_plus`);
+    await db.execute(sql`DROP VIEW IF EXISTS evaluation_pool_p_plus`);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW evaluation_pool_p_plus AS
+      SELECT pb.*
+      FROM paper_bets pb
+      WHERE pb.legacy_regime = false
+        AND pb.deleted_at IS NULL
+        AND pb.bet_track = 'paper'
+        AND pb.status IN ('won','lost')
+        AND pb.clv_source_tier IN (1, 2)
+        AND pb.gross_pnl IS NOT NULL
+        AND pb.commission_amount IS NOT NULL
+        AND pb.net_pnl IS NOT NULL
+        AND pb.placed_at >= COALESCE(
+          (SELECT value::timestamptz FROM agent_config WHERE key = 'evaluation_start_at'),
+          'infinity'::timestamptz
+        )
+    `);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW gate_components_p_plus AS
+      WITH p AS (SELECT * FROM evaluation_pool_p_plus)
+      SELECT
+        (SELECT COUNT(*) FROM p) AS pool_size,
+        (SELECT
+           CASE WHEN SUM(stake::numeric) > 0
+                THEN SUM(net_pnl::numeric) / SUM(stake::numeric)
+                ELSE NULL END
+         FROM p) AS aggregate_net_roi,
+        (SELECT AVG(clv_pct::numeric) FROM p) AS aggregate_net_clv,
+        (SELECT COUNT(*) FROM p WHERE clv_source_tier = 1) AS n_tier_1,
+        (SELECT COUNT(*) FROM p WHERE clv_source_tier = 2) AS n_tier_2
+    `);
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW switchover_whitelist_p_plus AS
+      SELECT pb.market_type, m.league,
+             COUNT(*) AS n,
+             SUM(pb.net_pnl::numeric) / NULLIF(SUM(pb.stake::numeric), 0) AS scope_net_roi,
+             AVG(pb.clv_pct::numeric) AS scope_net_clv,
+             COUNT(*) FILTER (WHERE pb.clv_source_tier = 1) AS n_tier_1,
+             COUNT(*) FILTER (WHERE pb.clv_source_tier = 2) AS n_tier_2,
+             COUNT(DISTINCT pb.clv_source) FILTER (WHERE pb.clv_source_tier = 2) AS distinct_t2_books
+      FROM evaluation_pool_p_plus pb
+      JOIN matches m ON m.id = pb.match_id
+      GROUP BY pb.market_type, m.league
+      HAVING COUNT(*) >= 50
+         AND (SUM(pb.net_pnl::numeric) / NULLIF(SUM(pb.stake::numeric), 0)) > 0
+         AND AVG(pb.clv_pct::numeric) > 0
+         -- Diversity guard: if scope has Tier-2 anchored bets, require ≥2
+         -- distinct Tier-2 books so we're not piggybacking a single soft.
+         AND (COUNT(*) FILTER (WHERE pb.clv_source_tier = 2) = 0
+              OR COUNT(DISTINCT pb.clv_source) FILTER (WHERE pb.clv_source_tier = 2) >= 2)
     `);
 
     // ────────────────────────────────────────────────────────────────────
