@@ -3226,6 +3226,163 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
   return { checked: pendingBets.length, updated, skipped };
 }
 
+// ─── DIAGNOSTIC: dump raw OddsPapi response for a (match, market) pair ─────
+// 2026-05-08 (post-Lever-1): used to drill into BTTS/DC/FH/TEAM_TOTAL parser
+// or coverage gaps. After Lever 1 deploy the closing-line cron is correctly
+// fetching per-market, but BTTS/DC/FH still showed zero oddspapi_pinnacle
+// snapshots over 30 days. This endpoint reveals whether the API genuinely
+// has no data for a market, or returns data without Pinnacle, or returns
+// Pinnacle in a label format we don't decode.
+//
+// Usage: POST /admin/debug-oddspapi-fetch with body { matchId, marketType }.
+// Returns structured dump: bookmaker count, slug list, Pinnacle outcome,
+// raw selection labels (truncated). Does NOT cache or store.
+
+export async function debugOddsPapiFetch(args: {
+  matchId: number;
+  marketType: string;
+}): Promise<{
+  matchId: number;
+  marketType: string;
+  oddspapiFixtureId: number | null;
+  oddspapiMarketId: number | null;
+  fetchedOk: boolean;
+  rawTopLevelKeys: string[];
+  bookmakerCount: number;
+  bookmakerSlugs: string[];
+  pinnacle: {
+    found: boolean;
+    rawSelectionLabels: string[];
+    decodedSelections: Array<{ key: string; odds: number | null }>;
+  };
+  sampleNonPinnacle: Array<{
+    slug: string;
+    selectionLabels: string[];
+  }>;
+  notes: string[];
+}> {
+  const notes: string[] = [];
+
+  const oddspapiFixtureId = await getOddspapiFixtureId(args.matchId);
+  if (!oddspapiFixtureId) {
+    notes.push("getOddspapiFixtureId returned null — match has no OddsPapi fixture mapping");
+    return {
+      matchId: args.matchId,
+      marketType: args.marketType,
+      oddspapiFixtureId: null,
+      oddspapiMarketId: null,
+      fetchedOk: false,
+      rawTopLevelKeys: [],
+      bookmakerCount: 0,
+      bookmakerSlugs: [],
+      pinnacle: { found: false, rawSelectionLabels: [], decodedSelections: [] },
+      sampleNonPinnacle: [],
+      notes,
+    };
+  }
+
+  const oddspapiMarketId = MARKET_IDS[args.marketType];
+  if (!oddspapiMarketId) {
+    notes.push(`MARKET_IDS["${args.marketType}"] not mapped — closing-line cron skips this market`);
+    return {
+      matchId: args.matchId,
+      marketType: args.marketType,
+      oddspapiFixtureId,
+      oddspapiMarketId: null,
+      fetchedOk: false,
+      rawTopLevelKeys: [],
+      bookmakerCount: 0,
+      bookmakerSlugs: [],
+      pinnacle: { found: false, rawSelectionLabels: [], decodedSelections: [] },
+      sampleNonPinnacle: [],
+      notes,
+    };
+  }
+
+  const rawData = await fetchOddsPapi<RawOddsResponse>(
+    "/odds",
+    { fixtureId: oddspapiFixtureId, marketId: oddspapiMarketId },
+    "diagnostic",
+    "P3",
+  );
+  if (!rawData) {
+    notes.push("fetchOddsPapi returned null — endpoint did not respond or returned non-OK");
+    return {
+      matchId: args.matchId,
+      marketType: args.marketType,
+      oddspapiFixtureId,
+      oddspapiMarketId,
+      fetchedOk: false,
+      rawTopLevelKeys: [],
+      bookmakerCount: 0,
+      bookmakerSlugs: [],
+      pinnacle: { found: false, rawSelectionLabels: [], decodedSelections: [] },
+      sampleNonPinnacle: [],
+      notes,
+    };
+  }
+
+  const rawTopLevelKeys = Object.keys(rawData as Record<string, unknown>);
+  const bookmakers = extractBookmakers(rawData as RawOddsResponse);
+  const bookmakerSlugs = bookmakers.map((b) => getBookmakerSlug(b));
+
+  const pinnacleBm = bookmakers.find((b) => getBookmakerSlug(b).includes("pinnacle"));
+  let pinnacleResult: {
+    found: boolean;
+    rawSelectionLabels: string[];
+    decodedSelections: Array<{ key: string; odds: number | null }>;
+  } = { found: false, rawSelectionLabels: [], decodedSelections: [] };
+
+  if (pinnacleBm) {
+    const sels = extractSelections(pinnacleBm);
+    const labels = sels.map((s) => String(s.label ?? s.selection ?? s.name ?? s.outcome ?? "")).slice(0, 30);
+    const decoded: Array<{ key: string; odds: number | null }> = [];
+    for (const key of getGenericSelectionKeys(args.marketType)) {
+      decoded.push({ key, odds: getSelectionOdds(sels, args.marketType, key) ?? null });
+    }
+    pinnacleResult = {
+      found: true,
+      rawSelectionLabels: labels,
+      decodedSelections: decoded,
+    };
+    if (decoded.every((d) => d.odds == null)) {
+      notes.push(
+        `Pinnacle bookmaker IS present in response but getSelectionOdds returned null for ALL keys [${decoded.map((d) => d.key).join(", ")}]. Inspect rawSelectionLabels for the actual format and extend the slash-format matcher (oddsPapi.ts:1983-2090).`,
+      );
+    } else {
+      notes.push("Pinnacle decoded successfully — closing-line cron should now be capturing this scope.");
+    }
+  } else {
+    notes.push(
+      `Pinnacle slug NOT found among ${bookmakerSlugs.length} bookmakers (${bookmakerSlugs.slice(0, 10).join(", ") || "(empty)"}). API genuinely has no Pinnacle data for ${args.marketType} on this fixture/league.`,
+    );
+  }
+
+  const sampleNonPinnacle = bookmakers
+    .filter((b) => !getBookmakerSlug(b).includes("pinnacle"))
+    .slice(0, 5)
+    .map((b) => ({
+      slug: getBookmakerSlug(b),
+      selectionLabels: extractSelections(b)
+        .map((s) => String(s.label ?? s.selection ?? s.name ?? s.outcome ?? ""))
+        .slice(0, 8),
+    }));
+
+  return {
+    matchId: args.matchId,
+    marketType: args.marketType,
+    oddspapiFixtureId,
+    oddspapiMarketId,
+    fetchedOk: true,
+    rawTopLevelKeys,
+    bookmakerCount: bookmakers.length,
+    bookmakerSlugs,
+    pinnacle: pinnacleResult,
+    sampleNonPinnacle,
+    notes,
+  };
+}
+
 // ─── Build Pinnacle validation cache from API-Football Pinnacle odds ──────────
 // OddsPapi fixture mapping often has no bookmaker data for our leagues, but
 // API-Football already pulls Pinnacle's odds as one of the bookmakers included

@@ -2418,6 +2418,27 @@ router.post("/admin/run-tier-ladder-v2", async (_req, res) => {
   }
 });
 
+// 2026-05-08 (CLV diagnostic): inspect raw OddsPapi response for a specific
+// (matchId, marketType). Used to diagnose why BTTS/DC/FH/TEAM_TOTAL show
+// zero oddspapi_pinnacle snapshots — reveals whether the API genuinely
+// has no Pinnacle data, or returns Pinnacle in a label format we don't
+// decode. Body: { matchId: number, marketType: string }.
+router.post("/admin/debug-oddspapi-fetch", async (req, res) => {
+  try {
+    const matchId = Number((req.body ?? {}).matchId);
+    const marketType = String((req.body ?? {}).marketType ?? "");
+    if (!matchId || !marketType) {
+      return res.status(400).json({ success: false, message: "Body requires { matchId: number, marketType: string }" });
+    }
+    const { debugOddsPapiFetch } = await import("../services/oddsPapi");
+    const r = await debugOddsPapiFetch({ matchId, marketType });
+    return res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "debug-oddspapi-fetch failed");
+    return res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // 2026-05-08 (Lever 2): manual trigger for dead-letter sweep + registry
 // completeness check. Auto-voids bets stuck >7d post-kickoff with >50
 // attempts and raises data_quality_alerts for any unregistered market types.
