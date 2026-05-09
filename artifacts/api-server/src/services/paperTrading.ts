@@ -2423,29 +2423,35 @@ function determineBetWon(
 
     case "ASIAN_HANDICAP": {
       // selectionName examples: "Home -0.5", "Away +1.5", "Home -1", "Away 0"
+      // 2026-05-09: leg-by-leg WIN/PUSH/LOSS evaluation. See
+      // marketTypes.ts:resolveAsianHandicap for the canonical implementation
+      // and rationale. This legacy switch is kept only as a fallback for
+      // unregistered market types — registry path is preferred.
       const parts = selectionName.split(" ");
       const side = parts[0]; // "Home" or "Away"
       const handicap = parseFloat(parts[1] ?? "0");
-      const adjustedHome = homeScore + (side === "Home" ? handicap : -handicap);
-      const adjustedAway = awayScore + (side === "Away" ? handicap : -handicap);
+
+      const evalLeg = (h: number): "win" | "push" | "loss" => {
+        const adjustedSide = (side === "Home" ? homeScore : awayScore) + h;
+        const opposing = side === "Home" ? awayScore : homeScore;
+        if (adjustedSide > opposing) return "win";
+        if (adjustedSide < opposing) return "loss";
+        return "push";
+      };
+
       if (Math.abs(handicap % 1) === 0.25) {
-        // Split bet: half each on nearest 0.5 lines.
-        // 2026-05-09: half-win/half-loss → binary collapse to won/lost via
-        // the upper-half outcome. See marketTypes.ts:resolveAsianHandicap
-        // for rationale (shadow learning data is binary; live real-money
-        // bets settle via Betfair's listClearedOrders before reaching here).
-        const lower = handicap - 0.25;
-        const upper = handicap + 0.25;
-        const adjHomeLow = homeScore + (side === "Home" ? lower : -lower);
-        const adjHomeHigh = homeScore + (side === "Home" ? upper : -upper);
-        const winLow = side === "Home" ? adjHomeLow > awayScore : adjustedAway > homeScore + lower;
-        const winHigh = side === "Home" ? adjHomeHigh > awayScore : adjustedAway > homeScore + upper;
-        if (winLow && winHigh) return true;
-        if (!winLow && !winHigh) return false;
-        return winHigh;
+        const lowerLeg = evalLeg(handicap - 0.25);
+        const upperLeg = evalLeg(handicap + 0.25);
+        if (lowerLeg === "win" && upperLeg === "win") return true;
+        if (lowerLeg === "loss" && upperLeg === "loss") return false;
+        if (lowerLeg === "push") return upperLeg === "win";
+        if (upperLeg === "push") return lowerLeg === "win";
+        return null;
       }
-      if (side === "Home") return adjustedHome > awayScore;
-      if (side === "Away") return adjustedAway > homeScore;
+
+      const outcome = evalLeg(handicap);
+      if (outcome === "win") return true;
+      if (outcome === "loss") return false;
       return null;
     }
 

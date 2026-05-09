@@ -96,41 +96,63 @@ function totalCards(threshold: number): Resolver {
 }
 
 // ── ASIAN_HANDICAP ──────────────────────────────────────────────────────────
-// 2026-05-09: paper/shadow settlement returned null on quarter-line
-// half-win/half-loss splits (the "void for simplicity" branch). The retry
-// loop in paperTrading.ts treats null as "outcome unresolved, retry until
-// 72h then settle as lost", which incorrectly turned half-wins into lost
-// rows after 72h and meanwhile froze them as pending. Shadow bets at £0
-// stake are binary won/lost in the learning data, so map:
-//   half-win  → won  (the bet's "good half" cleared its line)
-//   half-loss → lost (the bet's "bad half" failed its line)
-// Live real-money bets defer to Betfair's listClearedOrders (handled in
-// settleBets before this function is called) and are unaffected. Only
-// the paper/shadow learning track sees this binary collapse.
+// 2026-05-09: rewritten leg-by-leg evaluation. The original code's winLow/
+// winHigh tests were mathematically incorrect — they checked whether the
+// ORIGINAL handicap bet wins at a shifted line ("does Away +0.25 win at
+// line 0?") rather than whether each leg's actual line wins ("does Away +0
+// win?"). This meant Away +0.25 with 0-0 (a real-world half-WIN: Away +0
+// pushes, Away +0.5 wins) was reported as winLow=TRUE/winHigh=FALSE and
+// then either voided or — after my prior fix — incorrectly marked LOST.
+//
+// Correct algorithm: split a quarter-line bet into two adjacent half-goal
+// lines (handicap−0.25 and handicap+0.25). Evaluate each leg as WIN/PUSH/
+// LOSS. Combine:
+//   WIN + WIN   → full win (true)
+//   LOSS + LOSS → full loss (false)
+//   WIN + PUSH  → half-win → binary collapse to true (won)
+//   LOSS + PUSH → half-loss → binary collapse to false (lost)
+//   WIN + LOSS  → impossible for adjacent half-goal lines with integer
+//                 scores; return null defensively
+//
+// Live real-money bets defer to Betfair's listClearedOrders before reaching
+// this function, so the partial-credit math is handled by Betfair natively.
+// Only the paper/shadow learning path uses this resolver, where the binary
+// collapse is the right semantics for the won/lost label feeding the model.
 const resolveAsianHandicap: Resolver = (selection, ctx) => {
   const parts = selection.split(" ");
   const side = parts[0];
   const handicap = parseFloat(parts[1] ?? "0");
-  const adjustedHome = ctx.homeScore + (side === "Home" ? handicap : -handicap);
-  const adjustedAway = ctx.awayScore + (side === "Away" ? handicap : -handicap);
+
+  // Evaluate one leg of an Asian handicap bet at a given handicap value.
+  // Returns "win" (strict beat), "push" (exact tie at the line), or "loss".
+  const evalLeg = (h: number): "win" | "push" | "loss" => {
+    const adjustedSide = (side === "Home" ? ctx.homeScore : ctx.awayScore) + h;
+    const opposing = side === "Home" ? ctx.awayScore : ctx.homeScore;
+    if (adjustedSide > opposing) return "win";
+    if (adjustedSide < opposing) return "loss";
+    return "push";
+  };
+
   if (Math.abs(handicap % 1) === 0.25) {
-    const lower = handicap - 0.25;
-    const upper = handicap + 0.25;
-    const adjHomeLow = ctx.homeScore + (side === "Home" ? lower : -lower);
-    const adjHomeHigh = ctx.homeScore + (side === "Home" ? upper : -upper);
-    const winLow = side === "Home" ? adjHomeLow > ctx.awayScore : adjustedAway > ctx.homeScore + lower;
-    const winHigh = side === "Home" ? adjHomeHigh > ctx.awayScore : adjustedAway > ctx.homeScore + upper;
-    if (winLow && winHigh) return true;
-    if (!winLow && !winHigh) return false;
-    // Half-win/half-loss split: binary approximation for paper/shadow
-    // learning data. winHigh=true means the +0.25 half cleared, winLow=true
-    // means the -0.25 half cleared. If only one cleared, we lean toward the
-    // direction of the "winning" half: if upper-half won (handicap was
-    // generous enough), call it a win; otherwise a loss.
-    return winHigh;
+    const lowerLeg = evalLeg(handicap - 0.25);
+    const upperLeg = evalLeg(handicap + 0.25);
+    if (lowerLeg === "win" && upperLeg === "win") return true;
+    if (lowerLeg === "loss" && upperLeg === "loss") return false;
+    // Half-win/half-loss case: one leg pushes, the other decides.
+    if (lowerLeg === "push") return upperLeg === "win";
+    if (upperLeg === "push") return lowerLeg === "win";
+    // win + loss across adjacent half-goal lines should not occur with
+    // integer scores; be defensive and void rather than mis-settle.
+    return null;
   }
-  if (side === "Home") return adjustedHome > ctx.awayScore;
-  if (side === "Away") return adjustedAway > ctx.homeScore;
+
+  // Whole or half handicaps: single-leg evaluation. Half-goal lines
+  // (e.g. ±0.5) can't push (no integer score equals a half value).
+  // Whole-goal lines (e.g. ±1) push when adjusted == opposing — for
+  // shadow bets we treat that as void (return null).
+  const outcome = evalLeg(handicap);
+  if (outcome === "win") return true;
+  if (outcome === "loss") return false;
   return null;
 };
 
