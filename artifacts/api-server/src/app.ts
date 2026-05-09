@@ -6,6 +6,7 @@ import express, {
 } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
+import rateLimit from "express-rate-limit";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -31,6 +32,31 @@ app.use(
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Pre-flip blocker #9: rate limiting on POST endpoints. Strict cap on
+// cron-triggering / heavy admin endpoints to prevent abuse and accidental
+// fork-bombs; generous global cap for everything else.
+const STRICT_PATHS = /^\/api\/(ingestion|trading|features|admin)\//;
+const strictLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Rate limit exceeded — try again in a minute" },
+});
+const globalLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Rate limit exceeded — try again in a minute" },
+});
+app.use("/api", (req: Request, _res: Response, next: NextFunction) => {
+  if (req.method === "POST" && STRICT_PATHS.test(req.path)) {
+    return strictLimiter(req, _res, next);
+  }
+  return globalLimiter(req, _res, next);
+});
 
 // No-cache for API responses only — do NOT apply globally or it overrides
 // the static asset cache headers on the dashboard.

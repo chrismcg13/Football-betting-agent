@@ -17,6 +17,7 @@
     "cors": "^2",
     "drizzle-orm": "catalog:",
     "express": "^5",
+    "express-rate-limit": "^7",
     "ml-logistic-regression": "^2.0.0",
     "ml-matrix": "^6.12.1",
     "ml-random-forest": "^2.1.0",
