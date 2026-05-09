@@ -3355,6 +3355,165 @@ router.post("/admin/reserve/event", async (req, res) => {
   }
 });
 
+// Pre-flip blocker #12: live-health snapshot. Surfaces kill-switch
+// state, recent placement errors, drift, paper-emission rate trend, and
+// distance to daily-loss cap (volume-shock awareness item).
+router.get("/admin/live-health", async (_req, res) => {
+  try {
+    const { getCachedBalance } = await import("../services/betfairLive");
+    const { getLockedReserve } = await import("../services/lockedReserve");
+
+    const cfgRows = await db.execute(sql`
+      SELECT key, value, updated_at FROM agent_config
+      WHERE key IN ('live_placement_enabled','cutover_completed_at',
+                    'auto_disable_reason','last_auto_disable_at',
+                    'bankroll_floor','daily_loss_limit_pct','weekly_loss_limit_pct',
+                    'max_stake_pct')
+      ORDER BY key
+    `);
+    const cfg = ((cfgRows as any).rows ?? []) as Array<{ key: string; value: string; updated_at: string }>;
+    const get = (k: string) => cfg.find((r) => r.key === k)?.value ?? null;
+
+    const cached = getCachedBalance();
+    const locked = await getLockedReserve();
+
+    // Recent placement errors (last 24h)
+    const errRows = await db.execute(sql`
+      SELECT action_type, COUNT(*)::int AS n, MAX(timestamp)::text AS last
+      FROM compliance_logs
+      WHERE timestamp > NOW() - INTERVAL '24 hours'
+        AND action_type IN ('live_bet_placement_failed','live_auto_revert',
+                            'paper_to_live_conversion_failed_to_shadow',
+                            'betfair_api_error')
+      GROUP BY 1 ORDER BY 1
+    `);
+    const errs = ((errRows as any).rows ?? []) as Array<{ action_type: string; n: number; last: string }>;
+
+    // 7-day paper-emission rate trend (volume-shock awareness)
+    const paperTrendRows = await db.execute(sql`
+      SELECT DATE_TRUNC('day', placed_at)::text AS day,
+             COUNT(*)::int                       AS paper_emitted,
+             COUNT(*) FILTER (WHERE bet_track='live')::int AS live_attempted
+      FROM paper_bets
+      WHERE placed_at > NOW() - INTERVAL '7 days'
+        AND legacy_regime=false
+        AND bet_track IN ('paper','live')
+      GROUP BY 1 ORDER BY 1 DESC
+    `);
+    const paperTrend = ((paperTrendRows as any).rows ?? []) as Array<{ day: string; paper_emitted: number; live_attempted: number }>;
+
+    // Live performance since cutover (if any)
+    const cutoverAt = get("cutover_completed_at");
+    let livePerf: any = null;
+    if (cutoverAt) {
+      const lpRows = await db.execute(sql`
+        SELECT COUNT(*) FILTER (WHERE status IN ('won','lost'))::int AS settled,
+               COALESCE(SUM(net_pnl)::float8, 0)                      AS net_pnl,
+               COALESCE(SUM(stake)::float8, 0)                        AS stake
+        FROM paper_bets
+        WHERE bet_track='live' AND legacy_regime=false
+          AND placed_at >= ${cutoverAt}::timestamptz
+          AND status IN ('won','lost')
+      `);
+      livePerf = ((lpRows as any).rows ?? [])[0] ?? null;
+    }
+
+    // Today's stake exposure vs daily-loss cap implication
+    const todayStakeRows = await db.execute(sql`
+      SELECT
+        COALESCE(SUM(stake)::float8, 0) AS today_stake_total,
+        COALESCE(SUM(CASE WHEN status='lost' THEN -COALESCE(net_pnl, settlement_pnl, 0)
+                          WHEN status='won'  THEN  COALESCE(net_pnl, settlement_pnl, 0)
+                          ELSE 0 END)::float8, 0) AS today_realised_pnl
+      FROM paper_bets
+      WHERE bet_track='live' AND legacy_regime=false
+        AND placed_at >= DATE_TRUNC('day', NOW())
+    `);
+    const todayRow = ((todayStakeRows as any).rows ?? [])[0] ?? { today_stake_total: 0, today_realised_pnl: 0 };
+
+    const dailyLossLimitPct = Number(get("daily_loss_limit_pct") ?? 0);
+    const dailyLossCapAbs = cached && dailyLossLimitPct > 0
+      ? Math.round(cached.available * dailyLossLimitPct * 100) / 100
+      : null;
+    const distanceToDailyCap = dailyLossCapAbs != null
+      ? Math.max(0, Math.round((dailyLossCapAbs + Number(todayRow.today_realised_pnl)) * 100) / 100)
+      : null;
+
+    res.json({
+      success: true,
+      result: {
+        kill_switch: {
+          live_placement_enabled: get("live_placement_enabled") === "true",
+          last_updated:           cfg.find((r) => r.key === "live_placement_enabled")?.updated_at ?? null,
+          auto_disable_reason:    get("auto_disable_reason"),
+          last_auto_disable_at:   get("last_auto_disable_at"),
+        },
+        cutover_completed_at: cutoverAt,
+        bankroll: {
+          betfair_available_cached: cached?.available ?? null,
+          locked_reserve:           locked,
+          active_estimate:          cached ? Math.max(0, cached.available - locked) : null,
+        },
+        guardrails: {
+          max_stake_pct:         Number(get("max_stake_pct")        ?? 0),
+          bankroll_floor:        Number(get("bankroll_floor")        ?? 0),
+          daily_loss_limit_pct:  dailyLossLimitPct,
+          weekly_loss_limit_pct: Number(get("weekly_loss_limit_pct") ?? 0),
+        },
+        recent_24h_errors: errs,
+        paper_emission_7d_trend: paperTrend,
+        today_volume: {
+          stake_total:        Number(todayRow.today_stake_total),
+          realised_pnl:       Number(todayRow.today_realised_pnl),
+          daily_loss_cap_abs: dailyLossCapAbs,
+          distance_to_cap:    distanceToDailyCap,
+        },
+        live_perf_since_cutover: livePerf,
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, "live-health failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// Pre-flip blocker #12: operator-only re-enable after auto-revert.
+// Requires --confirm-reason. Writes compliance_logs row tagged
+// 'live_manual_resume' with the operator-supplied reason.
+router.post("/admin/live-resume", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as { confirm_reason?: string };
+    const reason = (body.confirm_reason ?? "").trim();
+    if (!reason || reason.length < 10) {
+      res.status(400).json({
+        success: false,
+        message: "confirm_reason is required and must describe why re-enabling is safe (>=10 chars).",
+      });
+      return;
+    }
+    await db.execute(sql`
+      INSERT INTO agent_config(key, value, updated_at)
+      VALUES ('live_placement_enabled', 'true', NOW())
+      ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    `);
+    await db.execute(sql`
+      INSERT INTO agent_config(key, value, updated_at)
+      VALUES ('auto_disable_reason', '', NOW())
+      ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    `);
+    await db.execute(sql`
+      INSERT INTO compliance_logs (action_type, details, timestamp)
+      VALUES ('live_manual_resume', ${JSON.stringify({ reason })}::jsonb, NOW())
+    `);
+    const { invalidateLivePlacementFlagCache } = await import("../services/livePlacementGate");
+    invalidateLivePlacementFlagCache();
+    res.json({ success: true, message: "live_placement_enabled set to true.", reason });
+  } catch (err) {
+    logger.error({ err }, "live-resume failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Phase 3 B9 (2026-05-08): manual trigger for gateMonitor. Cron runs
 // daily 04:00 UTC; this lets us produce a gate_status row immediately
 // after deploy for blocker validation. Pre-evaluation_start_at this
