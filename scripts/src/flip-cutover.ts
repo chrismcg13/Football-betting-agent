@@ -2,28 +2,21 @@
 /**
  * Pre-flip blocker #14 — flip atomic transaction CLI.
  *
- * Two-step usage:
+ * Required: --real-balance.
+ * Optional (any/all): --max-stake-pct, --bankroll-floor-pct,
+ *                     --daily-loss-limit-pct, --weekly-loss-limit-pct.
+ * Omitted guardrails leave the existing agent_config rows untouched.
  *
- *   1. Preview (no-op):
- *        npm run flip-cutover -- \
- *          --real-balance=1234.56 \
- *          --max-stake-pct=0.02 \
- *          --bankroll-floor-pct=0.50 \
- *          --daily-loss-limit-pct=0.04 \
- *          --weekly-loss-limit-pct=0.10
- *      Prints what would happen, then refuses without --confirm.
+ *   Preview (no changes):
+ *     npm run flip-cutover -- --real-balance=250
  *
- *   2. Confirm and execute:
- *        npm run flip-cutover -- --confirm \
- *          --real-balance=1234.56 \
- *          --max-stake-pct=0.02 \
- *          --bankroll-floor-pct=0.50 \
- *          --daily-loss-limit-pct=0.04 \
- *          --weekly-loss-limit-pct=0.10
- *      Sends to POST /api/admin/cutover/flip. The endpoint runs the
- *      Amendment 2 atomic transaction — view, kill-switch flip,
- *      cutover_completed_at, four guardrail percentages, derived
- *      absolute bankroll_floor, paper baseline snapshot, compliance log.
+ *   Execute, leaving all loose limits as-is in agent_config:
+ *     npm run flip-cutover -- --confirm --real-balance=250
+ *
+ *   Execute and tighten guardrails at the same time:
+ *     npm run flip-cutover -- --confirm --real-balance=250 \
+ *       --max-stake-pct=0.02 --bankroll-floor-pct=0.50 \
+ *       --daily-loss-limit-pct=0.04 --weekly-loss-limit-pct=0.10
  *
  * Required env: API_URL (default http://localhost:8080).
  */
@@ -72,37 +65,38 @@ interface FlipResponse {
 
 (async () => {
   const a = parseArgs(process.argv.slice(2));
-  const missing: string[] = [];
-  if (a.realBalance        == null || !Number.isFinite(a.realBalance))        missing.push("--real-balance");
-  if (a.maxStakePct        == null || !Number.isFinite(a.maxStakePct))        missing.push("--max-stake-pct");
-  if (a.bankrollFloorPct   == null || !Number.isFinite(a.bankrollFloorPct))   missing.push("--bankroll-floor-pct");
-  if (a.dailyLossLimitPct  == null || !Number.isFinite(a.dailyLossLimitPct))  missing.push("--daily-loss-limit-pct");
-  if (a.weeklyLossLimitPct == null || !Number.isFinite(a.weeklyLossLimitPct)) missing.push("--weekly-loss-limit-pct");
-  if (missing.length > 0) {
-    console.error(`Missing required: ${missing.join(", ")}`);
+  if (a.realBalance == null || !Number.isFinite(a.realBalance) || a.realBalance <= 0) {
+    console.error("Missing required: --real-balance=<positive number>");
     process.exit(2);
   }
 
-  const absoluteFloor = Math.round((a.bankrollFloorPct! * a.realBalance!) * 100) / 100;
+  const fmtPct = (v: number | null) => v == null ? "(unchanged in agent_config)" : `${(v * 100).toFixed(2)}%`;
+  const fmtAbs = (v: number | null) => v == null ? "(unchanged)" : `£${v.toFixed(2)}`;
+
+  const absoluteFloor = a.bankrollFloorPct != null
+    ? Math.round((a.bankrollFloorPct * a.realBalance) * 100) / 100
+    : null;
+  const dailyAbs = a.dailyLossLimitPct  != null ? a.realBalance * a.dailyLossLimitPct  : null;
+  const weeklyAbs = a.weeklyLossLimitPct != null ? a.realBalance * a.weeklyLossLimitPct : null;
 
   console.log("================================================================");
   console.log("                      FLIP-CUTOVER PREVIEW");
   console.log("================================================================");
-  console.log(`real Betfair availableToBetBalance:  £${a.realBalance!.toFixed(2)}`);
-  console.log(`max_stake_pct:                       ${(a.maxStakePct! * 100).toFixed(2)}%`);
-  console.log(`bankroll_floor_pct:                  ${(a.bankrollFloorPct! * 100).toFixed(2)}%`);
-  console.log(`  → absolute bankroll_floor:         £${absoluteFloor.toFixed(2)}`);
-  console.log(`daily_loss_limit_pct:                ${(a.dailyLossLimitPct! * 100).toFixed(2)}%`);
-  console.log(`  → daily loss cap absolute:         £${(a.realBalance! * a.dailyLossLimitPct!).toFixed(2)}`);
-  console.log(`weekly_loss_limit_pct:               ${(a.weeklyLossLimitPct! * 100).toFixed(2)}%`);
-  console.log(`  → weekly loss cap absolute:        £${(a.realBalance! * a.weeklyLossLimitPct!).toFixed(2)}`);
+  console.log(`real Betfair availableToBetBalance:  £${a.realBalance.toFixed(2)}`);
+  console.log(`max_stake_pct:                       ${fmtPct(a.maxStakePct)}`);
+  console.log(`bankroll_floor_pct:                  ${fmtPct(a.bankrollFloorPct)}`);
+  console.log(`  → absolute bankroll_floor:         ${fmtAbs(absoluteFloor)}`);
+  console.log(`daily_loss_limit_pct:                ${fmtPct(a.dailyLossLimitPct)}`);
+  console.log(`  → daily loss cap absolute:         ${fmtAbs(dailyAbs)}`);
+  console.log(`weekly_loss_limit_pct:               ${fmtPct(a.weeklyLossLimitPct)}`);
+  console.log(`  → weekly loss cap absolute:        ${fmtAbs(weeklyAbs)}`);
   console.log("");
   console.log("Atomic transaction will:");
   console.log("  1. CREATE OR REPLACE VIEW live_bets_current");
   console.log("  2. SET live_placement_enabled='true'");
   console.log("  3. SET cutover_completed_at=NOW()");
-  console.log("  4. UPSERT four guardrail percentages + absolute bankroll_floor");
-  console.log("  5. INSERT bankroll_snapshots row (label='paper_baseline_pre_flip')");
+  console.log("  4. UPSERT only the guardrails you supplied (omitted ones stay untouched)");
+  console.log("  5. INSERT bankroll_snapshots row (source='paper_baseline_pre_flip')");
   console.log("  6. INSERT compliance_logs entry tagged 'cutover_completed'");
   console.log("");
 
@@ -112,17 +106,18 @@ interface FlipResponse {
   }
 
   console.log("Sending flip to API...");
+  const payload: Record<string, unknown> = {
+    confirm: true,
+    real_betfair_balance: a.realBalance,
+  };
+  if (a.maxStakePct        != null) payload.max_stake_pct        = a.maxStakePct;
+  if (a.bankrollFloorPct   != null) payload.bankroll_floor_pct   = a.bankrollFloorPct;
+  if (a.dailyLossLimitPct  != null) payload.daily_loss_limit_pct = a.dailyLossLimitPct;
+  if (a.weeklyLossLimitPct != null) payload.weekly_loss_limit_pct = a.weeklyLossLimitPct;
   const r = await fetch(`${API_URL}/api/admin/cutover/flip`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      confirm: true,
-      real_betfair_balance: a.realBalance,
-      max_stake_pct: a.maxStakePct,
-      bankroll_floor_pct: a.bankrollFloorPct,
-      daily_loss_limit_pct: a.dailyLossLimitPct,
-      weekly_loss_limit_pct: a.weeklyLossLimitPct,
-    }),
+    body: JSON.stringify(payload),
   });
   const body = (await r.json()) as FlipResponse;
   if (!body.success) {
@@ -134,7 +129,7 @@ interface FlipResponse {
   console.log("================================================================");
   console.log(`paper_baseline_snapshot_id:     ${body.result?.snapshot_id ?? "—"}`);
   console.log(`paper_baseline_bankroll:        ${body.result?.paper_baseline_bankroll != null ? "£" + body.result.paper_baseline_bankroll.toFixed(2) : "—"}`);
-  console.log(`absolute_bankroll_floor:        £${body.result?.absolute_bankroll_floor.toFixed(2)}`);
+  console.log(`absolute_bankroll_floor:        ${body.result?.absolute_bankroll_floor != null ? "£" + body.result.absolute_bankroll_floor.toFixed(2) : "(unchanged)"}`);
   console.log(`compliance_log_id:              ${body.result?.compliance_log_id ?? "—"}`);
   console.log("");
   console.log("Next: review with `npm run live-health`, then `npm run cutover -- --dry-run`.");

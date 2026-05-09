@@ -3366,6 +3366,9 @@ router.post("/admin/cutover/flip", async (req, res) => {
     const body = (req.body ?? {}) as {
       confirm?: boolean;
       real_betfair_balance?: number;
+      // All four guardrail params are optional. Operator-supplied values overwrite
+      // the existing agent_config rows; omitted values leave the existing rows
+      // untouched ("loose" pre-flip values stay in effect — operator decision).
       max_stake_pct?: number;
       bankroll_floor_pct?: number;
       daily_loss_limit_pct?: number;
@@ -3378,18 +3381,23 @@ router.post("/admin/cutover/flip", async (req, res) => {
     }
 
     const realB = Number(body.real_betfair_balance);
-    const maxStakePct = Number(body.max_stake_pct);
-    const floorPct = Number(body.bankroll_floor_pct);
-    const dailyLossPct = Number(body.daily_loss_limit_pct);
-    const weeklyLossPct = Number(body.weekly_loss_limit_pct);
-
     const fail = (msg: string) => { res.status(400).json({ success: false, message: msg }); };
 
     if (!Number.isFinite(realB) || realB <= 0) return fail("real_betfair_balance must be a positive finite number.");
-    if (!Number.isFinite(maxStakePct) || maxStakePct <= 0 || maxStakePct > 0.10) return fail("max_stake_pct must be in (0, 0.10].");
-    if (!Number.isFinite(floorPct)     || floorPct < 0     || floorPct > 1)        return fail("bankroll_floor_pct must be in [0, 1].");
-    if (!Number.isFinite(dailyLossPct) || dailyLossPct <= 0 || dailyLossPct > 0.20) return fail("daily_loss_limit_pct must be in (0, 0.20].");
-    if (!Number.isFinite(weeklyLossPct) || weeklyLossPct <= 0 || weeklyLossPct > 0.40) return fail("weekly_loss_limit_pct must be in (0, 0.40].");
+
+    // Validate only the params the operator chose to override.
+    const has = <T>(v: T | undefined): v is T => v !== undefined && v !== null;
+    const maxStakePct   = has(body.max_stake_pct)         ? Number(body.max_stake_pct)         : null;
+    const floorPct      = has(body.bankroll_floor_pct)    ? Number(body.bankroll_floor_pct)    : null;
+    const dailyLossPct  = has(body.daily_loss_limit_pct)  ? Number(body.daily_loss_limit_pct)  : null;
+    const weeklyLossPct = has(body.weekly_loss_limit_pct) ? Number(body.weekly_loss_limit_pct) : null;
+
+    if (maxStakePct   !== null && (!Number.isFinite(maxStakePct)   || maxStakePct   <= 0 || maxStakePct   > 0.10)) return fail("max_stake_pct must be in (0, 0.10].");
+    if (floorPct      !== null && (!Number.isFinite(floorPct)      || floorPct      < 0 || floorPct      > 1))     return fail("bankroll_floor_pct must be in [0, 1].");
+    // Loss-limit ceilings allow 1.0 ("essentially disabled") so operator can
+    // explicitly opt into wide-open limits when the existing config is loose.
+    if (dailyLossPct  !== null && (!Number.isFinite(dailyLossPct)  || dailyLossPct  <= 0 || dailyLossPct  > 1))    return fail("daily_loss_limit_pct must be in (0, 1].");
+    if (weeklyLossPct !== null && (!Number.isFinite(weeklyLossPct) || weeklyLossPct <= 0 || weeklyLossPct > 1))    return fail("weekly_loss_limit_pct must be in (0, 1].");
 
     const existingCutover = await db.execute(sql`SELECT value FROM agent_config WHERE key='cutover_completed_at' LIMIT 1`);
     const cutoverAt = (((existingCutover as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
@@ -3410,7 +3418,7 @@ router.post("/admin/cutover/flip", async (req, res) => {
       return;
     }
 
-    const absoluteFloor = Math.round(floorPct * realB * 100) / 100;
+    const absoluteFloor = floorPct !== null ? Math.round(floorPct * realB * 100) / 100 : null;
 
     const result = await db.transaction(async (tx) => {
       await tx.execute(sql`
@@ -3432,15 +3440,35 @@ router.post("/admin/cutover/flip", async (req, res) => {
         VALUES ('cutover_completed_at', NOW()::text, NOW())
         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
       `);
-      await tx.execute(sql`
-        INSERT INTO agent_config(key, value, updated_at) VALUES
-          ('max_stake_pct',          ${String(maxStakePct)},  NOW()),
-          ('bankroll_floor_pct',     ${String(floorPct)},     NOW()),
-          ('daily_loss_limit_pct',   ${String(dailyLossPct)}, NOW()),
-          ('weekly_loss_limit_pct',  ${String(weeklyLossPct)},NOW()),
-          ('bankroll_floor',         ${String(absoluteFloor)},NOW())
-        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-      `);
+      // Optional guardrail upserts — only writes the keys the operator
+      // explicitly supplied. Omitted ones leave the existing agent_config row
+      // untouched (so "loose" pre-flip values can be preserved by intent).
+      if (maxStakePct !== null) {
+        await tx.execute(sql`
+          INSERT INTO agent_config(key, value, updated_at) VALUES ('max_stake_pct', ${String(maxStakePct)}, NOW())
+          ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+        `);
+      }
+      if (floorPct !== null && absoluteFloor !== null) {
+        await tx.execute(sql`
+          INSERT INTO agent_config(key, value, updated_at) VALUES
+            ('bankroll_floor_pct', ${String(floorPct)}, NOW()),
+            ('bankroll_floor',     ${String(absoluteFloor)}, NOW())
+          ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+        `);
+      }
+      if (dailyLossPct !== null) {
+        await tx.execute(sql`
+          INSERT INTO agent_config(key, value, updated_at) VALUES ('daily_loss_limit_pct', ${String(dailyLossPct)}, NOW())
+          ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+        `);
+      }
+      if (weeklyLossPct !== null) {
+        await tx.execute(sql`
+          INSERT INTO agent_config(key, value, updated_at) VALUES ('weekly_loss_limit_pct', ${String(weeklyLossPct)}, NOW())
+          ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+        `);
+      }
 
       const snap = await tx.execute(sql`
         INSERT INTO bankroll_snapshots (paper_bankroll, real_bankroll, source, notes, taken_at)
@@ -3459,12 +3487,13 @@ router.post("/admin/cutover/flip", async (req, res) => {
             decision_authority: "operator",
             real_betfair_balance: realB,
             absolute_bankroll_floor: absoluteFloor,
-            guardrails: {
+            guardrails_supplied: {
               max_stake_pct: maxStakePct,
               bankroll_floor_pct: floorPct,
               daily_loss_limit_pct: dailyLossPct,
               weekly_loss_limit_pct: weeklyLossPct,
             },
+            note: "Omitted guardrails left agent_config rows untouched (operator-chosen).",
             paper_baseline_snapshot_id: snapRow?.id ?? null,
             paper_baseline_bankroll: snapRow?.paper_bankroll ?? null,
           })}::jsonb,
