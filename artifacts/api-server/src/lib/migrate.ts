@@ -2814,6 +2814,71 @@ export async function runMigrations() {
     `);
     logger.info("referee_card_rates view ready");
 
+    // ────────────────────────────────────────────────────────────────────
+    // Pre-flip blocker #3 (2026-05-09): post-cutover paper-bet hard block.
+    // Once agent_config.cutover_completed_at is set, no new row may be
+    // inserted with bet_track='paper'. Existing rows untouched (the trigger
+    // is INSERT-only); settlement UPDATEs unaffected. Belt-and-braces backstop
+    // to placePaperBet's branch change.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE OR REPLACE FUNCTION reject_paper_bet_after_cutover() RETURNS trigger AS $$
+      DECLARE
+        cutover_at TIMESTAMPTZ;
+      BEGIN
+        SELECT (value::timestamptz) INTO cutover_at
+        FROM agent_config WHERE key = 'cutover_completed_at' LIMIT 1;
+
+        IF cutover_at IS NOT NULL AND NEW.bet_track = 'paper' THEN
+          RAISE EXCEPTION 'paper bet emission disallowed after cutover at % (match_id=%, market_type=%)',
+            cutover_at, NEW.match_id, NEW.market_type;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await db.execute(sql`
+      DROP TRIGGER IF EXISTS paper_bets_no_paper_post_cutover ON paper_bets
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER paper_bets_no_paper_post_cutover
+      BEFORE INSERT ON paper_bets
+      FOR EACH ROW EXECUTE FUNCTION reject_paper_bet_after_cutover()
+    `);
+    logger.info("paper_bets_no_paper_post_cutover trigger ready");
+
+    // ────────────────────────────────────────────────────────────────────
+    // Pre-flip blocker #7 (2026-05-09): locked_reserve singleton + audit.
+    // Active bankroll for staking = Betfair availableToBetBalance − locked_reserve.
+    // Operator locks profits via npm run reserve -- lock; physical Betfair → bank
+    // withdrawals are detected via listAccountStatement and auto-reduce the lock.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS locked_reserve (
+        id              SERIAL PRIMARY KEY,
+        current_locked  NUMERIC(14,2) NOT NULL DEFAULT 0,
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      INSERT INTO locked_reserve (current_locked)
+      SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM locked_reserve)
+    `);
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS reserve_events (
+        id                       SERIAL PRIMARY KEY,
+        event_type               TEXT NOT NULL CHECK (event_type IN ('lock','unlock','withdrawal_recorded','reconcile_adjust')),
+        amount                   NUMERIC(14,2) NOT NULL,
+        prior_locked             NUMERIC(14,2) NOT NULL,
+        new_locked               NUMERIC(14,2) NOT NULL,
+        betfair_balance_at_event NUMERIC(14,2),
+        notes                    TEXT,
+        created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_by               TEXT NOT NULL DEFAULT 'operator'
+      )
+    `);
+    logger.info("locked_reserve + reserve_events tables ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
