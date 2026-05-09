@@ -2007,43 +2007,38 @@ export async function placePaperBet(
 
     const match = matchData[0];
 
-    // 2026-05-08 (Lever 4): live-placement gates run BEFORE qualifiesForTier1.
-    // If kill switch is off, or the (market_type, league) scope isn't in
-    // live_whitelist with active=true, this is paper-only regardless of how
-    // good the bet looks. Defence-in-depth: tier1 still has to pass after.
+    // Post-cutover (2026-05-09): paper-eligibility = live-eligibility. The
+    // scope whitelist and qualifiesForTier1 post-filter are removed; only
+    // the live_placement_enabled kill switch remains. If a bet is good
+    // enough to be a paper bet, it's good enough to be a live bet.
     const liveGates = await checkLivePlacementGates({
       marketType,
       league: match?.league ?? "",
       betId: bet.id,
     });
 
-    const tier1Check = liveGates.allowed
-      ? await qualifiesForTier1({
-          opportunityScore: score,
-          dataTier,
-          marketType,
-          league: match?.league ?? "",
-          country: match?.country ?? "",
-          pinnacleOdds: pinnacleOdds ?? null,
-          pinnacleImplied: pinnacleImplied ?? null,
-          modelProbability,
-          backOdds,
-        })
-      : ({ qualifies: false, reason: liveGates.reason } satisfies Tier1CheckResult);
-
-    const liveTier = tier1Check.qualifies ? "tier1" : "tier2";
-    let qualificationPath: string = tier1Check.qualifies ? (tier1Check.path ?? "1B") : "paper";
-    // If this is an opportunity-boosted bet that passed the Tier 1B pre-check
-    // in the production quarantine, tag it as 1B_boosted (overrides "1B").
-    if (boostedTier1BApproved && tier1Check.qualifies) {
-      qualificationPath = "1B_boosted";
+    // Fail-loud guard (Amendment 1). live_whitelist is deprecated; the
+    // override field MUST be null. If a future change re-activates whitelist
+    // writes, this assertion fires before any unexpected stake scaling
+    // reaches Betfair.
+    if (liveGates.kellyFractionOverride !== null) {
+      throw new Error(
+        "kelly_fraction_override unexpectedly non-null after cutover. " +
+        "live_whitelist should be deprecated; investigate and remove the " +
+        "write path before re-enabling live placement."
+      );
     }
+
+    const liveTier = liveGates.allowed ? "tier1" : "tier2";
+    const qualificationPath: string = liveGates.allowed
+      ? (boostedTier1BApproved ? "1B_boosted" : "live_eligible")
+      : "paper";
     await db.update(paperBetsTable).set({ liveTier, qualificationPath }).where(eq(paperBetsTable.id, bet.id));
 
-    if (tier1Check.qualifies) {
+    if (liveGates.allowed) {
       logger.info(
-        { betId: bet.id, liveTier, path: tier1Check.path, reason: tier1Check.reason },
-        "TIER 1: Bet qualifies for live placement",
+        { betId: bet.id, reason: liveGates.reason },
+        "Live placement: gate passed (kill switch on) — proceeding",
       );
 
       await db.update(paperBetsTable)
@@ -2060,34 +2055,11 @@ export async function placePaperBet(
             .set({ status: "pending" })
             .where(eq(paperBetsTable.id, bet.id));
         } else if (match?.betfairEventId) {
-          // Phase 3 §1.7 / §11.7 (2026-05-08): apply live_whitelist
-          // kelly_fraction_override per scope. New graduations sit at 0.5 so
-          // first 50 (Path P) / 100 (Path S) live bets size at half Kelly;
-          // halfKellyRamp cron ratchets to 1.0 once rolling-N net ROI > 0.
-          // Pre-flip / non-whitelisted scopes never reach this branch
-          // (checkLivePlacementGates blocks them upstream), so this is a
-          // pure multiplier on already-allowed live bets.
-          let liveStake = stake;
-          if (
-            liveGates.kellyFractionOverride != null &&
-            liveGates.kellyFractionOverride < 1.0 &&
-            liveGates.kellyFractionOverride > 0
-          ) {
-            const preMultStake = liveStake;
-            liveStake = Math.round(preMultStake * liveGates.kellyFractionOverride * 100) / 100;
-            const newPotentialProfit = Math.round(liveStake * (backOdds - 1) * 100) / 100;
-            await db.update(paperBetsTable)
-              .set({ stake: String(liveStake), potentialProfit: String(newPotentialProfit) })
-              .where(eq(paperBetsTable.id, bet.id));
-            logger.info(
-              {
-                betId: bet.id, marketType, league: match.league,
-                preMultStake, liveStake, kellyFractionOverride: liveGates.kellyFractionOverride,
-                path: liveGates.path,
-              },
-              "Live placement: live_whitelist kelly_fraction_override applied",
-            );
-          }
+          // Post-cutover (2026-05-09): live_whitelist deprecated; no override
+          // scaling. The assertion at the top of the live-placement block
+          // guarantees liveGates.kellyFractionOverride is null. Stake comes
+          // straight from the upstream Kelly calc.
+          const liveStake = stake;
           const liveResult = await placeLiveBetOnBetfair({
             internalBetId: bet.id,
             betfairEventId: match.betfairEventId,
