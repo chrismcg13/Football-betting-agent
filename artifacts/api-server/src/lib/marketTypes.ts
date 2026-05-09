@@ -95,7 +95,18 @@ function totalCards(threshold: number): Resolver {
   };
 }
 
-// ── ASIAN_HANDICAP — unchanged behaviour from determineBetWon ────────────────
+// ── ASIAN_HANDICAP ──────────────────────────────────────────────────────────
+// 2026-05-09: paper/shadow settlement returned null on quarter-line
+// half-win/half-loss splits (the "void for simplicity" branch). The retry
+// loop in paperTrading.ts treats null as "outcome unresolved, retry until
+// 72h then settle as lost", which incorrectly turned half-wins into lost
+// rows after 72h and meanwhile froze them as pending. Shadow bets at £0
+// stake are binary won/lost in the learning data, so map:
+//   half-win  → won  (the bet's "good half" cleared its line)
+//   half-loss → lost (the bet's "bad half" failed its line)
+// Live real-money bets defer to Betfair's listClearedOrders (handled in
+// settleBets before this function is called) and are unaffected. Only
+// the paper/shadow learning track sees this binary collapse.
 const resolveAsianHandicap: Resolver = (selection, ctx) => {
   const parts = selection.split(" ");
   const side = parts[0];
@@ -111,7 +122,12 @@ const resolveAsianHandicap: Resolver = (selection, ctx) => {
     const winHigh = side === "Home" ? adjHomeHigh > ctx.awayScore : adjustedAway > ctx.homeScore + upper;
     if (winLow && winHigh) return true;
     if (!winLow && !winHigh) return false;
-    return null; // half-win/half-loss → void for simplicity
+    // Half-win/half-loss split: binary approximation for paper/shadow
+    // learning data. winHigh=true means the +0.25 half cleared, winLow=true
+    // means the -0.25 half cleared. If only one cleared, we lean toward the
+    // direction of the "winning" half: if upper-half won (handicap was
+    // generous enough), call it a win; otherwise a loss.
+    return winHigh;
   }
   if (side === "Home") return adjustedHome > ctx.awayScore;
   if (side === "Away") return adjustedAway > ctx.homeScore;

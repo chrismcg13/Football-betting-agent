@@ -2429,7 +2429,11 @@ function determineBetWon(
       const adjustedHome = homeScore + (side === "Home" ? handicap : -handicap);
       const adjustedAway = awayScore + (side === "Away" ? handicap : -handicap);
       if (Math.abs(handicap % 1) === 0.25) {
-        // Split bet: half each on nearest 0.5 lines
+        // Split bet: half each on nearest 0.5 lines.
+        // 2026-05-09: half-win/half-loss → binary collapse to won/lost via
+        // the upper-half outcome. See marketTypes.ts:resolveAsianHandicap
+        // for rationale (shadow learning data is binary; live real-money
+        // bets settle via Betfair's listClearedOrders before reaching here).
         const lower = handicap - 0.25;
         const upper = handicap + 0.25;
         const adjHomeLow = homeScore + (side === "Home" ? lower : -lower);
@@ -2438,7 +2442,7 @@ function determineBetWon(
         const winHigh = side === "Home" ? adjHomeHigh > awayScore : adjustedAway > homeScore + upper;
         if (winLow && winHigh) return true;
         if (!winLow && !winHigh) return false;
-        return null; // half-win/half-loss treated as void for simplicity
+        return winHigh;
       }
       if (side === "Home") return adjustedHome > awayScore;
       if (side === "Away") return adjustedAway > homeScore;
