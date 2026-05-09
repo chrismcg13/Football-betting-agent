@@ -1667,7 +1667,8 @@ export async function placeLiveBetOnBetfair(params: {
     return { success: false, error: msg };
   }
 
-  const customerRef = `BAO-${internalBetId}-${Date.now()}`;
+  // Idempotent on retry — Betfair rejects DUPLICATE_TRANSACTION; do NOT add a timestamp.
+  const customerRef = `BAO-${internalBetId}`;
 
   try {
     const result = await placeOrders(
