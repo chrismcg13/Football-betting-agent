@@ -3355,6 +3355,22 @@ router.post("/admin/reserve/event", async (req, res) => {
   }
 });
 
+// Pre-flip blocker #11: cutover orchestrator endpoint.
+// POST /admin/cutover/run with { dryRun: boolean }. Returns the structured
+// CutoverReport. Run dryRun=true first; review; then dryRun=false to commit.
+router.post("/admin/cutover/run", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as { dryRun?: boolean };
+    const dryRun = body.dryRun !== false; // default to dry-run for safety
+    const { runCutoverConversion } = await import("../services/paperToLiveCutover");
+    const report = await runCutoverConversion({ dryRun });
+    res.json({ success: true, result: report });
+  } catch (err) {
+    logger.error({ err }, "cutover/run failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Pre-flip blocker #12: live-health snapshot. Surfaces kill-switch
 // state, recent placement errors, drift, paper-emission rate trend, and
 // distance to daily-loss cap (volume-shock awareness item).

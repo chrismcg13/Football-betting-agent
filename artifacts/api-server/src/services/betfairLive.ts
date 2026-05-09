@@ -1395,7 +1395,7 @@ export async function findEventIdByTeamNames(
   }
 }
 
-async function findMarketForBet(
+export async function findMarketForBet(
   betfairEventId: string,
   internalMarketType: string,
   homeTeam?: string,

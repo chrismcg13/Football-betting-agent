@@ -9,6 +9,7 @@
     "reserve": "tsx ./src/reserve.ts",
     "live-health": "tsx ./src/live-health.ts",
     "live-resume": "tsx ./src/live-resume.ts",
+    "cutover": "tsx ./src/cutover.ts",
     "lint:no-raw-array-bind": "tsx ./src/lint-no-raw-array-bind.ts",
     "query-budget-test": "tsx ./src/query-budget-test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
