@@ -1,5 +1,5 @@
 import { db, alertsTable } from "@workspace/db";
-import { eq, and, gte, desc, sql, count, isNull } from "drizzle-orm";
+import { eq, and, gte, desc, sql, count, isNull, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 export type AlertSeverity = "critical" | "warning" | "info";
@@ -127,10 +127,14 @@ export async function acknowledgeAlert(id: number): Promise<boolean> {
 
 export async function acknowledgeAlerts(ids: number[]): Promise<number> {
   if (ids.length === 0) return 0;
+  // 2026-05-09 (Bundle 5): switched from raw `${col} = ANY(${arr})` to native
+  // inArray() — same anti-pattern as oddsPapi.ts:resolveTier2Anchor (Bundle 4)
+  // and migrate.ts dbHelpers.ts comment block. Drizzle's inArray special-cases
+  // arrays into a parameterised `IN (...)` instead of a record-tuple ANY.
   const result = await db
     .update(alertsTable)
     .set({ acknowledged: true, acknowledgedAt: new Date() })
-    .where(sql`${alertsTable.id} = ANY(${ids})`);
+    .where(inArray(alertsTable.id, ids));
   return result.rowCount ?? 0;
 }
 

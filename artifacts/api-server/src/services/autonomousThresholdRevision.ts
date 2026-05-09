@@ -36,7 +36,7 @@
  */
 
 import { db, agentConfigTable, modelDecisionAuditLogTable } from "@workspace/db";
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 async function readEnabledFlag(key: string): Promise<boolean> {
@@ -80,12 +80,18 @@ export async function lookupScopedThreshold(
   candidates.push({ type: "global" });
 
   const keys = candidates.map((s) => scopeKey(base, s));
-  const rows = await db.execute(sql`
-    SELECT key, value FROM agent_config
-    WHERE key = ANY(${keys})
-  `);
+  // 2026-05-09 (Bundle 5): switched from raw `WHERE key = ANY(${keys})`
+  // (which Drizzle interpolates as a record tuple, same anti-pattern as
+  // Bundle 4's oddsPapi.ts:resolveTier2Anchor fix) to query-builder
+  // inArray(). lookupScopedThreshold isn't currently called from any active
+  // path but is exported, so fixing preventatively before the bug bites
+  // a future caller.
+  const rows = await db
+    .select({ key: agentConfigTable.key, value: agentConfigTable.value })
+    .from(agentConfigTable)
+    .where(inArray(agentConfigTable.key, keys));
   const lookup = new Map<string, string>();
-  for (const r of (rows as any).rows ?? []) lookup.set(r.key, r.value);
+  for (const r of rows) lookup.set(r.key, r.value);
 
   for (const k of keys) {
     const v = lookup.get(k);
