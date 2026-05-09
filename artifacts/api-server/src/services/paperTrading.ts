@@ -892,6 +892,30 @@ export async function placePaperBet(
   let isShadowBet = placementTrack === "shadow" || universeTier === "B" || universeTier === "C";
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;
+
+  // Post-cutover (2026-05-09): the §3 trigger blocks any INSERT with
+  // bet_track='paper' once agent_config.cutover_completed_at is set. Production-
+  // track candidates (isShadowBet=false) must therefore route to bet_track='live'
+  // when the kill switch is on, or to bet_track='shadow' when it's off (degraded
+  // mode — record the signal without committing real money). Without this branch,
+  // every Tier A production candidate that passed upstream gates would trip the
+  // trigger and the cycle would lose the signal silently.
+  const cutoverCompletedAtRaw = await getConfigValue("cutover_completed_at");
+  const postCutover = !!cutoverCompletedAtRaw && cutoverCompletedAtRaw.trim() !== "";
+  if (postCutover && !isShadowBet) {
+    const { isLivePlacementEnabled } = await import("./livePlacementGate");
+    const killSwitchOn = isLiveMode() && (await isLivePlacementEnabled());
+    if (!killSwitchOn) {
+      await logShadowGateExemption(
+        "post_cutover_kill_switch_off",
+        experimentTag ?? null,
+        `Post-cutover degraded mode: kill switch off (live_placement_enabled=false or TRADING_MODE!=LIVE) — demoting production-track signal to shadow`,
+        null,
+        universeTier,
+      );
+      isShadowBet = true;
+    }
+  }
   // Mutable: boosted bets that pre-qualify for Tier 1B get tagged "1B_boosted"
   // and bypass the production quarantine.
   let boostedTier1BApproved = false;
@@ -1899,12 +1923,13 @@ export async function placePaperBet(
         clvSource: null,
         // Phase 3 B6 (2026-05-08): denormalised bet-track at placement.
         // 'paper' = real-stake paper-mode bet (stake>0, no betfair_bet_id).
-        // 'shadow' = £0 stake with shadow_stake notional Kelly (Tier B/C).
-        // 'live' is set elsewhere when placeLiveBetOnBetfair fires (post-flip).
+        // 'shadow' = £0 stake with shadow_stake notional Kelly.
+        // 'live' = real-stake bet emitted post-cutover (§3 trigger forbids
+        // 'paper' inserts once cutover_completed_at is set).
         betTrack:
           shadowStake != null && shadowStake > 0
             ? "shadow"
-            : "paper",
+            : (postCutover ? "live" : "paper"),
       })
       .returning();
 
