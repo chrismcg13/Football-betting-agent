@@ -21,7 +21,7 @@
  *   WHERE id = <id>;
  */
 
-import { db } from "@workspace/db";
+import { db, complianceLogsTable } from "@workspace/db";
 import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
@@ -228,5 +228,145 @@ export async function runDataQualityMonitor(): Promise<DataQualityResult> {
   }
 
   logger.info(result, "data_quality_monitor evaluated");
+  return result;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2026-05-09 (Bundle 6): unban-gate auto-detector.
+//
+// Plan v3 §3D Bundle 2 deferred OU_25/OU_35/FIRST_HALF_RESULT unban behind a
+// metric: oddspapi_pinnacle distinct_matches/24h ≥ 200 sustained 3 consecutive
+// days. The 2026-04-20 quarantine of those markets cited a "pricing-pipeline
+// fix" — the actual fix was the Phase 2.A prefetch regression remediation
+// (Option A KO_BUCKETS rebalance shipped 2026-05-08; Option D allowlist
+// shipped 2026-05-09 earlier today). When prefetch coverage normalises, the
+// quarantine reason is gone.
+//
+// This monitor doesn't ship the unban itself (operator-gated by design — see
+// "money guardrails" durable policy). It writes a compliance_logs row when
+// the gate clears so the operator knows to ship the one-line BANNED_MARKETS
+// edit. Idempotent: only one row per (gate_id) within a 7-day window.
+//
+// Daily cron in scheduler.ts:0 2 * * * runs alongside runDataQualityMonitor().
+//
+// Operator query to find pending unban actions:
+//   SELECT details FROM compliance_logs
+//   WHERE action_type = 'gate_metric_cleared' AND timestamp > NOW() - INTERVAL '7 days';
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface GateMetricCheck {
+  gate_id: string;                 // unique stable id for this gate
+  description: string;             // human-readable
+  metric_query: string;            // SQL returning rows of (day::date, value::numeric) for last N days
+  required_days: number;           // consecutive days required
+  required_value: number;          // value threshold per day
+  ship_action: string;             // human-readable next-step instruction
+}
+
+const GATE_METRIC_CHECKS: GateMetricCheck[] = [
+  {
+    gate_id: "ou_quarantine_unban_gate",
+    description: "OU_25 / OU_35 / FIRST_HALF_RESULT unban gate (Plan v3 Bundle 2 ride-along)",
+    metric_query: `
+      -- Last 3 complete UTC days only. Excludes today (partial day) and
+      -- cuts off at exactly 3 days ago so we always count whole-day buckets.
+      SELECT day::date AS day, distinct_matches::numeric AS value
+      FROM (
+        SELECT date_trunc('day', snapshot_time)::date AS day,
+               COUNT(DISTINCT match_id) AS distinct_matches
+        FROM odds_snapshots
+        WHERE source = 'oddspapi_pinnacle'
+          AND snapshot_time >= date_trunc('day', NOW() - INTERVAL '3 days')
+          AND snapshot_time < date_trunc('day', NOW())
+        GROUP BY 1
+      ) d
+      ORDER BY day DESC
+      LIMIT 3
+    `,
+    required_days: 3,
+    required_value: 200,
+    ship_action:
+      "Remove OVER_UNDER_25, OVER_UNDER_35, FIRST_HALF_RESULT from BANNED_MARKETS in paperTrading.ts:554-573",
+  },
+];
+
+export interface UnbanGateResult {
+  evaluatedAt: string;
+  gatesChecked: number;
+  gatesCleared: number;
+  details: Array<{
+    gate_id: string;
+    days_meeting_threshold: number;
+    required_days: number;
+    daily_values: Array<{ day: string; value: number }>;
+    cleared: boolean;
+    notification_emitted: boolean;
+  }>;
+}
+
+export async function runUnbanGateMonitor(): Promise<UnbanGateResult> {
+  const result: UnbanGateResult = {
+    evaluatedAt: new Date().toISOString(),
+    gatesChecked: GATE_METRIC_CHECKS.length,
+    gatesCleared: 0,
+    details: [],
+  };
+
+  for (const check of GATE_METRIC_CHECKS) {
+    try {
+      const rows = await db.execute(sql.raw(check.metric_query));
+      const daily = (((rows as any).rows ?? []) as Array<{ day: string; value: number | string }>)
+        .map((r) => ({ day: String(r.day), value: Number(r.value) }));
+      const meeting = daily.filter((d) => d.value >= check.required_value);
+      const cleared = daily.length >= check.required_days && meeting.length >= check.required_days;
+
+      // Idempotency: don't re-emit if a notification was emitted in the last 7 days
+      let notificationEmitted = false;
+      if (cleared) {
+        const recent = await db.execute(sql`
+          SELECT 1 FROM compliance_logs
+          WHERE action_type = 'gate_metric_cleared'
+            AND details->>'gate_id' = ${check.gate_id}
+            AND timestamp > NOW() - INTERVAL '7 days'
+          LIMIT 1
+        `);
+        const alreadyNotified = (((recent as any).rows ?? []) as unknown[]).length > 0;
+
+        if (!alreadyNotified) {
+          await db.insert(complianceLogsTable).values({
+            actionType: "gate_metric_cleared",
+            details: {
+              gate_id: check.gate_id,
+              description: check.description,
+              required_days: check.required_days,
+              required_value: check.required_value,
+              daily_values: daily,
+              ship_action: check.ship_action,
+            },
+            timestamp: new Date(),
+          });
+          notificationEmitted = true;
+          logger.warn(
+            { gate_id: check.gate_id, daily, ship_action: check.ship_action },
+            "Gate metric cleared — operator action required",
+          );
+        }
+        result.gatesCleared++;
+      }
+
+      result.details.push({
+        gate_id: check.gate_id,
+        days_meeting_threshold: meeting.length,
+        required_days: check.required_days,
+        daily_values: daily,
+        cleared,
+        notification_emitted: notificationEmitted,
+      });
+    } catch (err) {
+      logger.error({ err, gate_id: check.gate_id }, "Unban gate check failed");
+    }
+  }
+
+  logger.info(result, "unban_gate_monitor evaluated");
   return result;
 }

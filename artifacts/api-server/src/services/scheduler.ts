@@ -2169,9 +2169,17 @@ export function startSettlementCron(): void {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {
       try {
-        const { runDataQualityMonitor } = await import("./dataQualityMonitor");
-        const r = await runDataQualityMonitor();
-        logger.info(r, "Data quality monitor complete");
+        // 2026-05-09 (Bundle 6): unban-gate auto-detector runs alongside the
+        // existing low-coverage alerting. Detects when oddspapi_pinnacle
+        // distinct_matches/24h ≥ 200 sustained 3 days clears (currently the
+        // gate condition for OU_25/OU_35/FIRST_HALF_RESULT unban). Writes a
+        // compliance_logs row when the gate clears so operator knows to ship
+        // the BANNED_MARKETS one-line edit. Idempotent (one row per 7d window).
+        const { runDataQualityMonitor, runUnbanGateMonitor } = await import("./dataQualityMonitor");
+        const dq = await runDataQualityMonitor();
+        logger.info(dq, "Data quality monitor complete");
+        const ug = await runUnbanGateMonitor();
+        logger.info(ug, "Unban gate monitor complete");
       } catch (err) {
         logger.error({ err }, "Data quality monitor failed");
       }
