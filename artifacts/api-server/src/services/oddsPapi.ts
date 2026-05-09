@@ -2438,7 +2438,13 @@ export async function prefetchAndStoreOddsPapiOdds(
   earliestKickoff: Date,
   latestKickoff: Date,
   maxFetches = 4,
+  matchIdAllowlist?: ReadonlySet<number>,
 ): Promise<OddsPapiValidationCache> {
+  // matchIdAllowlist: when present, restrict the fetch to only those match
+  // IDs (skips the league-coverage ranking which biases toward known-good
+  // leagues). Used by runDailyDiscoverySweep to actually target anchorless
+  // long-tail matches rather than re-pulling fixtures that already have
+  // recent oddspapi_pinnacle snapshots.
   const cache: OddsPapiValidationCache = new Map();
 
   const key = process.env.ODDSPAPI_KEY;
@@ -2505,12 +2511,23 @@ export async function prefetchAndStoreOddsPapiOdds(
 
   const mappedRows = allRows
     .filter((r) => {
+      // Allowlist mode (discovery sweep): only fetch matches the caller
+      // explicitly identified. Bypasses league-coverage filtering so genuinely
+      // anchorless fixtures in unknown-coverage leagues actually get pulled.
+      if (matchIdAllowlist) return matchIdAllowlist.has(r.matchId);
       const cov = coverageMap.get(r.league ?? "");
       if (!cov) return true;
       if (cov.hasOdds === 1) return true;
       return cov.lastChecked < sevenDaysAgo;
     })
     .sort((a, b) => {
+      // Allowlist mode: rank by kickoff proximity only — fixtures entering
+      // the trading window soonest get pulled first within the budget.
+      if (matchIdAllowlist) {
+        const ta = a.kickoffTime?.getTime() ?? Infinity;
+        const tb = b.kickoffTime?.getTime() ?? Infinity;
+        return ta - tb;
+      }
       const aKnown = covGoodSet.has(a.league ?? "") || pinnacleLeagues.has(a.league ?? "") ? 1 : 0;
       const bKnown = covGoodSet.has(b.league ?? "") || pinnacleLeagues.has(b.league ?? "") ? 1 : 0;
       if (aKnown !== bKnown) return bKnown - aKnown;
@@ -3006,11 +3023,15 @@ export async function runDailyDiscoverySweep(): Promise<{
     return { candidatesFound: 0, pulled: 0, budgetUsed: 0, budgetRemaining: totalRemaining };
   }
 
-  // Group by kickoff window for the prefetch primitive
+  // Pass the candidate match IDs through as an allowlist so the prefetch
+  // primitive targets exactly the anchorless matches rather than ranking
+  // by league-known-good (which biases toward fixtures that already have
+  // coverage and undermines the long-tail intent of the sweep).
   const earliest = new Date(candidateRows[0]!.kickoff);
   const latest = new Date(candidateRows[candidateRows.length - 1]!.kickoff);
+  const allowlist = new Set(candidateRows.map((r) => r.id));
 
-  const result = await prefetchAndStoreOddsPapiOdds(earliest, latest, candidateRows.length);
+  const result = await prefetchAndStoreOddsPapiOdds(earliest, latest, candidateRows.length, allowlist);
   const pulled = result.size;
 
   logger.info(
