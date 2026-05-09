@@ -13,6 +13,33 @@ import { verifyDbHostForEnvironment, verifyTradingModeForEnvironment } from "./l
 const ENVIRONMENT = process.env["ENVIRONMENT"] ?? "development";
 const ALLOW_DEV_ON_PROD = process.env["ALLOW_DEV_ON_PROD"] === "true";
 
+// 2026-05-09 C1: worker role split. WORKER_ROLE=data runs only the heavy
+// data-pipeline crons (ingestion, exchange_book_sweep) in a separate PM2
+// process so they cannot OOM the trading/HTTP path. Default 'all' keeps
+// pre-split single-process behaviour for tests / non-PM2 launches.
+const WORKER_ROLE = (process.env["WORKER_ROLE"] ?? "all").toLowerCase();
+if (!["all", "api", "data"].includes(WORKER_ROLE)) {
+  console.warn(`WARN: Unknown WORKER_ROLE='${WORKER_ROLE}' — defaulting to 'all'`);
+}
+const IS_DATA_WORKER = WORKER_ROLE === "data";
+
+// 2026-05-09 C2: fail-closed crash handlers. Without these, an unhandled
+// promise rejection deep in an async chain leaves in-process locks
+// (tradingCycleRunning, ingestion lock, etc.) held forever and every
+// subsequent cron tick silently skips. Default Node behaviour for
+// unhandledRejection is to warn and continue; uncaughtException kills the
+// process. We treat both as fatal so PM2 restarts on a clean heap.
+process.on("uncaughtException", (err) => {
+  // Use console because logger may itself be the source of the throw.
+  console.error("FATAL: uncaughtException — exiting so PM2 restarts on a clean heap", err);
+  // Best-effort flush; do not await indefinitely.
+  setTimeout(() => process.exit(1), 500).unref();
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("FATAL: unhandledRejection — exiting so PM2 restarts on a clean heap", reason);
+  setTimeout(() => process.exit(1), 500).unref();
+});
+
 if (process.env["DATABASE_URL"]) {
   const result = verifyDbHostForEnvironment(ENVIRONMENT, process.env["DATABASE_URL"], ALLOW_DEV_ON_PROD);
   if (result.fatal) {
@@ -305,32 +332,50 @@ async function main() {
   if (shouldRunEngine && !liveHealthPassed) {
     logger.error("LIVE health checks failed — schedulers and trading engine DISABLED. Server will only serve API.");
   } else if (shouldRunEngine) {
-    startSettlementCron();
-    logger.info("Settlement cron started (every 5 min)");
-
-    startScheduler();
-    logger.info("Autonomous scheduler started");
-
-    modelLoaded = await loadLatestModel();
-    if (!modelLoaded) {
-      logger.info("No existing model found — triggering bootstrap training in background");
-      void bootstrapModels().catch((err) =>
-        logger.error({ err }, "Background bootstrap training failed"),
-      );
+    // 2026-05-09 C1: settlement / monitors / model are api-side concerns.
+    // On the data worker we only want ingestion + exchange_book_sweep
+    // crons (registered inside startScheduler when WORKER_ROLE=data),
+    // nothing else. Saves ~200 MB heap (model + reconciliation buffers)
+    // and stops the data worker burning compute on tasks owned by api.
+    if (!IS_DATA_WORKER) {
+      startSettlementCron();
+      logger.info("Settlement cron started (every 5 min)");
     }
 
-    void bootstrapDataIfEmpty();
+    startScheduler();
+    logger.info({ role: WORKER_ROLE }, "Autonomous scheduler started");
 
-    void recalculateAllDataRichness().catch((err) =>
-      logger.warn({ err }, "Startup data richness calculation failed — will run on next Sunday cron"),
-    );
+    if (!IS_DATA_WORKER) {
+      modelLoaded = await loadLatestModel();
+      if (!modelLoaded) {
+        logger.info("No existing model found — triggering bootstrap training in background");
+        void bootstrapModels().catch((err) =>
+          logger.error({ err }, "Background bootstrap training failed"),
+        );
+      }
+    }
+
+    // bootstrapDataIfEmpty triggers runIngestionNow when the DB is empty —
+    // legitimate on the data worker, redundant on api (the data worker
+    // would do the same on its own startup). Run it ONLY on data/all to
+    // avoid duplicate ingestion when both workers start near-simultaneously.
+    if (IS_DATA_WORKER || WORKER_ROLE === "all") {
+      void bootstrapDataIfEmpty();
+    }
+
+    if (!IS_DATA_WORKER) {
+      void recalculateAllDataRichness().catch((err) =>
+        logger.warn({ err }, "Startup data richness calculation failed — will run on next Sunday cron"),
+      );
+    }
   } else {
     logger.info("PRODUCTION MODE (PAPER) — schedulers, settlement, ML training, and data ingestion DISABLED");
     logger.info("Production serves dashboard API only. Data arrives via syncDevToProd pipeline.");
   }
 
-  // 5b. Startup reconciliation — check for bets stuck in PENDING_PLACEMENT from a crash
-  if (shouldRunEngine) {
+  // 5b. Startup reconciliation — check for bets stuck in PENDING_PLACEMENT from a crash.
+  // 2026-05-09 C1: paperTrading is api-side only; skip on data worker.
+  if (shouldRunEngine && !IS_DATA_WORKER) {
     try {
       const { reconcileStalePlacements } = await import("./services/paperTrading");
       const reconResult = await reconcileStalePlacements();
@@ -371,11 +416,21 @@ async function main() {
     startedAt: new Date().toISOString(),
   });
 
-  // 7. Start the HTTP server
+  // 7. Start the HTTP server — but only on api/all roles. The data worker
+  // runs headless to avoid port conflicts with api-server on the same box.
+  if (IS_DATA_WORKER) {
+    logger.info(
+      { role: WORKER_ROLE, dbConnected: dbOk, betfairConfigured: betfairOk },
+      "=== BET_AGENT_OS data-worker ready (headless — no HTTP listener) ===",
+    );
+    return;
+  }
+
   app.listen(port, () => {
     logger.info(
       {
         port,
+        role: WORKER_ROLE,
         environment: ENVIRONMENT,
         dbConnected: dbOk,
         betfairConfigured: betfairOk,
@@ -388,15 +443,37 @@ async function main() {
     // 8. Self-ping keepalive — prevents idle shutdown by calling the health
     //    endpoint every 5 minutes. Must start inside the listen callback so
     //    the server is guaranteed to be accepting connections first.
+    // 2026-05-09 C2: track consecutive failures. If two pings in a row fail,
+    // the process is wedged (event loop blocked, pool exhausted, etc.) and
+    // PM2 should restart it on a clean heap. Single failure could be a
+    // long-running query; only act on the second one.
     const KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
     const keepaliveUrl = `http://localhost:${port}/api/health`;
+    let consecutiveFailures = 0;
     setInterval(() => {
-      fetch(keepaliveUrl)
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30_000);
+      fetch(keepaliveUrl, { signal: controller.signal })
         .then((r) => {
-          if (!r.ok) logger.warn({ status: r.status }, "Keepalive ping returned non-OK");
+          clearTimeout(timeout);
+          if (!r.ok) {
+            consecutiveFailures++;
+            logger.warn({ status: r.status, consecutiveFailures }, "Keepalive ping returned non-OK");
+          } else {
+            consecutiveFailures = 0;
+          }
         })
         .catch((err) => {
-          logger.warn({ err }, "Keepalive ping failed — server may be under load");
+          clearTimeout(timeout);
+          consecutiveFailures++;
+          logger.warn({ err, consecutiveFailures }, "Keepalive ping failed — server may be under load");
+          if (consecutiveFailures >= 2) {
+            logger.error(
+              { consecutiveFailures },
+              "FATAL: keepalive ping failed twice in a row — exiting so PM2 restarts on a clean heap",
+            );
+            setTimeout(() => process.exit(1), 500).unref();
+          }
         });
     }, KEEPALIVE_INTERVAL_MS);
     logger.info({ intervalMs: KEEPALIVE_INTERVAL_MS }, "Keepalive ping active — GET /api/health every 5 min");

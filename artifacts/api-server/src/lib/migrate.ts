@@ -2656,6 +2656,31 @@ export async function runMigrations() {
       ) AND timestamp < '2026-04-18'::timestamptz
     `);
 
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-09: trading-cycle DISTINCT ON hot-path index. The query
+    //   SELECT DISTINCT ON (match_id, market_type, selection_name, source) ...
+    //   FROM odds_snapshots
+    //   WHERE match_id IN (...) AND snapshot_time >= ...
+    //   ORDER BY match_id, market_type, selection_name, source, snapshot_time DESC
+    // (valueDetection.ts:1283) was running 25–30s+ on the 15M-row table
+    // because the closest existing index, (match_id, snapshot_time DESC),
+    // doesn't satisfy the DISTINCT ON ordering. Postgres falls back to a
+    // huge in-memory sort. Adding the full key prefix lets the planner do
+    // an index skip-scan: one row per group. CONCURRENTLY because the
+    // table is 2.3 GB and we cannot lock writes during the build.
+    // Wrapped in a sub-try so the rest of migrations succeed if this
+    // index already exists or the build is in progress from a prior run.
+    // ────────────────────────────────────────────────────────────────────
+    try {
+      await db.execute(sql.raw(
+        `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_odds_snapshots_distinct_on
+           ON odds_snapshots (match_id, market_type, selection_name, source, snapshot_time DESC)`,
+      ));
+      logger.info("odds_snapshots DISTINCT-ON index ready");
+    } catch (err) {
+      logger.warn({ err }, "CREATE INDEX CONCURRENTLY for odds_snapshots failed (non-fatal — may already exist or be building)");
+    }
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

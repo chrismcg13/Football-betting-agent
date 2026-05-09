@@ -1910,6 +1910,16 @@ async function runSettlementPipeline(deep = false): Promise<void> {
 }
 
 export function startSettlementCron(): void {
+  // 2026-05-09 C1: settlement + monitor crons all live on the api-server
+  // side. The worker-data process only runs ingestion + exchange sweep
+  // (registered in startScheduler under role='data'); settlement / monitors
+  // / lazy-promoter all belong with the trading cycle in api-server.
+  const role = readWorkerRole();
+  if (role === "data") {
+    logger.info({ role }, "Worker role 'data' — skipping settlement/monitor crons");
+    return;
+  }
+
   cron.schedule("*/2 * * * *", () => {
     void runSettlementPipeline();
   }, { timezone: "UTC" });
@@ -2263,31 +2273,68 @@ export function startSettlementCron(): void {
 
 // ===================== Scheduler =====================
 
+// 2026-05-09 C1: worker role split. The api-server process used to host
+// every cron in one Node heap. ingestion (50–74 min/run) and
+// exchange_book_sweep (10–18 min/run) regularly OOM'd the 2 GB max-heap
+// limit, taking the trading cycle and HTTP server down with them. Splitting
+// them into a separate PM2 process (WORKER_ROLE=data) means a heavy cron
+// hitting max_memory_restart only kills its own worker; the trading + HTTP
+// process keeps placing bets and serving the dashboard.
+//
+// Role semantics:
+//   "all"  — register every cron (default, backward-compatible for tests
+//            and any non-PM2 launch).
+//   "api"  — register everything EXCEPT the heavy data-pipeline crons.
+//            Trading cycle, settlement, HTTP server, monitors, lazy
+//            promoter, etc. Lives in the api-server PM2 entry.
+//   "data" — register ONLY ingestion + exchange_book_sweep + their
+//            startup warmups. Lives in the worker-data PM2 entry.
+export type WorkerRole = "all" | "api" | "data";
+
+function readWorkerRole(): WorkerRole {
+  const raw = (process.env["WORKER_ROLE"] ?? "all").toLowerCase().trim();
+  if (raw === "api" || raw === "data" || raw === "all") return raw;
+  logger.warn({ raw }, "Unknown WORKER_ROLE — defaulting to 'all'");
+  return "all";
+}
+
 export function startScheduler(): void {
-  logger.info("Starting schedulers");
+  const role = readWorkerRole();
+  logger.info({ role }, "Starting schedulers");
 
-  // Data ingestion: every 30 min, 24/7 (matches scheduled globally at all hours)
-  cron.schedule("*/30 * * * *", () => { void safeRunIngestion(); }, { timezone: "UTC" });
-  logger.info("Ingestion scheduler active — every 30 min, 24/7");
+  const wantsData = role === "all" || role === "data";
+  const wantsApi = role === "all" || role === "api";
 
-  // Exchange book sweep: every 10 minutes, populates odds_snapshots with
-  // source='betfair_exchange' for the venue-anchored pricing picker. Runs
-  // unconditionally, independent of data_source config flag.
-  // Wave 1.5 (2026-05-05): extended window from 24h to 48h to match
-  // valueDetection's 1-48h evaluation window. Without this, ~half the
-  // matches valueDetection looks at have no betfair_exchange snapshot
-  // and get rejected at 02a_rej_no_betfair_exchange. Tier B firehose
-  // benefits especially since Tier B has fewer matches, so coverage
-  // gaps are proportionally more impactful.
-  cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep({ hoursAhead: 48 }); }, { timezone: "UTC" });
-  logger.info("Exchange book sweep scheduler active — every 10 minutes (48h window — Wave 1.5)");
+  if (wantsData) {
+    // Data ingestion: every 30 min, 24/7 (matches scheduled globally at all hours)
+    cron.schedule("*/30 * * * *", () => { void safeRunIngestion(); }, { timezone: "UTC" });
+    logger.info("Ingestion scheduler active — every 30 min, 24/7");
 
-  // Startup warmup: run one sweep ~30s after boot so the first population
-  // doesn't have to wait the full 10-minute cron interval.
-  setTimeout(() => {
-    logger.info("Exchange book sweep startup warmup triggered (T+30s, 48h window)");
-    void safeRunExchangeBookSweep({ hoursAhead: 48 });
-  }, 30_000);
+    // Exchange book sweep: every 10 minutes, populates odds_snapshots with
+    // source='betfair_exchange' for the venue-anchored pricing picker. Runs
+    // unconditionally, independent of data_source config flag.
+    // Wave 1.5 (2026-05-05): extended window from 24h to 48h to match
+    // valueDetection's 1-48h evaluation window. Without this, ~half the
+    // matches valueDetection looks at have no betfair_exchange snapshot
+    // and get rejected at 02a_rej_no_betfair_exchange. Tier B firehose
+    // benefits especially since Tier B has fewer matches, so coverage
+    // gaps are proportionally more impactful.
+    cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep({ hoursAhead: 48 }); }, { timezone: "UTC" });
+    logger.info("Exchange book sweep scheduler active — every 10 minutes (48h window — Wave 1.5)");
+
+    // Startup warmup: run one sweep ~30s after boot so the first population
+    // doesn't have to wait the full 10-minute cron interval.
+    setTimeout(() => {
+      logger.info("Exchange book sweep startup warmup triggered (T+30s, 48h window)");
+      void safeRunExchangeBookSweep({ hoursAhead: 48 });
+    }, 30_000);
+  }
+
+  // Worker-data role exits here — every cron below is API/trading/monitoring.
+  if (!wantsApi) {
+    logger.info({ role }, "Worker role 'data' — skipping API/trading crons");
+    return;
+  }
 
   // Feature computation: every 6 hours
   cron.schedule("0 */6 * * *", () => { void safeRunFeatures(); }, { timezone: "UTC" });

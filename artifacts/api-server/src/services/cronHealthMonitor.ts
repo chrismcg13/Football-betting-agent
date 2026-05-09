@@ -7,6 +7,16 @@
  * successful run against an expected cadence, and inserts rows into
  * cron_stale_alert when a cron is overdue.
  *
+ * 2026-05-09 (C2 active recovery): when trading_near is the stale cron and
+ * the in-process trading lock is held longer than its stale threshold, the
+ * monitor force-releases the lock and triggers one cycle. Pre-fix the
+ * monitor only inserted a row into cron_stale_alert that nobody read; the
+ * 10-hour outage of 2026-05-08 happened in part because nobody saw the
+ * alert. The recovery branch turns the monitor from a noticeboard into a
+ * self-healing watchdog. Other cron staleness still alerts only — those
+ * crons live in worker-data (ingestion/exchange) where remediation is
+ * "PM2 restart the worker" and there's no in-process state to poke.
+ *
  * Convention:
  *   - For each cron, we know its expected cadence (hardcoded below — must
  *     match scheduler.ts entries). If the time since last success exceeds
@@ -23,6 +33,7 @@
 import { db } from "@workspace/db";
 import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
+import { resetTradingCycleLock, runTradingCycle } from "./scheduler";
 
 interface ExpectedCron {
   jobName: string;
@@ -53,6 +64,7 @@ export interface CronHealthResult {
   crons_checked: number;
   alerts_fired: number;
   alerts_already_active: number;
+  recovery_actions: number;
 }
 
 export async function runCronHealthMonitor(): Promise<CronHealthResult> {
@@ -61,6 +73,7 @@ export async function runCronHealthMonitor(): Promise<CronHealthResult> {
     crons_checked: TRACKED_CRONS.length,
     alerts_fired: 0,
     alerts_already_active: 0,
+    recovery_actions: 0,
   };
 
   for (const expected of TRACKED_CRONS) {
@@ -83,6 +96,36 @@ export async function runCronHealthMonitor(): Promise<CronHealthResult> {
     }
 
     if (staleMs <= expected.alertAfterMs) continue;
+
+    // 2026-05-09 C2 active recovery: trading_near is the only cron that
+    // can be remediated in-process. Force-release the lock (in case it's
+    // wedged on a hung query) and trigger one cycle. The lock reset is
+    // safe — runTradingCycle's stale-detection (TRADING_CYCLE_STALE_MS)
+    // already does the same thing on a fresh entry. Doing it from here
+    // catches the case where no cron tick is firing at all (which is what
+    // happened on 2026-05-08).
+    let recoveryAttempted = false;
+    let recoveryNote: string | null = null;
+    if (expected.jobName === "trading_near") {
+      try {
+        const before = resetTradingCycleLock();
+        // Fire-and-forget: we must not await long here because this monitor
+        // runs every 5 min and a hung cycle could block the next tick.
+        void runTradingCycle({ tier: "near", minHoursAhead: 1, maxHoursAhead: 48 })
+          .catch((err) => logger.error({ err }, "Active-recovery trading cycle failed"));
+        recoveryAttempted = true;
+        recoveryNote = before.wasHeld
+          ? `lock force-released after ${before.heldFor}ms; triggered cycle`
+          : "lock was clear; triggered cycle";
+        result.recovery_actions++;
+        logger.warn(
+          { jobName: expected.jobName, staleMinutes: Math.round(staleMs / 60_000), wasHeld: before.wasHeld, heldForMs: before.heldFor },
+          "Cron health monitor: active recovery triggered for trading_near",
+        );
+      } catch (err) {
+        logger.error({ err }, "Active recovery for trading_near failed");
+      }
+    }
 
     // Dedupe: only one unacknowledged alert per cron in last 24h
     const existing = await db.execute(sql`
@@ -108,12 +151,14 @@ export async function runCronHealthMonitor(): Promise<CronHealthResult> {
         ${JSON.stringify({
           message: `Cron ${expected.jobName} has not succeeded in ${Math.round(staleMs / 60_000)} min (alert threshold: ${Math.round(expected.alertAfterMs / 60_000)} min)`,
           last_success_at: lastSuccess,
+          recovery_attempted: recoveryAttempted,
+          recovery_note: recoveryNote,
         })}::jsonb
       )
     `);
     result.alerts_fired++;
     logger.warn(
-      { jobName: expected.jobName, lastSuccess, staleMinutes: Math.round(staleMs / 60_000) },
+      { jobName: expected.jobName, lastSuccess, staleMinutes: Math.round(staleMs / 60_000), recoveryAttempted },
       "Cron stale alert fired",
     );
   }
