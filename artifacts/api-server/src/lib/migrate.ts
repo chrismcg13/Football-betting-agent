@@ -2085,8 +2085,18 @@ export async function runMigrations() {
     // view shows the bet's actual track explicitly. Display only — no
     // ROI/CLV/PnL metric depends on this view, so it's not a §12.3
     // operational-state violation, just a clarity fix.
+    //
+    // 2026-05-09 ROOT CAUSE FIX: this CREATE OR REPLACE VIEW renames a
+    // column (was bet_mode in a prior version, now bet_track). Postgres
+    // rejects that with "cannot change name of view column" because
+    // CREATE OR REPLACE VIEW only permits adding columns or changing
+    // their definition — never renames. Every boot since the rename was
+    // deployed has died here, putting the api-server into a PM2 restart
+    // loop. Fix: DROP first, then CREATE. View is display-only so no
+    // dependent objects break, and no CASCADE needed.
+    await db.execute(sql`DROP VIEW IF EXISTS v_upcoming_bets`);
     await db.execute(sql`
-      CREATE OR REPLACE VIEW v_upcoming_bets AS
+      CREATE VIEW v_upcoming_bets AS
       SELECT pb.id AS bet_id,
              pb.placed_at,
              m.kickoff_time,
