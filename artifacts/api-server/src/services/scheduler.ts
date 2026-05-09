@@ -1526,6 +1526,68 @@ export async function runTradingCycle(options?: {
     funnel["08_post_pinnacle_filter"] = betOrders.length;
     funnel["08b_pinnacle_filtered_out"] = selectedBets.length - betOrders.length;
 
+    // ── Bundle 3 (2026-05-09 / plan v3 §Item 7 follow-up): saturated-fixture
+    // pre-filter. valueDetection re-emits the same opportunities every 5-min
+    // cycle without per-cycle memory of which fixtures already saturated the
+    // shadow cap. Pre-Bundle-1 the pattern was 14k cap-rejects/24h burning
+    // placePaperBet compute (DB queries, log writes, gate evaluations) just
+    // to reject at the cap. Bundle 1 raised cap 12→24 — same retry shape, new
+    // ceiling. This filter drops candidates upstream when the match's shadow
+    // rail is already at 24 pending. Both rails saturated (paper 4 + shadow
+    // 24) is dropped because paper-cap demote-to-shadow would also hit the
+    // saturated shadow rail and reject. Net: zero placement-decision change,
+    // material compute saved on saturated fixtures.
+    if (betOrders.length > 0) {
+      const candidateMatchIds = Array.from(new Set(betOrders.map((o) => o.matchId)));
+      const saturatedRows = (await db
+        .select({
+          matchId: paperBetsTable.matchId,
+          shadowCount: sql<number>`COUNT(*) FILTER (WHERE ${paperBetsTable.betTrack} = 'shadow')::int`,
+          paperCount: sql<number>`COUNT(*) FILTER (WHERE COALESCE(${paperBetsTable.betTrack}, 'paper') = 'paper')::int`,
+        })
+        .from(paperBetsTable)
+        .where(
+          and(
+            inArray(paperBetsTable.matchId, candidateMatchIds),
+            sql`${paperBetsTable.deletedAt} IS NULL`,
+            sql`${paperBetsTable.status} IN ('pending','pending_placement')`,
+          ),
+        )
+        .groupBy(paperBetsTable.matchId));
+      // Both rails saturated = no slot for any new candidate (paper full +
+      // shadow full means paper-cap demote also rejects). Shadow ≥24 alone
+      // means shadow-track candidates reject; production candidates that
+      // hit paper cap and try to demote will also reject. Conservative:
+      // skip when shadow is full regardless of paper state.
+      const saturatedMatchIds = new Set<number>(
+        saturatedRows
+          .filter((r) => r.shadowCount >= 24)
+          .map((r) => r.matchId),
+      );
+      if (saturatedMatchIds.size > 0) {
+        const before = betOrders.length;
+        const skipped = betOrders.filter((o) => saturatedMatchIds.has(o.matchId));
+        const kept = betOrders.filter((o) => !saturatedMatchIds.has(o.matchId));
+        betOrders.length = 0;
+        betOrders.push(...kept);
+        funnel["08c_saturated_fixture_skip"] = before - kept.length;
+        logger.info(
+          {
+            saturatedMatchCount: saturatedMatchIds.size,
+            ordersDropped: skipped.length,
+            ordersBefore: before,
+            ordersAfter: kept.length,
+            sampleMatchIds: Array.from(saturatedMatchIds).slice(0, 5),
+          },
+          "Bundle 3: dropped orders for shadow-cap-saturated fixtures pre-emission",
+        );
+      } else {
+        funnel["08c_saturated_fixture_skip"] = 0;
+      }
+    } else {
+      funnel["08c_saturated_fixture_skip"] = 0;
+    }
+
     if (betOrders.length > 0) {
       logger.info(
         { orders: betOrders.length, tier },
