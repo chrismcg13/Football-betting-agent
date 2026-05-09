@@ -249,6 +249,24 @@ async function seedLeagueEdgeScores(): Promise<void> {
 async function main() {
   logger.info("=== BET_AGENT_OS starting ===");
 
+  // Bundle 9 follow-up (2026-05-09): operator-visible attribution log line
+  // for external data-source ToS compliance (notably OpenWeatherMap's
+  // "Visible attribution to OpenWeather in your application or service").
+  // Headless personal tool — operator IS the user, so log + /api/about/
+  // data-sources endpoint together constitute the visible attribution
+  // surface. Full source list available at GET /api/about/data-sources.
+  logger.info(
+    {
+      sources: [
+        "Weather data © OpenWeather (https://openweathermap.org/)",
+        "Stadium geocoding © OpenStreetMap contributors (Nominatim)",
+        "Stadium classifications via Wikipedia (CC BY-SA)",
+      ],
+      details_endpoint: "GET /api/about/data-sources",
+    },
+    "External data source attributions",
+  );
+
   // 1. Database migrations (will throw and abort if DB is unreachable)
   await runMigrations();
 

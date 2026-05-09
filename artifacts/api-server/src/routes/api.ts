@@ -124,6 +124,79 @@ async function getSettledBetsStats() {
 }
 
 // ─────────────────────────────────────────────
+// GET /api/about/data-sources
+// ─────────────────────────────────────────────
+// Bundle 9 follow-up (2026-05-09): operator-visible attribution for the
+// external data sources we ingest. Satisfies free-tier ToS attribution
+// requirements (notably OpenWeatherMap's "Visible attribution to OpenWeather
+// in your application or service") for a headless personal tool with no
+// public UI. Curl this endpoint to verify all attributions present:
+//   curl localhost:8080/api/about/data-sources
+router.get("/about/data-sources", (_req, res) => {
+  res.json({
+    sources: [
+      {
+        name: "OpenWeather",
+        attribution: "Weather data © OpenWeather",
+        url: "https://openweathermap.org/",
+        usage: "Match weather forecasts (temperature, wind, precipitation, humidity) at fixture kickoff",
+        license: "Free tier — commercial and non-commercial use permitted with visible attribution",
+      },
+      {
+        name: "API-Football",
+        attribution: "Football data via API-Football",
+        url: "https://www.api-football.com/",
+        usage: "Fixtures, odds, lineups, injuries, referee assignments, head-to-head, fixture statistics",
+        license: "Paid commercial subscription",
+      },
+      {
+        name: "OddsPapi",
+        attribution: "Odds data via OddsPapi",
+        url: "https://oddspapi.io/",
+        usage: "Pinnacle pre-bet validation, closing-line CLV anchors, Tier-2 sharp book aggregation",
+        license: "Paid commercial subscription",
+      },
+      {
+        name: "Betfair Exchange",
+        attribution: "Exchange data via Betfair API",
+        url: "https://developer.betfair.com/",
+        usage: "Real-time exchange odds, market catalogue, order placement, settlement reconciliation",
+        license: "Authenticated app key (commercial use)",
+      },
+      {
+        name: "Football-data.org",
+        attribution: "Fallback fixture data via Football-data.org",
+        url: "https://www.football-data.org/",
+        usage: "Fallback fixture metadata when API-Football unavailable",
+        license: "Free tier — non-commercial",
+      },
+      {
+        name: "Understat",
+        attribution: "xG data via Understat",
+        url: "https://understat.com/",
+        usage: "Team-level xG (expected goals) for top-5 European leagues + supplementary",
+        license: "Public-data scrape — fair-use rate-limited",
+      },
+      {
+        name: "OpenStreetMap / Nominatim",
+        attribution: "Stadium geocoding © OpenStreetMap contributors",
+        url: "https://nominatim.openstreetmap.org/",
+        usage: "Stadium lat/lon resolution from venue name + city + country",
+        license: "ODbL — attribution required",
+      },
+      {
+        name: "Wikipedia",
+        attribution: "Stadium roof classification via Wikipedia",
+        url: "https://en.wikipedia.org/",
+        usage: "Auto-classification of stadiums as outdoor / retractable / closed-roof for weather feature emission gating",
+        license: "CC BY-SA — attribution required",
+      },
+    ],
+    fetched_at: new Date().toISOString(),
+  });
+});
+
+// ─────────────────────────────────────────────
 // GET /api/dashboard/summary
 // ─────────────────────────────────────────────
 router.get("/dashboard/summary", async (_req, res) => {
