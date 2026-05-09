@@ -2583,11 +2583,36 @@ export async function runMigrations() {
     // CREATE INDEX with the existing match_id-only index already in place
     // means inserts during build are slowed but not blocked. Acceptable
     // one-time cost for ongoing efficiency.
+    //
+    // 2026-05-09 ROOT CAUSE FIX: even with IF NOT EXISTS, Postgres still
+    // tries to acquire the table lock to verify, and on this hot table
+    // (constantly written by exchange_book_sweep) the lock_timeout=5s
+    // role-level setting fails the statement. This crashed startup on
+    // every boot once we got past the v_upcoming_bets fix. Skip if the
+    // index already exists — it does, in production — to avoid the lock
+    // attempt entirely. Catch any other error so a single migration
+    // failure doesn't kill the entire startup.
     // ────────────────────────────────────────────────────────────────────
-    await db.execute(sql`
-      CREATE INDEX IF NOT EXISTS odds_snapshots_match_time_idx
-        ON odds_snapshots(match_id, snapshot_time DESC)
-    `);
+    try {
+      const existing = await db.execute(sql`
+        SELECT 1 FROM pg_indexes
+        WHERE tablename = 'odds_snapshots'
+          AND indexname = 'odds_snapshots_match_time_idx'
+        LIMIT 1
+      `);
+      const alreadyExists = (((existing as any).rows ?? []) as unknown[]).length > 0;
+      if (!alreadyExists) {
+        await db.execute(sql`
+          CREATE INDEX IF NOT EXISTS odds_snapshots_match_time_idx
+            ON odds_snapshots(match_id, snapshot_time DESC)
+        `);
+        logger.info("odds_snapshots_match_time_idx created");
+      } else {
+        logger.debug("odds_snapshots_match_time_idx already exists — skipping");
+      }
+    } catch (err) {
+      logger.warn({ err }, "odds_snapshots_match_time_idx migration skipped (non-fatal)");
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // 2026-05-08 (§4.1 of root-cause-analysis): role-level Postgres
