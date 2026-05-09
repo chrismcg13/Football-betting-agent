@@ -10,6 +10,12 @@ const BETFAIR_APP_KEY = process.env["LIVE_BETFAIR_KEY"] ?? "";
 const BETFAIR_USERNAME = process.env["BETFAIR_USERNAME"] ?? "";
 const BETFAIR_PASSWORD = process.env["BETFAIR_PASSWORD"] ?? "";
 
+// Refuse to start without VPS_RELAY_SECRET — pre-flip blocker #8.
+if (!RELAY_SECRET) {
+  console.error("[FATAL] VPS_RELAY_SECRET is not set; refusing to start (relay must be authenticated).");
+  process.exit(1);
+}
+
 const IDENTITY_BASE = "https://identitysso.betfair.com";
 const BETTING_BASE = "https://api.betfair.com/exchange/betting/rest/v1.0";
 const ACCOUNT_BASE = "https://api.betfair.com/exchange/account/rest/v1.0";
@@ -52,9 +58,6 @@ function log(level: string, msg: string, data?: Record<string, unknown>) {
 }
 
 function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (!RELAY_SECRET) {
-    return next();
-  }
   const token = req.headers["x-relay-secret"] || req.query["secret"];
   if (token !== RELAY_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -654,7 +657,7 @@ setInterval(async () => {
 app.listen(PORT, "0.0.0.0", () => {
   log("INFO", `VPS Relay started on port ${PORT}`);
   log("INFO", `Betfair credentials ${BETFAIR_APP_KEY ? "configured" : "MISSING"}`);
-  log("INFO", `Relay secret ${RELAY_SECRET ? "configured" : "NOT SET — open access"}`);
+  log("INFO", "Relay secret configured (mandatory — startup would have aborted otherwise)");
 
   if (BETFAIR_APP_KEY && BETFAIR_USERNAME) {
     void authenticate()
