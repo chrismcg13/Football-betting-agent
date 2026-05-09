@@ -438,20 +438,24 @@ export function isBalanceFresh(): boolean {
 }
 
 export async function getLiveBankroll(): Promise<number> {
+  // Active bankroll = Betfair available − locked_reserve (pre-flip blocker #7).
+  const { getLockedReserve } = await import("./lockedReserve");
+  const locked = await getLockedReserve();
+
   if (cachedBalance && !isBalanceStale() && isBalanceFresh()) {
-    return cachedBalance.available;
+    return Math.max(0, cachedBalance.available - locked);
   }
 
   try {
     const funds = await getAccountFunds();
-    return funds.availableToBetBalance;
+    return Math.max(0, funds.availableToBetBalance - locked);
   } catch (err) {
     if (cachedBalance && !isBalanceStale()) {
       logger.warn(
         { lastFetchedAt: new Date(cachedBalance.fetchedAt).toISOString() },
         "Balance fetch failed — using cached value",
       );
-      return cachedBalance.available;
+      return Math.max(0, cachedBalance.available - locked);
     }
     logger.error(
       "CRITICAL: Balance fetch failed and cached balance is stale (>1hr) — halting bet placement",

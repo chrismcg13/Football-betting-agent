@@ -3276,6 +3276,85 @@ router.post("/admin/run-bankroll-tier-caps", async (_req, res) => {
   }
 });
 
+// Pre-flip blocker #7: locked_reserve admin endpoints. The CLI in
+// scripts/src/reserve.ts wraps these. All lock/unlock/withdrawal events
+// are recorded in reserve_events for audit.
+router.get("/admin/reserve/status", async (_req, res) => {
+  try {
+    const { getLockedReserve, getRecentReserveEvents } = await import("../services/lockedReserve");
+    const { getCachedBalance } = await import("../services/betfairLive");
+    const locked = await getLockedReserve();
+    const events = await getRecentReserveEvents(20);
+    const cached = getCachedBalance();
+    res.json({
+      success: true,
+      result: {
+        current_locked: locked,
+        betfair_available_cached: cached?.available ?? null,
+        active_bankroll_estimate: cached ? Math.max(0, cached.available - locked) : null,
+        recent_events: events,
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, "reserve/status failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+router.post("/admin/reserve/event", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as {
+      event_type?: string; amount?: number; notes?: string | null;
+      betfair_balance_at_event?: number | null;
+    };
+    const validTypes = ["lock", "unlock", "withdrawal_recorded", "reconcile_adjust"] as const;
+    if (!body.event_type || !validTypes.includes(body.event_type as any)) {
+      res.status(400).json({ success: false, message: `event_type must be one of ${validTypes.join(",")}` });
+      return;
+    }
+    const amount = Number(body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      res.status(400).json({ success: false, message: "amount must be a positive finite number" });
+      return;
+    }
+
+    // Lock safeguard: refuse if it would push active bankroll below 2× bankroll_floor.
+    if (body.event_type === "lock") {
+      const { getCachedBalance } = await import("../services/betfairLive");
+      const { getLockedReserve } = await import("../services/lockedReserve");
+      const cached = getCachedBalance();
+      const currentLocked = await getLockedReserve();
+      if (cached) {
+        const floor = await (async () => {
+          const r = await db.execute(sql`SELECT value FROM agent_config WHERE key='bankroll_floor' LIMIT 1`);
+          const v = (((r as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
+          return Number(v ?? 0);
+        })();
+        const after = cached.available - currentLocked - amount;
+        if (floor > 0 && after < 2 * floor) {
+          res.status(400).json({
+            success: false,
+            message: `Lock would leave £${after.toFixed(2)} active, below 2× bankroll_floor (£${(2 * floor).toFixed(2)}). Reduce lock or unlock first.`,
+          });
+          return;
+        }
+      }
+    }
+
+    const { applyReserveEvent } = await import("../services/lockedReserve");
+    const result = await applyReserveEvent({
+      eventType: body.event_type as any,
+      amount,
+      notes: body.notes ?? null,
+      betfairBalanceAtEvent: body.betfair_balance_at_event ?? null,
+    });
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "reserve/event failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Phase 3 B9 (2026-05-08): manual trigger for gateMonitor. Cron runs
 // daily 04:00 UTC; this lets us produce a gate_status row immediately
 // after deploy for blocker validation. Pre-evaluation_start_at this
