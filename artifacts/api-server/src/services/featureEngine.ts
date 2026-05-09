@@ -865,6 +865,96 @@ async function computeFeaturesFromDb(
   }
   const totalMissingFixtureDiff = homeMissingFixtureCount - awayMissingFixtureCount;
 
+  // ─── Bundle 8 (2026-05-09): manager-tenure + sidelined-active features ────
+  // Team-name -> team_api_id resolution via UNION of injury_reports +
+  // team_standings (most reliable sources of the mapping). Falls back to
+  // null if the team has never been seen in either source — feature simply
+  // doesn't emit for that match.
+  let homeManagerTenureDays: number | null = null;
+  let awayManagerTenureDays: number | null = null;
+  let homeActiveSidelined: number | null = null;
+  let awayActiveSidelined: number | null = null;
+  try {
+    const teamIdRows = await db.execute(sql`
+      WITH team_id_map AS (
+        SELECT DISTINCT ON (team_name) team_name, team_api_id::int AS team_api_id, src_priority
+        FROM (
+          SELECT team_name, team_api_id, 1 AS src_priority FROM injury_reports
+          UNION ALL
+          SELECT team_name, api_team_id AS team_api_id, 2 AS src_priority FROM team_standings
+        ) t
+        WHERE team_api_id IS NOT NULL
+        ORDER BY team_name, src_priority
+      )
+      SELECT
+        (SELECT team_api_id FROM team_id_map WHERE team_name = ${homeTeam}) AS home_id,
+        (SELECT team_api_id FROM team_id_map WHERE team_name = ${awayTeam}) AS away_id
+    `);
+    const idRow = ((teamIdRows as { rows?: Array<{ home_id: number | null; away_id: number | null }> }).rows ?? [])[0];
+    const homeApiId = idRow?.home_id ?? null;
+    const awayApiId = idRow?.away_id ?? null;
+
+    // Manager-tenure: days since the current coach's start_date.
+    // team_coaches uses (team_api_id, is_current=true). Lower tenure = newer
+    // manager = potential disruption signal. Null when no current coach
+    // captured (e.g. team never reached Sunday cron's metadata refresh).
+    if (homeApiId !== null) {
+      const r = await db.execute(sql`
+        SELECT EXTRACT(EPOCH FROM (NOW() - MAX(start_date::timestamptz))) / 86400.0 AS days
+        FROM team_coaches
+        WHERE team_api_id = ${homeApiId} AND is_current = true AND start_date IS NOT NULL
+      `);
+      const v = ((r as { rows?: Array<{ days: number | null }> }).rows ?? [])[0]?.days;
+      if (v != null && Number.isFinite(Number(v))) homeManagerTenureDays = Math.round(Number(v) * 10) / 10;
+    }
+    if (awayApiId !== null) {
+      const r = await db.execute(sql`
+        SELECT EXTRACT(EPOCH FROM (NOW() - MAX(start_date::timestamptz))) / 86400.0 AS days
+        FROM team_coaches
+        WHERE team_api_id = ${awayApiId} AND is_current = true AND start_date IS NOT NULL
+      `);
+      const v = ((r as { rows?: Array<{ days: number | null }> }).rows ?? [])[0]?.days;
+      if (v != null && Number.isFinite(Number(v))) awayManagerTenureDays = Math.round(Number(v) * 10) / 10;
+    }
+
+    // Active sidelined count: number of players from the team's roster
+    // (observed in fixture_player_stats across any prior match) who are
+    // currently sidelined (player_sidelined.end_date IS NULL OR > NOW()).
+    // Wide-net heuristic: a player who's appeared for the team historically
+    // is treated as a roster member. False positives possible (rotation,
+    // departed players) — mitigated by sample-size at validation time.
+    if (homeApiId !== null) {
+      const r = await db.execute(sql`
+        SELECT COUNT(DISTINCT ps.player_api_id)::int AS n
+        FROM player_sidelined ps
+        WHERE ps.player_api_id IN (
+          SELECT DISTINCT fps.player_id::int
+          FROM fixture_player_stats fps
+          WHERE fps.team_id = ${homeApiId} AND fps.player_id IS NOT NULL
+        )
+        AND (ps.end_date IS NULL OR ps.end_date::date >= CURRENT_DATE)
+      `);
+      const v = ((r as { rows?: Array<{ n: number | null }> }).rows ?? [])[0]?.n;
+      homeActiveSidelined = v == null ? 0 : Number(v);
+    }
+    if (awayApiId !== null) {
+      const r = await db.execute(sql`
+        SELECT COUNT(DISTINCT ps.player_api_id)::int AS n
+        FROM player_sidelined ps
+        WHERE ps.player_api_id IN (
+          SELECT DISTINCT fps.player_id::int
+          FROM fixture_player_stats fps
+          WHERE fps.team_id = ${awayApiId} AND fps.player_id IS NOT NULL
+        )
+        AND (ps.end_date IS NULL OR ps.end_date::date >= CURRENT_DATE)
+      `);
+      const v = ((r as { rows?: Array<{ n: number | null }> }).rows ?? [])[0]?.n;
+      awayActiveSidelined = v == null ? 0 : Number(v);
+    }
+  } catch (err) {
+    logger.warn({ err, matchId, homeTeam, awayTeam }, "Manager/sidelined feature lookup failed — features absent for this match");
+  }
+
   const features: Array<[string, number]> = [
     ["home_form_last5", homeForm5],
     ["away_form_last5", awayForm5],
@@ -931,6 +1021,27 @@ async function computeFeaturesFromDb(
   if (homeRefereeCardRate !== null && refereeCardSampleSize !== null) {
     await upsertFeature(matchId, "referee_avg_cards_per_match", homeRefereeCardRate);
     await upsertFeature(matchId, "referee_card_sample_size", refereeCardSampleSize);
+  }
+
+  // Bundle 8 (2026-05-09): manager-tenure features. Conditional — only emit
+  // when team_api_id resolved AND a current coach is captured. Days-since-
+  // start is the raw signal; a future predictive-use step can derive
+  // "manager_change_recent_days" with decay weighting.
+  if (homeManagerTenureDays !== null) {
+    await upsertFeature(matchId, "home_manager_tenure_days", homeManagerTenureDays);
+  }
+  if (awayManagerTenureDays !== null) {
+    await upsertFeature(matchId, "away_manager_tenure_days", awayManagerTenureDays);
+  }
+  // Active-sidelined count features. Always emitted when team_api_id
+  // resolved (0 means "no sidelined players observed for this team's known
+  // roster" — semantically distinct from "couldn't resolve team_api_id"
+  // which results in no row at all).
+  if (homeActiveSidelined !== null) {
+    await upsertFeature(matchId, "home_active_sidelined_count", homeActiveSidelined);
+  }
+  if (awayActiveSidelined !== null) {
+    await upsertFeature(matchId, "away_active_sidelined_count", awayActiveSidelined);
   }
 
   logger.info(
