@@ -799,6 +799,72 @@ async function computeFeaturesFromDb(
 
   const leaguePositionDiff = 0;
 
+  // ─── Bundle 7 (2026-05-09): referee + injury features ─────────────────────
+  // Sub-phase 7 of PHASE 2 FULL PUSH strategic doc. Pure ingestion-side
+  // emission — features land in features table for retrospective predictive-
+  // power validation against settled bets in a future Bundle. predictionEngine.ts
+  // is NOT changed here: per strategic doc "validate predictive power before
+  // predictive use", a feature only graduates into bet decisions after
+  // retrospective evidence shows signal.
+  //
+  // Failure-mode discipline: each query wrapped in try/catch. If the lookup
+  // fails or returns no row, the feature simply isn't emitted (vs emitting a
+  // zero, which would conflate "no data" with "data showing zero"). featureEngine
+  // already treats absent features as null at consumer time.
+  let homeRefereeCardRate: number | null = null;
+  let refereeCardSampleSize: number | null = null;
+  try {
+    // referee_card_rates view (Bundle 2, migrate.ts) is grouped by
+    // (referee_name, league). Look up the referee assigned to this match.
+    const refRows = await db.execute(sql`
+      SELECT rcr.avg_cards_per_match::float8 AS rate, rcr.n_matches::int AS n
+      FROM match_referees mr
+      JOIN referee_card_rates rcr
+        ON rcr.referee_name = mr.referee_name
+       AND rcr.league = ${league}
+      WHERE mr.match_id = ${matchId}
+      LIMIT 1
+    `);
+    const row = ((refRows as { rows?: Array<{ rate: number; n: number }> }).rows ?? [])[0];
+    if (row) {
+      homeRefereeCardRate = Number(row.rate);
+      refereeCardSampleSize = Number(row.n);
+    }
+  } catch (err) {
+    logger.warn({ err, matchId }, "Referee feature lookup failed — feature absent for this match");
+  }
+
+  // Injury features from injury_reports (sub-phase 7.0a ingestion at
+  // apiFootball.ts:2225). Idempotent ingestion writes per-fixture snapshots
+  // keyed by api_fixture_id with a match_id back-reference. Count by
+  // injury_type per side. injury_type ∈ {'Missing Fixture','Questionable'}
+  // per the CHECK constraint.
+  let homeMissingFixtureCount = 0;
+  let homeQuestionableCount = 0;
+  let awayMissingFixtureCount = 0;
+  let awayQuestionableCount = 0;
+  try {
+    const injCounts = await db.execute(sql`
+      SELECT
+        COUNT(*) FILTER (WHERE ir.team_name = ${homeTeam} AND ir.injury_type = 'Missing Fixture')::int AS home_missing,
+        COUNT(*) FILTER (WHERE ir.team_name = ${homeTeam} AND ir.injury_type = 'Questionable')::int AS home_questionable,
+        COUNT(*) FILTER (WHERE ir.team_name = ${awayTeam} AND ir.injury_type = 'Missing Fixture')::int AS away_missing,
+        COUNT(*) FILTER (WHERE ir.team_name = ${awayTeam} AND ir.injury_type = 'Questionable')::int AS away_questionable
+      FROM injury_reports ir
+      WHERE ir.match_id = ${matchId}
+    `);
+    const row = ((injCounts as { rows?: Array<{ home_missing: number; home_questionable: number; away_missing: number; away_questionable: number }> }).rows ?? [])[0];
+    if (row) {
+      homeMissingFixtureCount = Number(row.home_missing ?? 0);
+      homeQuestionableCount = Number(row.home_questionable ?? 0);
+      awayMissingFixtureCount = Number(row.away_missing ?? 0);
+      awayQuestionableCount = Number(row.away_questionable ?? 0);
+    }
+  } catch (err) {
+    logger.warn({ err, matchId }, "Injury feature lookup failed — counts default to 0");
+  }
+  const totalMissingFixtureDiff = homeMissingFixtureCount - awayMissingFixtureCount;
+
   const features: Array<[string, number]> = [
     ["home_form_last5", homeForm5],
     ["away_form_last5", awayForm5],
@@ -837,6 +903,15 @@ async function computeFeaturesFromDb(
     ["combined_corners_prediction", combinedCornersPrediction],
     ["home_goals_last3_vs_last10", Math.max(0, homeGoalMomentum)],
     ["away_goals_last3_vs_last10", Math.max(0, awayGoalMomentum)],
+    // Bundle 7 (2026-05-09): injury counts per side. Always emitted; 0 means
+    // "no injuries reported" (which IS data — fixture had injury ingestion
+    // run and returned zero rows). Absence of the feature row in the table
+    // means injury ingestion hasn't fired for this fixture yet.
+    ["home_missing_fixture_count", homeMissingFixtureCount],
+    ["home_questionable_count", homeQuestionableCount],
+    ["away_missing_fixture_count", awayMissingFixtureCount],
+    ["away_questionable_count", awayQuestionableCount],
+    ["total_missing_fixture_diff", totalMissingFixtureDiff],
   ];
 
   for (const [name, value] of features) {
@@ -846,6 +921,16 @@ async function computeFeaturesFromDb(
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
   if (lineupPublishMins !== null) {
     await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
+  }
+
+  // Bundle 7 (2026-05-09): referee features. Conditional emission — only
+  // ship the feature when a referee was assigned AND has historical card
+  // data in the league. n_matches is emitted alongside the rate so a
+  // future predictive-use step can apply a sample-size floor (e.g. n>=20)
+  // and treat low-n referees as null fallback to league-average.
+  if (homeRefereeCardRate !== null && refereeCardSampleSize !== null) {
+    await upsertFeature(matchId, "referee_avg_cards_per_match", homeRefereeCardRate);
+    await upsertFeature(matchId, "referee_card_sample_size", refereeCardSampleSize);
   }
 
   logger.info(
