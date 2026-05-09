@@ -865,6 +865,58 @@ async function computeFeaturesFromDb(
   }
   const totalMissingFixtureDiff = homeMissingFixtureCount - awayMissingFixtureCount;
 
+  // ─── Bundle 9 (2026-05-09): weather features ──────────────────────────────
+  // Raw features (5) + compound features (6) per plan v3 §2.C. Pure ingestion-
+  // side emission — no predictionEngine.ts changes here. Indoor short-circuit
+  // emits NO weather features at all (the absence is the signal).
+  let kickoffTempC: number | null = null;
+  let kickoffWindKph: number | null = null;
+  let kickoffPrecipMm: number | null = null;
+  let kickoffHumidityPct: number | null = null;
+  let isExtremeWeather = 0;
+  let weatherEmissionAllowed = false;
+  try {
+    const wRows = await db.execute(sql`
+      SELECT mw.kickoff_temp_c::float8 AS temp,
+             mw.kickoff_wind_kph::float8 AS wind,
+             mw.kickoff_precipitation_mm::float8 AS precip,
+             mw.kickoff_humidity_pct::int AS humidity,
+             COALESCE(v.is_indoor, false) AS is_indoor
+      FROM match_weather mw
+      LEFT JOIN matches m ON m.id = mw.match_id
+      LEFT JOIN venues v ON v.api_venue_id = m.venue_api_id
+      WHERE mw.match_id = ${matchId}
+      LIMIT 1
+    `);
+    const row = ((wRows as { rows?: Array<{ temp: number; wind: number; precip: number; humidity: number; is_indoor: boolean }> }).rows ?? [])[0];
+    if (row && !row.is_indoor) {
+      kickoffTempC = Number(row.temp);
+      kickoffWindKph = Number(row.wind);
+      kickoffPrecipMm = Number(row.precip);
+      kickoffHumidityPct = Number(row.humidity);
+      const extreme =
+        kickoffWindKph >= 32 ||
+        kickoffPrecipMm >= 5 ||
+        kickoffTempC < 5 ||
+        kickoffTempC > 28;
+      isExtremeWeather = extreme ? 1 : 0;
+      weatherEmissionAllowed = true;
+    }
+    // If row.is_indoor === true OR no row exists: weatherEmissionAllowed stays false.
+    // No weather features emitted for this match.
+  } catch (err) {
+    logger.warn({ err, matchId }, "Bundle 9 weather feature lookup failed — features absent");
+  }
+  // Compound features (per plan v3 strong-effect cells):
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+  const windOversDampener = weatherEmissionAllowed ? clamp(((kickoffWindKph ?? 0) - 15) / 17, 0, 1.5) : null;
+  const windBttsNoInflator = weatherEmissionAllowed ? clamp(((kickoffWindKph ?? 0) - 15) / 17, 0, 1.5) : null;
+  const rainOversDampener = weatherEmissionAllowed ? clamp((kickoffPrecipMm ?? 0) / 5, 0, 2) : null;
+  const combinedOversDampener = weatherEmissionAllowed && windOversDampener !== null && rainOversDampener !== null
+    ? Math.round(windOversDampener * rainOversDampener * 10000) / 10000 : null;
+  const hotCardsInflator = weatherEmissionAllowed ? clamp(((kickoffTempC ?? 0) - 25) / 5, 0, 1.5) : null;
+  const coldOversDampener = weatherEmissionAllowed ? clamp((5 - (kickoffTempC ?? 0)) / 5, 0, 1.5) : null;
+
   // ─── Bundle 8 (2026-05-09): manager-tenure + sidelined-active features ────
   // Team-name -> team_api_id resolution via UNION of injury_reports +
   // team_standings (most reliable sources of the mapping). Falls back to
@@ -1042,6 +1094,24 @@ async function computeFeaturesFromDb(
   }
   if (awayActiveSidelined !== null) {
     await upsertFeature(matchId, "away_active_sidelined_count", awayActiveSidelined);
+  }
+
+  // Bundle 9 (2026-05-09): weather features — raw + 6 compounds. Conditional
+  // on outdoor venue + match_weather row present. Indoor matches emit NO
+  // weather features (absence is the signal — predictionEngine downstream
+  // can interpret missing weather as "indoor or unfetched", not as zero).
+  if (weatherEmissionAllowed) {
+    await upsertFeature(matchId, "kickoff_temp_c", kickoffTempC!);
+    await upsertFeature(matchId, "kickoff_wind_kph", kickoffWindKph!);
+    await upsertFeature(matchId, "kickoff_precipitation_mm", kickoffPrecipMm!);
+    await upsertFeature(matchId, "kickoff_humidity_pct", kickoffHumidityPct!);
+    await upsertFeature(matchId, "is_extreme_weather", isExtremeWeather);
+    if (windOversDampener !== null) await upsertFeature(matchId, "wind_overs_dampener", windOversDampener);
+    if (windBttsNoInflator !== null) await upsertFeature(matchId, "wind_btts_no_inflator", windBttsNoInflator);
+    if (rainOversDampener !== null) await upsertFeature(matchId, "rain_overs_dampener", rainOversDampener);
+    if (combinedOversDampener !== null) await upsertFeature(matchId, "combined_overs_dampener", combinedOversDampener);
+    if (hotCardsInflator !== null) await upsertFeature(matchId, "hot_cards_inflator", hotCardsInflator);
+    if (coldOversDampener !== null) await upsertFeature(matchId, "cold_overs_dampener", coldOversDampener);
   }
 
   logger.info(

@@ -2897,6 +2897,59 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("H2H ingestion scheduler active — daily 07:00 UTC");
 
+  // Bundle 9 (2026-05-09): venue enrichment — daily 04:30 UTC.
+  // Phase A capture happens during fixture ingestion (apiFootball.ts).
+  // Phase B (Wikipedia classification + Nominatim geocoding) runs here.
+  // Idempotent: only enriches venues with classified_at IS NULL OR lat IS NULL.
+  // Steady-state: a few new venues per day. Initial run: ~300 venues, ~10min.
+  cron.schedule("30 4 * * *", () => {
+    logger.info("Venue enrichment triggered (daily 04:30 UTC)");
+    void (async () => {
+      try {
+        const { runVenueEnrichmentCron } = await import("./venueIngestionService");
+        const r = await runVenueEnrichmentCron();
+        logger.info(r, "Venue enrichment complete");
+      } catch (err) {
+        logger.error({ err }, "Venue enrichment failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Venue enrichment scheduler active — daily 04:30 UTC");
+
+  // Bundle 9 (2026-05-09): weather T-24h sweep — daily 00:00 UTC.
+  // Targets fixtures kicking off in next 24h with weather-relevant pending
+  // bets and outdoor venue. Per plan v3 §2.B: ~200 matches/day at this
+  // trigger, fits 1000/day OpenWeatherMap free-tier with headroom.
+  cron.schedule("0 0 * * *", () => {
+    logger.info("Weather T-24h sweep triggered (daily 00:00 UTC)");
+    void (async () => {
+      try {
+        const { runWeatherCron } = await import("./weatherService");
+        const r = await runWeatherCron("cron_t24h");
+        logger.info(r, "Weather T-24h sweep complete");
+      } catch (err) {
+        logger.error({ err }, "Weather T-24h sweep failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Weather T-24h sweep scheduler active — daily 00:00 UTC");
+
+  // Bundle 9 (2026-05-09): weather T-3h refresh — every 3h (refines forecast
+  // accuracy as kickoff approaches; skips if already-fetched within 2h).
+  cron.schedule("0 */3 * * *", () => {
+    logger.info("Weather T-3h refresh triggered (every 3h)");
+    void (async () => {
+      try {
+        const { runWeatherCron } = await import("./weatherService");
+        const r = await runWeatherCron("cron_t3h");
+        logger.info(r, "Weather T-3h refresh complete");
+      } catch (err) {
+        logger.error({ err }, "Weather T-3h refresh failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Weather T-3h refresh scheduler active — every 3h");
+
   // X4 (2026-05-07): post-match fixture/events ingestion — daily 02:00 UTC.
   cron.schedule("0 2 * * *", () => {
     logger.info("Fixture-events ingestion triggered (daily 02:00 UTC)");

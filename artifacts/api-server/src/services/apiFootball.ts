@@ -2163,7 +2163,8 @@ export async function capturePreKickoffLineups(): Promise<{
 
     try {
       const data = await fetchApiFootball<{
-        fixture: { id: number };
+        fixture: { id: number; venue?: { id?: number | null; name?: string | null; city?: string | null } | null };
+        league?: { id?: number | null; name?: string | null; country?: string | null };
         lineups?: Array<{
           team: { id: number; name: string };
           startXI?: Array<{ player: { id: number; name: string; number: number; pos: string } }>;
@@ -2178,6 +2179,18 @@ export async function capturePreKickoffLineups(): Promise<{
       if (!fixture?.lineups || fixture.lineups.length === 0) continue;
 
       const matchId = Number(row.id);
+
+      // Bundle 9 (2026-05-09): capture venue + trigger weather refresh on
+      // lineup release. AF /fixtures returns venue id/name/city and league
+      // country in the same call we already make for lineups — Phase A
+      // capture is free here. Phase B enrichment (Wikipedia + Nominatim)
+      // runs in the daily 04:30 UTC cron.
+      try {
+        const { captureVenueFromFixture } = await import("./venueIngestionService");
+        await captureVenueFromFixture(matchId, fixture.fixture?.venue, fixture.league?.country ?? null);
+      } catch (err) {
+        logger.warn({ err, matchId, fixtureId }, "Bundle 9 venue capture failed (non-fatal)");
+      }
       const lineupData = {
         lineups: fixture.lineups.map((l) => ({
           team: l.team.name,
@@ -2196,6 +2209,20 @@ export async function capturePreKickoffLineups(): Promise<{
       }).onConflictDoNothing();
 
       captured++;
+
+      // Bundle 9 (2026-05-09): lineup-event weather refresh trigger.
+      // Per plan v3 §2.B: this is the strategic peak-info-density fetch —
+      // lineups confirmed + final weather forecast at the same moment.
+      // Fire-and-forget (non-blocking, weather failure doesn't stop lineup
+      // capture).
+      try {
+        const { refreshForMatch } = await import("./weatherService");
+        void refreshForMatch(matchId).catch((err) =>
+          logger.warn({ err, matchId }, "Bundle 9 lineup-event weather refresh failed (non-fatal)"),
+        );
+      } catch (err) {
+        logger.warn({ err, matchId }, "Bundle 9 weather import failed (non-fatal)");
+      }
 
       logger.info(
         { matchId, fixtureId, home: row.home_team, away: row.away_team },

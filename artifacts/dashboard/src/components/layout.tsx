@@ -356,6 +356,19 @@ export function Layout({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         </div>
+        {/* Bundle 9 (2026-05-09): OpenWeatherMap attribution per ToS requirement.
+            "Visible attribution to OpenWeather in your application or service" — sidebar footer. */}
+        <div className="px-4 py-2 mt-auto text-[9px] text-slate-600 border-t" style={{ borderColor: "#334155" }}>
+          Weather data ©{" "}
+          <a
+            href="https://openweathermap.org/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-slate-400 underline-offset-2 hover:underline"
+          >
+            OpenWeather
+          </a>
+        </div>
       </aside>
 
       {/* Main Content */}

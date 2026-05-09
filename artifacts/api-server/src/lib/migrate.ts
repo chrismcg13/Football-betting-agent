@@ -2717,6 +2717,73 @@ export async function runMigrations() {
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // 2026-05-09 (Bundle 9 — weather expansion): venues + match_weather tables.
+    // Per Bundle 9 plan v3. Wikipedia auto-classifier feeds is_indoor /
+    // is_retractable. OpenWeatherMap fetches fed by 3 triggers (T-24h /
+    // T-3h / lineup-event). featureEngine consumes raw + 6 compound features
+    // for retrospective predictive-power validation per cell.
+    //
+    // is_indoor=true short-circuits weather fetch (no row written; features
+    // absent — the absence IS the signal). Default outdoor for unknown
+    // classifications per plan §0.3 — less harmful than mis-emitting weather
+    // for an undetected indoor stadium.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS venues (
+        api_venue_id INTEGER PRIMARY KEY,
+        venue_name TEXT,
+        city TEXT,
+        country TEXT,
+        lat NUMERIC(8,5),
+        lon NUMERIC(8,5),
+        is_indoor BOOLEAN NOT NULL DEFAULT FALSE,
+        is_retractable BOOLEAN NOT NULL DEFAULT FALSE,
+        classification_text TEXT,
+        wikipedia_url TEXT,
+        geocoded_at TIMESTAMPTZ,
+        classified_at TIMESTAMPTZ,
+        geocoding_source TEXT,
+        classification_source TEXT
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS venues_classification_pending_idx
+        ON venues(classified_at) WHERE classified_at IS NULL
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS venues_geocoding_pending_idx
+        ON venues(geocoded_at) WHERE geocoded_at IS NULL
+    `);
+
+    // venue_api_id back-reference on matches. Idempotent ADD COLUMN IF NOT EXISTS.
+    await db.execute(sql`
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS venue_api_id INTEGER
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS matches_venue_api_id_idx
+        ON matches(venue_api_id) WHERE venue_api_id IS NOT NULL
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS match_weather (
+        match_id INTEGER PRIMARY KEY REFERENCES matches(id) ON DELETE CASCADE,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        trigger_source TEXT NOT NULL,
+        kickoff_temp_c NUMERIC(4,1),
+        kickoff_wind_kph NUMERIC(5,1),
+        kickoff_precipitation_mm NUMERIC(5,2),
+        kickoff_humidity_pct INTEGER,
+        kickoff_cloud_pct INTEGER,
+        weather_source TEXT NOT NULL DEFAULT 'openweathermap'
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS match_weather_fetched_idx
+        ON match_weather(fetched_at DESC)
+    `);
+    logger.info("venues + match_weather + matches.venue_api_id ready");
+
+    // ────────────────────────────────────────────────────────────────────
     // 2026-05-09 (Bundle 2 / plan v3 §M7): per-referee card-rate aggregation.
     // Joins match_referees with matches.total_cards (already populated for
     // matches with stats coverage). Sample-size floor of n>=20 is enforced
