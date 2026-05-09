@@ -2385,27 +2385,46 @@ const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   // BTTS
   { marketType: "BTTS",              selectionName: "Yes" },
   { marketType: "BTTS",              selectionName: "No" },
-  // Double Chance
-  { marketType: "DOUBLE_CHANCE",     selectionName: "1X" },
-  { marketType: "DOUBLE_CHANCE",     selectionName: "X2" },
-  { marketType: "DOUBLE_CHANCE",     selectionName: "12" },
-  // ── 2026-05-08 Phase A2: Asian Handicap, common lines (-2..+2 in 0.5 steps) ──
+  // DOUBLE_CHANCE removed 2026-05-09 (Bundle 1) — banned 2026-04-20, no Pinnacle data
+  // (0/0 rows in oddspapi/api_football), mathematically dominated by MATCH_ODDS.
+  // Removing from PREFETCH_TARGETS so we stop parsing DC selections on every fixture.
+  // ── 2026-05-08 Phase A2 + 2026-05-09 quarter-line expansion: Asian Handicap on the 0.25 grid (-2..+2) ──
+  // Quarter-line additions (-1.75 … +1.75) added per Bundle 1 / plan v3 §M1.
+  // Resolver `marketTypes.ts:resolveAsianHandicap` already handles WIN/PUSH/LOSS leg-by-leg for 0.25
+  // lines. PREFETCH_TARGETS only adds parsing of selection names already returned in the existing
+  // /odds payload — zero quota cost.
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home -2" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away -2" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -1.75" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -1.75" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home -1.5" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away -1.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -1.25" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -1.25" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home -1" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away -1" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -0.75" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -0.75" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home -0.5" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away -0.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home -0.25" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away -0.25" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home 0" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away 0" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +0.25" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +0.25" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home +0.5" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away +0.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +0.75" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +0.75" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home +1" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away +1" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +1.25" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +1.25" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home +1.5" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away +1.5" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Home +1.75" },
+  { marketType: "ASIAN_HANDICAP",    selectionName: "Away +1.75" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Home +2" },
   { marketType: "ASIAN_HANDICAP",    selectionName: "Away +2" },
   // ── 2026-05-08 Phase B: Team-total Over/Under, common lines ──

@@ -1421,19 +1421,22 @@ export async function placePaperBet(
       }
     }
 
-    // 3. Hard cap — bet-track-aware (Phase 3 A3, 2026-05-08; demote 2026-05-09).
+    // 3. Hard cap — bet-track-aware (Phase 3 A3, 2026-05-08; demote 2026-05-09;
+    //    shadow cap raised 12→24 on 2026-05-09 per plan v3 Bundle 1 / §Item 7).
     // Paper rail: cap=4 (capital-discipline analogue, prevents per-fixture
     //   correlation/exposure). Threshold-category dedup above prevents
     //   correlated picks; the 4-cap then limits independent-edge stacking.
-    // Shadow rail: cap=12. Shadow is £0 learning data with no capital risk.
+    // Shadow rail: cap=24. Shadow is £0 learning data with no capital risk.
+    //   AH/ATG-rich fixtures saturated the prior cap of 12 (13,210 rejects/24h
+    //   from 698 distinct (match × selection) pairs). Doubling captures the
+    //   marginal candidates that were lost; further raises hit diminishing
+    //   returns because valueDetection re-emits the same opportunities every
+    //   5-min cycle (structural retry — separate follow-up ticket).
     // 2026-05-09 (no-bet-dropped): paper cap saturation no longer drops the
-    //   bet — it demotes to shadow if shadow has room. Compliance logs
-    //   showed ~79k 'paper max 4' rejections/day; those are independent
-    //   edges (correlation dedup steps 0A/0B/1 already removed correlated
-    //   picks) that we want as shadow learning data. Only when BOTH rails
+    //   bet — it demotes to shadow if shadow has room. Only when BOTH rails
     //   are saturated does the bet drop.
     const incomingTrack: "paper" | "shadow" = isShadowBet ? "shadow" : "paper";
-    const cap = incomingTrack === "shadow" ? 12 : 4;
+    const cap = incomingTrack === "shadow" ? 24 : 4;
     const sameTrackPending = existingPending.filter(
       (b) => (b.betTrack ?? "paper") === incomingTrack,
     );
@@ -1442,7 +1445,7 @@ export async function placePaperBet(
         const shadowPending = existingPending.filter(
           (b) => (b.betTrack ?? "paper") === "shadow",
         );
-        if (shadowPending.length < 12) {
+        if (shadowPending.length < 24) {
           logger.info(
             {
               matchId,
@@ -1456,14 +1459,14 @@ export async function placePaperBet(
           await logShadowGateExemption(
             "paper_per_match_cap",
             experimentTag ?? null,
-            `Paper per-match cap of 4 reached on match ${matchId}; shadow has ${12 - shadowPending.length} slots free — demoted`,
+            `Paper per-match cap of 4 reached on match ${matchId}; shadow has ${24 - shadowPending.length} slots free — demoted`,
             null,
             universeTier,
           );
           isShadowBet = true;
         } else {
           return logReject(
-            `Match ${matchId} saturated on both rails (paper ${sameTrackPending.length}/4, shadow ${shadowPending.length}/12) — dropping ${marketType}:${selectionName}`,
+            `Match ${matchId} saturated on both rails (paper ${sameTrackPending.length}/4, shadow ${shadowPending.length}/24) — dropping ${marketType}:${selectionName}`,
           );
         }
       } else {
@@ -3472,16 +3475,15 @@ export async function deduplicatePendingBets(): Promise<{
       removedByReason.cross_market_dedup++;
     }
 
-    // ── Step C: Per-match cap, bet-track-aware (Phase 3 A3, 2026-05-08).
-    // Paper rail: cap=4 (capital-discipline). Shadow rail: cap=12 (£0
-    // learning data, no capital risk; matches the emission-time check).
-    // Apply caps per track independently so paper/shadow don't compete
-    // for slots within the same match. Pre-fix this hardcoded 4 across
-    // both rails, voiding ~1,400 shadow bets per cycle that emission had
-    // legitimately allowed.
+    // ── Step C: Per-match cap, bet-track-aware (Phase 3 A3, 2026-05-08; shadow
+    // cap raised 12→24 on 2026-05-09 per Bundle 1 / plan v3 §Item 7).
+    // Paper rail: cap=4 (capital-discipline). Shadow rail: cap=24 (£0
+    // learning data, no capital risk; matches the emission-time check above).
+    // The two caps MUST stay in sync — emission allowing 24 while dedup
+    // voids back to 12 would re-create the original problem we were fixing.
     const remainingBets = activeBetsForMatch(matchId);
     for (const track of ["paper", "shadow"] as const) {
-      const cap = track === "shadow" ? 12 : 4;
+      const cap = track === "shadow" ? 24 : 4;
       const trackBets = remainingBets.filter((b) => (b.betTrack ?? "paper") === track);
       if (trackBets.length > cap) {
         const sorted = [...trackBets].sort((a, b) => (b.opportunityScore ?? 0) - (a.opportunityScore ?? 0));

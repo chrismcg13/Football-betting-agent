@@ -180,16 +180,11 @@ export const MARKET_TYPES: Record<string, MarketType> = {
     },
   },
 
-  DOUBLE_CHANCE: {
-    id: "DOUBLE_CHANCE",
-    resolveFrom: "final_score",
-    resolve: (selection, ctx) => {
-      if (selection === "Home or Draw" || selection === "1X") return ctx.homeScore >= ctx.awayScore;
-      if (selection === "Away or Draw" || selection === "X2") return ctx.awayScore >= ctx.homeScore;
-      if (selection === "Home or Away" || selection === "12") return ctx.homeScore !== ctx.awayScore;
-      return null;
-    },
-  },
+  // DOUBLE_CHANCE removed 2026-05-09 (Bundle 1 / plan v3 §3B). Banned 2026-04-20,
+  // no Pinnacle data in either oddspapi or api_football (0/0 rows verified),
+  // mathematically dominated by MATCH_ODDS (DC alpha = MO alpha − vig). Still
+  // listed in BANNED_MARKETS as defence in depth. Verified 0 pending DC bets
+  // before removal; settlement only processes pending/pending_placement rows.
 
   ASIAN_HANDICAP: {
     id: "ASIAN_HANDICAP",
