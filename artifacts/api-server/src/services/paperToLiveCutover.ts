@@ -67,6 +67,8 @@ interface EligibleBet {
   match_id: number;
   market_type: string;
   selection_name: string;
+  selection_canonical: string | null;
+  bet_type: string;
   odds_at_placement: number;
   stake: number;
   experiment_tag: string | null;
@@ -144,6 +146,7 @@ async function readMaxStakePct(): Promise<number> {
 async function selectEligibleBets(): Promise<EligibleBet[]> {
   const r = await db.execute(sql`
     SELECT pb.id, pb.match_id, pb.market_type, pb.selection_name,
+           pb.selection_canonical, pb.bet_type,
            pb.odds_at_placement::float8 AS odds_at_placement,
            pb.stake::float8              AS stake,
            pb.experiment_tag, pb.universe_tier_at_placement,
@@ -251,6 +254,8 @@ async function shadowDemote(
       matchId: bet.match_id,
       marketType: bet.market_type,
       selectionName: bet.selection_name,
+      selectionCanonical: bet.selection_canonical ?? bet.selection_name.toLowerCase().trim(),
+      betType: bet.bet_type,
       oddsAtPlacement: String(bet.odds_at_placement),
       stake: "0",
       potentialProfit: "0",
