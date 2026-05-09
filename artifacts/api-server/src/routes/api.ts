@@ -3355,6 +3355,142 @@ router.post("/admin/reserve/event", async (req, res) => {
   }
 });
 
+// Pre-flip blocker #14: flip atomic transaction. Single endpoint that runs
+// the Amendment 2 SQL — view creation, kill-switch flip, cutover_completed_at
+// stamp, four guardrail percentage upserts, absolute bankroll_floor derivation,
+// pre-flip bankroll snapshot, compliance log — all in one transaction. Refuses
+// if any operator input is missing or out of range, or if the cutover has
+// already been performed.
+router.post("/admin/cutover/flip", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as {
+      confirm?: boolean;
+      real_betfair_balance?: number;
+      max_stake_pct?: number;
+      bankroll_floor_pct?: number;
+      daily_loss_limit_pct?: number;
+      weekly_loss_limit_pct?: number;
+    };
+
+    if (body.confirm !== true) {
+      res.status(400).json({ success: false, message: '{"confirm": true} required to execute the flip.' });
+      return;
+    }
+
+    const realB = Number(body.real_betfair_balance);
+    const maxStakePct = Number(body.max_stake_pct);
+    const floorPct = Number(body.bankroll_floor_pct);
+    const dailyLossPct = Number(body.daily_loss_limit_pct);
+    const weeklyLossPct = Number(body.weekly_loss_limit_pct);
+
+    const fail = (msg: string) => { res.status(400).json({ success: false, message: msg }); };
+
+    if (!Number.isFinite(realB) || realB <= 0) return fail("real_betfair_balance must be a positive finite number.");
+    if (!Number.isFinite(maxStakePct) || maxStakePct <= 0 || maxStakePct > 0.10) return fail("max_stake_pct must be in (0, 0.10].");
+    if (!Number.isFinite(floorPct)     || floorPct < 0     || floorPct > 1)        return fail("bankroll_floor_pct must be in [0, 1].");
+    if (!Number.isFinite(dailyLossPct) || dailyLossPct <= 0 || dailyLossPct > 0.20) return fail("daily_loss_limit_pct must be in (0, 0.20].");
+    if (!Number.isFinite(weeklyLossPct) || weeklyLossPct <= 0 || weeklyLossPct > 0.40) return fail("weekly_loss_limit_pct must be in (0, 0.40].");
+
+    const existingCutover = await db.execute(sql`SELECT value FROM agent_config WHERE key='cutover_completed_at' LIMIT 1`);
+    const cutoverAt = (((existingCutover as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
+    if (cutoverAt) {
+      res.status(409).json({
+        success: false,
+        message: `cutover_completed_at already set to ${cutoverAt}. Refusing to re-flip.`,
+      });
+      return;
+    }
+    const existingKill = await db.execute(sql`SELECT value FROM agent_config WHERE key='live_placement_enabled' LIMIT 1`);
+    const killVal = (((existingKill as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
+    if ((killVal ?? "").toLowerCase() === "true") {
+      res.status(409).json({
+        success: false,
+        message: "live_placement_enabled is already 'true'. Refusing to re-flip — re-disable manually first if you really mean it.",
+      });
+      return;
+    }
+
+    const absoluteFloor = Math.round(floorPct * realB * 100) / 100;
+
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`
+        CREATE OR REPLACE VIEW live_bets_current AS
+        SELECT * FROM paper_bets
+        WHERE bet_track = 'live'
+          AND legacy_regime = false
+          AND placed_at >= (SELECT (value::timestamptz)
+                            FROM agent_config WHERE key = 'cutover_completed_at')
+      `);
+
+      await tx.execute(sql`
+        INSERT INTO agent_config(key, value, updated_at)
+        VALUES ('live_placement_enabled', 'true', NOW())
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+      `);
+      await tx.execute(sql`
+        INSERT INTO agent_config(key, value, updated_at)
+        VALUES ('cutover_completed_at', NOW()::text, NOW())
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+      `);
+      await tx.execute(sql`
+        INSERT INTO agent_config(key, value, updated_at) VALUES
+          ('max_stake_pct',          ${String(maxStakePct)},  NOW()),
+          ('bankroll_floor_pct',     ${String(floorPct)},     NOW()),
+          ('daily_loss_limit_pct',   ${String(dailyLossPct)}, NOW()),
+          ('weekly_loss_limit_pct',  ${String(weeklyLossPct)},NOW()),
+          ('bankroll_floor',         ${String(absoluteFloor)},NOW())
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+      `);
+
+      const snap = await tx.execute(sql`
+        INSERT INTO bankroll_snapshots (paper_bankroll, real_bankroll, source, notes, taken_at)
+        SELECT ac.value::numeric, ${String(realB)}::numeric, 'paper_baseline_pre_flip',
+               'Paper-mode compounded final value at cutover. Live mode reads Betfair API only.',
+               NOW()
+        FROM agent_config ac WHERE ac.key='bankroll'
+        RETURNING id, paper_bankroll::float8 AS paper_bankroll, real_bankroll::float8 AS real_bankroll
+      `);
+      const snapRow = (((snap as any).rows ?? []) as Array<{ id: number; paper_bankroll: number; real_bankroll: number }>)[0];
+
+      const audit = await tx.execute(sql`
+        INSERT INTO compliance_logs (action_type, details, timestamp)
+        VALUES ('cutover_completed',
+          ${JSON.stringify({
+            decision_authority: "operator",
+            real_betfair_balance: realB,
+            absolute_bankroll_floor: absoluteFloor,
+            guardrails: {
+              max_stake_pct: maxStakePct,
+              bankroll_floor_pct: floorPct,
+              daily_loss_limit_pct: dailyLossPct,
+              weekly_loss_limit_pct: weeklyLossPct,
+            },
+            paper_baseline_snapshot_id: snapRow?.id ?? null,
+            paper_baseline_bankroll: snapRow?.paper_bankroll ?? null,
+          })}::jsonb,
+          NOW())
+        RETURNING id
+      `);
+      const auditRow = (((audit as any).rows ?? []) as Array<{ id: number }>)[0];
+
+      return {
+        snapshot_id: snapRow?.id ?? null,
+        paper_baseline_bankroll: snapRow?.paper_bankroll ?? null,
+        absolute_bankroll_floor: absoluteFloor,
+        compliance_log_id: auditRow?.id ?? null,
+      };
+    });
+
+    const { invalidateLivePlacementFlagCache } = await import("../services/livePlacementGate");
+    invalidateLivePlacementFlagCache();
+
+    res.json({ success: true, message: "Cutover flipped.", result });
+  } catch (err) {
+    logger.error({ err }, "cutover/flip failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 // Pre-flip blocker #11: cutover orchestrator endpoint.
 // POST /admin/cutover/run with { dryRun: boolean }. Returns the structured
 // CutoverReport. Run dryRun=true first; review; then dryRun=false to commit.
