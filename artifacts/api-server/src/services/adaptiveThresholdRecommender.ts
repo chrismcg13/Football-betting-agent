@@ -26,6 +26,7 @@
 import { db } from "@workspace/db";
 import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
+import { getBankroll } from "./paperTrading";
 
 // ── Configuration constants ────────────────────────────────────────────────
 // Pinnacle-edge specific (legacy — preserved for backward compat). For
@@ -215,9 +216,8 @@ async function ingestionHealthy(): Promise<{ passed: boolean; reason: string }> 
 }
 
 async function getBankrollEstimate(): Promise<number> {
-  const r = await db.execute(sql`SELECT value FROM agent_config WHERE key='bankroll' LIMIT 1`);
-  const v = (((r as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
-  return v != null ? Number(v) : 10000;
+  // Live mode: Betfair availableToBetBalance, not paper-compounded agent_config.bankroll.
+  return await getBankroll();
 }
 
 async function persistGenericRecommendation(
