@@ -36,6 +36,7 @@ import { logger } from "../lib/logger";
 import {
   getLiveBankroll,
   refreshBalanceIfStale,
+  getAccountFunds,
   findMarketForBet,
   findSelectionId,
   placeLiveBetOnBetfair,
@@ -92,7 +93,8 @@ export type ConversionFailureReason =
   | "market_suspended"
   | "drift_exceeded"
   | "edge_collapsed"
-  | "liquidity_short"
+  | "liquidity_short"          // top-of-book size at current price < requested stake (pre-placement)
+  | "account_funds_short"      // Betfair returned INSUFFICIENT_FUNDS after we tried to place
   | "stake_below_minimum"
   | "no_model_probability"
   | "api_error"
@@ -487,7 +489,8 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
       const reason: ConversionFailureReason = (() => {
         const e = (result.error ?? "").toLowerCase();
         if (e.includes("suspended") || e.includes("not_open")) return "market_suspended";
-        if (e.includes("nsufficient") || e.includes("balance")) return "liquidity_short";
+        // INSUFFICIENT_FUNDS / "balance" / "fund" — distinct from gate-4 market-liquidity
+        if (e.includes("nsufficient") || e.includes("fund") || e.includes("balance")) return "account_funds_short";
         if (e.includes("below betfair minimum") || e.includes("below £2")) return "stake_below_minimum";
         return "api_error";
       })();
@@ -509,6 +512,22 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
     });
     recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: stake },
       "converted", null, result.betfairBetId);
+
+    // Refresh available balance so subsequent Kelly recomputes use the current
+    // post-placement bankroll. Without this the in-memory liveBankroll stays at
+    // the pre-pass value and bet 50 of 94 still sizes against a balance that's
+    // effectively been spent — Betfair then rejects with INSUFFICIENT_FUNDS.
+    // getAccountFunds() refreshes the cache; getLiveBankroll() then subtracts
+    // locked_reserve consistently with the upstream Kelly path.
+    try {
+      await getAccountFunds();
+      report.liveBankroll = await getLiveBankroll();
+    } catch (refreshErr) {
+      logger.warn(
+        { err: refreshErr, betId: bet.id },
+        "Cutover: post-placement balance refresh failed — continuing with stale bankroll",
+      );
+    }
   }
 
   return report;
