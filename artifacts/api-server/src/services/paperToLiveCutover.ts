@@ -1,22 +1,33 @@
 /**
- * Pre-flip blocker #11: paper-to-live cutover orchestrator.
+ * Pre-flip blocker #11 (revised): paper-to-live cutover orchestrator.
  *
  * Single orchestrated pass. Converts every paper-pending bet with kickoff
- * > NOW() + 1h into a live placement attempt. Each conversion:
- *   - Per-bet feasibility gates (1: market open, 2: drift, 3: residual edge,
- *     4: liquidity).
- *   - Recompute Kelly stake against live B = getLiveBankroll().
- *   - placeLiveBetOnBetfair() on pass; UPDATE paper_bets to bet_track='live'
- *     per Amendment 4 field-refresh policy on success.
- *   - On any failure: UPDATE original row to status='cancelled', INSERT a
- *     shadow row with stake=0, write compliance_logs entry with reason.
+ * > NOW() + 1h into a live placement attempt. Each bet has exactly one of
+ * three outcomes — there is no "skipped" state, every non-converted bet
+ * cancels the original paper row and inserts a shadow row with reason:
+ *
+ *   1. Converted: gates pass + stake>=£2 + Betfair placement succeeds
+ *      → original row UPDATEd to bet_track='live'.
+ *
+ *   2. Shadow-demoted: any of the per-bet feasibility gates fail OR the
+ *      Kelly helper returns 0 (edge<=0 at current price) OR Betfair
+ *      placement fails → original row UPDATEd to status='cancelled',
+ *      a new bet_track='shadow' row inserted with stake=0 and
+ *      qualification_path='cutover_demoted_to_shadow', compliance_logs
+ *      entry tagged 'paper_to_live_conversion_failed_to_shadow' with reason
+ *      ∈ {market_suspended, drift_exceeded, edge_collapsed, liquidity_short,
+ *         market_not_found, selection_not_found, no_betfair_event,
+ *         api_error, stake_below_minimum}.
+ *
+ * Stake sizing IS the same as new live emissions: the cutover calls
+ * calculateDynamicKellyStake() exported from paperTrading.ts. That helper
+ * encodes the £2 floor rule (paperTrading.ts:718): edge<=0 returns 0
+ * (we shadow-demote 'edge_collapsed'); edge>0 floors stake to £2 minimum.
+ * No conversion-specific staking rules are introduced.
  *
  * Drift tolerance (Option (i) per plan §B): max(3 ticks, 1.5% × paper_price).
- * Residual edge floor: existing valueDetection minEdge (no new threshold).
- * Liquidity floor: availableToBack >= roundedStake.
- *
- * Per-bet atomicity. Re-running is safe — converted bets are no longer
- * bet_track='paper' so they drop out of the SELECT.
+ * Edge floor: agent_config.min_edge_threshold (default 0.03), recomputed
+ * against current market-book price using the bet's stored model_probability.
  */
 
 import { db, paperBetsTable, complianceLogsTable } from "@workspace/db";
@@ -31,8 +42,7 @@ import {
 } from "./betfairLive";
 import { listMarketBook } from "./betfair";
 import { isLivePlacementEnabled } from "./livePlacementGate";
-
-const KICKOFF_BUFFER_INTERVAL = "1 hour";
+import { calculateDynamicKellyStake } from "./paperTrading";
 
 // Betfair tick sizes by price band (from Betfair price ladder spec).
 function tickSize(price: number): number {
@@ -49,9 +59,7 @@ function tickSize(price: number): number {
 }
 
 function driftTolerance(paperPrice: number): number {
-  const threeTicks = 3 * tickSize(paperPrice);
-  const onePointFivePct = 0.015 * paperPrice;
-  return Math.max(threeTicks, onePointFivePct);
+  return Math.max(3 * tickSize(paperPrice), 0.015 * paperPrice);
 }
 
 interface EligibleBet {
@@ -84,6 +92,7 @@ export type ConversionFailureReason =
   | "edge_collapsed"
   | "liquidity_short"
   | "stake_below_minimum"
+  | "no_model_probability"
   | "api_error"
   | "unknown";
 
@@ -94,9 +103,10 @@ interface PerBetOutcome {
   paperOdds: number;
   paperStake: number;
   currentBackOdds: number | null;
-  recomputedEdge: number | null;
-  recomputedStake: number | null;
-  outcome: "converted" | "shadow" | "skipped";
+  modelProbability: number | null;
+  edgeAtCurrentPrice: number | null;
+  computedStake: number | null;
+  outcome: "converted" | "shadow_demoted";
   reason: ConversionFailureReason | null;
   betfairBetId: string | null;
 }
@@ -108,12 +118,11 @@ export interface CutoverReport {
   killSwitchOn: boolean;
   totalEligible: number;
   converted: number;
-  shadowed: number;
-  skipped: number;
+  shadowDemoted: number;
+  cancelledOriginalCount: number;  // every non-converted bet cancels the original
   byReason: Record<string, number>;
   totalLiveExposure: number;
   perBet: PerBetOutcome[];
-  // Amendment 3 surface item: historical Tier1 silent-rejection rate.
   historicalTier1Rate: Array<{ day: string; paper_emitted: number; live_attempted: number; silently_rejected: number; pct_rejected: number | null }> | null;
 }
 
@@ -130,29 +139,6 @@ async function readMaxStakePct(): Promise<number> {
   const v = (((r as any).rows ?? []) as Array<{ value: string }>)[0]?.value;
   const n = Number(v ?? "");
   return Number.isFinite(n) && n > 0 ? n : 0.02;
-}
-
-async function readBoundedKellyFraction(opportunityScore: number | null): Promise<number> {
-  // Match the existing kellyFractionForScore behaviour from lazyPromoteShadowToPaper.ts:46-51.
-  const s = opportunityScore ?? 0;
-  if (s >= 80) return 0.50;
-  if (s >= 72) return 0.375;
-  if (s >= 65) return 0.25;
-  return 0.125;
-}
-
-function recomputeKellyStake(
-  bankroll: number,
-  edgeFraction: number,
-  backOdds: number,
-  kellyFraction: number,
-  maxStakePct: number,
-): number {
-  if (edgeFraction <= 0 || backOdds <= 1) return 0;
-  const fullKelly = edgeFraction / (backOdds - 1);
-  let stake = bankroll * fullKelly * kellyFraction;
-  stake = Math.min(stake, bankroll * maxStakePct);
-  return Math.round(stake * 100) / 100;
 }
 
 async function selectEligibleBets(): Promise<EligibleBet[]> {
@@ -202,106 +188,59 @@ async function fetchHistoricalTier1Rate(): Promise<CutoverReport["historicalTier
   }));
 }
 
-interface GateResult {
+interface MarketContext {
   pass: boolean;
   reason: ConversionFailureReason | null;
   currentBackOdds: number | null;
-  availableLay: number | null;
+  availableSize: number | null;
   marketStatus: string | null;
   marketId: string | null;
   selectionId: number | null;
 }
 
-async function applyFeasibilityGates(bet: EligibleBet, recomputedStake: number): Promise<GateResult> {
+async function fetchMarketContext(bet: EligibleBet): Promise<MarketContext> {
   if (!bet.betfair_event_id) {
-    return { pass: false, reason: "no_betfair_event", currentBackOdds: null, availableLay: null, marketStatus: null, marketId: null, selectionId: null };
+    return { pass: false, reason: "no_betfair_event", currentBackOdds: null, availableSize: null, marketStatus: null, marketId: null, selectionId: null };
   }
   const market = await findMarketForBet(bet.betfair_event_id, bet.market_type, bet.home_team, bet.away_team);
   if (!market || !market.runners) {
-    return { pass: false, reason: "market_not_found", currentBackOdds: null, availableLay: null, marketStatus: null, marketId: null, selectionId: null };
+    return { pass: false, reason: "market_not_found", currentBackOdds: null, availableSize: null, marketStatus: null, marketId: null, selectionId: null };
   }
   const selectionId = findSelectionId(market.runners as any, bet.selection_name, bet.home_team, bet.away_team);
   if (!selectionId) {
-    return { pass: false, reason: "selection_not_found", currentBackOdds: null, availableLay: null, marketStatus: null, marketId: market.marketId, selectionId: null };
+    return { pass: false, reason: "selection_not_found", currentBackOdds: null, availableSize: null, marketStatus: null, marketId: market.marketId, selectionId: null };
   }
 
   const books = await listMarketBook([market.marketId]);
   const book = books[0];
   if (!book) {
-    return { pass: false, reason: "market_not_found", currentBackOdds: null, availableLay: null, marketStatus: null, marketId: market.marketId, selectionId };
+    return { pass: false, reason: "market_not_found", currentBackOdds: null, availableSize: null, marketStatus: null, marketId: market.marketId, selectionId };
   }
-
-  // Gate 1: market open + not suspended.
   if (book.status !== "OPEN") {
-    return { pass: false, reason: "market_suspended", currentBackOdds: null, availableLay: null, marketStatus: book.status, marketId: market.marketId, selectionId };
+    return { pass: false, reason: "market_suspended", currentBackOdds: null, availableSize: null, marketStatus: book.status, marketId: market.marketId, selectionId };
   }
 
   const runner = book.runners.find((rr) => rr.selectionId === selectionId);
   const backTop = runner?.ex?.availableToBack?.[0];
   if (!runner || !backTop) {
-    return { pass: false, reason: "liquidity_short", currentBackOdds: null, availableLay: null, marketStatus: book.status, marketId: market.marketId, selectionId };
-  }
-  const currentBack = backTop.price;
-  const availableSize = backTop.size ?? 0;
-
-  // Gate 2: drift tolerance — option (i) max(3 ticks, 1.5% × paper_price).
-  const tol = driftTolerance(bet.odds_at_placement);
-  if (Math.abs(currentBack - bet.odds_at_placement) > tol) {
-    return {
-      pass: false, reason: "drift_exceeded",
-      currentBackOdds: currentBack, availableLay: availableSize,
-      marketStatus: book.status, marketId: market.marketId, selectionId,
-    };
-  }
-
-  // Gate 4: liquidity (size at top of back-side queue >= our stake).
-  // Lay-side size on the back queue is what we'd take if we placed at currentBack.
-  if (availableSize < recomputedStake) {
-    return {
-      pass: false, reason: "liquidity_short",
-      currentBackOdds: currentBack, availableLay: availableSize,
-      marketStatus: book.status, marketId: market.marketId, selectionId,
-    };
+    return { pass: false, reason: "liquidity_short", currentBackOdds: null, availableSize: 0, marketStatus: book.status, marketId: market.marketId, selectionId };
   }
 
   return {
     pass: true, reason: null,
-    currentBackOdds: currentBack, availableLay: availableSize,
-    marketStatus: book.status, marketId: market.marketId, selectionId,
+    currentBackOdds: backTop.price,
+    availableSize: backTop.size ?? 0,
+    marketStatus: book.status,
+    marketId: market.marketId,
+    selectionId,
   };
 }
 
-async function logSuccessToCompliance(
+async function shadowDemote(
   bet: EligibleBet,
-  betfairBetId: string,
+  reason: ConversionFailureReason,
   detail: Record<string, unknown>,
 ): Promise<void> {
-  await db.insert(complianceLogsTable).values({
-    actionType: "paper_to_live_conversion_success",
-    details: { bet_id: bet.id, betfair_bet_id: betfairBetId, ...detail },
-    timestamp: new Date(),
-  });
-}
-
-async function applyConversionSuccess(bet: EligibleBet, params: {
-  recomputedStake: number;
-  conversionAt: Date;
-}): Promise<void> {
-  // Amendment 4 field-refresh policy. placeLiveBetOnBetfair already sets
-  // betfair_* fields and betfair_placed_at; here we only set the cutover-
-  // specific deltas.
-  const newPotentialProfit = Math.round(params.recomputedStake * (bet.odds_at_placement - 1) * 100) / 100;
-  await db.update(paperBetsTable).set({
-    betTrack: "live",
-    status: "pending",
-    stake: String(params.recomputedStake),
-    potentialProfit: String(newPotentialProfit),
-    qualificationPath: "cutover_converted",
-    placedAt: params.conversionAt,
-  }).where(eq(paperBetsTable.id, bet.id));
-}
-
-async function applyConversionFailure(bet: EligibleBet, reason: ConversionFailureReason, detail: Record<string, unknown>): Promise<void> {
   await db.transaction(async (tx) => {
     await tx.update(paperBetsTable).set({
       status: "cancelled",
@@ -335,6 +274,36 @@ async function applyConversionFailure(bet: EligibleBet, reason: ConversionFailur
   });
 }
 
+async function applyConversionSuccess(bet: EligibleBet, params: {
+  recomputedStake: number;
+  conversionAt: Date;
+}): Promise<void> {
+  // Amendment 4 field-refresh policy. placeLiveBetOnBetfair already sets
+  // betfair_* fields and betfair_placed_at; here we set the cutover-specific
+  // deltas only.
+  const newPotentialProfit = Math.round(params.recomputedStake * (bet.odds_at_placement - 1) * 100) / 100;
+  await db.update(paperBetsTable).set({
+    betTrack: "live",
+    status: "pending",
+    stake: String(params.recomputedStake),
+    potentialProfit: String(newPotentialProfit),
+    qualificationPath: "cutover_converted",
+    placedAt: params.conversionAt,
+  }).where(eq(paperBetsTable.id, bet.id));
+}
+
+async function logSuccessToCompliance(
+  bet: EligibleBet,
+  betfairBetId: string,
+  detail: Record<string, unknown>,
+): Promise<void> {
+  await db.insert(complianceLogsTable).values({
+    actionType: "paper_to_live_conversion_success",
+    details: { bet_id: bet.id, betfair_bet_id: betfairBetId, ...detail },
+    timestamp: new Date(),
+  });
+}
+
 export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<CutoverReport> {
   const evaluatedAt = new Date().toISOString();
   const killSwitchOn = await isLivePlacementEnabled();
@@ -346,8 +315,8 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
     killSwitchOn,
     totalEligible: 0,
     converted: 0,
-    shadowed: 0,
-    skipped: 0,
+    shadowDemoted: 0,
+    cancelledOriginalCount: 0,
     byReason: {},
     totalLiveExposure: 0,
     perBet: [],
@@ -359,9 +328,6 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
     return report;
   }
 
-  // Surface item: historical Tier1 silent-rejection rate (Amendment 3 caveat
-  // query — full lookback, not 7-day-only). Always include in report so dry-run
-  // surfaces day-one volume-uplift expectation.
   report.historicalTier1Rate = await fetchHistoricalTier1Rate();
 
   await refreshBalanceIfStale();
@@ -373,120 +339,130 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
   const bets = await selectEligibleBets();
   report.totalEligible = bets.length;
 
-  // Sort by paper-side score: edge × stake (proxy for the documented
-  // ordering function; remaining-budget term is implicit via per-bet
-  // recomputation against B_live).
+  // Best-first ordering. Use paper-recorded edge as a proxy for sort order;
+  // recomputation against current price happens per-bet during processing.
   const scored = bets.map((b) => {
-    const paperEdge = b.pinnacle_implied != null && b.odds_at_placement > 0
-      ? (1 / b.odds_at_placement - b.pinnacle_implied) / b.pinnacle_implied  // pseudo edge for ordering
+    const proxyEdge = b.model_probability != null && b.odds_at_placement > 0
+      ? (b.model_probability * b.odds_at_placement) - 1
       : 0;
-    return { b, score: Math.abs(paperEdge) * b.stake };
+    return { b, score: Math.max(0, proxyEdge) * b.stake };
   }).sort((a, c) => c.score - a.score);
 
+  const recordOutcome = (
+    bet: EligibleBet,
+    ctx: { currentBackOdds: number | null; edgeAtCurrentPrice: number | null; computedStake: number | null },
+    outcome: "converted" | "shadow_demoted",
+    reason: ConversionFailureReason | null,
+    betfairBetId: string | null,
+  ) => {
+    report.perBet.push({
+      betId: bet.id,
+      marketType: bet.market_type,
+      league: bet.league,
+      paperOdds: bet.odds_at_placement,
+      paperStake: bet.stake,
+      currentBackOdds: ctx.currentBackOdds,
+      modelProbability: bet.model_probability,
+      edgeAtCurrentPrice: ctx.edgeAtCurrentPrice,
+      computedStake: ctx.computedStake,
+      outcome,
+      reason,
+      betfairBetId,
+    });
+    if (outcome === "converted") {
+      report.converted += 1;
+      if (ctx.computedStake != null) report.totalLiveExposure += ctx.computedStake;
+    } else {
+      report.shadowDemoted += 1;
+      report.cancelledOriginalCount += 1;
+      const k = reason ?? "unknown";
+      report.byReason[k] = (report.byReason[k] ?? 0) + 1;
+    }
+  };
+
   for (const { b: bet } of scored) {
-    const kellyFraction = await readBoundedKellyFraction(bet.opportunity_score);
+    // Pre-flight: model_probability must exist for any meaningful edge calc.
+    if (bet.model_probability == null || !Number.isFinite(bet.model_probability) || bet.model_probability <= 0) {
+      recordOutcome(bet, { currentBackOdds: null, edgeAtCurrentPrice: null, computedStake: null },
+        "shadow_demoted", "no_model_probability", null);
+      if (!opts.dryRun) await shadowDemote(bet, "no_model_probability", { paper_odds: bet.odds_at_placement });
+      continue;
+    }
 
-    // Provisional Kelly stake (will be revised after we see current price).
-    const provisionalStake = recomputeKellyStake(
+    // Gate 1: market open (also resolves marketId, selectionId, current odds, available size).
+    const ctx = await fetchMarketContext(bet);
+    if (!ctx.pass) {
+      recordOutcome(bet, { currentBackOdds: ctx.currentBackOdds, edgeAtCurrentPrice: null, computedStake: null },
+        "shadow_demoted", ctx.reason, null);
+      if (!opts.dryRun) await shadowDemote(bet, ctx.reason ?? "unknown", {
+        paper_odds: bet.odds_at_placement,
+        market_status: ctx.marketStatus,
+      });
+      continue;
+    }
+
+    const currentBack = ctx.currentBackOdds!;
+    const edgeAtCurrentPrice = (bet.model_probability * currentBack) - 1;
+
+    // Gate 2: drift tolerance (Option (i): max(3 ticks, 1.5% × paper_price)).
+    const tol = driftTolerance(bet.odds_at_placement);
+    if (Math.abs(currentBack - bet.odds_at_placement) > tol) {
+      recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: null },
+        "shadow_demoted", "drift_exceeded", null);
+      if (!opts.dryRun) await shadowDemote(bet, "drift_exceeded", {
+        paper_odds: bet.odds_at_placement, current_back_odds: currentBack, tolerance: tol,
+      });
+      continue;
+    }
+
+    // Stake sizing — same helper as new live emissions. The helper returns 0
+    // if edge<=0 (we'll shadow-demote 'edge_collapsed'); otherwise floors to £2.
+    const opportunityScore = bet.opportunity_score ?? 0;
+    const stake = calculateDynamicKellyStake(
       report.liveBankroll,
-      // Use paper-recorded edge as approximation; refined post-gate-2.
-      Math.max(0, (1 / bet.odds_at_placement) - (bet.pinnacle_implied ?? (1 / bet.odds_at_placement))),
-      bet.odds_at_placement,
-      kellyFraction,
+      edgeAtCurrentPrice,
+      currentBack,
       maxStakePct,
+      opportunityScore,
+      bet.market_type,
     );
 
-    if (provisionalStake < 2) {
-      report.skipped += 1;
-      report.byReason["stake_below_minimum"] = (report.byReason["stake_below_minimum"] ?? 0) + 1;
-      report.perBet.push({
-        betId: bet.id, marketType: bet.market_type, league: bet.league,
-        paperOdds: bet.odds_at_placement, paperStake: bet.stake,
-        currentBackOdds: null, recomputedEdge: null, recomputedStake: provisionalStake,
-        outcome: "skipped", reason: "stake_below_minimum", betfairBetId: null,
+    // Gate 3: residual edge must clear the same threshold paper emission uses.
+    // If edgeAtCurrentPrice<=0 the helper already returned 0 and we'd shadow-demote
+    // below — but we also shadow-demote when edge is positive but below minEdge,
+    // matching valueDetection's emission-time floor.
+    if (stake === 0) {
+      recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: 0 },
+        "shadow_demoted", "edge_collapsed", null);
+      if (!opts.dryRun) await shadowDemote(bet, "edge_collapsed", {
+        paper_odds: bet.odds_at_placement, current_back_odds: currentBack,
+        edge_at_current_price: edgeAtCurrentPrice,
+      });
+      continue;
+    }
+    if (edgeAtCurrentPrice < minEdge) {
+      recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: stake },
+        "shadow_demoted", "edge_collapsed", null);
+      if (!opts.dryRun) await shadowDemote(bet, "edge_collapsed", {
+        paper_odds: bet.odds_at_placement, current_back_odds: currentBack,
+        edge_at_current_price: edgeAtCurrentPrice, min_edge_threshold: minEdge,
       });
       continue;
     }
 
-    const gates = await applyFeasibilityGates(bet, provisionalStake);
-    if (!gates.pass) {
-      report.byReason[gates.reason ?? "unknown"] = (report.byReason[gates.reason ?? "unknown"] ?? 0) + 1;
-      report.perBet.push({
-        betId: bet.id, marketType: bet.market_type, league: bet.league,
-        paperOdds: bet.odds_at_placement, paperStake: bet.stake,
-        currentBackOdds: gates.currentBackOdds, recomputedEdge: null, recomputedStake: provisionalStake,
-        outcome: "shadow", reason: gates.reason, betfairBetId: null,
+    // Gate 4: liquidity at top of back queue.
+    if ((ctx.availableSize ?? 0) < stake) {
+      recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: stake },
+        "shadow_demoted", "liquidity_short", null);
+      if (!opts.dryRun) await shadowDemote(bet, "liquidity_short", {
+        current_back_odds: currentBack, available_size: ctx.availableSize, requested_stake: stake,
       });
-      if (!opts.dryRun) {
-        await applyConversionFailure(bet, gates.reason ?? "unknown", {
-          paper_odds: bet.odds_at_placement,
-          current_back_odds: gates.currentBackOdds,
-          market_status: gates.marketStatus,
-          available_size: gates.availableLay,
-          provisional_stake: provisionalStake,
-        });
-      }
-      report.shadowed += 1;
-      continue;
-    }
-
-    // Gate 3: residual edge against current price.
-    const currentBack = gates.currentBackOdds!;
-    const pinImplied = bet.pinnacle_implied;
-    const recomputedEdge = pinImplied != null ? (1 / currentBack) - pinImplied : null;
-    if (recomputedEdge != null && recomputedEdge < minEdge) {
-      report.byReason["edge_collapsed"] = (report.byReason["edge_collapsed"] ?? 0) + 1;
-      report.perBet.push({
-        betId: bet.id, marketType: bet.market_type, league: bet.league,
-        paperOdds: bet.odds_at_placement, paperStake: bet.stake,
-        currentBackOdds: currentBack, recomputedEdge, recomputedStake: provisionalStake,
-        outcome: "shadow", reason: "edge_collapsed", betfairBetId: null,
-      });
-      if (!opts.dryRun) {
-        await applyConversionFailure(bet, "edge_collapsed", {
-          paper_odds: bet.odds_at_placement,
-          current_back_odds: currentBack,
-          recomputed_edge: recomputedEdge,
-          min_edge_threshold: minEdge,
-        });
-      }
-      report.shadowed += 1;
-      continue;
-    }
-
-    // Recompute stake against the current price and refreshed B.
-    const finalEdgeFraction = recomputedEdge != null && recomputedEdge > 0
-      ? recomputedEdge
-      : Math.max(0, (1 / bet.odds_at_placement) - (pinImplied ?? (1 / bet.odds_at_placement)));
-    const refreshedStake = recomputeKellyStake(
-      report.liveBankroll, finalEdgeFraction, currentBack, kellyFraction, maxStakePct,
-    );
-    if (refreshedStake < 2) {
-      report.byReason["stake_below_minimum"] = (report.byReason["stake_below_minimum"] ?? 0) + 1;
-      report.perBet.push({
-        betId: bet.id, marketType: bet.market_type, league: bet.league,
-        paperOdds: bet.odds_at_placement, paperStake: bet.stake,
-        currentBackOdds: currentBack, recomputedEdge, recomputedStake: refreshedStake,
-        outcome: "shadow", reason: "stake_below_minimum", betfairBetId: null,
-      });
-      if (!opts.dryRun) {
-        await applyConversionFailure(bet, "stake_below_minimum", {
-          recomputed_stake: refreshedStake, current_back_odds: currentBack,
-        });
-      }
-      report.shadowed += 1;
       continue;
     }
 
     if (opts.dryRun) {
-      report.converted += 1;
-      report.totalLiveExposure += refreshedStake;
-      report.perBet.push({
-        betId: bet.id, marketType: bet.market_type, league: bet.league,
-        paperOdds: bet.odds_at_placement, paperStake: bet.stake,
-        currentBackOdds: currentBack, recomputedEdge, recomputedStake: refreshedStake,
-        outcome: "converted", reason: null, betfairBetId: null,
-      });
+      recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: stake },
+        "converted", null, null);
       continue;
     }
 
@@ -497,7 +473,7 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
       marketType: bet.market_type,
       selectionName: bet.selection_name,
       odds: currentBack,
-      stake: refreshedStake,
+      stake,
       homeTeam: bet.home_team,
       awayTeam: bet.away_team,
     });
@@ -510,40 +486,24 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
         if (e.includes("below betfair minimum") || e.includes("below £2")) return "stake_below_minimum";
         return "api_error";
       })();
-      report.byReason[reason] = (report.byReason[reason] ?? 0) + 1;
-      report.perBet.push({
-        betId: bet.id, marketType: bet.market_type, league: bet.league,
-        paperOdds: bet.odds_at_placement, paperStake: bet.stake,
-        currentBackOdds: currentBack, recomputedEdge, recomputedStake: refreshedStake,
-        outcome: "shadow", reason, betfairBetId: null,
+      recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: stake },
+        "shadow_demoted", reason, null);
+      await shadowDemote(bet, reason, {
+        error: result.error, current_back_odds: currentBack, requested_stake: stake,
       });
-      await applyConversionFailure(bet, reason, {
-        error: result.error, current_back_odds: currentBack, recomputed_stake: refreshedStake,
-      });
-      report.shadowed += 1;
       continue;
     }
 
-    // Success — UPDATE per Amendment 4 field-refresh policy.
-    await applyConversionSuccess(bet, {
-      recomputedStake: refreshedStake,
-      conversionAt: new Date(),
-    });
+    await applyConversionSuccess(bet, { recomputedStake: stake, conversionAt: new Date() });
     await logSuccessToCompliance(bet, result.betfairBetId, {
       paper_odds: bet.odds_at_placement,
       current_back_odds: currentBack,
       paper_stake: bet.stake,
-      live_stake: refreshedStake,
-      kelly_fraction: kellyFraction,
+      live_stake: stake,
+      edge_at_current_price: edgeAtCurrentPrice,
     });
-    report.converted += 1;
-    report.totalLiveExposure += refreshedStake;
-    report.perBet.push({
-      betId: bet.id, marketType: bet.market_type, league: bet.league,
-      paperOdds: bet.odds_at_placement, paperStake: bet.stake,
-      currentBackOdds: currentBack, recomputedEdge, recomputedStake: refreshedStake,
-      outcome: "converted", reason: null, betfairBetId: result.betfairBetId,
-    });
+    recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: stake },
+      "converted", null, result.betfairBetId);
   }
 
   return report;

@@ -700,7 +700,7 @@ async function logShadowGateExemption(
   }
 }
 
-function calculateDynamicKellyStake(
+export function calculateDynamicKellyStake(
   bankroll: number,
   edge: number,
   backOdds: number,
@@ -708,6 +708,9 @@ function calculateDynamicKellyStake(
   opportunityScore: number,
   marketType?: string,
 ): number {
+  // Floor rule (line 718): edge<=0 returns 0; edge>0 floors stake to £2 minimum.
+  // Cutover conversion (paperToLiveCutover.ts) calls this so emission-side and
+  // conversion-side stake sizing stay in lockstep.
   if (edge <= 0 || backOdds <= 1) return 0;
 
   const fraction = kellyFractionForScore(opportunityScore, marketType);

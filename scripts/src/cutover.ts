@@ -22,8 +22,9 @@ interface PerBet {
   betId: number; marketType: string; league: string;
   paperOdds: number; paperStake: number;
   currentBackOdds: number | null;
-  recomputedEdge: number | null;
-  recomputedStake: number | null;
+  modelProbability: number | null;
+  edgeAtCurrentPrice: number | null;
+  computedStake: number | null;
   outcome: string; reason: string | null;
   betfairBetId: string | null;
 }
@@ -35,8 +36,8 @@ interface Report {
   killSwitchOn: boolean;
   totalEligible: number;
   converted: number;
-  shadowed: number;
-  skipped: number;
+  shadowDemoted: number;
+  cancelledOriginalCount: number;
   byReason: Record<string, number>;
   totalLiveExposure: number;
   perBet: PerBet[];
@@ -79,15 +80,15 @@ function parseArgs(argv: string[]): { dryRun: boolean } {
   console.log(`kill_switch:     ${x.killSwitchOn ? "ON" : "OFF (will refuse to run)"}`);
   console.log(`live_bankroll:   ${fmtMoney(x.liveBankroll)}`);
   console.log("");
-  console.log(`eligible:        ${x.totalEligible}`);
-  console.log(`converted:       ${x.converted}`);
-  console.log(`shadowed:        ${x.shadowed}`);
-  console.log(`skipped:         ${x.skipped}`);
-  console.log(`live exposure:   ${fmtMoney(x.totalLiveExposure)}`);
+  console.log(`eligible:                  ${x.totalEligible}`);
+  console.log(`converted (live):          ${x.converted}`);
+  console.log(`shadow-demoted:            ${x.shadowDemoted}`);
+  console.log(`originals cancelled:       ${x.cancelledOriginalCount}  (= shadow-demoted; every non-converted cancels original)`);
+  console.log(`live exposure:             ${fmtMoney(x.totalLiveExposure)}`);
   console.log("");
   if (Object.keys(x.byReason).length > 0) {
-    console.log("By reason:");
-    for (const [k, v] of Object.entries(x.byReason)) {
+    console.log("Shadow-demote breakdown by reason:");
+    for (const [k, v] of Object.entries(x.byReason).sort((a, b) => b[1] - a[1])) {
       console.log(`  ${k.padEnd(28)} ${v}`);
     }
     console.log("");
@@ -105,15 +106,15 @@ function parseArgs(argv: string[]): { dryRun: boolean } {
     console.log("");
   }
   console.log(`Per-bet (${x.perBet.length}):`);
-  const head = "  betId   market_type/league                                outcome      paper→curr odds   stake → recomp   reason";
-  console.log(head);
+  console.log("  betId   market_type/league                                outcome         paper→curr odds   edge%   stake    reason");
   for (const p of x.perBet.slice(0, 200)) {
     const scope = `${p.marketType}/${p.league}`.slice(0, 50).padEnd(50);
-    const outcome = p.outcome.padEnd(12);
+    const outcome = p.outcome.padEnd(15);
     const odds = `${p.paperOdds.toFixed(2)} → ${p.currentBackOdds != null ? p.currentBackOdds.toFixed(2) : "—"}`.padStart(15);
-    const stake = `${p.paperStake.toFixed(2)} → ${p.recomputedStake != null ? p.recomputedStake.toFixed(2) : "—"}`.padStart(15);
+    const edge = p.edgeAtCurrentPrice != null ? `${(p.edgeAtCurrentPrice * 100).toFixed(1)}%`.padStart(6) : "    —";
+    const stake = p.computedStake != null ? `£${p.computedStake.toFixed(2)}`.padStart(7) : "      —";
     const reason = p.reason ?? "";
-    console.log(`  ${String(p.betId).padStart(6)} ${scope} ${outcome} ${odds}  ${stake}   ${reason}`);
+    console.log(`  ${String(p.betId).padStart(6)} ${scope} ${outcome} ${odds}  ${edge}  ${stake}   ${reason}`);
   }
   if (x.perBet.length > 200) {
     console.log(`  ... and ${x.perBet.length - 200} more`);
