@@ -609,6 +609,23 @@ async function getTierKellyFractionForTag(experimentTag: string | null | undefin
   }
 }
 
+// 2026-05-09 (no-bet-dropped): operator kill-switch for the production→
+// shadow fallthrough behavior added in this commit. Default true.
+// When false, every demote site reverts to its previous reject behavior.
+// Cached for 30s to keep the placement hot path lookup-free in steady state.
+let cachedFallthroughFlag: { value: boolean; fetchedAt: number } | null = null;
+const FALLTHROUGH_FLAG_TTL_MS = 30_000;
+async function isLiveToShadowFallthroughEnabled(): Promise<boolean> {
+  const now = Date.now();
+  if (cachedFallthroughFlag && now - cachedFallthroughFlag.fetchedAt < FALLTHROUGH_FLAG_TTL_MS) {
+    return cachedFallthroughFlag.value;
+  }
+  const raw = (await getConfigValue("live_to_shadow_fallthrough_enabled"))?.toLowerCase()?.trim() ?? "true";
+  const value = raw !== "false" && raw !== "0";
+  cachedFallthroughFlag = { value, fetchedAt: now };
+  return value;
+}
+
 // Wave 1 (Phase 2 closeout): shadow-bet gate exemption audit log.
 // Each Tier B/C bet that bypasses a production-track risk gate writes a row
 // to model_decision_audit_log. Bucket-batched at one row per
@@ -1080,10 +1097,30 @@ export async function placePaperBet(
   // are allowed through ONLY if they pre-qualify for Tier 1B (Pinnacle odds
   // present, Pinnacle edge ≥ 1%, score ≥ threshold, odds ≥ 1.80). Approved
   // boosted bets get a 0.5x stake multiplier and qualification_path = '1B_boosted'.
+  // 2026-05-09 (no-bet-dropped): both quarantine paths now demote to shadow
+  // when live_to_shadow_fallthrough_enabled=true rather than dropping the
+  // bet entirely. Capital is still protected (shadow stakes £0); the model
+  // gets the learning signal on quarantined-tier or non-Tier-1B-boosted
+  // bets so re-graduation evidence accumulates.
   const currentEnv = process.env["ENVIRONMENT"] ?? "development";
   if (currentEnv === "production") {
     if (dataTier === "abandoned" || dataTier === "demoted") {
-      return logReject(`Production quarantine: ${dataTier}-tier bets blocked in prod`);
+      if (!isShadowBet && (await isLiveToShadowFallthroughEnabled())) {
+        logger.info(
+          { matchId, marketType, selectionName, dataTier },
+          "Production quarantine: demoting to shadow rail",
+        );
+        await logShadowGateExemption(
+          "production_quarantine",
+          experimentTag ?? null,
+          `Production quarantine: ${dataTier}-tier — demoted to shadow`,
+          null,
+          universeTier,
+        );
+        isShadowBet = true;
+      } else {
+        return logReject(`Production quarantine: ${dataTier}-tier bets blocked in prod`);
+      }
     }
     if (opportunityBoosted) {
       // Lookup match league/country for Tier 1B pre-check.
@@ -1142,17 +1179,33 @@ export async function placePaperBet(
         backOdds,
       });
       if (!preCheck.qualifies || preCheck.path !== "1B") {
-        return logReject(
-          `Production quarantine: opportunity-boosted bet not Tier 1B-qualified (${preCheck.reason})`,
+        if (!isShadowBet && (await isLiveToShadowFallthroughEnabled())) {
+          logger.info(
+            { matchId, marketType, score, edge, reason: preCheck.reason },
+            "Boosted-bet quarantine: demoting to shadow rail",
+          );
+          await logShadowGateExemption(
+            "production_quarantine_boosted",
+            experimentTag ?? null,
+            `Production quarantine: opportunity-boosted not Tier 1B-qualified (${preCheck.reason}) — demoted to shadow`,
+            null,
+            universeTier,
+          );
+          isShadowBet = true;
+        } else {
+          return logReject(
+            `Production quarantine: opportunity-boosted bet not Tier 1B-qualified (${preCheck.reason})`,
+          );
+        }
+      } else {
+        // Approved: apply 0.5x stake and tag for later.
+        stakeMultiplier *= 0.5;
+        boostedTier1BApproved = true;
+        logger.info(
+          { matchId, marketType, score, edge, stakeMultiplier },
+          "Boosted bet exempted from quarantine — pre-qualifies Tier 1B at 0.5x stake",
         );
       }
-      // Approved: apply 0.5x stake and tag for later.
-      stakeMultiplier *= 0.5;
-      boostedTier1BApproved = true;
-      logger.info(
-        { matchId, marketType, score, edge, stakeMultiplier },
-        "Boosted bet exempted from quarantine — pre-qualifies Tier 1B at 0.5x stake",
-      );
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -1368,29 +1421,56 @@ export async function placePaperBet(
       }
     }
 
-    // 3. Hard cap — bet-track-aware (Phase 3 A3, 2026-05-08).
+    // 3. Hard cap — bet-track-aware (Phase 3 A3, 2026-05-08; demote 2026-05-09).
     // Paper rail: cap=4 (capital-discipline analogue, prevents per-fixture
     //   correlation/exposure). Threshold-category dedup above prevents
     //   correlated picks; the 4-cap then limits independent-edge stacking.
-    // Shadow rail: cap=12. Shadow is £0 learning data with no capital risk;
-    //   the 4-cap was killing 60-80% of would-be Path S evidence on AH-rich
-    //   matches (compliance_logs showed ~98k 'max 4 pending' rejections in
-    //   3 days, dominated by AH alternatives). 12 covers a typical AH
-    //   ladder (6-9 active lines) plus 2-4 cross-market edges.
-    // Counts are same-track only — paper and shadow have independent
-    // correlation profiles (paper = real exposure, shadow = no exposure).
-    // isShadowBet is set above (line ~800) from placementTrack/universeTier.
-    // Late £2-fallthrough reclassification (line ~1456) happens after this
-    // cap check, so it's evaluated as paper here — matches original behavior.
+    // Shadow rail: cap=12. Shadow is £0 learning data with no capital risk.
+    // 2026-05-09 (no-bet-dropped): paper cap saturation no longer drops the
+    //   bet — it demotes to shadow if shadow has room. Compliance logs
+    //   showed ~79k 'paper max 4' rejections/day; those are independent
+    //   edges (correlation dedup steps 0A/0B/1 already removed correlated
+    //   picks) that we want as shadow learning data. Only when BOTH rails
+    //   are saturated does the bet drop.
     const incomingTrack: "paper" | "shadow" = isShadowBet ? "shadow" : "paper";
     const cap = incomingTrack === "shadow" ? 12 : 4;
     const sameTrackPending = existingPending.filter(
       (b) => (b.betTrack ?? "paper") === incomingTrack,
     );
     if (sameTrackPending.length >= cap) {
-      return logReject(
-        `Match ${matchId} already has ${sameTrackPending.length} pending ${incomingTrack} bets (max ${cap}) — skipping ${marketType}:${selectionName}`,
-      );
+      if (incomingTrack === "paper" && (await isLiveToShadowFallthroughEnabled())) {
+        const shadowPending = existingPending.filter(
+          (b) => (b.betTrack ?? "paper") === "shadow",
+        );
+        if (shadowPending.length < 12) {
+          logger.info(
+            {
+              matchId,
+              marketType,
+              selectionName,
+              paperPending: sameTrackPending.length,
+              shadowPending: shadowPending.length,
+            },
+            "Paper per-match cap reached — demoting to shadow rail",
+          );
+          await logShadowGateExemption(
+            "paper_per_match_cap",
+            experimentTag ?? null,
+            `Paper per-match cap of 4 reached on match ${matchId}; shadow has ${12 - shadowPending.length} slots free — demoted`,
+            null,
+            universeTier,
+          );
+          isShadowBet = true;
+        } else {
+          return logReject(
+            `Match ${matchId} saturated on both rails (paper ${sameTrackPending.length}/4, shadow ${shadowPending.length}/12) — dropping ${marketType}:${selectionName}`,
+          );
+        }
+      } else {
+        return logReject(
+          `Match ${matchId} already has ${sameTrackPending.length} pending ${incomingTrack} bets (max ${cap}) — skipping ${marketType}:${selectionName}`,
+        );
+      }
     }
   }
 
@@ -1590,21 +1670,63 @@ export async function placePaperBet(
     const effectiveBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
     const maxExposure = effectiveBankroll * maxExposurePct;
     if (currentExposure + stake > maxExposure) {
-      return logReject(
-        `Exposure limit reached (£${(currentExposure + stake).toFixed(0)}/£${maxExposure.toFixed(0)} = ${(maxExposurePct * 100).toFixed(0)}% of ${liveLimits ? `live balance, Level ${liveLimits.level}` : "paper bankroll"}). Skipping bet on match ${matchId}.`,
-      );
+      // 2026-05-09 (no-bet-dropped): exposure cap is a capital-risk gate;
+      // demote to shadow (£0 contributes nothing to exposure) when enabled.
+      if (await isLiveToShadowFallthroughEnabled()) {
+        const fullKellyStake = stake;
+        shadowStakeKellyFraction = 0.25;
+        shadowStake = Math.round(fullKellyStake * 0.25 * 100) / 100;
+        stake = 0;
+        isShadowBet = true;
+        await logShadowGateExemption(
+          "paper_exposure_limit",
+          experimentTag ?? null,
+          `Exposure limit hit £${(currentExposure + fullKellyStake).toFixed(0)}/£${maxExposure.toFixed(0)} — demoted to shadow`,
+          shadowStake,
+          universeTier,
+        );
+        logger.info(
+          { matchId, marketType, currentExposure, maxExposure, fullKellyStake, shadowStake },
+          "Exposure limit hit — production bet demoted to shadow rail",
+        );
+      } else {
+        return logReject(
+          `Exposure limit reached (£${(currentExposure + stake).toFixed(0)}/£${maxExposure.toFixed(0)} = ${(maxExposurePct * 100).toFixed(0)}% of ${liveLimits ? `live balance, Level ${liveLimits.level}` : "paper bankroll"}). Skipping bet on match ${matchId}.`,
+        );
+      }
+    } else {
+      exposureAtPlacement = { current: currentExposure, max: maxExposure, pct: Math.round((currentExposure / maxExposure) * 1000) / 10 };
     }
-
-    exposureAtPlacement = { current: currentExposure, max: maxExposure, pct: Math.round((currentExposure / maxExposure) * 1000) / 10 };
   }
 
   // ── Live concentration limits (per-league, per-market-type, per-fixture) ──
   // Phase 2.B.2: shadow bets bypass — they don't go to Betfair and have no
   // real-money concentration implications.
+  // 2026-05-09 (no-bet-dropped): demote production bets that hit a live
+  // concentration cap rather than dropping them.
   if (isLiveMode() && !isShadowBet) {
     const concentrationCheck = await runLiveConcentrationChecks(matchId, marketType, stake);
     if (!concentrationCheck.passed) {
-      return logReject(`Live concentration limit: ${concentrationCheck.reason}`);
+      if (await isLiveToShadowFallthroughEnabled()) {
+        const fullKellyStake = stake;
+        shadowStakeKellyFraction = 0.25;
+        shadowStake = Math.round(fullKellyStake * 0.25 * 100) / 100;
+        stake = 0;
+        isShadowBet = true;
+        await logShadowGateExemption(
+          "paper_live_concentration",
+          experimentTag ?? null,
+          `Live concentration limit (${concentrationCheck.reason}) — demoted to shadow`,
+          shadowStake,
+          universeTier,
+        );
+        logger.info(
+          { matchId, marketType, fullKellyStake, shadowStake, reason: concentrationCheck.reason },
+          "Live concentration limit hit — production bet demoted to shadow rail",
+        );
+      } else {
+        return logReject(`Live concentration limit: ${concentrationCheck.reason}`);
+      }
     }
   }
 
@@ -1975,32 +2097,64 @@ export async function placePaperBet(
           });
 
           if (!liveResult.success) {
-            logger.warn(
-              { betId: bet.id, error: liveResult.error },
-              "LIVE: Betfair placement failed — paper bet recorded but no live bet",
-            );
-            await db.update(paperBetsTable)
-              .set({ status: "placement_failed", betfairStatus: `FAILED: ${liveResult.error ?? "unknown"}` })
-              .where(eq(paperBetsTable.id, bet.id));
+            const errLower = (liveResult.error ?? "").toLowerCase();
+            const isMarketUnavailable = !!liveResult.unavailableOnExchange;
+            const isInsufficientFunds = errLower.includes("nsufficient") || errLower.includes("balance") || errLower.includes("bankroll");
+            const isStakeBelowMin = errLower.includes("below betfair minimum") || errLower.includes("below £2");
+            const isAccount = errLower.includes("account") || errLower.includes("no betfaireventid");
+            const isTerminal = isMarketUnavailable || isInsufficientFunds || isStakeBelowMin || isAccount;
 
-            // Suppression bookkeeping: hard-suppress on "market unavailable",
-            // otherwise increment circuit-breaker counter for this (match, market).
-            // Skip the breaker for global/account-level errors (insufficient
-            // funds, balance issues) — those aren't a market-specific problem
-            // and would unfairly ban the market when bankroll is the cause.
-            if (liveResult.unavailableOnExchange) {
-              markMarketUnavailable(matchId, marketType);
+            // 2026-05-09 (no-bet-dropped): terminal failures (market gone,
+            // no funds, stake too small, account-level) demote the row to
+            // shadow rail so it still settles and feeds shadow_evaluation_pool.
+            // Transient retryables stay placement_failed for liveReconciliation.
+            if (isTerminal && (await isLiveToShadowFallthroughEnabled())) {
+              const intendedKellyStake = liveStake;
+              const shadowStakeOnDemote = Math.round(intendedKellyStake * 0.25 * 100) / 100;
+              const errCategory = isMarketUnavailable ? "market_unavailable"
+                : isInsufficientFunds ? "insufficient_funds"
+                : isStakeBelowMin ? "stake_below_min"
+                : "account_issue";
+              await db.update(paperBetsTable)
+                .set({
+                  status: "pending",
+                  betTrack: "shadow",
+                  stake: "0",
+                  potentialProfit: "0",
+                  shadowStake: String(shadowStakeOnDemote),
+                  shadowStakeKellyFraction: 0.25,
+                  betfairStatus: `LIVE_FAILED_DEMOTED_TO_SHADOW: ${liveResult.error ?? "unknown"}`,
+                  qualificationPath: `live_demoted_${errCategory}`,
+                })
+                .where(eq(paperBetsTable.id, bet.id));
+              await logShadowGateExemption(
+                "live_placement_failed",
+                experimentTag ?? null,
+                `Live placement failed (${errCategory}: ${liveResult.error ?? ""}) — demoted to shadow`,
+                shadowStakeOnDemote,
+                universeTier,
+              );
+              logger.info(
+                { betId: bet.id, errCategory, liveError: liveResult.error, intendedKellyStake, shadowStakeOnDemote },
+                "Live placement failed (terminal) — demoted to shadow rail; will settle as shadow",
+              );
             } else {
-              const errLower = (liveResult.error ?? "").toLowerCase();
-              const isGlobalError =
-                errLower.includes("nsufficient") ||      // Insufficient/INSUFFICIENT
-                errLower.includes("account") ||
-                errLower.includes("balance") ||
-                errLower.includes("bankroll") ||
-                errLower.includes("no betfaireventid");
-              if (!isGlobalError) {
-                recordPlacementFailure(matchId, marketType);
-              }
+              logger.warn(
+                { betId: bet.id, error: liveResult.error },
+                "LIVE: Betfair placement failed — paper bet recorded but no live bet",
+              );
+              await db.update(paperBetsTable)
+                .set({ status: "placement_failed", betfairStatus: `FAILED: ${liveResult.error ?? "unknown"}` })
+                .where(eq(paperBetsTable.id, bet.id));
+            }
+
+            // Suppression bookkeeping (regardless of demote): protect future
+            // cycles from re-attempting a broken market. Skip the breaker
+            // for global/account errors that aren't market-specific.
+            if (isMarketUnavailable) {
+              markMarketUnavailable(matchId, marketType);
+            } else if (!isInsufficientFunds && !isAccount) {
+              recordPlacementFailure(matchId, marketType);
             }
           } else {
             clearPlacementFailures(matchId, marketType);
@@ -2017,11 +2171,39 @@ export async function placePaperBet(
       } catch (err) {
         logger.error(
           { err, betId: bet.id },
-          "LIVE: Unexpected error during Betfair placement — paper bet preserved",
+          "LIVE: Unexpected error during Betfair placement — demoting to shadow if enabled",
         );
-        await db.update(paperBetsTable)
-          .set({ status: "placement_failed", betfairStatus: `EXCEPTION: ${err instanceof Error ? err.message : String(err)}` })
-          .where(eq(paperBetsTable.id, bet.id));
+        // 2026-05-09 (no-bet-dropped): unexpected exception is treated as
+        // terminal — demote to shadow if fallthrough enabled. Worst case
+        // is we mis-classify a transient error and the bet settles as
+        // shadow rather than placement_failed; that still feeds learning.
+        if (await isLiveToShadowFallthroughEnabled()) {
+          const intendedKellyStake = stake;
+          const shadowStakeOnDemote = Math.round(intendedKellyStake * 0.25 * 100) / 100;
+          await db.update(paperBetsTable)
+            .set({
+              status: "pending",
+              betTrack: "shadow",
+              stake: "0",
+              potentialProfit: "0",
+              shadowStake: String(shadowStakeOnDemote),
+              shadowStakeKellyFraction: 0.25,
+              betfairStatus: `LIVE_FAILED_DEMOTED_TO_SHADOW (exception): ${err instanceof Error ? err.message : String(err)}`,
+              qualificationPath: "live_demoted_exception",
+            })
+            .where(eq(paperBetsTable.id, bet.id));
+          await logShadowGateExemption(
+            "live_placement_failed",
+            experimentTag ?? null,
+            `Live placement exception — demoted to shadow`,
+            shadowStakeOnDemote,
+            universeTier,
+          );
+        } else {
+          await db.update(paperBetsTable)
+            .set({ status: "placement_failed", betfairStatus: `EXCEPTION: ${err instanceof Error ? err.message : String(err)}` })
+            .where(eq(paperBetsTable.id, bet.id));
+        }
       }
     } else {
       logger.info(

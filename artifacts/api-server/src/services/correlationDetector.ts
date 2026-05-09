@@ -539,12 +539,14 @@ export async function applyCorrelationDetection(
     }
   }
 
-  // ── 4. Hard cap: max 4 bets per match ────────────────────────────────────
-  // After all dedup, if any match still has >4 bets, keep only the top 4 by
-  // opportunity score. Cap raised from 2 → 4 to allow capturing independent
-  // edges across MATCH_ODDS / OVER_UNDER / BTTS / cards / corners on the same
-  // fixture. Threshold-category dedup (step 0A) and cross-market correlation
-  // dedup (step 0B) still prevent correlated picks from filling the slots.
+  // ── 4. Production-rail cap: top-4 stay production, overflow → shadow ─────
+  // 2026-05-09 (no-bet-dropped): previously the top 4 by score were kept and
+  // the rest *removed*. That deleted independent-edge picks (correlation
+  // dedup in steps 0A/0B/1 already removed correlated ones, so picks 5+ are
+  // genuinely independent edges that just lost the priority race). They now
+  // demote to placementTrack='shadow' so the model still gets the learning
+  // signal at £0 capital risk. The shadow rail's per-match cap (12 in
+  // placePaperBet) still protects against firehose volume.
   const MAX_BETS_PER_MATCH = 4;
   for (const [matchId, bets] of byMatch) {
     const activeBets = bets
@@ -553,14 +555,20 @@ export async function applyCorrelationDetection(
 
     if (activeBets.length <= MAX_BETS_PER_MATCH) continue;
 
-    const toRemove = activeBets.slice(MAX_BETS_PER_MATCH);
+    const overflow = activeBets.slice(MAX_BETS_PER_MATCH);
     const kept = activeBets.slice(0, MAX_BETS_PER_MATCH);
-    const msg = `Max-${MAX_BETS_PER_MATCH}-bets-per-match cap applied on ${activeBets[0]?.homeTeam ?? "match"} vs ${activeBets[0]?.awayTeam ?? ""}. Kept ${kept.map((b) => `${b.selectionName} (${b.opportunityScore.toFixed(0)})`).join(" & ")}. Removed ${toRemove.length} lower-scored bets: ${toRemove.map((b) => b.selectionName).join(", ")}.`;
-    narratives.push(msg);
-    logger.info({ matchId, keptCount: MAX_BETS_PER_MATCH, removedCount: toRemove.length }, `max-${MAX_BETS_PER_MATCH}-bets-per-match cap applied`);
-    for (const b of toRemove) {
-      removeBet(selected, removed, byMatch, b);
+    const productionOverflow = overflow.filter((b) => b.placementTrack !== "shadow");
+    const alreadyShadow = overflow.length - productionOverflow.length;
+    for (const b of productionOverflow) {
+      const idx = selected.findIndex((s) => betKey(s) === betKey(b));
+      if (idx >= 0) selected[idx]!.placementTrack = "shadow";
     }
+    const msg = `Max-${MAX_BETS_PER_MATCH}-bets-per-match cap applied on ${activeBets[0]?.homeTeam ?? "match"} vs ${activeBets[0]?.awayTeam ?? ""}. Kept ${kept.map((b) => `${b.selectionName} (${b.opportunityScore.toFixed(0)})`).join(" & ")} on production. Demoted ${productionOverflow.length} lower-scored bets to shadow: ${productionOverflow.map((b) => b.selectionName).join(", ")}${alreadyShadow > 0 ? ` (plus ${alreadyShadow} already shadow)` : ""}.`;
+    narratives.push(msg);
+    logger.info(
+      { matchId, keptCount: kept.length, demotedToShadow: productionOverflow.length, alreadyShadow },
+      `max-${MAX_BETS_PER_MATCH}-bets-per-match cap — overflow demoted to shadow`,
+    );
   }
 
   // Log narratives to DB
