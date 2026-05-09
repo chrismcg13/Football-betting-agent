@@ -2160,6 +2160,25 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Cron health monitor scheduler active — every 5 minutes");
 
+  // Pre-flip blocker #6 (2026-05-09): live auto-revert kill switch.
+  // Three triggers — Betfair API failure rate, reconciliation drift,
+  // idempotency anomaly. Any trigger flips live_placement_enabled=false
+  // and writes a compliance_logs row. Re-enabling is operator-only.
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const { runLiveAutoRevert } = await import("./liveAutoRevert");
+        const r = await runLiveAutoRevert();
+        if (r.fired) {
+          logger.warn(r, "Live auto-revert fired");
+        }
+      } catch (err) {
+        logger.error({ err }, "Live auto-revert evaluation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Live auto-revert scheduler active — every 5 minutes UTC");
+
   // 2026-05-08 (post-RCA): generalised data-quality monitor. Daily 02:00
   // UTC. Tracks every external data source's daily volume vs 30-day
   // baseline (excluding last 5 days). Inserts data_quality_alerts row on
