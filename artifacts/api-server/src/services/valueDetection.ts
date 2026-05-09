@@ -81,6 +81,12 @@ export interface ValueBet {
   // B/C bet) routes to shadow at £0 stake. The placement track is decided here
   // so paperTrading.ts can branch deterministically.
   placementTrack: "production" | "shadow";
+  // 2026-05-09: universe tier from competition_config (A/B/C). Carried through
+  // to placePaperBet so shadow-rail rows are tier-tagged for downstream
+  // analysis. Pre-fix this field was absent from the interface, so Tier A
+  // near-misses routed via placementTrack='shadow' had universe_tier_at_placement
+  // = NULL on insert.
+  universeTier: "A" | "B" | "C" | null;
 }
 
 export interface EvaluationSummary {
@@ -1646,6 +1652,7 @@ export async function detectValueBets(options?: {
           fairValueOdds,
           fairValueSource,
           placementTrack,
+          universeTier: matchUniverseTier as "A" | "B" | "C" | null,
         });
       }
     }
