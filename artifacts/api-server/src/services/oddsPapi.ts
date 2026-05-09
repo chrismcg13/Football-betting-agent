@@ -3193,13 +3193,22 @@ async function resolveTier2Anchor(args: {
 }): Promise<{ odds: number; source: string } | null> {
   // Pull all candidate snapshots from priority list in one query, ordered
   // by (priority, snapshot_time DESC). Take the highest-priority+freshest.
+  // 2026-05-09 (Bundle 4): switched array binding from `ANY(${arr}::text[])`
+  // — which Drizzle was interpolating as a record tuple causing "cannot cast
+  // type record to text[]" runtime errors observed on AH closing-line CLV
+  // captures — to explicit IN list via sql.join. Functionally identical;
+  // unblocks Tier-2 anchor lookups for AH bets where Pinnacle is unavailable.
+  const sourceList = sql.join(
+    TIER_2_SOURCE_PRIORITY.map((s) => sql`${s}`),
+    sql`, `,
+  );
   const rows = await db.execute(sql`
     SELECT source, back_odds::float8 AS odds, snapshot_time
     FROM odds_snapshots
     WHERE match_id = ${args.matchId}
       AND market_type = ${args.marketType}
       AND selection_name = ${args.selectionName}
-      AND source = ANY(${TIER_2_SOURCE_PRIORITY}::text[])
+      AND source IN (${sourceList})
       AND back_odds::numeric > 1.01
       AND snapshot_time > NOW() - INTERVAL '24 hours'
     ORDER BY snapshot_time DESC
