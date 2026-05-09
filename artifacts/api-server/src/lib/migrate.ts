@@ -2716,6 +2716,37 @@ export async function runMigrations() {
       logger.warn({ err }, "CREATE INDEX CONCURRENTLY for odds_snapshots failed (non-fatal — may already exist or be building)");
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-05-09 (Bundle 2 / plan v3 §M7): per-referee card-rate aggregation.
+    // Joins match_referees with matches.total_cards (already populated for
+    // matches with stats coverage). Sample-size floor of n>=20 is enforced
+    // at the consumer side (featureEngine), not the view, so the view's
+    // n_matches column lets the consumer fall back to league-average when
+    // the referee is below the floor.
+    //
+    // Currently sparse: ~24 referee rows total / 24 distinct referees. The
+    // view will return empty rows above the threshold for several weeks
+    // while referee data accumulates. The pipeline is built so that lift
+    // materialises automatically as data flows in.
+    // ────────────────────────────────────────────────────────────────────
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW referee_card_rates AS
+      SELECT
+        mr.referee_name,
+        m.league,
+        COUNT(*) AS n_matches,
+        AVG(m.total_cards::numeric)::numeric(6,3) AS avg_cards_per_match,
+        STDDEV(m.total_cards::numeric)::numeric(6,3) AS stddev_cards_per_match,
+        MIN(m.total_cards) AS min_cards,
+        MAX(m.total_cards) AS max_cards
+      FROM match_referees mr
+      JOIN matches m ON m.id = mr.match_id
+      WHERE m.total_cards IS NOT NULL
+        AND m.status = 'finished'
+      GROUP BY mr.referee_name, m.league
+    `);
+    logger.info("referee_card_rates view ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

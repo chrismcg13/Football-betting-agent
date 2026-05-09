@@ -1228,6 +1228,13 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   // ALT_TOTAL_GOALS = single market with multiple OU lines as runners.
   // Captured for completeness; settlement model uses standard OU.
   ALT_TOTAL_GOALS: "ALT_TOTAL_GOALS",
+  // 2026-05-09 (Bundle 2): ASIAN_TOTAL_GOALS internal name -> ALT_TOTAL_GOALS
+  // Betfair code. Pinnacle prices ATG at quarter lines; Betfair Exchange's
+  // ALT_TOTAL_GOALS market carries the corresponding runners. The runner-
+  // matching for line-aware capture is deferred — verified via [verify]
+  // catalogue inspection. Settlement and prediction work without exchange
+  // capture (paper_mode shadow bets settle from final score directly).
+  ASIAN_TOTAL_GOALS: "ALT_TOTAL_GOALS",
 };
 
 // Sub-phase 4.B (2026-05-08): set of internal market types whose Betfair code

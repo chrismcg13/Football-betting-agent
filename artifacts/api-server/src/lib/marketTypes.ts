@@ -95,6 +95,51 @@ function totalCards(threshold: number): Resolver {
   };
 }
 
+// ── ASIAN_TOTAL_GOALS ───────────────────────────────────────────────────────
+// 2026-05-09 (Bundle 2): mirrors resolveAsianHandicap but operates on the
+// goal TOTAL (homeScore + awayScore) instead of side-handicap. Same leg-by-
+// leg WIN/PUSH/LOSS algorithm for quarter-line bets:
+//   "Over 2.25": split into Over 2.0 (push if total=2) and Over 2.5
+//                (no push). Combine: WIN+WIN -> true, LOSS+LOSS -> false,
+//                WIN+PUSH -> half-win (binary collapse to true), LOSS+PUSH
+//                -> half-loss (binary collapse to false).
+// Selection format: "Over 2.25", "Under 2.75", "Over 3", etc. Single
+// MARKET_TYPES["ASIAN_TOTAL_GOALS"] entry with line in selection (mirrors AH).
+const resolveAsianTotalGoals: Resolver = (selection, ctx) => {
+  const m = selection.match(/^(Over|Under)\s+([\d.]+)$/);
+  if (!m) return null;
+  const side = m[1] as "Over" | "Under";
+  const threshold = parseFloat(m[2]!);
+  if (!Number.isFinite(threshold)) return null;
+
+  const total = ctx.homeScore + ctx.awayScore;
+  const evalLeg = (line: number): "win" | "push" | "loss" => {
+    if (side === "Over") {
+      if (total > line) return "win";
+      if (total < line) return "loss";
+      return "push";
+    }
+    if (total < line) return "win";
+    if (total > line) return "loss";
+    return "push";
+  };
+
+  if (Math.abs(threshold % 1) === 0.25) {
+    const lowerLeg = evalLeg(threshold - 0.25);
+    const upperLeg = evalLeg(threshold + 0.25);
+    if (lowerLeg === "win" && upperLeg === "win") return true;
+    if (lowerLeg === "loss" && upperLeg === "loss") return false;
+    if (lowerLeg === "push") return upperLeg === "win";
+    if (upperLeg === "push") return lowerLeg === "win";
+    return null;
+  }
+
+  const outcome = evalLeg(threshold);
+  if (outcome === "win") return true;
+  if (outcome === "loss") return false;
+  return null;
+};
+
 // ── ASIAN_HANDICAP ──────────────────────────────────────────────────────────
 // 2026-05-09: rewritten leg-by-leg evaluation. The original code's winLow/
 // winHigh tests were mathematically incorrect — they checked whether the
@@ -190,6 +235,12 @@ export const MARKET_TYPES: Record<string, MarketType> = {
     id: "ASIAN_HANDICAP",
     resolveFrom: "final_score",
     resolve: resolveAsianHandicap,
+  },
+
+  ASIAN_TOTAL_GOALS: {
+    id: "ASIAN_TOTAL_GOALS",
+    resolveFrom: "final_score",
+    resolve: resolveAsianTotalGoals,
   },
 
   // Match-total over/under

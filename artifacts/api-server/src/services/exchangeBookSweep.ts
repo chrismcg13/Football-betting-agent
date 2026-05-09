@@ -40,6 +40,7 @@ const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   "ODD_OR_EVEN",
   "DOUBLE_CHANCE",
   "ASIAN_HANDICAP",         // Sub-phase 4.A — was previously skipped
+  "ALT_TOTAL_GOALS",        // 2026-05-09 (Bundle 2): Asian Total Goals
   "FIRST_HALF_GOALS_05",
   "FIRST_HALF_GOALS_15",
   "FIRST_HALF_GOALS_25",
@@ -71,6 +72,7 @@ function toInternalMarketType(bfMarketType: string): string {
     case "FIRST_HALF_GOALS_05": return "FIRST_HALF_OU_05";
     case "FIRST_HALF_GOALS_15": return "FIRST_HALF_OU_15";
     case "FIRST_HALF_GOALS_25": return "FIRST_HALF_OU_25";
+    case "ALT_TOTAL_GOALS": return "ASIAN_TOTAL_GOALS";
     default: return bfMarketType; // OVER_UNDER_*, DRAW_NO_BET, HALF_TIME_FULL_TIME,
                                   // DOUBLE_CHANCE, ASIAN_HANDICAP map 1:1
   }

@@ -564,14 +564,16 @@ function mapOddsToMarket(
 
   // C4 (2026-05-07): Asian Total Goals (quarter lines). AF tags as
   // "Asian Goals" / "Asian Total" with numeric lines like "2.25".
+  // 2026-05-09 (Bundle 2): unified to single ASIAN_TOTAL_GOALS market_type
+  // with line carried in selection (mirrors ASIAN_HANDICAP). Prior
+  // `ASIAN_GOALS_${bucketSuffix}` per-line market scheme was clunky and
+  // required N registry entries; verified zero existing bets used it
+  // before rename.
   if ((norm.includes("asian") && (norm.includes("total") || norm.includes("goals"))) && (norm.includes("over") || norm.includes("under") || v.startsWith("Over") || v.startsWith("Under"))) {
     const m = v.match(/^(Over|Under)\s+([\d.]+)$/);
     if (m) {
       const line = m[2];
-      // Bucket by line — keep one market type per *integer* boundary so
-      // PREFETCH/cache lookups work; selection carries the precise line.
-      const bucketSuffix = line.replace(".", "_");
-      return { marketType: `ASIAN_GOALS_${bucketSuffix}`, selectionName: `${m[1]} ${line}`, backOdds: o };
+      return { marketType: "ASIAN_TOTAL_GOALS", selectionName: `${m[1]} ${line}`, backOdds: o };
     }
   }
 

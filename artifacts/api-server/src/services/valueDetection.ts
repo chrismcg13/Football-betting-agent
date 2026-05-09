@@ -694,9 +694,13 @@ function getModelProbability(
     if (selectionName === "Draw") return r.draw;
     if (selectionName === "Away") return r.away;
   }
-  // ─── C4: Asian Total Goals (quarter lines) ─────────────────────────────────
+  // ─── Asian Total Goals (quarter lines) ─────────────────────────────────────
   // Selection format: "Over 2.75", "Under 2.25", etc. Parse line from name.
-  if (marketType.startsWith("ASIAN_GOALS_")) {
+  // 2026-05-09 (Bundle 2): unified from prior `ASIAN_GOALS_${bucketSuffix}`
+  // multi-market design to single ASIAN_TOTAL_GOALS market with line in
+  // selection — mirrors ASIAN_HANDICAP convention. Zero existing bets used
+  // the old naming, so rename is safe.
+  if (marketType === "ASIAN_TOTAL_GOALS") {
     const m = selectionName.match(/^(Over|Under)\s+([\d.]+)$/);
     if (!m) return null;
     const side = m[1].toLowerCase() as "over" | "under";
