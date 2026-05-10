@@ -193,7 +193,15 @@ export async function mapBetfairEventsToFixtures(
     for (const ev of eventsSorted) {
       const candidates = remainingAfFixtures.filter((f) => !usedFixtureIds.has(f.id));
       if (candidates.length === 0) break;
-      const match = findBestFixtureMatch(ev, candidates, { minSimilarity: 0.6, maxKickoffHours: 6 });
+      // 2026-05-10: loosened Pass 2 thresholds to recover more af_* fixtures.
+      // Previous (sim 0.6, ±6h) matched only ~0.9% of af_* candidates against
+      // the 116 events Pass 1 didn't bind. Loosened to (sim 0.45, ±18h) —
+      // still requires meaningful team-name overlap, but tolerates the
+      // larger kickoff drift seen between API-Football and Betfair on
+      // far-horizon (day+3-7) fixtures. False-positive risk bounded by the
+      // tradeable-league filter above (only fixtures in leagues with
+      // has_betfair_exchange=TRUE are eligible).
+      const match = findBestFixtureMatch(ev, candidates, { minSimilarity: 0.45, maxKickoffHours: 18 });
       if (!match) continue;
       const existing = match.fixture.betfairEventId;
       if (existing && !existing.startsWith("af_") && existing === ev.id) {
