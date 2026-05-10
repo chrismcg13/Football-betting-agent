@@ -157,6 +157,7 @@ export interface StatementReconcileResult {
   pnlDrifts: number;
   totalLocalNetPnl: number;
   totalBetfairNetAmount: number;
+  betfairPnlBackfilled: number;
 }
 
 interface PerBetfairRefAggregate {
@@ -248,6 +249,7 @@ export async function reconcileLiveAccountStatement(
   let pnlDrifts = 0;
   let totalLocalNetPnl = 0;
   let totalBetfairNetAmount = 0;
+  let betfairPnlBackfilled = 0;
 
   // Pass 1: walk Betfair statement → check for orphans + p&l drift.
   for (const [refId, agg] of byRefId) {
@@ -308,6 +310,20 @@ export async function reconcileLiveAccountStatement(
       });
       logger.warn({ betId: local.id, refId, localNetPnl, betfairAmount: agg.totalAmount, drift }, "Live statement P&L drift");
     }
+
+    // 2026-05-10: write Betfair's authoritative wallet impact to betfair_pnl.
+    // Pre-fix, betfair_pnl was set in reconcileSettlements as cleared.profit -
+    // cleared.commission (commission almost always 0 at bet level), making it
+    // identical to gross_pnl/net_pnl from the same source — liveAutoRevert's
+    // drift comparison (local vs betfair_pnl) was effectively comparing a
+    // value to itself. agg.totalAmount sums every wallet line for this refId
+    // (win credit, commission debit, voids, refunds), so it is the true
+    // independent Betfair-of-record value the drift detector needs.
+    await db
+      .update(paperBetsTable)
+      .set({ betfairPnl: agg.totalAmount.toFixed(2) })
+      .where(eq(paperBetsTable.id, local.id));
+    betfairPnlBackfilled++;
   }
 
   // Pass 2: walk local settled bets → check for missing statement entries.
@@ -350,6 +366,7 @@ export async function reconcileLiveAccountStatement(
     pnlDrifts,
     totalLocalNetPnl,
     totalBetfairNetAmount,
+    betfairPnlBackfilled,
   };
 
   await db.insert(complianceLogsTable).values({
