@@ -59,7 +59,18 @@ function kellyFractionForScore(opportunityScore: number): number {
 }
 
 const FRESH_EXCHANGE_WINDOW_MIN = 30;
-const KICKOFF_LOOKAHEAD_HOURS = 6;
+// 2026-05-10: extended from 6h to 168h to match trading_far emission window.
+// Pre-fix, only bets within 6h of kickoff were lazy-promote eligible.
+// Today's analysis found 216 quality AH shadow bets (Tier A + score 70+ +
+// Pinnacle + mapped Betfair event + Exchange AH snapshot) sitting beyond 6h
+// with no promotion mechanism. They were emitted as shadow when the fixture
+// was af_*-unmapped; mapping has since resolved them but the existing shadow
+// rows have no path to live without re-emission. Wider lazy-promote window
+// catches them. Cost: more candidate scans per cron cycle (5min cadence).
+// Each candidate still gates on fresh Exchange snapshot (30 min) + Kelly
+// stake ≥ £2 fallback + scope checks — so widening the window doesn't lower
+// the placement quality bar, just expands the eligible pool.
+const KICKOFF_LOOKAHEAD_HOURS = 168;
 const BETFAIR_MIN_STAKE = 2.00;
 
 export interface LazyPromoteResult {

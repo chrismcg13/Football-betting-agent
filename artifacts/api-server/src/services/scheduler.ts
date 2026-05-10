@@ -1611,19 +1611,23 @@ export async function runTradingCycle(options?: {
         // gates have fired this cycle (see top of runTradingCycle).
         //
         // 2026-05-10 AH high-quality unblock: Tier A AH bets meeting strict
-        // criteria (score ≥ 70, edge ≥ 5%, Pinnacle data present, Betfair
-        // Exchange has AH listed for the match) override valueDetection's
-        // shadowOnly routing and go to production track. Historical signal
-        // since 3 May: 70-89 score band shows 85% WR, +30-34% ROI, +6-10%
-        // CLV with t > 3 across 490+ settled bets. The Pinnacle requirement
-        // implicitly filters out the Bundle 6.5 phantom Exchange-fallback
-        // path — those bets have pinnacle_odds=NULL by construction.
+        // criteria override valueDetection's shadowOnly routing and go to
+        // production track.
+        // Historical signal since 3 May:
+        //   - 60-69: 839 decided, 68.9% WR, +45.9% ROI, +8.63% CLV (t = 5.29/2.79)
+        //   - 70-79: 383 decided, 85.4% WR, +34.1% ROI, +6.27% CLV (t = 3.68/3.27)
+        //   - 80-89: 107 decided, 85.0% WR, +30.6% ROI, +10.20% CLV (t = 3.68/2.31)
+        // Threshold dropped 70 → 60 (2026-05-10) to widen volume on the
+        // bounded mapped-event universe. 60-69 has lower WR but higher ROI;
+        // both bands are statistically robust on n > 100 samples.
+        // Pinnacle requirement implicitly filters Bundle 6.5 phantoms
+        // (those bets have pinnacle_odds=NULL by construction).
         placementTrack: forceShadowOnly
           ? "shadow"
           : (
               candidate.universeTier === "A"
                 && candidate.marketType === "ASIAN_HANDICAP"
-                && (effectiveScore ?? 0) >= 70
+                && (effectiveScore ?? 0) >= 60
                 && (candidate.edge ?? 0) >= 0.05
                 && validation?.pinnacleOdds != null
                 && exchangeAhMatchIds.has(candidate.matchId)
