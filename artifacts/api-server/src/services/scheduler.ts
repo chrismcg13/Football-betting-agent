@@ -3514,6 +3514,60 @@ export function startScheduler(): void {
   }, 30 * 1000);
   logger.info("Startup warmup scheduled — OddsPapi mapping + bulk prefetch + odds refresh in 30s (trading cycle warmup disabled 2026-05-08)");
 
+  // 2026-05-10 (recurring incident #3): trading_near cron has wedged 3x
+  // since the live-mode flip. Each time, node-cron silently stopped
+  // scheduling future ticks (canonical signal: [NODE-CRON] [WARN] missed
+  // execution at … Possible blocking IO or high CPU user). The rest of
+  // the process kept running, but trading_near, trading_far, and
+  // cronHealthMonitor (which would normally force-recover) all stopped
+  // because they're sibling node-cron entries hit by the same wedge.
+  //
+  // This setInterval-based watchdog runs OUTSIDE node-cron, on libuv
+  // timers, so it survives the failure mode that disables node-cron.
+  // Every 60s it polls cron_executions for trading_near's last successful
+  // run; if stale > 15 min (matching cronHealthMonitor.TRACKED_CRONS
+  // alertAfterMs), it logs fatal and exits — pm2 then restarts the
+  // process and node-cron starts firing again on a fresh registry.
+  //
+  // 10-minute boot-grace prevents exit during startup before the first
+  // trading_near tick has had a chance to land in cron_executions.
+  // .unref() on the interval handle so it doesn't keep an otherwise-idle
+  // process alive (irrelevant in practice — the http server keeps it up).
+  const WATCHDOG_INTERVAL_MS = 60_000;
+  const WATCHDOG_STALE_THRESHOLD_MS = 15 * 60_000;
+  const WATCHDOG_BOOT_GRACE_MS = 10 * 60_000;
+  const watchdogStartedAt = Date.now();
+  setInterval(() => {
+    void (async () => {
+      const uptimeMs = Date.now() - watchdogStartedAt;
+      if (uptimeMs < WATCHDOG_BOOT_GRACE_MS) return;
+      try {
+        const r = await db.execute(sql`
+          SELECT MAX(started_at) AS last_run
+          FROM cron_executions
+          WHERE job_name = 'trading_near' AND success = true
+        `);
+        const lastRun = (((r as any).rows ?? [])[0]?.last_run ?? null) as string | Date | null;
+        if (lastRun == null) return;
+        const staleMs = Date.now() - new Date(lastRun).getTime();
+        if (staleMs > WATCHDOG_STALE_THRESHOLD_MS) {
+          logger.fatal(
+            { staleMinutes: Math.round(staleMs / 60_000), lastRun: new Date(lastRun).toISOString() },
+            "WATCHDOG: trading_near stale > 15 min — exiting for pm2 restart",
+          );
+          // Give pino 1s to flush, then hard-exit so pm2 respawns the process.
+          setTimeout(() => process.exit(1), 1000).unref();
+        }
+      } catch (err) {
+        logger.warn({ err }, "Watchdog DB check failed — non-fatal, will retry next tick");
+      }
+    })();
+  }, WATCHDOG_INTERVAL_MS).unref();
+  logger.info(
+    { intervalSec: WATCHDOG_INTERVAL_MS / 1000, staleThresholdMin: WATCHDOG_STALE_THRESHOLD_MS / 60_000, bootGraceMin: WATCHDOG_BOOT_GRACE_MS / 60_000 },
+    "trading_near watchdog active — exits process if cron stale",
+  );
+
   // Seed baseline leagues + competition config at startup (idempotent — uses onConflictDoNothing)
   void seedBaselineLeagues().catch((err) => logger.warn({ err }, "Baseline league seed failed — non-fatal"));
   void seedCompetitionConfig().catch((err) => logger.warn({ err }, "Competition config seed failed — non-fatal"));
