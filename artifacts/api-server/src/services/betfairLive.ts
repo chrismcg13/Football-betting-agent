@@ -908,12 +908,27 @@ export async function reconcileSettlements(): Promise<{
     // edge case). Without this, `undefined - undefined = NaN` was being written
     // into betfair_pnl as the literal numeric NaN, breaking pnlDiff comparison
     // (Math.abs(NaN - x) = NaN, which silently fails the `> 0.02` check).
+    //
+    // 2026-05-10: Betfair's listClearedOrders returns commission=0 at the
+    // per-bet level — commission is settled per-MARKET in their API and
+    // is not attributed back to individual bet rows when fetched by betId.
+    // When profit > 0 but the API reports commission = 0, fall back to the
+    // standard 5% rate locally so net_pnl reflects the actual cost of
+    // trading. The authoritative per-market commission still flows in via
+    // reconcileLiveAccountStatement (drift detector); a future fix could
+    // backfill from the account ledger but the 5% fallback is correct for
+    // standard accounts (no discount tier reached, no premium charge).
+    const STANDARD_BETFAIR_COMMISSION_RATE = 0.05;
     const profit = Number(cleared.profit ?? 0);
-    const commission = Number(cleared.commission ?? 0);
-    const betfairPnl = Number.isFinite(profit) && Number.isFinite(commission)
-      ? profit - commission
-      : 0;
-    if (!Number.isFinite(profit) || !Number.isFinite(commission)) {
+    const reportedCommission = Number(cleared.commission ?? 0);
+    const haveReportedCommission = Number.isFinite(reportedCommission) && reportedCommission > 0;
+    const effectiveCommission = haveReportedCommission
+      ? reportedCommission
+      : (Number.isFinite(profit) && profit > 0
+        ? Math.round(profit * STANDARD_BETFAIR_COMMISSION_RATE * 100) / 100
+        : 0);
+    const betfairPnl = Number.isFinite(profit) ? profit - effectiveCommission : 0;
+    if (!Number.isFinite(profit) || !Number.isFinite(reportedCommission)) {
       logger.warn(
         { betId: bet.id, betfairBetId: bet.betfairBetId, rawProfit: cleared.profit, rawCommission: cleared.commission },
         "reconcileSettlements: non-finite profit/commission from Betfair — treating as 0",
@@ -1006,7 +1021,7 @@ export async function reconcileSettlements(): Promise<{
       : cleared.betOutcome === "LOST" ? "lost"
       : "void";
     const grossPnl = Number.isFinite(profit) ? profit : 0;
-    const commissionAmount = Number.isFinite(commission) ? commission : 0;
+    const commissionAmount = effectiveCommission;
     const commissionRate = grossPnl > 0
       ? Math.round((commissionAmount / grossPnl) * 10000) / 10000
       : 0;
