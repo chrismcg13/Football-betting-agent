@@ -197,18 +197,41 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
 
   for (const r of rows) {
     try {
-      // Check fresh exchange data for this specific selection. AH lines are
-      // captured by exact selectionName match in odds_snapshots (set by
-      // exchangeBookSweep.deriveSelectionName as "Home -1.5" / "Away +0.5").
-      const fresh = await db.execute(sql`
-        SELECT 1 FROM odds_snapshots
-        WHERE match_id = ${r.match_id}
-          AND market_type = ${r.market_type}
-          AND selection_name = ${r.selection_name}
-          AND source = 'betfair_exchange'
-          AND snapshot_time > NOW() - INTERVAL '${sql.raw(String(FRESH_EXCHANGE_WINDOW_MIN))} minutes'
-        LIMIT 1
-      `);
+      // Check fresh exchange data. Two modes:
+      //
+      // strictAhOnly mode (current default): only require Exchange has captured
+      // ANY snapshot for the (match, market_type) within last 24h — the EXACT
+      // selection_name doesn't have to be in our snapshot store. Reasoning:
+      // exchange_book_sweep currently captures only the ±4 default AH line per
+      // event (Bundle 6.5 finding), but Betfair Exchange does list other AH
+      // lines per event. By submitting the bet we let Betfair either match it
+      // or reject with market_unavailable. Rescues the ~190 stuck shadows
+      // sitting on lines like Home +2 / Away +1.5 / etc. that pass every
+      // override gate but exact-selection-snapshot doesn't exist.
+      // Bounded cost: rejected attempts caught by the existing demote handler.
+      //
+      // strictAhOnly OFF (any-market mode): retain the original tight
+      // exact-selection check (30 min window). Less aggressive when the
+      // operator widens the universe to all markets — minimises false attempts.
+      const exchangeCheckSql = strictAhOnly
+        ? sql`
+            SELECT 1 FROM odds_snapshots
+            WHERE match_id = ${r.match_id}
+              AND market_type = ${r.market_type}
+              AND source = 'betfair_exchange'
+              AND snapshot_time > NOW() - INTERVAL '24 hours'
+            LIMIT 1
+          `
+        : sql`
+            SELECT 1 FROM odds_snapshots
+            WHERE match_id = ${r.match_id}
+              AND market_type = ${r.market_type}
+              AND selection_name = ${r.selection_name}
+              AND source = 'betfair_exchange'
+              AND snapshot_time > NOW() - INTERVAL '${sql.raw(String(FRESH_EXCHANGE_WINDOW_MIN))} minutes'
+            LIMIT 1
+          `;
+      const fresh = await db.execute(exchangeCheckSql);
       const hasFreshExchange = (((fresh as any).rows ?? []) as unknown[]).length > 0;
       if (!hasFreshExchange) {
         result.skipped_no_exchange++;
