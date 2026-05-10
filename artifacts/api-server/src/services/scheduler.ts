@@ -2760,7 +2760,7 @@ export function startScheduler(): void {
     logger.info("Betfair event mapping triggered by scheduler (30-min cadence)");
     void trackCronExecution("betfair_event_map", async () => {
       const { mapBetfairEventsToFixtures } = await import("./betfairEventMapping");
-      const stats = await mapBetfairEventsToFixtures(72);
+      const stats = await mapBetfairEventsToFixtures(168);
       logger.info(stats, "Betfair event mapping stats");
       return stats.fixturesUpdated;
     }).catch((err) => logger.error({ err }, "Betfair event mapping failed"));
@@ -2772,7 +2772,7 @@ export function startScheduler(): void {
     logger.info("Betfair event mapping — startup run");
     void trackCronExecution("betfair_event_map", async () => {
       const { mapBetfairEventsToFixtures } = await import("./betfairEventMapping");
-      const stats = await mapBetfairEventsToFixtures(72);
+      const stats = await mapBetfairEventsToFixtures(168);
       logger.info(stats, "Betfair event mapping startup stats");
       return stats.fixturesUpdated;
     }).catch((err) => logger.error({ err }, "Betfair event mapping startup failed"));
