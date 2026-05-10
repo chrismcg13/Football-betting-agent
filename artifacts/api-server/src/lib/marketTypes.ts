@@ -34,12 +34,23 @@ export interface ResolveContext {
 }
 
 /**
- * Resolver signature: given the match state and selection name, returns
- * true (won), false (lost), or null (cannot resolve — typically because
- * a stat field is missing). Null routes through the 72h timeout retry
- * in settlement; persistent null is a bug, not a recoverable state.
+ * Resolver signature:
+ *   true   — bet won
+ *   false  — bet lost
+ *   "void" — definitive push / refund (e.g. ASIAN_HANDICAP whole-line where
+ *            adjusted score equals opposing). Data IS available; the
+ *            outcome is "neither side wins". Settlement should void
+ *            immediately and refund stake. Distinct from null.
+ *   null   — cannot resolve (typically because a stat/HT field is missing).
+ *            Routes through the 72h timeout retry in settlement; persistent
+ *            null is a bug, not a recoverable state.
+ *
+ * 2026-05-10 (settlement bucket A fix): "void" added to differentiate
+ * "definitive push" from "data missing". Pre-fix, AH whole-line PUSH
+ * cases returned null and after 72h were force-settled as losses, which
+ * was wrong. Now PUSH returns "void" and settles immediately.
  */
-export type Resolver = (selection: string, ctx: ResolveContext) => boolean | null;
+export type Resolver = (selection: string, ctx: ResolveContext) => boolean | "void" | null;
 
 export interface MarketType {
   id: string;
@@ -131,13 +142,16 @@ const resolveAsianTotalGoals: Resolver = (selection, ctx) => {
     if (lowerLeg === "loss" && upperLeg === "loss") return false;
     if (lowerLeg === "push") return upperLeg === "win";
     if (upperLeg === "push") return lowerLeg === "win";
-    return null;
+    return "void";
   }
 
+  // Whole-line totals (e.g. "Over 2") push when total exactly equals the line.
+  // 2026-05-10: was returning null; settlement loop's null→retry→72h-loss
+  // path was settling pushes as losses.
   const outcome = evalLeg(threshold);
   if (outcome === "win") return true;
   if (outcome === "loss") return false;
-  return null;
+  return "void";
 };
 
 // ── ASIAN_HANDICAP ──────────────────────────────────────────────────────────
@@ -188,17 +202,19 @@ const resolveAsianHandicap: Resolver = (selection, ctx) => {
     if (upperLeg === "push") return lowerLeg === "win";
     // win + loss across adjacent half-goal lines should not occur with
     // integer scores; be defensive and void rather than mis-settle.
-    return null;
+    return "void";
   }
 
   // Whole or half handicaps: single-leg evaluation. Half-goal lines
   // (e.g. ±0.5) can't push (no integer score equals a half value).
-  // Whole-goal lines (e.g. ±1) push when adjusted == opposing — for
-  // shadow bets we treat that as void (return null).
+  // Whole-goal lines (e.g. ±1) push when adjusted == opposing — settle
+  // immediately as void (refund stake). 2026-05-10 fix: was returning
+  // null which conflated push with data-missing; the 72h-retry path
+  // then force-settled these as losses.
   const outcome = evalLeg(handicap);
   if (outcome === "win") return true;
   if (outcome === "loss") return false;
-  return null;
+  return "void";
 };
 
 // ── The registry ─────────────────────────────────────────────────────────────
@@ -319,7 +335,7 @@ export function resolveOutcome(
   marketId: string,
   selection: string,
   ctx: ResolveContext,
-): boolean | null {
+): boolean | "void" | null {
   const def = MARKET_TYPES[marketId];
   if (!def) {
     // We deliberately do NOT throw — settlement of a single unknown bet

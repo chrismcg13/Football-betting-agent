@@ -2543,7 +2543,15 @@ function determineBetWon(
     homeScoreHt?: number | null;
     awayScoreHt?: number | null;
   } | null,
-): boolean | null {
+): boolean | "void" | null {
+  // Return semantics:
+  //   true   — bet won
+  //   false  — bet lost
+  //   "void" — definitive push (e.g. AH whole-line where adjusted == opposing).
+  //            Settle immediately as void, refund stake, no PnL impact.
+  //   null   — cannot resolve from data given. Routes through 72h retry; if
+  //            still null after 72h, force-settled as loss (bet got dropped
+  //            by the data feed).
   // Registry path — preferred for any market type it knows about.
   if (isMarketTypeRegistered(marketType)) {
     return resolveViaRegistry(marketType, selectionName, {
@@ -2631,13 +2639,15 @@ function determineBetWon(
         if (lowerLeg === "loss" && upperLeg === "loss") return false;
         if (lowerLeg === "push") return upperLeg === "win";
         if (upperLeg === "push") return lowerLeg === "win";
-        return null;
+        return "void";
       }
 
       const outcome = evalLeg(handicap);
       if (outcome === "win") return true;
       if (outcome === "loss") return false;
-      return null;
+      // Whole-line push — definitive void. Pre-fix returned null which got
+      // force-settled as loss after 72h. (Same fix as marketTypes.ts:201.)
+      return "void";
     }
 
     // ─── Corners markets — use stored stats ───────────────────────────────────
@@ -2919,6 +2929,10 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     //     Only applies to bets without a betfair_bet_id (real-money matched bets
     //     are handled above). For paper bets, give the data feed a window to catch
     //     up; after 72h post-kickoff, accept the loss rather than leaving pending forever.
+    //     2026-05-10: outcome === "void" is a definitive push (e.g. AH whole-line
+    //     adjusted == opposing). Settle immediately as void; do NOT enter the
+    //     null/retry branch — pre-fix bug routed pushes through the 72h timeout
+    //     and force-settled them as losses.
     if (outcome === null && !bet.betfairBetId) {
       const hoursSinceKickoff =
         (Date.now() - new Date(match.kickoffTime).getTime()) / 3_600_000;
@@ -2952,8 +2966,10 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       );
     }
 
-    // null = void (data unavailable or unmatched) — refund stake, no PnL impact
-    const isVoid = outcome === null;
+    // "void" = definitive push (refund stake, no PnL impact).
+    // null    = forced loss after 72h timeout fell through above, OR a real-
+    //           money unmatched-bet guard hit at line ~2914 (also voids).
+    const isVoid = outcome === "void" || outcome === null;
     const betWon = outcome === true;
 
     const { calculateSettlementWithCommission, getCommissionRate, getBetfairExchangeId } = await import("./commissionService");
@@ -3330,7 +3346,10 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
       },
     );
 
-    if (outcome === null) continue;
+    // null = can't resolve, skip. "void" = definitive push, leave the bet
+    // voided (re-settling as won/lost would be wrong). Only resolved
+    // boolean outcomes (true/false) trigger re-settlement here.
+    if (outcome === null || outcome === "void") continue;
 
     const stake = Number(bet.stake);
     const odds = Number(bet.oddsAtPlacement);
