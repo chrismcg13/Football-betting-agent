@@ -376,6 +376,40 @@ export async function runTradingCycle(options?: {
   const maxHours = options?.maxHoursAhead ?? (tier === "near" ? 48 : 168);
   const cycleStartedAt = Date.now();
 
+  // 2026-05-10 (root-cause-#4 of recurring failures): every exit path from
+  // runTradingCycle MUST write a row to cron_executions. Pre-fix, the 5
+  // early-return paths (lock_held / risk_triggered / agent_not_running /
+  // no_model / no_value_bets) returned silently with no row. The 15-min
+  // watchdog (which queries cron_executions for trading_near freshness)
+  // then falsely fired during legitimate skip periods (e.g. paused_streak
+  // could persist for hours; trading_near firing every 5min and silently
+  // skipping looked indistinguishable from a node-cron wedge), kicking
+  // off process-restart loops that achieved nothing because the skip
+  // condition lives in the database.
+  //
+  // Skips are logged as success=true with error_message='skipped: <reason>'
+  // — semantically: the cron tick completed without error. The watchdog
+  // sees them as alive (correct), and forensic queries can filter on
+  // error_message LIKE 'skipped:%' to count skips by reason.
+  const logCycleCompletion = async (params: {
+    success: boolean;
+    recordsProcessed: number;
+    errorMessage?: string;
+  }): Promise<void> => {
+    try {
+      const { cronExecutionsTable } = await import("@workspace/db");
+      await db.insert(cronExecutionsTable).values({
+        jobName: `trading_${tier}`,
+        startedAt: new Date(cycleStartedAt),
+        completedAt: new Date(),
+        success: params.success,
+        recordsProcessed: params.recordsProcessed,
+        durationMs: Date.now() - cycleStartedAt,
+        errorMessage: params.errorMessage ?? null,
+      });
+    } catch (_) { /* best-effort; never let logging failure break the cycle */ }
+  };
+
   if (tradingCycleRunning) {
     const heldMs = tradingCycleAcquiredAt != null ? Date.now() - tradingCycleAcquiredAt : 0;
     if (heldMs > TRADING_CYCLE_STALE_MS) {
@@ -388,6 +422,7 @@ export async function runTradingCycle(options?: {
     } else {
       logger.warn({ tier, heldMs }, "Trading cycle already in progress — skipping this run");
       markRun("trading", "skipped");
+      await logCycleCompletion({ success: true, recordsProcessed: 0, errorMessage: `skipped: lock_held heldMs=${heldMs}` });
       return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
   }
@@ -420,6 +455,15 @@ export async function runTradingCycle(options?: {
     if (riskResult.anyTriggered) {
       logger.warn({ tier }, "Risk check triggered — skipping bet placement this cycle");
       markRun("trading", "success");
+      const triggers = Object.entries(riskResult)
+        .filter(([k, v]) => k !== "anyTriggered" && v === true)
+        .map(([k]) => k)
+        .join(",");
+      await logCycleCompletion({
+        success: true,
+        recordsProcessed: settlement.settled,
+        errorMessage: `skipped: risk_triggered (${triggers || "unknown"})`,
+      });
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: true, tier, fixtureWindowHours: maxHours };
     }
 
@@ -428,6 +472,11 @@ export async function runTradingCycle(options?: {
     if (agentStatus !== "running") {
       logger.info({ agentStatus, tier }, "Agent not running — skipping bet placement");
       markRun("trading", "skipped");
+      await logCycleCompletion({
+        success: true,
+        recordsProcessed: settlement.settled,
+        errorMessage: `skipped: agent_not_running (status=${agentStatus})`,
+      });
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
 
@@ -436,6 +485,11 @@ export async function runTradingCycle(options?: {
     if (!modelVersion) {
       logger.info({ tier }, "No model loaded — skipping value detection");
       markRun("trading", "skipped");
+      await logCycleCompletion({
+        success: true,
+        recordsProcessed: settlement.settled,
+        errorMessage: `skipped: no_model_loaded`,
+      });
       return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
 
@@ -524,7 +578,12 @@ export async function runTradingCycle(options?: {
 
     if (timely.length === 0) {
       markRun("trading", "success");
-      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false };
+      await logCycleCompletion({
+        success: true,
+        recordsProcessed: settlement.settled,
+        errorMessage: `skipped: no_value_bets`,
+      });
+      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
     }
 
     // 6. OddsPapi validation — Pinnacle +5 bonus scoring
@@ -1739,17 +1798,7 @@ export async function runTradingCycle(options?: {
       "Trading cycle complete",
     );
     markRun("trading", "success");
-    try {
-      const { cronExecutionsTable } = await import("@workspace/db");
-      await db.insert(cronExecutionsTable).values({
-        jobName: `trading_${tier}`,
-        startedAt: new Date(cycleStartedAt),
-        completedAt: new Date(),
-        success: true,
-        recordsProcessed: betsPlaced,
-        durationMs: cycleDurationMs,
-      });
-    } catch (_) {}
+    await logCycleCompletion({ success: true, recordsProcessed: betsPlaced });
     return {
       betsPlaced,
       betsSettled: settlement.settled,
@@ -1761,17 +1810,11 @@ export async function runTradingCycle(options?: {
   } catch (err) {
     logger.error({ err, tier }, "Trading cycle failed");
     markRun("trading", "error");
-    try {
-      const { cronExecutionsTable } = await import("@workspace/db");
-      await db.insert(cronExecutionsTable).values({
-        jobName: `trading_${tier}`,
-        startedAt: new Date(cycleStartedAt),
-        completedAt: new Date(),
-        success: false,
-        errorMessage: err instanceof Error ? err.message : String(err),
-        durationMs: Date.now() - cycleStartedAt,
-      });
-    } catch (_) {}
+    await logCycleCompletion({
+      success: false,
+      recordsProcessed: 0,
+      errorMessage: err instanceof Error ? err.message : String(err),
+    });
     return { betsPlaced: 0, betsSettled: 0, riskTriggered: false, tier, fixtureWindowHours: maxHours };
   } finally {
     tradingCycleRunning = false;
