@@ -329,8 +329,29 @@ export async function checkBankrollFloor(): Promise<boolean> {
   return false;
 }
 
+// 2026-05-10 (Fix B): consecutive-losses threshold raised 5 → 15 and made
+// config-driven. The pre-fix hardcoded 5 was hair-trigger sensitive for
+// the current bet cadence (mostly £2 min-stake-fallback bets, large daily
+// volume) — a 5-loss swing of ~£20 would trip the breaker, halt placement,
+// and require manual operator intervention to resume. 15 gives realistic
+// short-term variance room without losing the catastrophic-streak signal.
+// Operator can tune via:
+//   INSERT INTO agent_config (key, value, updated_at)
+//     VALUES ('consecutive_losses_threshold', '<N>', NOW())
+//     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+const DEFAULT_CONSECUTIVE_LOSSES_THRESHOLD = 15;
+
+async function getConsecutiveLossesThreshold(): Promise<number> {
+  const raw = await getConfigValue("consecutive_losses_threshold");
+  const n = raw ? Number(raw) : DEFAULT_CONSECUTIVE_LOSSES_THRESHOLD;
+  return Number.isFinite(n) && n >= 1
+    ? Math.floor(n)
+    : DEFAULT_CONSECUTIVE_LOSSES_THRESHOLD;
+}
+
 export async function checkConsecutiveLosses(): Promise<boolean> {
-  const lastFive = await db
+  const threshold = await getConsecutiveLossesThreshold();
+  const lastN = await db
     .select({
       settlementPnl: paperBetsCurrentView.settlementPnl,
       status: paperBetsCurrentView.status,
@@ -338,37 +359,94 @@ export async function checkConsecutiveLosses(): Promise<boolean> {
     .from(paperBetsCurrentView)
     .where(inArray(paperBetsCurrentView.status, ["won", "lost"]))
     .orderBy(desc(paperBetsCurrentView.settledAt))
-    .limit(5);
+    .limit(threshold);
 
-  if (lastFive.length < 5) return false;
+  if (lastN.length < threshold) return false;
 
-  const allLost = lastFive.every((b) => b.status === "lost");
+  const allLost = lastN.every((b) => b.status === "lost");
   if (allLost) {
-    const totalLoss = lastFive.reduce(
+    const totalLoss = lastN.reduce(
       (sum, b) => sum + Math.abs(Number(b.settlementPnl ?? 0)),
       0,
     );
 
     if (isDevMode) {
       logger.warn(
-        { consecutiveLosses: 5, totalLossInStreak: totalLoss, mode: "paper" },
-        "DEV: 5 consecutive losses WOULD have triggered — logging only, not pausing",
+        { consecutiveLosses: threshold, totalLossInStreak: totalLoss, mode: "paper" },
+        `DEV: ${threshold} consecutive losses WOULD have triggered — logging only, not pausing`,
       );
       const bankroll = await getBankroll();
       await logDrawdownEvent("consecutive_losses", await getHighWaterMark(), bankroll,
         (totalLoss / bankroll) * 100, 0, true,
-        { consecutiveLosses: 5, totalLossInStreak: totalLoss });
+        { consecutiveLosses: threshold, totalLossInStreak: totalLoss });
       return false;
     }
 
     await setAgentStatus(
       "paused_streak",
-      "5 consecutive losses detected",
-      { consecutiveLosses: 5, totalLossInStreak: totalLoss },
+      `${threshold} consecutive losses detected`,
+      { consecutiveLosses: threshold, totalLossInStreak: totalLoss, threshold },
     );
     return true;
   }
   return false;
+}
+
+// 2026-05-10 (Fix C): auto-resume from paused_streak after a cooldown.
+// Pre-fix, paused_streak required explicit operator action to clear (only
+// resumeAgent() flips it, and that's not called automatically). Once the
+// streak triggered, the agent stayed paused indefinitely until SQL was run.
+// The cooldown gives the agent room to retry on its own — if losses are
+// genuinely catastrophic, the next checkConsecutiveLosses() will trip again
+// and pause for another cooldown window. Default 30 minutes; tune via:
+//   INSERT INTO agent_config (key, value, updated_at)
+//     VALUES ('paused_streak_cooldown_minutes', '<N>', NOW())
+//     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+//
+// Only resumes paused_streak. Other paused statuses (paused_daily,
+// paused_weekly, stopped) are left alone — they have different semantics
+// and recovery requirements.
+//
+// Uses agent_config.updated_at for the cooldown clock. setAgentStatus()
+// is no-op when status is unchanged, so updated_at reflects the original
+// pause transition (not subsequent re-trips while already paused).
+const DEFAULT_PAUSED_STREAK_COOLDOWN_MIN = 30;
+
+async function maybeAutoResumePausedStreak(): Promise<void> {
+  const status = await getAgentStatus();
+  if (status !== "paused_streak") return;
+
+  const cooldownRaw = await getConfigValue("paused_streak_cooldown_minutes");
+  const cooldownMin = cooldownRaw ? Number(cooldownRaw) : DEFAULT_PAUSED_STREAK_COOLDOWN_MIN;
+  if (!Number.isFinite(cooldownMin) || cooldownMin <= 0) return;
+
+  const result = await db.execute(sql`
+    SELECT updated_at FROM agent_config WHERE key = 'agent_status' LIMIT 1
+  `);
+  const updatedAtRaw = (((result as any).rows ?? [])[0]?.updated_at ?? null) as string | Date | null;
+  if (updatedAtRaw == null) return;
+
+  const elapsedMin = (Date.now() - new Date(updatedAtRaw).getTime()) / 60_000;
+  if (elapsedMin < cooldownMin) return;
+
+  logger.warn(
+    { elapsedMinutes: Math.round(elapsedMin), cooldownMin },
+    "Auto-resuming agent: paused_streak cooldown elapsed",
+  );
+
+  await setConfigValue("agent_status", "running");
+
+  await db.insert(complianceLogsTable).values({
+    actionType: "agent_auto_resumed",
+    details: {
+      previousStatus: "paused_streak",
+      newStatus: "running",
+      reason: `Auto-resume after ${Math.round(elapsedMin)}min cooldown (threshold: ${cooldownMin}min)`,
+      elapsedMinutes: Math.round(elapsedMin),
+      cooldownThresholdMinutes: cooldownMin,
+    },
+    timestamp: new Date(),
+  });
 }
 
 export interface RiskCheckResult {
@@ -381,6 +459,16 @@ export interface RiskCheckResult {
 
 export async function runAllRiskChecks(): Promise<RiskCheckResult> {
   logger.debug({ environment: currentEnv, isDevMode }, "Running risk checks");
+
+  // 2026-05-10 (Fix C): auto-resume paused_streak after cooldown (default
+  // 30min). Fires before the regular risk checks so a fresh check can run
+  // with a clean status. If consecutive losses are still occurring, the
+  // breaker will trip again — that's the correct behavior (gives the
+  // system room to retry but still protects against true catastrophes).
+  // Skipped in dev (the dev-mode block below auto-resumes anyway).
+  if (!isDevMode) {
+    await maybeAutoResumePausedStreak();
+  }
 
   if (isDevMode) {
     const agentStatus = await getAgentStatus();
