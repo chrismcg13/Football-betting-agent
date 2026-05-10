@@ -1464,6 +1464,29 @@ export async function runTradingCycle(options?: {
 
     const betOrders: BetOrder[] = [];
 
+    // 2026-05-10 AH high-quality unblock pre-fetch: build a Set of match_ids
+    // where Betfair Exchange has captured an ASIAN_HANDICAP snapshot in the
+    // last 24h. Used by the isHighQualityAH gate inside the loop to avoid
+    // emitting AH bets on fixtures Betfair has no AH market for. Single
+    // batched query — cheap relative to the per-cycle Betfair API spend.
+    const exchangeAhMatchIds = new Set<number>();
+    if (selectedBets.length > 0) {
+      const candidateMatchIds = Array.from(new Set(selectedBets.map((b) => b.matchId)));
+      try {
+        const result = await db.execute(sql`
+          SELECT DISTINCT match_id::int AS match_id FROM odds_snapshots
+          WHERE match_id = ANY(${candidateMatchIds})
+            AND market_type = 'ASIAN_HANDICAP'
+            AND source = 'betfair_exchange'
+            AND snapshot_time > NOW() - INTERVAL '24 hours'
+        `);
+        const rows = (result as unknown as { rows?: Array<{ match_id: number }> }).rows ?? [];
+        for (const r of rows) exchangeAhMatchIds.add(Number(r.match_id));
+      } catch (err) {
+        logger.warn({ err }, "AH unblock pre-fetch failed — gate falls back to deny");
+      }
+    }
+
     for (const candidate of selectedBets) {
       const extra = candidate as BetCandidate & Record<string, unknown>;
       const validation = extra._validation as Awaited<ReturnType<typeof getOddspapiValidation>> | null;
@@ -1586,11 +1609,29 @@ export async function runTradingCycle(options?: {
         // (Tier A near-miss OR any Tier B/C bet).
         // forceShadowOnly overrides every order to shadow when capital-risk
         // gates have fired this cycle (see top of runTradingCycle).
+        //
+        // 2026-05-10 AH high-quality unblock: Tier A AH bets meeting strict
+        // criteria (score ≥ 70, edge ≥ 5%, Pinnacle data present, Betfair
+        // Exchange has AH listed for the match) override valueDetection's
+        // shadowOnly routing and go to production track. Historical signal
+        // since 3 May: 70-89 score band shows 85% WR, +30-34% ROI, +6-10%
+        // CLV with t > 3 across 490+ settled bets. The Pinnacle requirement
+        // implicitly filters out the Bundle 6.5 phantom Exchange-fallback
+        // path — those bets have pinnacle_odds=NULL by construction.
         placementTrack: forceShadowOnly
           ? "shadow"
-          : ((candidate as { placementTrack?: "production" | "shadow" }).placementTrack ?? (
-              candidate.universeTier === "A" ? "production" : "shadow"
-            )),
+          : (
+              candidate.universeTier === "A"
+                && candidate.marketType === "ASIAN_HANDICAP"
+                && (effectiveScore ?? 0) >= 70
+                && (candidate.edge ?? 0) >= 0.05
+                && validation?.pinnacleOdds != null
+                && exchangeAhMatchIds.has(candidate.matchId)
+              ? "production"
+              : ((candidate as { placementTrack?: "production" | "shadow" }).placementTrack ?? (
+                  candidate.universeTier === "A" ? "production" : "shadow"
+                ))
+            ),
       });
     }
 
