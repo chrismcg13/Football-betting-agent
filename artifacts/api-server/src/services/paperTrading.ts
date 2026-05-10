@@ -902,6 +902,28 @@ export async function placePaperBet(
   // min-stake / exposure / live-concentration gates and writes stake=0 +
   // shadow_stake.
   let isShadowBet = placementTrack === "shadow" || universeTier === "B" || universeTier === "C";
+
+  // 2026-05-10 staged re-enable: while `live_strict_ah_only_mode` is true,
+  // only AH bets with score ≥ 60 are allowed to go live. Everything else
+  // demotes to shadow regardless of how the candidate would otherwise route.
+  // Set live_strict_ah_only_mode='false' in agent_config to re-open all
+  // paths (Path 2 direct production for non-AH, lazyPromote any-market
+  // rescue). Both paths read the same config — no code change required.
+  const strictAhOnly = (await getConfigValue("live_strict_ah_only_mode")) === "true";
+  if (strictAhOnly && !isShadowBet) {
+    const isAhAndScored = marketType === "ASIAN_HANDICAP" && score >= 60;
+    if (!isAhAndScored) {
+      await logShadowGateExemption(
+        "strict_ah_only_mode",
+        experimentTag ?? null,
+        `live_strict_ah_only_mode active — only AH score≥60 may go live. ${marketType}:${selectionName} (score ${score}) demoted to shadow`,
+        null,
+        universeTier,
+      );
+      isShadowBet = true;
+    }
+  }
+
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;
 

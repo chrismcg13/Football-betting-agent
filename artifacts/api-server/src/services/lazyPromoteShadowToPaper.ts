@@ -148,7 +148,16 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   const cutoverCompletedAtRaw = await getConfig("cutover_completed_at");
   const cutoverActive = !!cutoverCompletedAtRaw && cutoverCompletedAtRaw.trim() !== "";
 
-  // Find candidates: pending Tier A shadow bets, kickoff within 6h.
+  // 2026-05-10 staged re-enable: while `live_strict_ah_only_mode` is true,
+  // only AH score ≥ 60 candidates are eligible for rescue. Mirrors the same
+  // gate applied at placePaperBet for direct production. Set
+  // live_strict_ah_only_mode='false' to allow any-market rescues again.
+  const strictAhOnly = (await getConfig("live_strict_ah_only_mode")) === "true";
+  const strictAhFilter = strictAhOnly
+    ? sql`AND pb.market_type = 'ASIAN_HANDICAP' AND pb.opportunity_score::numeric >= 60`
+    : sql``;
+
+  // Find candidates: pending Tier A shadow bets, kickoff within KICKOFF_LOOKAHEAD_HOURS.
   const candidates = await db.execute(sql`
     SELECT pb.id, pb.match_id, pb.market_type, pb.selection_name,
            pb.selection_canonical, pb.opportunity_score::numeric AS score,
@@ -163,6 +172,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       AND pb.universe_tier_at_placement = 'A'
       AND pb.placed_at >= ${new Date(evalStartStr)}
       AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '${sql.raw(String(KICKOFF_LOOKAHEAD_HOURS))} hours'
+      ${strictAhFilter}
     ORDER BY pb.calculated_edge DESC NULLS LAST
   `);
   const rows = (((candidates as any).rows ?? []) as Array<{
