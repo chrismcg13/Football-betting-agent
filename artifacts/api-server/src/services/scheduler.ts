@@ -48,7 +48,7 @@ import { applyCorrelationDetection, type BetCandidate } from "./correlationDetec
 import { fetchRecentFixtureResults, teamNameMatch, fetchMatchStatsForSettlement, backfillPinnacleSnapshotsFromAf } from "./apiFootball";
 import { runLeagueDiscovery, seedBaselineLeagues, updatePinnacleOddsFromActualMappings, seedCompetitionConfig } from "./leagueDiscovery";
 import { runBetfairReverseMapping } from "./betfairFirstUniverse";
-import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable } from "@workspace/db";
+import { db, pool, agentConfigTable, leagueEdgeScoresTable, paperBetsTable, matchesTable, cronExecutionsTable, complianceLogsTable } from "@workspace/db";
 import { eq, and, inArray, sql, gte, lte } from "drizzle-orm";
 import { runPromotionEngine, runProposalGenerator } from "./promotionEngine";
 import { runWeeklyExperimentAnalysis } from "./experimentAnalysis";
@@ -118,7 +118,6 @@ async function trackCronExecution(
   } catch (err) {
     const durationMs = Date.now() - startedAt.getTime();
     try {
-      const { cronExecutionsTable } = await import("@workspace/db");
       await db.insert(cronExecutionsTable).values({
         jobName,
         startedAt,
@@ -397,7 +396,6 @@ export async function runTradingCycle(options?: {
     errorMessage?: string;
   }): Promise<void> => {
     try {
-      const { cronExecutionsTable } = await import("@workspace/db");
       await db.insert(cronExecutionsTable).values({
         jobName: `trading_${tier}`,
         startedAt: new Date(cycleStartedAt),
@@ -435,6 +433,21 @@ export async function runTradingCycle(options?: {
   try {
     logger.info({ tier, minHours, maxHours }, "Starting trading cycle");
 
+    // 2026-05-10 (architectural fix per project_shadow_bets_principle):
+    // capital-risk gates (riskManager breakers, agent_status pauses) must
+    // NOT halt shadow emission. Shadow bets stake £0; they exist for
+    // learning-data continuity and are exempt from every money guardrail.
+    // Pre-fix, both early-returned the cycle, silencing ~30 min of shadow
+    // signal each time the bankroll wobbled. Now we collect reasons,
+    // flip forceShadowOnly, and continue the cycle — every order built
+    // downstream has its placementTrack overridden to 'shadow' regardless
+    // of tier or valueDetection's assignment. Production-track candidates
+    // (Tier A) become shadow rows for the duration of the reduced mode;
+    // when breakers clear / agent resumes, the next cycle re-emits them
+    // on the production track normally.
+    let forceShadowOnly = false;
+    const reducedModeReasons: string[] = [];
+
     // 1. Settle any finished bets first
     const settlement = await settleBets();
     logger.info(
@@ -450,34 +463,29 @@ export async function runTradingCycle(options?: {
       "Settlement complete",
     );
 
-    // 2. Run risk checks
+    // 2. Run risk checks (gates production track only — shadow continues)
     const riskResult = await runAllRiskChecks();
     if (riskResult.anyTriggered) {
-      logger.warn({ tier }, "Risk check triggered — skipping bet placement this cycle");
-      markRun("trading", "success");
       const triggers = Object.entries(riskResult)
         .filter(([k, v]) => k !== "anyTriggered" && v === true)
-        .map(([k]) => k)
-        .join(",");
-      await logCycleCompletion({
-        success: true,
-        recordsProcessed: settlement.settled,
-        errorMessage: `skipped: risk_triggered (${triggers || "unknown"})`,
-      });
-      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: true, tier, fixtureWindowHours: maxHours };
+        .map(([k]) => k);
+      logger.warn(
+        { tier, triggers },
+        "Risk check triggered — production placement gated; continuing in shadow-only mode",
+      );
+      forceShadowOnly = true;
+      reducedModeReasons.push(`risk_triggered:${triggers.join(",") || "unknown"}`);
     }
 
-    // 3. Check agent is running
+    // 3. Check agent is running (pauses gate production track only — shadow continues)
     const agentStatus = await getAgentStatus();
     if (agentStatus !== "running") {
-      logger.info({ agentStatus, tier }, "Agent not running — skipping bet placement");
-      markRun("trading", "skipped");
-      await logCycleCompletion({
-        success: true,
-        recordsProcessed: settlement.settled,
-        errorMessage: `skipped: agent_not_running (status=${agentStatus})`,
-      });
-      return { betsPlaced: 0, betsSettled: settlement.settled, riskTriggered: false, tier, fixtureWindowHours: maxHours };
+      logger.info(
+        { agentStatus, tier },
+        "Agent not running — production placement gated; continuing in shadow-only mode",
+      );
+      forceShadowOnly = true;
+      reducedModeReasons.push(`agent_status:${agentStatus}`);
     }
 
     // 4. Check model is available
@@ -1576,9 +1584,13 @@ export async function runTradingCycle(options?: {
         // B1+B2 (2026-05-07): placement-track signal from valueDetection.
         // 'production' → real stake on Tier A; 'shadow' → £0 learning bet
         // (Tier A near-miss OR any Tier B/C bet).
-        placementTrack: (candidate as { placementTrack?: "production" | "shadow" }).placementTrack ?? (
-          candidate.universeTier === "A" ? "production" : "shadow"
-        ),
+        // forceShadowOnly overrides every order to shadow when capital-risk
+        // gates have fired this cycle (see top of runTradingCycle).
+        placementTrack: forceShadowOnly
+          ? "shadow"
+          : ((candidate as { placementTrack?: "production" | "shadow" }).placementTrack ?? (
+              candidate.universeTier === "A" ? "production" : "shadow"
+            )),
       });
     }
 
@@ -1798,11 +1810,37 @@ export async function runTradingCycle(options?: {
       "Trading cycle complete",
     );
     markRun("trading", "success");
-    await logCycleCompletion({ success: true, recordsProcessed: betsPlaced });
+    if (forceShadowOnly) {
+      // Forensic record: one row per reduced-mode cycle so we can quantify
+      // shadow-only periods (count, total bets emitted, reason histogram)
+      // without rebuilding state from cron_executions error_message strings.
+      try {
+        await db.insert(complianceLogsTable).values({
+          actionType: "reduced_mode_shadow_only",
+          details: {
+            tier,
+            reasons: reducedModeReasons,
+            betsEmitted: betsPlaced,
+            cycleStartedAt: new Date(cycleStartedAt).toISOString(),
+            cycleDurationMs: Date.now() - cycleStartedAt,
+          },
+          timestamp: new Date(),
+        });
+      } catch (err) {
+        logger.warn({ err }, "Failed to write reduced_mode_shadow_only compliance log");
+      }
+    }
+    await logCycleCompletion({
+      success: true,
+      recordsProcessed: betsPlaced,
+      errorMessage: forceShadowOnly
+        ? `reduced_mode_shadow_only: ${reducedModeReasons.join("|")}`
+        : undefined,
+    });
     return {
       betsPlaced,
       betsSettled: settlement.settled,
-      riskTriggered: false,
+      riskTriggered: forceShadowOnly && reducedModeReasons.some((r) => r.startsWith("risk_triggered:")),
       tier,
       fixtureWindowHours: maxHours,
       signalGeneratedAt: new Date().toISOString(),
