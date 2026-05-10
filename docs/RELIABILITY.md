@@ -37,7 +37,7 @@ The selective-mirror patterns get the best of both.
 #### `placement_reconciliation`
 - **Write trigger:** Every reconciliation pass UPSERTs the row for that bet.
 - **Why Neon:** the state-of-the-world for "is this bet's recorded status consistent with Betfair's." Per-pass history goes to VPS SQLite (and to `mismatch_pass_history` only when mismatched).
-- **Volume:** bounded by paper_bets row count. UPSERT pattern keeps it bounded.
+- **Volume:** bounded by the bets table row count (live bets only post-cutover; paper-bet emission is permanently disabled). UPSERT pattern keeps it bounded.
 
 #### `system_health`
 - **Write trigger:** UPSERT (`ON CONFLICT (component) DO UPDATE`) only when `status` changes OR `last_check_at` would lag >5 min.

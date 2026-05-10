@@ -102,7 +102,12 @@ export const escalationsTable = pgTable(
 // One row per bet, UPSERT in place. Single canonical record of "is this bet
 // in the same state on Betfair as in our DB?". Updated on every reconciliation
 // pass (per-pass history goes to VPS SQLite, OR mismatch_pass_history below
-// when currently mismatched). Bounded by bet count (paper_bets row count).
+// when currently mismatched). Bounded by the bets table row count.
+//
+// Note: the bets table is named `paper_bets` for historical reasons (legacy
+// from the pre-cutover paper-trading era). Post-2026-05-09 cutover all bets
+// are live — paper-bet emission is permanently disabled. The `paper_bets`
+// name is a database artifact; do not let it mislead the architecture.
 export const placementReconciliationTable = pgTable(
   "placement_reconciliation",
   {

@@ -2889,10 +2889,16 @@ export async function runMigrations() {
     // under "Why each Neon write exists."
     //
     // No foreign keys to operational tables (no FK from internal_bet_id to
-    // paper_bets, etc). Deliberate: reliability schema must remain queryable
-    // even if upstream rows are pruned, and FK constraints fight UPSERT
-    // patterns under retry. Consequence: writers must validate referential
-    // integrity at write time where it matters.
+    // the bets table, etc). Deliberate: reliability schema must remain
+    // queryable even if upstream rows are pruned, and FK constraints fight
+    // UPSERT patterns under retry. Consequence: writers must validate
+    // referential integrity at write time where it matters.
+    //
+    // Naming note: the bets-of-record table is called `paper_bets` in the
+    // schema for historical reasons (pre-cutover paper-trading era). Post-
+    // 2026-05-09 cutover, paper-bet emission is permanently disabled — every
+    // bet in that table is now live. The table name is a database artifact,
+    // not an architectural concept.
     //
     // All reliability tables are additive-only. No ALTER TABLE in this
     // block. If a column needs adding, do it in a NEW startup block below
