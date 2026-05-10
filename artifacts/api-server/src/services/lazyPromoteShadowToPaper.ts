@@ -149,12 +149,23 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   const cutoverActive = !!cutoverCompletedAtRaw && cutoverCompletedAtRaw.trim() !== "";
 
   // 2026-05-10 staged re-enable: while `live_strict_ah_only_mode` is true,
-  // only AH score ≥ 60 candidates are eligible for rescue. Mirrors the same
-  // gate applied at placePaperBet for direct production. Set
-  // live_strict_ah_only_mode='false' to allow any-market rescues again.
+  // only AH score ≥ 60 candidates with Pinnacle data are eligible for rescue.
+  // Mirrors the same gate applied at placePaperBet AH override.
+  //
+  // Pinnacle requirement (2026-05-11) is the phantom filter. Pre-fix, this
+  // gate only checked AH + score≥60, allowing the Bundle 6.5 phantom Away+4
+  // bets (fair_value_source = 'betfair_exchange', no Pinnacle data) to be
+  // promoted. Result tonight: 64 of 83 live bets today were phantom Away+4
+  // promotions burning ~£300 of stake on lines that don't have real edge.
+  // Adding the fair_value_source ILIKE '%pinnacle%' filter blocks these.
+  //
+  // Set live_strict_ah_only_mode='false' to allow any-market rescues again
+  // (also drops the Pinnacle requirement — operator opens the gate fully).
   const strictAhOnly = (await getConfig("live_strict_ah_only_mode")) === "true";
   const strictAhFilter = strictAhOnly
-    ? sql`AND pb.market_type = 'ASIAN_HANDICAP' AND pb.opportunity_score::numeric >= 60`
+    ? sql`AND pb.market_type = 'ASIAN_HANDICAP'
+          AND pb.opportunity_score::numeric >= 60
+          AND COALESCE(pb.fair_value_source, '') ILIKE '%pinnacle%'`
     : sql``;
 
   // Find candidates: pending Tier A shadow bets, kickoff within KICKOFF_LOOKAHEAD_HOURS.
