@@ -3171,6 +3171,14 @@ interface ResolvedClosing {
  *   - oddspapi_bet365      — softest of the tier; included because Bet365
  *                            tracks sharp money on big markets, but ranked
  *                            lowest within Tier 2 for soft-book tendency.
+ *   - betfair_exchange     — 2026-05-10 addition: raw Betfair Exchange book
+ *                            sweep (best back at snapshot). Lowest priority
+ *                            within Tier 2; primary purpose is to provide
+ *                            a closing anchor for markets Pinnacle does NOT
+ *                            price (e.g. BTTS — Pinnacle lacks BTTS via
+ *                            api-football and oddspapi for our leagues).
+ *                            Without this, BTTS bets always settle with
+ *                            clv_pct=NULL, blocking CLV-driven learning.
  *
  * Diversity guard for the gate is at the SCOPE level (Path P+ view requires
  * ≥2 distinct Tier-2 books per scope to admit). This function returns a
@@ -3184,6 +3192,7 @@ const TIER_2_SOURCE_PRIORITY = [
   "oddspapi_sbobet",
   "oddspapi_sbo",
   "oddspapi_bet365",
+  "betfair_exchange",
 ];
 
 async function resolveTier2Anchor(args: {
