@@ -2212,8 +2212,13 @@ export async function placePaperBet(
         }
       }
     } else {
+      // 2026-05-10: tier1Check was removed in the post-cutover refactor
+      // (qualifiesForTier1 / scope-whitelist deprecated, kill switch is the
+      // only live gate). The log line still referenced the removed variable
+      // — caused ReferenceError on every cycle when kill switch was off,
+      // crashing trading_near with "tier1Check is not defined".
       logger.info(
-        { betId: bet.id, liveTier, reason: tier1Check.reason },
+        { betId: bet.id, liveTier, reason: liveGates.reason },
         "TIER 2: Bet does not qualify for live placement — paper only",
       );
     }
