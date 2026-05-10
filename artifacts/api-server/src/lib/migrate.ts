@@ -2879,6 +2879,231 @@ export async function runMigrations() {
     `);
     logger.info("locked_reserve + reserve_events tables ready");
 
+    // ────────────────────────────────────────────────────────────────────
+    // Reliability / observability schema (Phase 2 of VPS-first architecture
+    // with selective Neon backup). Ten tables.
+    //
+    // Drizzle ORM types live in lib/db/src/schema/reliability.ts; the SQL
+    // below is the source-of-truth DDL that runs on startup. Every Neon
+    // writer added in Phase 3+ MUST be entered in docs/RELIABILITY.md
+    // under "Why each Neon write exists."
+    //
+    // No foreign keys to operational tables (no FK from internal_bet_id to
+    // paper_bets, etc). Deliberate: reliability schema must remain queryable
+    // even if upstream rows are pruned, and FK constraints fight UPSERT
+    // patterns under retry. Consequence: writers must validate referential
+    // integrity at write time where it matters.
+    //
+    // All reliability tables are additive-only. No ALTER TABLE in this
+    // block. If a column needs adding, do it in a NEW startup block below
+    // and document why. The CREATE-IF-NOT-EXISTS-on-startup model tolerates
+    // additive growth but is fragile under destructive change — see
+    // TODO.md "Migration model technical debt."
+    // ────────────────────────────────────────────────────────────────────
+
+    // 1. self_healing_actions — append-only audit of recovery actions.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS self_healing_actions (
+        id            SERIAL PRIMARY KEY,
+        occurred_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        action_type   TEXT NOT NULL,
+        component     TEXT NOT NULL,
+        triggered_by  TEXT NOT NULL,
+        before_state  JSONB,
+        after_state   JSONB,
+        detail        JSONB,
+        success       BOOLEAN NOT NULL,
+        error_message TEXT
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_self_healing_actions_occurred ON self_healing_actions(occurred_at)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_self_healing_actions_component ON self_healing_actions(component)`);
+
+    // 2. escalations — alerts dispatched to a notification channel, with
+    //    full lifecycle (raise → deliver → ack → resolve).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS escalations (
+        id                SERIAL PRIMARY KEY,
+        raised_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        severity          TEXT NOT NULL,
+        code              TEXT NOT NULL,
+        title             TEXT NOT NULL,
+        message           TEXT NOT NULL,
+        metadata          JSONB,
+        channel           TEXT NOT NULL,
+        delivered         BOOLEAN NOT NULL DEFAULT FALSE,
+        delivered_at      TIMESTAMPTZ,
+        delivery_error    TEXT,
+        acknowledged      BOOLEAN NOT NULL DEFAULT FALSE,
+        acknowledged_at   TIMESTAMPTZ,
+        acknowledged_by   TEXT,
+        resolved          BOOLEAN NOT NULL DEFAULT FALSE,
+        resolved_at       TIMESTAMPTZ,
+        resolution_note   TEXT
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_escalations_raised ON escalations(raised_at)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_escalations_open ON escalations(resolved, raised_at)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_escalations_code ON escalations(code)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_escalations_severity ON escalations(severity, raised_at)`);
+
+    // 3. placement_reconciliation — one row per bet, in-place UPSERT.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS placement_reconciliation (
+        internal_bet_id          INTEGER PRIMARY KEY,
+        betfair_bet_id           TEXT,
+        db_status                TEXT NOT NULL,
+        betfair_status           TEXT,
+        mismatch_class           TEXT,
+        mismatch_first_seen_at   TIMESTAMPTZ,
+        mismatch_resolved_at     TIMESTAMPTZ,
+        pass_count               INTEGER NOT NULL DEFAULT 0,
+        last_check_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_pass_detail         JSONB
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_placement_recon_mismatch ON placement_reconciliation(mismatch_class, last_check_at)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_placement_recon_betfair_id ON placement_reconciliation(betfair_bet_id)`);
+
+    // 4. system_health — UPSERT keyed by component, ~10 rows total.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS system_health (
+        component                  TEXT PRIMARY KEY,
+        status                     TEXT NOT NULL,
+        last_check_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_status_change_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        consecutive_failures       INTEGER NOT NULL DEFAULT 0,
+        detail                     JSONB
+      )
+    `);
+
+    // 5. reliability_daily_summary — one row per UTC day from VPS rollup.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS reliability_daily_summary (
+        day                          DATE PRIMARY KEY,
+        placements_attempted         INTEGER NOT NULL DEFAULT 0,
+        placements_succeeded         INTEGER NOT NULL DEFAULT 0,
+        placements_failed            INTEGER NOT NULL DEFAULT 0,
+        bets_settled                 INTEGER NOT NULL DEFAULT 0,
+        avg_settlement_lag_hours     NUMERIC(6,2),
+        p95_settlement_lag_hours     NUMERIC(6,2),
+        abs_drift_gbp                NUMERIC(10,2),
+        rel_drift_pct                NUMERIC(6,3),
+        self_healing_count           INTEGER NOT NULL DEFAULT 0,
+        escalation_count             INTEGER NOT NULL DEFAULT 0,
+        mismatches_open_at_eod       INTEGER NOT NULL DEFAULT 0,
+        mismatches_resolved          INTEGER NOT NULL DEFAULT 0,
+        net_pnl_gbp                  NUMERIC(10,2),
+        detail                       JSONB,
+        written_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    // 6. health_5m_rollup — per-component 5-min status time-series, 14d.
+    //    UPSERT (component, bucket_start) with worst-status CASE.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS health_5m_rollup (
+        component         TEXT NOT NULL,
+        bucket_start      TIMESTAMPTZ NOT NULL,
+        dominant_status   TEXT NOT NULL,
+        event_count       INTEGER NOT NULL DEFAULT 0,
+        error_count       INTEGER NOT NULL DEFAULT 0,
+        last_error_class  TEXT,
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (component, bucket_start)
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_health_5m_component_recent ON health_5m_rollup(component, bucket_start)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_health_5m_bucket ON health_5m_rollup(bucket_start)`);
+
+    // 7. cycle_counters_5m — system-wide 5-min counters, 14d. UPSERT
+    //    (bucket_start) with atomic counter increments via EXCLUDED.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS cycle_counters_5m (
+        bucket_start         TIMESTAMPTZ PRIMARY KEY,
+        cycles_run           INTEGER NOT NULL DEFAULT 0,
+        cycles_failed        INTEGER NOT NULL DEFAULT 0,
+        cycles_zero_bets     INTEGER NOT NULL DEFAULT 0,
+        bets_attempted       INTEGER NOT NULL DEFAULT 0,
+        bets_placed          INTEGER NOT NULL DEFAULT 0,
+        bets_failed          INTEGER NOT NULL DEFAULT 0,
+        betfair_api_errors   INTEGER NOT NULL DEFAULT 0,
+        betfair_api_p95_ms   INTEGER,
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_cycle_counters_5m_bucket ON cycle_counters_5m(bucket_start)`);
+
+    // 8. recent_cycles_buffer — fixed ring buffer, last 500 cycles.
+    //    Cap enforced by post-INSERT DELETE-by-rank in writer code (NOT DDL).
+    //    Weekly storage check verifies COUNT(*) <= 550 amber / 1000 red.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS recent_cycles_buffer (
+        cycle_id             TEXT PRIMARY KEY,
+        cycle_type           TEXT NOT NULL,
+        started_at           TIMESTAMPTZ NOT NULL,
+        ended_at             TIMESTAMPTZ,
+        duration_ms          INTEGER,
+        steps_attempted      INTEGER NOT NULL DEFAULT 0,
+        steps_succeeded      INTEGER NOT NULL DEFAULT 0,
+        steps_failed         INTEGER NOT NULL DEFAULT 0,
+        bets_attempted       INTEGER NOT NULL DEFAULT 0,
+        bets_placed          INTEGER NOT NULL DEFAULT 0,
+        terminal_outcome     TEXT NOT NULL,
+        terminal_error_class TEXT,
+        summary_detail       JSONB
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_recent_cycles_started ON recent_cycles_buffer(started_at)`);
+
+    // 9. failed_cycle_breadcrumbs — full per-step trace, copied from VPS
+    //    SQLite ONLY for cycles that terminated in failure. 30-day retention.
+    //    UNIQUE(cycle_id, step_seq): the VPS→Neon copy is retry-prone (network
+    //    blip mid-copy → half rows land → retry). Phase 3 writer must use
+    //    `INSERT ... ON CONFLICT (cycle_id, step_seq) DO NOTHING` — without
+    //    this constraint, retries produce duplicate breadcrumbs that mislead
+    //    forensic reads.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS failed_cycle_breadcrumbs (
+        id              SERIAL PRIMARY KEY,
+        cycle_id        TEXT NOT NULL,
+        step_seq        INTEGER NOT NULL,
+        step_name       TEXT NOT NULL,
+        started_at      TIMESTAMPTZ NOT NULL,
+        ended_at        TIMESTAMPTZ,
+        success         BOOLEAN NOT NULL,
+        duration_ms     INTEGER,
+        error_message   TEXT,
+        detail          JSONB,
+        copied_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_breadcrumbs_cycle_step ON failed_cycle_breadcrumbs(cycle_id, step_seq)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_failed_breadcrumbs_copied ON failed_cycle_breadcrumbs(copied_at)`);
+
+    // 10. mismatch_pass_history — reconciliation passes ONLY for currently
+    //     mismatched bets. Bounded by open-mismatch count, not bet count.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS mismatch_pass_history (
+        id                SERIAL PRIMARY KEY,
+        internal_bet_id   INTEGER NOT NULL,
+        betfair_bet_id    TEXT,
+        pass_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        db_status         TEXT NOT NULL,
+        betfair_status    TEXT,
+        mismatch_class    TEXT NOT NULL,
+        detail            JSONB,
+        resolved          BOOLEAN NOT NULL DEFAULT FALSE,
+        resolved_at       TIMESTAMPTZ
+      )
+    `);
+    // The unique index uq_mismatch_pass_bet_at covers (internal_bet_id, pass_at)
+    // for both lookup and uniqueness — no separate non-unique index needed.
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_mismatch_pass_unresolved ON mismatch_pass_history(resolved, pass_at)`);
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_mismatch_pass_bet_at ON mismatch_pass_history(internal_bet_id, pass_at)`);
+
+    logger.info("Reliability observability tables ready (10 tables)");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

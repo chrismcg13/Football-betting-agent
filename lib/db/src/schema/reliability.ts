@@ -2,15 +2,18 @@
  * Reliability / observability schema (Phase 2 of the VPS-first architecture
  * with selective Neon backup).
  *
- * Eight tables, grouped here because they form one cohesive observability
+ * Ten tables, grouped here because they form one cohesive observability
  * subsystem. The selection rules:
  *
  *   - Append-only audit of real actions (self_healing_actions, escalations)
  *   - Per-bet state of one canonical record (placement_reconciliation)
  *   - Tiny per-component status (system_health)
  *   - Daily rollup (reliability_daily_summary)
+ *   - Two 5-minute time-series rollups for phone-debug trend visibility:
+ *       health_5m_rollup    — per-component status, 14-day retention
+ *       cycle_counters_5m   — system-wide cycle/bet counters, 14-day retention
  *   - Three selective-mirror patterns:
- *       recent_cycles_buffer   — fixed ring buffer, last 200 cycles
+ *       recent_cycles_buffer    — fixed ring buffer, last 500 cycles
  *       failed_cycle_breadcrumbs — full breadcrumbs only on failure
  *       mismatch_pass_history    — passes only for currently-problematic bets
  *
@@ -30,6 +33,7 @@ import {
   date,
   index,
   uniqueIndex,
+  primaryKey,
 } from "drizzle-orm/pg-core";
 
 // ── self_healing_actions ────────────────────────────────────────────────────
@@ -89,6 +93,8 @@ export const escalationsTable = pgTable(
     index("idx_escalations_raised").on(t.raisedAt),
     index("idx_escalations_open").on(t.resolved, t.raisedAt),
     index("idx_escalations_code").on(t.code),
+    // Phone-debug "show me only the criticals raised today" — tiny table, trivial cost.
+    index("idx_escalations_severity").on(t.severity, t.raisedAt),
   ],
 );
 
@@ -159,11 +165,85 @@ export const reliabilityDailySummaryTable = pgTable(
   },
 );
 
+// ── health_5m_rollup ────────────────────────────────────────────────────────
+// Per-component, per-5-minute time-series of dominant status. Lets the
+// phone-debug view answer "was trading flapping overnight?" with a single
+// SELECT against this table — no SSH required.
+//
+// Write trigger: every component status update (which UPSERTs system_health)
+// ALSO UPSERTs the corresponding (component, bucket_start) row here. Bucket
+// is `date_bin('5 minutes', NOW(), TIMESTAMP '2000-01-01')`. ON CONFLICT
+// resolves the dominant_status using a CASE that picks the worst seen in
+// the bucket (red > amber > green) — atomic, single-statement.
+//
+// Volume: ~10 components × 288 buckets/day = 2,880 rows/day max.
+// At 14-day retention ≈ 40k rows ≈ 5 MB.
+// Retention: nightly cleanup deletes rows where bucket_start < NOW() - 14 days.
+export const health5mRollupTable = pgTable(
+  "health_5m_rollup",
+  {
+    component: text("component").notNull(),
+    bucketStart: timestamp("bucket_start", { withTimezone: true }).notNull(),
+    dominantStatus: text("dominant_status").notNull(),  // "green" | "amber" | "red"
+    eventCount: integer("event_count").notNull().default(0),
+    errorCount: integer("error_count").notNull().default(0),
+    lastErrorClass: text("last_error_class"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.component, t.bucketStart] }),
+    // Serves "last 24h of component X" with WHERE component=X ORDER BY bucket_start DESC.
+    // PG can scan a btree on (component, bucket_start) in reverse — DESC in the index
+    // definition is unnecessary.
+    index("idx_health_5m_component_recent").on(t.component, t.bucketStart),
+    // Serves cleanup query "WHERE bucket_start < cutoff".
+    index("idx_health_5m_bucket").on(t.bucketStart),
+  ],
+);
+
+// ── cycle_counters_5m ───────────────────────────────────────────────────────
+// System-wide (no component dimension) per-5-minute counters. Directly
+// answers the silent-failure mode: "are we placing bets at the expected rate
+// right now?" — SELECT bets_placed FROM cycle_counters_5m WHERE bucket_start
+// > NOW() - INTERVAL '6 hours' ORDER BY bucket_start. Zeros over the last
+// hour despite available selections = silent failure happening NOW.
+//
+// Write trigger: end-of-cycle hook UPSERTs the bucket the cycle ended in,
+// incrementing relevant counters via atomic single-statement
+// `INSERT ... ON CONFLICT (bucket_start) DO UPDATE SET cycles_run =
+//  cycle_counters_5m.cycles_run + EXCLUDED.cycles_run, ...`. PG row-locking
+// serialises concurrent inserts on the same bucket — no read-modify-write
+// race.
+//
+// Volume: 288 rows/day max. At 14-day retention ≈ 4k rows ≈ 2 MB.
+// Retention: nightly cleanup, same as health_5m_rollup.
+export const cycleCounters5mTable = pgTable(
+  "cycle_counters_5m",
+  {
+    bucketStart: timestamp("bucket_start", { withTimezone: true }).primaryKey(),
+    cyclesRun: integer("cycles_run").notNull().default(0),
+    cyclesFailed: integer("cycles_failed").notNull().default(0),
+    cyclesZeroBets: integer("cycles_zero_bets").notNull().default(0),  // qualifying selections existed but no bets placed
+    betsAttempted: integer("bets_attempted").notNull().default(0),
+    betsPlaced: integer("bets_placed").notNull().default(0),
+    betsFailed: integer("bets_failed").notNull().default(0),
+    betfairApiErrors: integer("betfair_api_errors").notNull().default(0),
+    betfairApiP95Ms: integer("betfair_api_p95_ms"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // Serves time-range queries WHERE bucket_start > X ORDER BY bucket_start.
+    // (Implicit since bucket_start is the PK; PG btree on PK serves both directions.)
+    index("idx_cycle_counters_5m_bucket").on(t.bucketStart),
+  ],
+);
+
 // ── recent_cycles_buffer ────────────────────────────────────────────────────
-// Fixed-size ring buffer, last 200 trading cycles. End-of-cycle hook INSERTs
-// then DELETE-by-rank prunes back to 200. Stays at exactly ~200 rows ≈ 5 MB.
-// Gives last ~50 hours of cycle-level visibility from anywhere even if VPS
-// is down.
+// Fixed-size ring buffer, last 500 trading cycles. End-of-cycle hook INSERTs
+// then DELETE-by-rank prunes back to 500. Stays at exactly ~500 rows ≈ 12 MB.
+// 500 cycles × 5 min near-cadence ≈ 42 hours of detail; far/lazy cycles
+// extend the lookback window further. Lets you catch "this started Wednesday"
+// patterns from a phone with no VPS access.
 export const recentCyclesBufferTable = pgTable(
   "recent_cycles_buffer",
   {
@@ -207,7 +287,10 @@ export const failedCycleBreadcrumbsTable = pgTable(
     copiedAt: timestamp("copied_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    index("idx_failed_breadcrumbs_cycle").on(t.cycleId, t.stepSeq),
+    // UNIQUE: VPS→Neon copy is retry-prone. Writer must use
+    // `INSERT ... ON CONFLICT (cycle_id, step_seq) DO NOTHING` — without
+    // uniqueness, retries produce duplicate breadcrumbs that mislead reads.
+    uniqueIndex("uq_failed_breadcrumbs_cycle_step").on(t.cycleId, t.stepSeq),
     index("idx_failed_breadcrumbs_copied").on(t.copiedAt),
   ],
 );
@@ -231,7 +314,9 @@ export const mismatchPassHistoryTable = pgTable(
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   },
   (t) => [
-    index("idx_mismatch_pass_bet").on(t.internalBetId, t.passAt),
+    // The unique index covers (internal_bet_id, pass_at) for both lookup and
+    // uniqueness — no separate non-unique index needed (saves storage, halves
+    // write amplification on this table).
     index("idx_mismatch_pass_unresolved").on(t.resolved, t.passAt),
     uniqueIndex("uq_mismatch_pass_bet_at").on(t.internalBetId, t.passAt),
   ],
