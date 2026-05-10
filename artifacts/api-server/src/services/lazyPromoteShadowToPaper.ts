@@ -39,7 +39,7 @@
 import { db, paperBetsTable, agentConfigTable, complianceLogsTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
-import { isLiveMode } from "./betfairLive";
+import { isLiveMode, getLiveBankroll, getAccountFunds } from "./betfairLive";
 
 async function getConfig(key: string): Promise<string | null> {
   const rows = await db
@@ -90,15 +90,31 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     logger.debug("lazyPromoteShadowToPaper: no evaluation_start_at — no-op");
     return result;
   }
-  const bankrollStr = await getConfig("bankroll");
-  const bankroll = bankrollStr != null ? Number(bankrollStr) : 0;
+  // 2026-05-10: in live mode the relevant bankroll is the actual Betfair
+  // available cash (minus locked_reserve), NOT agent_config.bankroll which
+  // is the virtual paper-trading P&L ledger that has grown to ~£31k while
+  // real cash is ~£50. Sizing against the virtual figure produced Kelly
+  // stakes of £15-£632 that all failed INSUFFICIENT_FUNDS at Betfair.
+  // Pre-cutover (paper-only mode) keeps the legacy agent_config read.
+  let bankroll: number;
+  if (isLiveMode()) {
+    try {
+      bankroll = await getLiveBankroll();
+    } catch (err) {
+      logger.warn({ err }, "lazyPromoteShadowToPaper: getLiveBankroll failed — no-op");
+      return result;
+    }
+  } else {
+    const bankrollStr = await getConfig("bankroll");
+    bankroll = bankrollStr != null ? Number(bankrollStr) : 0;
+  }
   if (!(bankroll > 0)) {
     logger.warn({ bankroll }, "lazyPromoteShadowToPaper: invalid bankroll — no-op");
     return result;
   }
   const maxStakePctStr = await getConfig("max_stake_pct");
   const maxStakePct = maxStakePctStr != null ? Number(maxStakePctStr) : 0.02;
-  const maxStake = Math.round(bankroll * maxStakePct * 100) / 100;
+  let maxStake = Math.round(bankroll * maxStakePct * 100) / 100;
 
   // Cutover state: post-cutover, promote shadow→live (real Betfair placement).
   // Pre-cutover: legacy shadow→paper. The §3 trigger forbids paper INSERTs
@@ -279,6 +295,22 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           { betId: r.id, matchId: r.match_id, marketType: r.market_type, selection: r.selection_name, stake, betfairBetId: placeResult.betfairBetId },
           "lazyPromote: shadow bet promoted to LIVE on Betfair",
         );
+
+        // 2026-05-10: refresh available balance so the next candidate's Kelly
+        // sizes against post-placement bankroll. Without this, bet N+1 in the
+        // same pass uses the same balance bet 1 saw — which Betfair has now
+        // partially spent — and we re-emit oversized stakes that fail
+        // INSUFFICIENT_FUNDS. Mirrors paperToLiveCutover.ts:516-530.
+        try {
+          await getAccountFunds();
+          bankroll = await getLiveBankroll();
+          maxStake = Math.round(bankroll * maxStakePct * 100) / 100;
+        } catch (refreshErr) {
+          logger.warn(
+            { err: refreshErr, betId: r.id },
+            "lazyPromote: post-placement balance refresh failed — continuing with stale bankroll",
+          );
+        }
         continue;
       }
 
