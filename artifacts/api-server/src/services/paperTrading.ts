@@ -2105,19 +2105,22 @@ export async function placePaperBet(
             const isInsufficientFunds = errLower.includes("nsufficient") || errLower.includes("balance") || errLower.includes("bankroll");
             const isStakeBelowMin = errLower.includes("below betfair minimum") || errLower.includes("below £2");
             const isAccount = errLower.includes("account") || errLower.includes("no betfaireventid");
-            const isTerminal = isMarketUnavailable || isInsufficientFunds || isStakeBelowMin || isAccount;
 
-            // 2026-05-09 (no-bet-dropped): terminal failures (market gone,
-            // no funds, stake too small, account-level) demote the row to
-            // shadow rail so it still settles and feeds shadow_evaluation_pool.
-            // Transient retryables stay placement_failed for liveReconciliation.
-            if (isTerminal && (await isLiveToShadowFallthroughEnabled())) {
+            // 2026-05-10 policy update: ANY live placement failure demotes
+            // to the shadow rail (prev behavior: terminal failures demote,
+            // transient stay placement_failed for liveReconciliation to retry).
+            // No retry mechanism actually exists — placement_failed bets just
+            // sit forever, contributing nothing. Demoting to shadow ensures
+            // every value-identified bet still settles and feeds learning.
+            // The fallthrough flag is retained as a kill-switch.
+            const errCategory = isMarketUnavailable ? "market_unavailable"
+              : isInsufficientFunds ? "insufficient_funds"
+              : isStakeBelowMin ? "stake_below_min"
+              : isAccount ? "account_issue"
+              : "transient_or_unknown";
+            if (await isLiveToShadowFallthroughEnabled()) {
               const intendedKellyStake = liveStake;
               const shadowStakeOnDemote = Math.round(intendedKellyStake * 0.25 * 100) / 100;
-              const errCategory = isMarketUnavailable ? "market_unavailable"
-                : isInsufficientFunds ? "insufficient_funds"
-                : isStakeBelowMin ? "stake_below_min"
-                : "account_issue";
               await db.update(paperBetsTable)
                 .set({
                   status: "pending",
@@ -2139,12 +2142,12 @@ export async function placePaperBet(
               );
               logger.info(
                 { betId: bet.id, errCategory, liveError: liveResult.error, intendedKellyStake, shadowStakeOnDemote },
-                "Live placement failed (terminal) — demoted to shadow rail; will settle as shadow",
+                "Live placement failed — demoted to shadow rail; will settle as shadow",
               );
             } else {
               logger.warn(
                 { betId: bet.id, error: liveResult.error },
-                "LIVE: Betfair placement failed — paper bet recorded but no live bet",
+                "LIVE: Betfair placement failed (fallthrough disabled) — marked placement_failed",
               );
               await db.update(paperBetsTable)
                 .set({ status: "placement_failed", betfairStatus: `FAILED: ${liveResult.error ?? "unknown"}` })
@@ -2288,13 +2291,31 @@ export async function reconcileStalePlacements(): Promise<{ reconciled: number; 
           }
         }
 
+        // 2026-05-10 policy update: stale pending_placement (>10 min, no Betfair
+        // order found via clearedOrders) demotes to shadow instead of marking
+        // placement_failed. The clearedOrders lookup above already confirmed
+        // Betfair has no record of the bet, so no real-money exposure exists.
+        // Demoting to shadow lets the bet still contribute settlement signal.
+        const intendedKellyStake = Number(bet.stake ?? 0);
+        const shadowStakeOnDemote = intendedKellyStake > 0
+          ? Math.round(intendedKellyStake * 0.25 * 100) / 100
+          : 0;
         await db.update(paperBetsTable)
-          .set({ status: "placement_failed", betfairStatus: "STALE_PENDING: not found on Betfair" })
+          .set({
+            status: "pending",
+            betTrack: "shadow",
+            stake: "0",
+            potentialProfit: "0",
+            shadowStake: String(shadowStakeOnDemote),
+            shadowStakeKellyFraction: 0.25,
+            betfairStatus: "STALE_PENDING_DEMOTED_TO_SHADOW: not found on Betfair",
+            qualificationPath: "live_demoted_stale_pending",
+          })
           .where(eq(paperBetsTable.id, bet.id));
         flagged++;
 
         await db.insert(complianceLogsTable).values({
-          actionType: "stale_placement_flagged",
+          actionType: "stale_placement_demoted_to_shadow",
           details: {
             betId: bet.id,
             matchId: bet.matchId,
@@ -2302,6 +2323,8 @@ export async function reconcileStalePlacements(): Promise<{ reconciled: number; 
             selectionName: bet.selectionName,
             placedAt: bet.placedAt?.toISOString(),
             ageMinutes: Math.round((Date.now() - (bet.placedAt?.getTime() ?? 0)) / 60000),
+            intendedKellyStake,
+            shadowStakeOnDemote,
           },
           timestamp: new Date(),
         });
@@ -2311,12 +2334,12 @@ export async function reconcileStalePlacements(): Promise<{ reconciled: number; 
           severity: "warning",
           category: "execution",
           code: "STALE_PENDING_PLACEMENT",
-          title: "Stale pending placement detected",
-          message: `Bet #${bet.id} (${bet.marketType} on match ${bet.matchId}) was in PENDING_PLACEMENT for ${Math.round((Date.now() - (bet.placedAt?.getTime() ?? 0)) / 60000)} minutes without resolution. Marked as placement_failed.`,
-          metadata: { betId: bet.id, matchId: bet.matchId, marketType: bet.marketType },
+          title: "Stale pending placement demoted to shadow",
+          message: `Bet #${bet.id} (${bet.marketType} on match ${bet.matchId}) was in PENDING_PLACEMENT for ${Math.round((Date.now() - (bet.placedAt?.getTime() ?? 0)) / 60000)} minutes without resolution and not found on Betfair. Demoted to shadow track.`,
+          metadata: { betId: bet.id, matchId: bet.matchId, marketType: bet.marketType, shadowStakeOnDemote },
         });
 
-        logger.warn({ betId: bet.id }, "Stale bet flagged as placement_failed — no Betfair match found");
+        logger.warn({ betId: bet.id, shadowStakeOnDemote }, "Stale bet demoted to shadow — no Betfair match found");
       }
     } catch (err) {
       logger.error({ err, betId: bet.id }, "Error reconciling stale placement");
