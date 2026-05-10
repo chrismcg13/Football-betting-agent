@@ -69,17 +69,44 @@ async function logDrawdownEvent(
   });
 }
 
+// 2026-05-10: split paper vs live high-water mark tracking. Pre-fix, both
+// modes shared agent_config.high_water_mark, contaminating live circuit
+// breakers with paper-era virtual values. Concrete failure: paper-trading
+// HWM grew to £31,641 (accumulated paper P&L); when live mode kicked in,
+// live totalWealth = £854 but HWM stayed at £31k, computing as 97%
+// drawdown → catastrophic_drawdown breaker fired → agent_status='stopped'
+// → all live placement halted. Splitting the HWM by mode prevents the
+// paper ledger from poisoning live decisions.
+async function getHwmKey(): Promise<{ valueKey: string; updatedAtKey: string }> {
+  try {
+    const { isLiveMode } = await import("./betfairLive");
+    if (isLiveMode()) {
+      return { valueKey: "live_high_water_mark", updatedAtKey: "live_hwm_updated_at" };
+    }
+  } catch {
+    // Fall through to paper key if betfairLive import fails.
+  }
+  return { valueKey: "high_water_mark", updatedAtKey: "hwm_updated_at" };
+}
+
 async function getHighWaterMark(): Promise<number> {
-  const val = await getConfigValue("high_water_mark");
-  return val ? Number(val) : 5000;
+  const { valueKey } = await getHwmKey();
+  const val = await getConfigValue(valueKey);
+  // Live HWM defaults to 0 so the first updateHighWaterMark() call
+  // establishes a sane baseline from current totalWealth (rather than
+  // computing drawdown against a hardcoded 5000 default that may
+  // wildly mismatch a small live account).
+  if (val) return Number(val);
+  return valueKey === "live_high_water_mark" ? 0 : 5000;
 }
 
 async function updateHighWaterMark(bankroll: number): Promise<number> {
+  const { valueKey, updatedAtKey } = await getHwmKey();
   const current = await getHighWaterMark();
   if (bankroll > current) {
-    await setConfigValue("high_water_mark", String(bankroll));
-    await setConfigValue("hwm_updated_at", new Date().toISOString());
-    logger.info({ oldHwm: current, newHwm: bankroll }, "High-water mark updated");
+    await setConfigValue(valueKey, String(bankroll));
+    await setConfigValue(updatedAtKey, new Date().toISOString());
+    logger.info({ oldHwm: current, newHwm: bankroll, key: valueKey }, "High-water mark updated");
     return bankroll;
   }
   return current;
