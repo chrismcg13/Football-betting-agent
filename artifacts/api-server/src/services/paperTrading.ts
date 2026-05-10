@@ -2135,7 +2135,37 @@ export async function placePaperBet(
           await db.update(paperBetsTable)
             .set({ status: "pending" })
             .where(eq(paperBetsTable.id, bet.id));
-        } else if (match?.betfairEventId) {
+        } else if (stake < 2) {
+          // 2026-05-10 defensive guard: stake fell below £2 between the
+          // line-1670 floor and this block. Should not happen — line 1670
+          // either force-floors to £2 (when edge meets threshold) or
+          // demotes to shadow. If we see this fire, something downstream
+          // of line 1670 is zeroing stake without flipping isShadowBet.
+          // Skip the Betfair API call (would return "Stake £0 below
+          // Betfair minimum £2" anyway), demote to shadow, log loudly so
+          // forensics can find the path.
+          logger.warn(
+            { betId: bet.id, stake, universeTier, marketType, selectionName, edge, score },
+            "LIVE: stake < £2 at placement entry — upstream gate bypass detected, demoting to shadow",
+          );
+          await db.update(paperBetsTable)
+            .set({
+              betTrack: "shadow",
+              stake: "0",
+              shadowStake: String(Math.round(stake * 0.25 * 100) / 100),
+              shadowStakeKellyFraction: 0.25,
+              status: "pending",
+              betfairStatus: `SKIPPED_PRE_PLACEMENT: stake £${stake} below £2 minimum`,
+              qualificationPath: "live_skipped_stake_below_min",
+            })
+            .where(eq(paperBetsTable.id, bet.id));
+        } else if (match?.betfairEventId && /^\d+$/.test(match.betfairEventId)) {
+          // 2026-05-10: regex check rejects non-numeric betfairEventId
+          // (e.g., 'af_*' provisional API-Football IDs). Those events have
+          // no Betfair markets at all; attempting placement burns an API
+          // call to get "market unavailable" back. Matches exchange_book_sweep's
+          // BETFAIR_EVENT_ID_RE filter for symmetry. Bets on such matches
+          // fall through to the else branch below and demote to shadow.
           // Post-cutover (2026-05-09): live_whitelist deprecated; no override
           // scaling. The assertion at the top of the live-placement block
           // guarantees liveGates.kellyFractionOverride is null. Stake comes
@@ -2219,12 +2249,29 @@ export async function placePaperBet(
             clearPlacementFailures(matchId, marketType);
           }
         } else {
-          logger.warn(
-            { betId: bet.id, matchId },
-            "LIVE: No betfairEventId for match — paper bet only",
+          // 2026-05-10: falls through here when betfairEventId is missing
+          // OR non-numeric (af_* provisional IDs). Betfair has no markets
+          // either way — demote to shadow so the bet doesn't sit as a
+          // pending 'live' row forever. Today this catches 144+ bets/day
+          // from leagues like 3. Liga / Segunda División where the event
+          // mapping never resolved to a real Betfair eventId.
+          const reason = !match?.betfairEventId
+            ? "no betfairEventId"
+            : `non-numeric betfairEventId (${match.betfairEventId}) — provisional ID, Betfair has no markets`;
+          logger.info(
+            { betId: bet.id, matchId, reason },
+            "LIVE: skipping placement — Betfair event not mapped; demoting to shadow",
           );
           await db.update(paperBetsTable)
-            .set({ status: "pending" })
+            .set({
+              betTrack: "shadow",
+              stake: "0",
+              shadowStake: String(Math.round(stake * 0.25 * 100) / 100),
+              shadowStakeKellyFraction: 0.25,
+              status: "pending",
+              betfairStatus: `SKIPPED: ${reason}`,
+              qualificationPath: "live_skipped_no_betfair_event",
+            })
             .where(eq(paperBetsTable.id, bet.id));
         }
       } catch (err) {
