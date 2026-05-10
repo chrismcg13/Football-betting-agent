@@ -834,6 +834,45 @@ export async function fetchRecentFixtureResults(daysBack = 7, opts?: { priority?
   return all;
 }
 
+// ─── Fetch specific fixtures by API-Football fixture_id ─────────────────────
+// 2026-05-10 (settlement bucket D fix): the date-bulk /fixtures?date=YYYY-MM-DD
+// path doesn't reliably return every league's fixtures (subscription tier
+// + country coverage gaps observed in Argentina Primera Nacional, Bulgaria
+// Super Liga, French Ligue 2, etc.). When syncMatchResults' bulk pass leaves
+// scheduled-past-KO matches unmatched, this targeted ID-batched fetch reaches
+// the same fixtures via /fixtures?ids=<a>-<b>-<c> (which the API does honour
+// per-league regardless of date-bulk filtering). Used as a fallback only —
+// the date-bulk path stays primary for budget efficiency.
+export async function fetchFixturesByIds(
+  fixtureIds: number[],
+  opts?: { priority?: boolean },
+): Promise<ApiFixture[]> {
+  if (fixtureIds.length === 0) return [];
+  const all: ApiFixture[] = [];
+  const BATCH = 20;
+  for (let i = 0; i < fixtureIds.length; i += BATCH) {
+    const batch = fixtureIds.slice(i, i + BATCH);
+    const idsParam = batch.join("-");
+    try {
+      const fixtures = await fetchApiFootball<ApiFixture[]>(
+        "/fixtures",
+        { ids: idsParam },
+        opts,
+      );
+      if (fixtures && fixtures.length > 0) {
+        all.push(...fixtures);
+      }
+    } catch (err) {
+      logger.warn({ err, batch }, "fetchFixturesByIds: error fetching batch");
+    }
+  }
+  logger.info(
+    { requested: fixtureIds.length, returned: all.length, priority: !!opts?.priority },
+    "fetchFixturesByIds: targeted fixtures fetched via API-Football",
+  );
+  return all;
+}
+
 export { teamNameMatch };
 
 interface FixtureMatch {

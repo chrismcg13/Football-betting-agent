@@ -1902,8 +1902,77 @@ export async function syncMatchResults(daysBack = 2): Promise<number> {
     logger.info({ updated }, "syncMatchResults: matches synced from API-Football");
   }
 
+  // 2026-05-10 (bucket D fix): Fallback path — for scheduled-past-KO matches
+  // that the date-bulk fetch didn't return (typically lower-tier leagues
+  // outside our API-Football subscription's date-endpoint coverage), try a
+  // targeted /fixtures?ids=<...> fetch using each match's stored
+  // apiFixtureId. The ID-batched endpoint resolves cross-league regardless
+  // of date-bulk filtering. Same FT/AET/PEN status filter applied.
+  let unmatched = scheduledMatches.filter(
+    (m) => !matchedDbIds.has(m.id) && m.apiFixtureId != null,
+  );
+
+  if (unmatched.length > 0) {
+    const { fetchFixturesByIds } = await import("./apiFootball");
+    const ids = unmatched.map((m) => m.apiFixtureId!).filter(Boolean);
+    let targeted: Awaited<ReturnType<typeof fetchFixturesByIds>>;
+    try {
+      targeted = await fetchFixturesByIds(ids, { priority: true });
+    } catch (err) {
+      logger.warn({ err, ids: ids.length }, "syncMatchResults: targeted-id fallback fetch failed");
+      targeted = [];
+    }
+
+    for (const fixture of targeted) {
+      const status = fixture.fixture.status.short;
+      if (status !== "FT" && status !== "AET" && status !== "PEN") continue;
+
+      const homeGoals = fixture.goals?.home ?? fixture.score?.fulltime?.home;
+      const awayGoals = fixture.goals?.away ?? fixture.score?.fulltime?.away;
+      if (homeGoals === null || homeGoals === undefined || awayGoals === null || awayGoals === undefined) continue;
+      const htHome = fixture.score?.halftime?.home;
+      const htAway = fixture.score?.halftime?.away;
+
+      const dbMatch = unmatched.find((m) => m.apiFixtureId === fixture.fixture.id);
+      if (!dbMatch) continue;
+
+      const matchStats = await fetchMatchStatsForSettlement(fixture.fixture.id);
+
+      await db
+        .update(matchesTable)
+        .set({
+          status: "finished",
+          homeScore: homeGoals,
+          awayScore: awayGoals,
+          ...(htHome !== null && htHome !== undefined && htAway !== null && htAway !== undefined
+            ? { homeScoreHt: htHome, awayScoreHt: htAway }
+            : {}),
+          ...(matchStats !== null
+            ? { totalCorners: matchStats.totalCorners, totalCards: matchStats.totalCards }
+            : {}),
+        })
+        .where(eq(matchesTable.id, dbMatch.id));
+
+      logger.info(
+        {
+          matchId: dbMatch.id,
+          homeTeam: dbMatch.homeTeam,
+          awayTeam: dbMatch.awayTeam,
+          score: `${homeGoals}-${awayGoals}`,
+          apiFixtureId: fixture.fixture.id,
+          source: "targeted_id_fallback",
+        },
+        "syncMatchResults: match updated to finished (via targeted-id fallback)",
+      );
+      updated++;
+      matchedDbIds.add(dbMatch.id);
+    }
+
+    // Recompute remaining unmatched after the fallback pass.
+    unmatched = scheduledMatches.filter((m) => !matchedDbIds.has(m.id));
+  }
+
   // Log any scheduled past matches that still couldn't be matched (diagnostic)
-  const unmatched = scheduledMatches.filter((m) => !matchedDbIds.has(m.id));
   if (unmatched.length > 0) {
     for (const m of unmatched) {
       logger.warn(
