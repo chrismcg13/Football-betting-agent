@@ -3620,6 +3620,12 @@ router.get("/admin/live-health", async (_req, res) => {
       ? Math.max(0, Math.round((dailyLossCapAbs + Number(todayRow.today_realised_pnl)) * 100) / 100)
       : null;
 
+    // 2026-05-10: surface auto-revert Trigger C drift so thresholds can
+    // be tuned against actual data, not guesses. Same computation
+    // liveAutoRevert.runLiveAutoRevert() uses — exported as evalTriggerC.
+    const { evalTriggerC } = await import("../services/liveAutoRevert");
+    const drift = await evalTriggerC();
+
     res.json({
       success: true,
       result: {
@@ -3640,6 +3646,16 @@ router.get("/admin/live-health", async (_req, res) => {
           bankroll_floor:        Number(get("bankroll_floor")        ?? 0),
           daily_loss_limit_pct:  dailyLossLimitPct,
           weekly_loss_limit_pct: Number(get("weekly_loss_limit_pct") ?? 0),
+        },
+        drift_24h: {
+          local_pnl:           Math.round(drift.localPnl * 100) / 100,
+          betfair_pnl:         Math.round(drift.betfairPnl * 100) / 100,
+          abs_drift_gbp:       Math.round(drift.absDrift * 100) / 100,
+          rel_drift_pct:       drift.pctDrift != null ? Math.round(drift.pctDrift * 10000) / 100 : null,
+          abs_threshold_gbp:   drift.absThreshold,
+          rel_threshold_pct:   Math.round(drift.relThreshold * 10000) / 100,
+          would_fire:          drift.fire,
+          condition:           "AND (both abs and rel must exceed threshold)",
         },
         recent_24h_errors: errs,
         paper_emission_7d_trend: paperTrend,

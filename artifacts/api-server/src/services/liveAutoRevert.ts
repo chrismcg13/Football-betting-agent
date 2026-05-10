@@ -59,7 +59,43 @@ async function evalTriggerA(): Promise<{ fire: boolean; errors: number; total: n
   return { fire: total >= 20 && rate != null && rate > 0.10, errors, total, rate };
 }
 
-async function evalTriggerC(): Promise<{ fire: boolean; localPnl: number; betfairPnl: number; absDrift: number; pctDrift: number | null }> {
+// 2026-05-10: thresholds moved from hardcoded (£20 abs, 0.5% rel) to
+// agent_config so they can be tuned without a code deploy. Two changes
+// vs the hardcoded version:
+//   1. Defaults raised: £50 abs / 1% rel (was £20 / 0.5%). 0.5% was too
+//      tight for small live accounts — a £854 account with £8 of
+//      expected commission-rounding noise tripped the kill switch on
+//      2026-05-10 at 12:35 UTC.
+//   2. Trigger condition changed from OR to AND. Old logic fired on
+//      rel-threshold alone, so small-account noise (£15 drift on a £200
+//      day = 7.5% rel) tripped despite trivial absolute pounds. AND
+//      requires BOTH conditions material — catches genuine pipeline
+//      bugs (large abs AND large rel) while ignoring small-noise.
+const DRIFT_ABS_DEFAULT_GBP = 50;
+const DRIFT_REL_DEFAULT = 0.01;
+
+async function readDriftThresholds(): Promise<{ abs: number; rel: number }> {
+  const r = await db.execute(sql`
+    SELECT key, value FROM agent_config
+    WHERE key IN ('live_drift_abs_threshold', 'live_drift_rel_threshold')
+  `);
+  const rows = (((r as any).rows ?? []) as Array<{ key: string; value: string }>);
+  const map = new Map(rows.map((x) => [x.key, x.value]));
+  const absRaw = map.get("live_drift_abs_threshold");
+  const relRaw = map.get("live_drift_rel_threshold");
+  const abs = absRaw != null && Number.isFinite(Number(absRaw)) && Number(absRaw) > 0
+    ? Number(absRaw)
+    : DRIFT_ABS_DEFAULT_GBP;
+  const rel = relRaw != null && Number.isFinite(Number(relRaw)) && Number(relRaw) > 0
+    ? Number(relRaw)
+    : DRIFT_REL_DEFAULT;
+  return { abs, rel };
+}
+
+// Exported so /admin/live-health can surface today's drift values and
+// thresholds without duplicating the SQL — single source of truth.
+export async function evalTriggerC(): Promise<{ fire: boolean; localPnl: number; betfairPnl: number; absDrift: number; pctDrift: number | null; absThreshold: number; relThreshold: number }> {
+  const { abs: absThreshold, rel: relThreshold } = await readDriftThresholds();
   const r = await db.execute(sql`
     SELECT
       COALESCE(SUM(net_pnl)::float8, 0)     AS local_pnl,
@@ -73,8 +109,11 @@ async function evalTriggerC(): Promise<{ fire: boolean; localPnl: number; betfai
   const betfairPnl = Number(row?.betfair_pnl ?? 0);
   const absDrift = Math.abs(localPnl - betfairPnl);
   const pctDrift = Math.abs(betfairPnl) > 0 ? absDrift / Math.abs(betfairPnl) : null;
-  const fire = absDrift > 20 || (pctDrift != null && pctDrift > 0.005);
-  return { fire, localPnl, betfairPnl, absDrift, pctDrift };
+  // 2026-05-10: AND (was OR). Both conditions must be material to fire.
+  // pctDrift==null means betfair_pnl is 0 and rel is undefined — treat
+  // as "rel condition not met" so we don't fire on abs alone.
+  const fire = absDrift > absThreshold && pctDrift != null && pctDrift > relThreshold;
+  return { fire, localPnl, betfairPnl, absDrift, pctDrift, absThreshold, relThreshold };
 }
 
 async function evalTriggerD(): Promise<{ fire: boolean; duplicates: Array<{ customerRef: string; distinct_orders: number }> }> {
@@ -144,7 +183,7 @@ export async function runLiveAutoRevert(): Promise<AutoRevertEvaluation> {
 
   const reasons: string[] = [];
   if (a.fire) reasons.push(`A: betfair_api_error rate ${(a.rate! * 100).toFixed(1)}% (${a.errors}/${a.total}) > 10% in 15min window`);
-  if (c.fire) reasons.push(`C: reconciliation drift abs=£${c.absDrift.toFixed(2)} pct=${c.pctDrift != null ? (c.pctDrift * 100).toFixed(3) + "%" : "n/a"} > thresholds (£20 abs or 0.5% rel)`);
+  if (c.fire) reasons.push(`C: reconciliation drift abs=£${c.absDrift.toFixed(2)} pct=${c.pctDrift != null ? (c.pctDrift * 100).toFixed(3) + "%" : "n/a"} > thresholds (£${c.absThreshold.toFixed(0)} abs or ${(c.relThreshold * 100).toFixed(2)}% rel)`);
   if (d.fire) reasons.push(`D: idempotency anomaly — ${d.duplicates.length} customerRef(s) with multiple distinct betfair_bet_id`);
 
   if (reasons.length > 0) {
