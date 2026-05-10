@@ -1,5 +1,5 @@
 /**
- * Phase 3 Path C+ (2026-05-08): lazy shadow→paper promotion.
+ * Phase 3 Path C+ (2026-05-08): lazy shadow → paper / live promotion.
  *
  * Pre-fix: when valueDetection emits a bet but no recent betfair_exchange
  * snapshot exists for the (match, market, selection) tuple, the bet routes
@@ -15,24 +15,31 @@
  *   - kickoff in next 6h
  *   - betfair_exchange has a fresh snapshot (≤30 min) for the specific
  *     (match_id, market_type, selection_name)
- *   - the bet's selection_canonical isn't already a pending paper bet
- * Re-route by promoting in place: bet_track='paper', stake=fresh Kelly,
- * potential_profit=stake×(odds-1), shadow_stake/shadow_stake_kelly_fraction=NULL.
+ *   - the bet's selection_canonical isn't already a pending paper/live bet
+ *
+ * Promotion target depends on cutover state:
+ *   PRE-cutover  → in-place UPDATE bet_track='paper', stake=fresh Kelly.
+ *                  Settles deterministically as paper P&L. Legacy behaviour.
+ *   POST-cutover → call placeLiveBetOnBetfair(). On success in-place UPDATE
+ *                  bet_track='live', betfair_* fields populated, real money
+ *                  on the exchange. On any failure (kill switch off, market
+ *                  unavailable, INSUFFICIENT_FUNDS, drift, etc.) the row
+ *                  stays bet_track='shadow' — the next lazy-promoter pass
+ *                  will retry. Never UPDATE to bet_track='paper' post-
+ *                  cutover (the §3 trigger forbids fresh paper inserts but
+ *                  doesn't catch UPDATEs; we enforce it here).
  *
  * Uses the bet's stored opportunity_score + edge to compute Kelly fraction
  * (no re-prediction; the original valueDetection decision stands). If the
  * fresh Kelly stake < £2 (Betfair minimum), the bet stays shadow — no
- * regression to a sub-minimum paper stake. Idempotent — already-paper rows
- * are skipped.
- *
- * Pre-flip: stake is computed but the bet stays a paper-mode bet (no
- * Betfair placement). Post-flip: same bet enters the live placement
- * pipeline via paperTrading.ts handlers when isLiveMode().
+ * regression to a sub-minimum paper stake. Idempotent — already-paper /
+ * already-live rows are skipped.
  */
 
 import { db, paperBetsTable, agentConfigTable, complianceLogsTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
+import { isLiveMode } from "./betfairLive";
 
 async function getConfig(key: string): Promise<string | null> {
   const rows = await db
@@ -92,6 +99,13 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   const maxStakePctStr = await getConfig("max_stake_pct");
   const maxStakePct = maxStakePctStr != null ? Number(maxStakePctStr) : 0.02;
   const maxStake = Math.round(bankroll * maxStakePct * 100) / 100;
+
+  // Cutover state: post-cutover, promote shadow→live (real Betfair placement).
+  // Pre-cutover: legacy shadow→paper. The §3 trigger forbids paper INSERTs
+  // post-cutover; we honour that here by gating UPDATEs to bet_track='paper'
+  // on the same condition.
+  const cutoverCompletedAtRaw = await getConfig("cutover_completed_at");
+  const cutoverActive = !!cutoverCompletedAtRaw && cutoverCompletedAtRaw.trim() !== "";
 
   // Find candidates: pending Tier A shadow bets, kickoff within 6h.
   const candidates = await db.execute(sql`
@@ -179,7 +193,96 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       }
       const potentialProfit = Math.round(stake * (odds - 1) * 100) / 100;
 
-      // Promote in place: stake>0, bet_track='paper', clear shadow_stake.
+      // Post-cutover: try live placement. On any failure leave the row as
+      // shadow so the next pass can retry. The §3 trigger forbids paper
+      // INSERTs once cutover_completed_at is set — and it would correctly
+      // flag this UPDATE-to-paper path as semantically illegal too — so we
+      // gate ourselves explicitly here rather than relying on a downstream
+      // catch.
+      if (cutoverActive) {
+        const { isLivePlacementEnabled } = await import("./livePlacementGate");
+        const killSwitchOn = isLiveMode() && (await isLivePlacementEnabled());
+        if (!killSwitchOn) {
+          // Degraded mode: kill switch off. Don't promote — leave as shadow.
+          // The shadow row keeps its £0 stake / shadow_stake notional and the
+          // next lazy-promoter run can retry once the operator re-enables.
+          result.skipped_kelly_below_min++;  // reuse counter for "not eligible for live"
+          continue;
+        }
+
+        // Look up match identity for placeLiveBetOnBetfair.
+        const matchRow = await db.execute(sql`
+          SELECT home_team, away_team, betfair_event_id
+          FROM matches WHERE id = ${r.match_id} LIMIT 1
+        `);
+        const m = (((matchRow as any).rows ?? []) as Array<{
+          home_team: string; away_team: string; betfair_event_id: string | null;
+        }>)[0];
+        if (!m || !m.betfair_event_id) {
+          result.errors++;
+          continue;
+        }
+
+        const { placeLiveBetOnBetfair } = await import("./betfairLive");
+        const placeResult = await placeLiveBetOnBetfair({
+          internalBetId: r.id,
+          betfairEventId: m.betfair_event_id,
+          marketType: r.market_type,
+          selectionName: r.selection_name,
+          odds,
+          stake,
+          homeTeam: m.home_team,
+          awayTeam: m.away_team,
+        });
+
+        if (!placeResult.success || !placeResult.betfairBetId) {
+          // Stays shadow. Compliance event already written by placeLiveBetOnBetfair.
+          logger.info(
+            { betId: r.id, matchId: r.match_id, error: placeResult.error },
+            "lazyPromote: live placement failed — bet stays shadow for retry",
+          );
+          result.errors++;
+          continue;
+        }
+
+        // Live placement succeeded — promote bet_track to 'live'.
+        // placeLiveBetOnBetfair already set the betfair_* fields and
+        // betfair_placed_at; here we set the cutover-equivalent deltas
+        // (bet_track, stake, potential_profit, qualification_path).
+        await db
+          .update(paperBetsTable)
+          .set({
+            stake: String(stake),
+            potentialProfit: String(potentialProfit),
+            betTrack: "live",
+            shadowStake: null,
+            shadowStakeKellyFraction: null,
+            qualificationPath: "lazy_promoted_to_live",
+          } as any)
+          .where(eq(paperBetsTable.id, r.id));
+
+        await db.insert(complianceLogsTable).values({
+          actionType: "lazy_promoted_shadow_to_live",
+          details: {
+            betId: r.id,
+            matchId: r.match_id,
+            marketType: r.market_type,
+            selectionName: r.selection_name,
+            betfairBetId: placeResult.betfairBetId,
+            score, edge, odds, newStake: stake, kellyFraction, bankroll,
+          } as Record<string, unknown>,
+          timestamp: new Date(),
+        } as any);
+
+        result.promoted++;
+        logger.info(
+          { betId: r.id, matchId: r.match_id, marketType: r.market_type, selection: r.selection_name, stake, betfairBetId: placeResult.betfairBetId },
+          "lazyPromote: shadow bet promoted to LIVE on Betfair",
+        );
+        continue;
+      }
+
+      // Pre-cutover: legacy in-place shadow→paper promotion.
       await db
         .update(paperBetsTable)
         .set({
@@ -198,13 +301,10 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           matchId: r.match_id,
           marketType: r.market_type,
           selectionName: r.selection_name,
-          score,
-          edge,
-          odds,
+          score, edge, odds,
           newStake: stake,
           newPotentialProfit: potentialProfit,
-          kellyFraction,
-          bankroll,
+          kellyFraction, bankroll,
         } as Record<string, unknown>,
         timestamp: new Date(),
       } as any);
@@ -212,7 +312,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       result.promoted++;
       logger.info(
         { betId: r.id, matchId: r.match_id, marketType: r.market_type, selection: r.selection_name, stake, score, edge, odds },
-        "lazyPromoteShadowToPaper: promoted shadow bet to paper",
+        "lazyPromoteShadowToPaper: promoted shadow bet to paper (pre-cutover legacy path)",
       );
     } catch (err) {
       logger.warn({ err, betId: r.id }, "lazyPromoteShadowToPaper: failed to promote bet — skipping");
