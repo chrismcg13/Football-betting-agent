@@ -2066,7 +2066,14 @@ export async function placePaperBet(
     "Paper bet placed",
   );
 
-  if (isLiveMode() && bet?.id) {
+  // 2026-05-10: gate live placement on !isShadowBet. Pre-fix, shadow bets
+  // (stake=0) reached placeLiveBetOnBetfair, failed with "Stake £0 below
+  // Betfair minimum £2", and triggered the demote-to-shadow handler that
+  // pointlessly overwrote shadow_stake to 0. The placement attempt also
+  // generated noisy compliance logs and Betfair API calls for bets that
+  // can never fill. Shadow bets keep their compliance metadata from the
+  // upstream shadow-stake branch.
+  if (isLiveMode() && bet?.id && !isShadowBet) {
     const matchData = await db
       .select({
         homeTeam: matchesTable.homeTeam,

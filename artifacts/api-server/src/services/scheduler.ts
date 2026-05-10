@@ -2553,19 +2553,25 @@ export function startScheduler(): void {
     // source='betfair_exchange' for the venue-anchored pricing picker. Runs
     // unconditionally, independent of data_source config flag.
     // Wave 1.5 (2026-05-05): extended window from 24h to 48h to match
-    // valueDetection's 1-48h evaluation window. Without this, ~half the
-    // matches valueDetection looks at have no betfair_exchange snapshot
-    // and get rejected at 02a_rej_no_betfair_exchange. Tier B firehose
-    // benefits especially since Tier B has fewer matches, so coverage
-    // gaps are proportionally more impactful.
-    cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep({ hoursAhead: 48 }); }, { timezone: "UTC" });
-    logger.info("Exchange book sweep scheduler active — every 10 minutes (48h window — Wave 1.5)");
+    // valueDetection's 1-48h evaluation window.
+    // 2026-05-10: extended 48h → 168h to cover trading_far's emission window
+    // (1-168h). Pre-fix, candidates for matches > 48h ahead had zero Exchange
+    // snapshots so valueDetection's selectPricingSources returned
+    // shadowOnly=true and the bet routed upstream-shadow with no real-stake
+    // placement path. Bankroll sat unused while emission rate (~31/day from
+    // lazyPromote rescue only) couldn't keep up with settlement rate
+    // (~167/day) — pending live count drained from 170 → 78. Wider sweep
+    // restores Exchange data for the 5-of-8 candidates currently outside
+    // the window. Cost: ~3.5× more events per sweep cycle; first run will
+    // surface any rate-limit issue in logs.
+    cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep({ hoursAhead: 168 }); }, { timezone: "UTC" });
+    logger.info("Exchange book sweep scheduler active — every 10 minutes (168h window — 2026-05-10)");
 
     // Startup warmup: run one sweep ~30s after boot so the first population
     // doesn't have to wait the full 10-minute cron interval.
     setTimeout(() => {
-      logger.info("Exchange book sweep startup warmup triggered (T+30s, 48h window)");
-      void safeRunExchangeBookSweep({ hoursAhead: 48 });
+      logger.info("Exchange book sweep startup warmup triggered (T+30s, 168h window)");
+      void safeRunExchangeBookSweep({ hoursAhead: 168 });
     }, 30_000);
   }
 
