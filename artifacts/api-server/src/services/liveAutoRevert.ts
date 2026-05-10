@@ -96,6 +96,19 @@ async function readDriftThresholds(): Promise<{ abs: number; rel: number }> {
 // thresholds without duplicating the SQL — single source of truth.
 export async function evalTriggerC(): Promise<{ fire: boolean; localPnl: number; betfairPnl: number; absDrift: number; pctDrift: number | null; absThreshold: number; relThreshold: number }> {
   const { abs: absThreshold, rel: relThreshold } = await readDriftThresholds();
+  // 2026-05-10 fix: only count bets where Betfair has reconciled
+  // (betfair_settled_at IS NOT NULL AND betfair_pnl IS NOT NULL). Pre-fix,
+  // bets locally settled by paperTrading.settleBets had net_pnl populated
+  // but betfair_pnl=NULL until reconcileSettlements (every 15 min) backfilled
+  // it. COALESCE(NULL, 0) treated those as zero on the Betfair side, creating
+  // transient drift up to ~£170 during the 15-min reconciliation gap. The
+  // auto-revert (every 5 min) fired on this transient noise tonight at
+  // 20:00 UTC, flipping live_placement_enabled=false and halting all live
+  // placement (lazyPromote + direct production) for ~2 hours despite real-
+  // money state being fine. Filtering to reconciled-only bets eliminates
+  // the false positive without weakening real-drift detection — a genuine
+  // commission or settlement mismatch still trips because both columns are
+  // populated and diverge.
   const r = await db.execute(sql`
     SELECT
       COALESCE(SUM(net_pnl)::float8, 0)     AS local_pnl,
@@ -103,6 +116,8 @@ export async function evalTriggerC(): Promise<{ fire: boolean; localPnl: number;
     FROM paper_bets
     WHERE bet_track='live' AND status IN ('won','lost')
       AND settled_at > NOW() - INTERVAL '24 hours'
+      AND betfair_settled_at IS NOT NULL
+      AND betfair_pnl IS NOT NULL
   `);
   const row = (((r as any).rows ?? []) as Array<{ local_pnl: number; betfair_pnl: number }>)[0];
   const localPnl = Number(row?.local_pnl ?? 0);
