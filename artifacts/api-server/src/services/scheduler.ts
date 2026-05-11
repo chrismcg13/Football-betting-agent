@@ -2446,6 +2446,24 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Calibration fitter scheduler active — Mondays 04:00 UTC");
 
+  // Task 11 (Phase 3d.1) — Smarkets ingestion every 15 min when the flag
+  // is on. Maps Smarkets events to our match_id via team-name fuzzy match
+  // (apiFootball.teamNameMatch) and persists per-selection snapshots
+  // via sharpConsensus.persistSourceSnapshot. Pre-flag (the default),
+  // this is a no-op.
+  cron.schedule("3,18,33,48 * * * *", () => {
+    void (async () => {
+      try {
+        const { runSmarketsIngestion } = await import("./sharpSources/runSmarketsIngestion");
+        const r = await runSmarketsIngestion();
+        if (r.enabled) logger.info(r, "Smarkets ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "Smarkets ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Smarkets ingestion scheduler active — every 15 min (gated on agent_config.smarkets_ingestion_enabled)");
+
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {

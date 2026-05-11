@@ -59,6 +59,18 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   // a match. Below the slippage tolerance, demote to shadow.
   { key: "take_best_back_min_edge", value: "0.10" },
   { key: "take_best_back_slippage_tolerance", value: "0.05" },
+  // Task 11 (2026-05-11): synthetic CLV consensus. Phase 3d.1 ships the
+  // Smarkets fetcher only; gated behind a flag so the first deploy is a
+  // no-op until the operator flips it. Matchbook + Betfair SP fetchers
+  // arrive in Phase 3d.2 with their own flags.
+  { key: "smarkets_ingestion_enabled", value: "false" },
+  // Per-source trust weights for the weighted geometric-mean consensus.
+  // JSON keyed by source name. Overrides the in-code defaults
+  // (pinnacle=1.0, smarkets=0.8, matchbook=0.7, betfair_sp=0.9).
+  {
+    key: "synthetic_consensus_trust_weights",
+    value: '{"pinnacle":1.0,"smarkets":0.8,"matchbook":0.7,"betfair_sp":0.9}',
+  },
 ];
 
 export async function runMigrations() {
@@ -3247,6 +3259,35 @@ export async function runMigrations() {
     `);
 
     logger.info("Calibration buckets ready (Task 12)");
+
+    // Task 11 — sharp consensus snapshots (Phase 3d.1). One row per
+    // (match × market × selection × snapshot_at × source). The
+    // sharpConsensus service reads + aggregates these via weighted
+    // geometric mean for the CLV pipeline (Phase 3d.2 wires it in).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS sharp_consensus_snapshots (
+        match_id         INTEGER NOT NULL,
+        market_type      TEXT NOT NULL,
+        selection_name   TEXT NOT NULL,
+        snapshot_at      TIMESTAMPTZ NOT NULL,
+        source           TEXT NOT NULL,
+        back_odds        NUMERIC(10,4) NOT NULL,
+        fair_probability NUMERIC(8,6),
+        trust_weight     NUMERIC(6,4),
+        raw_payload      JSONB,
+        PRIMARY KEY (match_id, market_type, selection_name, snapshot_at, source)
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS sharp_consensus_lookup
+        ON sharp_consensus_snapshots(match_id, market_type, selection_name, snapshot_at DESC)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS sharp_consensus_source_recent
+        ON sharp_consensus_snapshots(source, snapshot_at DESC)
+    `);
+
+    logger.info("Sharp consensus snapshots ready (Task 11)");
 
     logger.info("Migrations complete");
   } catch (err) {
