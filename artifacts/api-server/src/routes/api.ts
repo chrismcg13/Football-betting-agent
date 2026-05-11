@@ -6052,6 +6052,23 @@ router.post("/admin/run-kelly-montecarlo", async (_req, res) => {
   }
 });
 
+// 2026-05-11: manual trigger for the lazy shadow→live promoter. The 5-min
+// cron in scheduler.ts runs this automatically; this endpoint lets the
+// operator force a pass immediately (e.g. after raising the dynamic Kelly
+// fraction floor, to see whether previously-too-small shadows now qualify
+// for live promotion). Returns the number of pending shadow candidates
+// scanned + how many were promoted to live.
+router.post("/admin/run-lazy-promote", async (_req, res) => {
+  try {
+    const { runLazyPromoteShadowToPaper } = await import("../services/lazyPromoteShadowToPaper");
+    const result = await runLazyPromoteShadowToPaper();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual lazy-promote run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // 2026-05-11: manual trigger for live account-statement reconciliation
 // (clears net_pnl vs betfair_pnl drift). Same code path as the daily 05:00
 // UTC cron and the new hourly cron. Use after the auto-revert kill switch
