@@ -1460,6 +1460,9 @@ export async function runTradingCycle(options?: {
       validatorBestOdds: number | null;
       universeTier?: string | null;
       placementTrack: "production" | "shadow";
+      // Task 12 (2026-05-11): pre-calibration prob + bucket id for audit.
+      rawModelProbability: number;
+      calibrationBucketId: number | null;
     }
 
     const betOrders: BetOrder[] = [];
@@ -1601,6 +1604,13 @@ export async function runTradingCycle(options?: {
         fairValueOdds: candidate.fairValueOdds,
         fairValueSource: candidate.fairValueSource,
         validatorBestOdds,
+        // Task 12 (2026-05-11): forward pre-calibration probability and
+        // calibration_bucket_id from the candidate so paperTrading.placePaperBet
+        // can store both for audit. Without these, the insert sees them as
+        // undefined and writes NULL for raw_model_probability +
+        // calibration_bucket_id even though the calibration was applied.
+        rawModelProbability: candidate.rawModelProbability,
+        calibrationBucketId: candidate.calibrationBucketId,
         // Phase 2.B.2: tier carried through to placePaperBet for the
         // shadow-stake branch.
         universeTier: candidate.universeTier ?? null,
