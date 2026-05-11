@@ -424,15 +424,24 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
     }
 
     // Stake sizing — same helper as new live emissions. The helper returns 0
-    // if edge<=0 (we'll shadow-demote 'edge_collapsed'); otherwise floors to £2.
+    // when pFair * b_net <= q (no positive Kelly fraction after commission).
+    //
+    // Task 1 (2026-05-11): signature changed from (edge) to (pFair).
+    // pFair sourced from the bet's stored model_probability (post-Phase-3b:
+    // isotonic-calibrated). The cutover script ran on 2026-05-09 and isn't
+    // expected to run again; this keeps it compatible if re-invoked.
     const opportunityScore = bet.opportunity_score ?? 0;
+    const pFair = Number(bet.model_probability ?? 0);
+    const { getCommissionRate } = await import("./commissionService");
+    const commissionRate = await getCommissionRate("betfair");
     const stake = calculateDynamicKellyStake(
       report.liveBankroll,
-      edgeAtCurrentPrice,
+      pFair,
       currentBack,
       maxStakePct,
       opportunityScore,
       bet.market_type,
+      commissionRate,
     );
 
     // Gate 3: residual edge must clear the same threshold paper emission uses.

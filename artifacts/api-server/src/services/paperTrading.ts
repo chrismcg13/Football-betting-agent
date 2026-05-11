@@ -702,26 +702,52 @@ async function logShadowGateExemption(
 
 export function calculateDynamicKellyStake(
   bankroll: number,
-  edge: number,
+  pFair: number,
   backOdds: number,
   maxStakePct: number,
   opportunityScore: number,
   marketType?: string,
+  commissionRate: number = 0.05,
 ): number {
-  // Returns raw Kelly stake (no £2 floor). Caller is responsible for routing
-  // sub-£2 results to the shadow rail — see the demote block in placePaperBet.
+  // Task 1 (2026-05-11): commission-aware Kelly. Replaces the legacy
+  // `edge / (backOdds - 1)` formula (which sized against gross edge and
+  // ignored Betfair's 5% commission entirely) with the canonical Kelly
+  // criterion applied to the COMMISSION-ADJUSTED decimal odds:
   //
-  // Task 2 (2026-05-11): removed the applyMinStakeFloor parameter and the
-  // Math.max(stake, 2) line. Flooring Kelly to the Betfair minimum contradicts
-  // Kelly theory (it over-bets every bet whose mathematical optimum is below
-  // the minimum), and the 163-of-280 live bets sitting in the £1.50–£2.50
-  // floor band carried -£3.09 PnL on £327 stake — break-even on volume with
-  // zero growth contribution. Demoting sub-£2 to shadow preserves the signal
-  // for learning without staking a wrong-sized bet.
-  if (edge <= 0 || backOdds <= 1) return 0;
+  //   b_net   = (backOdds - 1) * (1 - commissionRate)  // net win multiplier
+  //   f* full = (p_fair × b_net − (1 − p_fair)) / b_net
+  //
+  // p_fair is the true-win-probability estimate. Caller is expected to pass:
+  //   - 1 / fairValueOdds when a non-degenerate Pinnacle (or CLV-equivalent)
+  //     source is available (the strongest unbiased prior we have); OR
+  //   - the calibrated model probability when no sharp reference exists
+  //     (post-Phase-3b: this is the isotonic-calibrated sigmoid, not raw).
+  //
+  // Returns raw Kelly stake (no £2 floor — Task 2 removed it). Caller is
+  // responsible for routing sub-£2 results to the shadow rail; see the
+  // demote block in placePaperBet.
+  //
+  // Worked example (AH at odds 2.00, p_fair 0.55, commission 5%, score 70):
+  //   b_net   = 1.00 * 0.95 = 0.95
+  //   f* full = (0.55 * 0.95 − 0.45) / 0.95
+  //           = (0.5225 − 0.45) / 0.95
+  //           = 0.0763  (≈ 7.6% of bankroll if score-multiplier were 1.0)
+  //   Compared to legacy gross-edge sizing the bet is ~5% smaller on the
+  //   win term, which is exactly the size of the commission haircut on
+  //   realised P&L. Stakes that previously sat just above the maxStakePct
+  //   cap shrink modestly; sub-marginal edges (close to commission
+  //   break-even) shrink to zero, correctly demoting them to shadow.
+  if (!Number.isFinite(pFair) || pFair <= 0 || pFair >= 1) return 0;
+  if (!Number.isFinite(backOdds) || backOdds <= 1) return 0;
+
+  const bNet = (backOdds - 1) * (1 - commissionRate);
+  if (bNet <= 0) return 0;
+
+  const q = 1 - pFair;
+  const kellyFull = (pFair * bNet - q) / bNet;
+  if (kellyFull <= 0) return 0;
 
   const fraction = kellyFractionForScore(opportunityScore, marketType);
-  const kellyFull = edge / (backOdds - 1);
   let stake = bankroll * kellyFull * fraction;
 
   stake = Math.min(stake, bankroll * maxStakePct);
@@ -1544,13 +1570,30 @@ export async function placePaperBet(
     ? liveLimits.config.maxSingleBetPct
     : Number((await getConfigValue("max_stake_pct")) ?? "0.02");
   const stakingBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
+  // Task 1 (2026-05-11): p_fair source priority. Prefer the Pinnacle-derived
+  // sharp probability (1/fairValueOdds) when a non-degenerate fair value
+  // source is available; fall back to the calibrated model probability
+  // otherwise. The fairValueSource === actionableSource case is the
+  // degenerate fallback used for non-Pinnacle leagues (see valueDetection.ts
+  // — that branch synthesises fair_value from the exchange row itself, so
+  // 1/fairValueOdds collapses to the book's implied prob and is useless for
+  // sizing). modelProbability is post-Phase-3b calibrated.
+  const fvAvailable =
+    fairValueOdds != null &&
+    Number(fairValueOdds) > 1 &&
+    fairValueSource != null &&
+    fairValueSource !== actionableSource;
+  const pFair = fvAvailable ? 1 / Number(fairValueOdds) : modelProbability;
+  const { getCommissionRate: __getCommissionRate } = await import("./commissionService");
+  const commissionRate = await __getCommissionRate("betfair");
   let stake = calculateDynamicKellyStake(
     stakingBankroll,
-    edge,
+    pFair,
     backOdds,
     maxStakePct,
     score,
     marketType,
+    commissionRate,
   );
 
   if (liveLimits) {
