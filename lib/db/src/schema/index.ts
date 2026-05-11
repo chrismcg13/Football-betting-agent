@@ -32,3 +32,5 @@ export * from "./graduationEvaluationLog";
 export * from "./modelDecisionAuditLog";
 export * from "./pendingThresholdRevisions";
 export * from "./reliability";
+export * from "./analysisSegmentStats";
+export * from "./analysisSignalStrength";

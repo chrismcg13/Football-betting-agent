@@ -3110,6 +3110,77 @@ export async function runMigrations() {
 
     logger.info("Reliability observability tables ready (10 tables)");
 
+    // Bundle B — analytics scratch tables (Task 12 from theory plan).
+    // Populated nightly by runBundleBAnalytics() in services/analysisJobs.ts.
+    // Composite PK keeps history; one row per (snapshot, league, market, track).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS analysis_segment_stats (
+        computed_at   TIMESTAMPTZ NOT NULL,
+        league        TEXT NOT NULL,
+        market_type   TEXT NOT NULL,
+        bet_track     TEXT NOT NULL,
+        n             INTEGER NOT NULL,
+        w             INTEGER NOT NULL,
+        stake         NUMERIC NOT NULL,
+        pnl           NUMERIC NOT NULL,
+        avg_clv       NUMERIC,
+        sd_clv        NUMERIC,
+        clv_n         INTEGER NOT NULL,
+        PRIMARY KEY (computed_at, league, market_type, bet_track)
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_analysis_segment_stats_recent ON analysis_segment_stats(computed_at DESC)`);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS analysis_signal_strength (
+        computed_at          TIMESTAMPTZ NOT NULL,
+        league               TEXT NOT NULL,
+        market_type          TEXT NOT NULL,
+        bet_track            TEXT NOT NULL,
+        n                    INTEGER NOT NULL,
+        win_rate             NUMERIC,
+        wilson_lo95_winrate  NUMERIC,
+        roi                  NUMERIC,
+        shrunk_roi           NUMERIC,
+        avg_clv              NUMERIC,
+        clv_t_stat           NUMERIC,
+        qualifies_live       BOOLEAN NOT NULL DEFAULT FALSE,
+        qualification_basis  TEXT NOT NULL DEFAULT 'insufficient',
+        PRIMARY KEY (computed_at, league, market_type, bet_track)
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_analysis_signal_strength_recent ON analysis_signal_strength(computed_at DESC)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_analysis_signal_strength_qualifies ON analysis_signal_strength(qualifies_live, computed_at DESC) WHERE qualifies_live = TRUE`);
+
+    // Operator view — latest live-eligibility candidates, sorted by strength.
+    // No UI consumer (per project memory); read via SQL editor.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_live_eligibility_candidates AS
+      SELECT
+        s.league,
+        s.market_type,
+        s.bet_track,
+        s.n,
+        s.win_rate,
+        s.wilson_lo95_winrate,
+        s.roi,
+        s.shrunk_roi,
+        s.avg_clv,
+        s.clv_t_stat,
+        s.qualifies_live,
+        s.qualification_basis,
+        s.computed_at
+      FROM analysis_signal_strength s
+      WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+        AND s.qualifies_live = TRUE
+      ORDER BY
+        CASE WHEN s.clv_t_stat IS NULL THEN 1 ELSE 0 END,
+        s.clv_t_stat DESC NULLS LAST,
+        s.shrunk_roi DESC NULLS LAST
+    `);
+
+    logger.info("Bundle B analytics tables ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

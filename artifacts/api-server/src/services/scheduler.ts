@@ -2385,6 +2385,24 @@ export function startSettlementCron(): void {
   // baseline (excluding last 5 days). Inserts data_quality_alerts row on
   // < 0.5x ratio. Operator queries data_quality_alerts WHERE
   // acknowledged_at IS NULL.
+  // Bundle B analytics — daily 02:30 UTC (Tasks 3, 5, 6, 7, 9 from
+  // theory-plan rebake). Recomputes per-(league × market × track) stats
+  // and live-eligibility verdicts. Operator reads results from
+  // v_live_eligibility_candidates.
+  cron.schedule("30 2 * * *", () => {
+    logger.info("Bundle B analytics triggered (daily 02:30 UTC)");
+    void (async () => {
+      try {
+        const { runBundleBAnalytics } = await import("./analysisJobs");
+        const r = await runBundleBAnalytics();
+        logger.info(r, "Bundle B analytics complete");
+      } catch (err) {
+        logger.error({ err }, "Bundle B analytics failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle B analytics scheduler active — daily 02:30 UTC");
+
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {
