@@ -435,6 +435,34 @@ export async function computeFeaturesForMatch(
   const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
   const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
 
+  // ─── Task 15 (Phase 4a.2) — ClubElo shadow features ──────────────────
+  // Looks up home/away team Elo ratings via fuzzy resolver. Stored as
+  // shadow features (NOT yet in FEATURE_NAMES / model input). Used by
+  // a follow-up PR once we verify the resolver hit rate is acceptable
+  // by inspecting home_clubelo / away_clubelo distributions in features.
+  let homeClubElo: number | null = null;
+  let awayClubElo: number | null = null;
+  try {
+    const matchRow = await db
+      .select({
+        homeTeam: matchesTable.homeTeam,
+        awayTeam: matchesTable.awayTeam,
+        country: matchesTable.country,
+      })
+      .from(matchesTable)
+      .where(eq(matchesTable.id, matchId))
+      .limit(1);
+    if (matchRow.length > 0 && matchRow[0]) {
+      const { getClubEloForTeam } = await import("./clubEloLookup");
+      const homeRes = await getClubEloForTeam(matchRow[0].homeTeam);
+      const awayRes = await getClubEloForTeam(matchRow[0].awayTeam);
+      homeClubElo = homeRes.elo;
+      awayClubElo = awayRes.elo;
+    }
+  } catch (err) {
+    logger.debug({ err, matchId }, "ClubElo feature lookup failed (non-fatal)");
+  }
+
   // Sub-phase 7.6: fixture density (last 14 days) + congestion diff.
   const homeFixtures14d = computeFixturesInLastDays(homeMatches, homeTeamId, 14);
   const awayFixtures14d = computeFixturesInLastDays(awayMatches, awayTeamId, 14);
@@ -525,6 +553,14 @@ export async function computeFeaturesForMatch(
 
   for (const [name, value] of features) {
     await upsertFeature(matchId, name, value);
+  }
+
+  // Task 15 shadow features — persist alongside the main set. Skipped
+  // when the resolver returns null (team not yet known to ClubElo).
+  if (homeClubElo != null) await upsertFeature(matchId, "home_clubelo", homeClubElo);
+  if (awayClubElo != null) await upsertFeature(matchId, "away_clubelo", awayClubElo);
+  if (homeClubElo != null && awayClubElo != null) {
+    await upsertFeature(matchId, "elo_diff", homeClubElo - awayClubElo);
   }
 
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
@@ -769,6 +805,34 @@ async function computeFeaturesFromDb(
 
   const homeDaysSince = computeDaysSinceLastMatch(homeMatches, homeTeamId);
   const awayDaysSince = computeDaysSinceLastMatch(awayMatches, awayTeamId);
+
+  // ─── Task 15 (Phase 4a.2) — ClubElo shadow features ──────────────────
+  // Looks up home/away team Elo ratings via fuzzy resolver. Stored as
+  // shadow features (NOT yet in FEATURE_NAMES / model input). Used by
+  // a follow-up PR once we verify the resolver hit rate is acceptable
+  // by inspecting home_clubelo / away_clubelo distributions in features.
+  let homeClubElo: number | null = null;
+  let awayClubElo: number | null = null;
+  try {
+    const matchRow = await db
+      .select({
+        homeTeam: matchesTable.homeTeam,
+        awayTeam: matchesTable.awayTeam,
+        country: matchesTable.country,
+      })
+      .from(matchesTable)
+      .where(eq(matchesTable.id, matchId))
+      .limit(1);
+    if (matchRow.length > 0 && matchRow[0]) {
+      const { getClubEloForTeam } = await import("./clubEloLookup");
+      const homeRes = await getClubEloForTeam(matchRow[0].homeTeam);
+      const awayRes = await getClubEloForTeam(matchRow[0].awayTeam);
+      homeClubElo = homeRes.elo;
+      awayClubElo = awayRes.elo;
+    }
+  } catch (err) {
+    logger.debug({ err, matchId }, "ClubElo feature lookup failed (non-fatal)");
+  }
 
   // Sub-phase 7.6: fixture density (last 14 days) + congestion diff.
   const homeFixtures14d = computeFixturesInLastDays(homeMatches, homeTeamId, 14);
@@ -1058,6 +1122,14 @@ async function computeFeaturesFromDb(
 
   for (const [name, value] of features) {
     await upsertFeature(matchId, name, value);
+  }
+
+  // Task 15 shadow features — persist alongside the main set. Skipped
+  // when the resolver returns null (team not yet known to ClubElo).
+  if (homeClubElo != null) await upsertFeature(matchId, "home_clubelo", homeClubElo);
+  if (awayClubElo != null) await upsertFeature(matchId, "away_clubelo", awayClubElo);
+  if (homeClubElo != null && awayClubElo != null) {
+    await upsertFeature(matchId, "elo_diff", homeClubElo - awayClubElo);
   }
 
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
