@@ -28,10 +28,15 @@ const USER_AGENT = "BetAgentOS/1.0 (research; chris.mcg@hotmail.co.uk)";
 export interface SmarketsEvent {
   id: string;
   name: string;
-  type_domain: string; // 'sport-soccer'
+  // 2026-05-11: corrected from `type_domain` (a REQUEST parameter the API
+  // doesn't actually accept) to `type` (the RESPONSE field). Live probe
+  // confirms football fixtures carry `type: "football_match"`; competition
+  // nodes use other values (politics, etc.). The old `type_domain:
+  // "sport-soccer"` filter parameter on the request URL caused HTTP 400.
+  type: string; // 'football_match' for soccer fixtures
   competition_id?: string;
   competition_name?: string;
-  start_datetime: string; // ISO
+  start_datetime: string | null; // ISO; null on competition nodes
   home_team?: string;
   away_team?: string;
 }
@@ -166,8 +171,13 @@ export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 10
       nextPath = pageResp.pagination?.next_page ?? null;
       pageCount++;
     }
+    // 2026-05-11 (post-rebuild verification): live response uses
+    // `type: "football_match"` for soccer fixtures, NOT `type_domain:
+    // "sport-soccer"`. Pre-fix filter discarded 100% of returned events
+    // because the field didn't exist on the response. Confirmed via
+    // direct API probe.
     const footballEvents = collected.filter(
-      (e) => e.type_domain === "sport-soccer",
+      (e) => (e as { type?: string }).type === "football_match",
     );
     logger.info(
       {
@@ -176,6 +186,7 @@ export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 10
         totalReturned: collected.length,
         footballCount: footballEvents.length,
         firstFootballName: footballEvents[0]?.name ?? null,
+        sampleTypes: collected.slice(0, 5).map((e) => (e as { type?: string }).type),
       },
       "Smarkets: top-level single_event walk",
     );
