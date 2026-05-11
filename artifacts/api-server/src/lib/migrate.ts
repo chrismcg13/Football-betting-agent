@@ -3235,9 +3235,14 @@ export async function runMigrations() {
         s.clv_t_stat,
         s.qualifies_live,
         s.qualification_basis,
+        s.computed_at,
+        -- 2026-05-11: is_womens_league appended at the END of the SELECT list.
+        -- Postgres CREATE OR REPLACE VIEW rejects column-order changes;
+        -- new columns must be appended after existing ones (cannot change
+        -- name of view column 'computed_at' to 'is_womens_league' — this
+        -- caused a startup crash-loop when initially placed mid-list).
         (s.league ~* '\\m(women|wsl|nwsl|femenina|féminine|feminina|frauen|damallsvenskan|toppserien|kvindeligaen)\\M')
-          AS is_womens_league,
-        s.computed_at
+          AS is_womens_league
       FROM analysis_signal_strength s
       WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
         AND s.qualifies_live = TRUE
