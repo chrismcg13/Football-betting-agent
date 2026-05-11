@@ -2501,6 +2501,24 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Betfair SP ingestion scheduler active — every 1 min (gated on agent_config.betfair_sp_ingestion_enabled)");
 
+  // Task 11 (Phase 3d.3) — synthetic CLV backfill. Every 15 min, scans
+  // recently-settled bets with null synthetic_clv_pct, looks up consensus
+  // within ±5min of kickoff, and writes synthetic_clv_pct +
+  // consensus_quality + clv_consensus_sources. Caps at 500 bets per run.
+  // Shadow column — does NOT touch the existing clv_pct.
+  cron.schedule("13,28,43,58 * * * *", () => {
+    void (async () => {
+      try {
+        const { runSyntheticClvBackfill } = await import("./syntheticClv");
+        const r = await runSyntheticClvBackfill();
+        if (r.scanned > 0) logger.info(r, "Synthetic CLV backfill complete");
+      } catch (err) {
+        logger.error({ err }, "Synthetic CLV backfill failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Synthetic CLV backfill scheduler active — every 15 min");
+
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {

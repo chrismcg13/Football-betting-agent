@@ -31,6 +31,7 @@ import { db, sharpConsensusSnapshotsTable, agentConfigTable } from "@workspace/d
 import { and, eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { devig, type DevigMethod } from "./devig";
+import { canonicalSelectionName } from "./paperTrading";
 
 export type SharpSource = "pinnacle" | "smarkets" | "matchbook" | "betfair_sp";
 
@@ -99,7 +100,12 @@ export async function persistSourceSnapshot(args: {
   const rows = selections.map((sel, i) => ({
     matchId: args.matchId,
     marketType: args.marketType,
-    selectionName: sel,
+    // Phase 3d.3: canonicalise so cross-source consensus joins line up
+    // with paper_bets.selection_canonical. Smarkets contract_ids stay
+    // contract_ids after canonicalisation (unique strings, just won't
+    // match paper_bets.selection_canonical until the Smarkets contract
+    // → name resolution lands).
+    selectionName: canonicalSelectionName(args.marketType, sel),
     snapshotAt: args.snapshotAt,
     source: args.source,
     backOdds: String(odds[i]!),
@@ -138,6 +144,9 @@ export async function computeConsensusForSnapshot(args: {
   const windowMs = args.windowMs ?? 30 * 60 * 1000; // ±30 min
   const lo = new Date(args.snapshotAt.getTime() - windowMs);
   const hi = new Date(args.snapshotAt.getTime() + windowMs);
+  // Phase 3d.3: lookup selection name is canonicalised to match how
+  // persistSourceSnapshot stores it.
+  const canonicalSel = canonicalSelectionName(args.marketType, args.selectionName);
 
   const rows = await db
     .select({
@@ -150,7 +159,7 @@ export async function computeConsensusForSnapshot(args: {
       and(
         eq(sharpConsensusSnapshotsTable.matchId, args.matchId),
         eq(sharpConsensusSnapshotsTable.marketType, args.marketType),
-        eq(sharpConsensusSnapshotsTable.selectionName, args.selectionName),
+        eq(sharpConsensusSnapshotsTable.selectionName, canonicalSel),
         sql`${sharpConsensusSnapshotsTable.snapshotAt} BETWEEN ${lo} AND ${hi}`,
       ),
     );

@@ -3265,6 +3265,24 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS calibration_bucket_id INTEGER
     `);
 
+    // Task 11 (Phase 3d.3) — synthetic CLV shadow columns. Parallels
+    // clv_pct without touching it. Backfilled by the syntheticClv cron
+    // for recently-settled bets where consensus snapshots exist within
+    // ±5min of kickoff.
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS synthetic_clv_pct NUMERIC(8,3),
+        ADD COLUMN IF NOT EXISTS consensus_quality SMALLINT,
+        ADD COLUMN IF NOT EXISTS clv_consensus_sources JSONB
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS paper_bets_synthetic_clv_backfill
+        ON paper_bets(settled_at)
+        WHERE synthetic_clv_pct IS NULL
+          AND status IN ('won','lost')
+          AND deleted_at IS NULL
+    `);
+
     logger.info("Calibration buckets ready (Task 12)");
 
     // Task 11 — sharp consensus snapshots (Phase 3d.1). One row per

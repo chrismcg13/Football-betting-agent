@@ -10,6 +10,7 @@ import {
   real,
   smallint,
   uniqueIndex,
+  jsonb,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
@@ -37,6 +38,15 @@ export const paperBetsTable = pgTable("paper_bets", {
   // when a calibration_buckets entry exists for the (league, market_type)).
   rawModelProbability: numeric("raw_model_probability", { precision: 8, scale: 6 }),
   calibrationBucketId: integer("calibration_bucket_id"),
+  // Task 11 (Phase 3d.3, 2026-05-11): synthetic CLV shadow column. Computed
+  // at settlement time from sharp_consensus_snapshots (weighted geometric
+  // mean of de-vigged fair probabilities across pinnacle / smarkets /
+  // matchbook / betfair_sp). Parallels the existing clv_pct without
+  // touching it — lets the operator compare both signals for a few
+  // weeks before any flip-over.
+  syntheticClvPct: numeric("synthetic_clv_pct", { precision: 8, scale: 3 }),
+  consensusQuality: smallint("consensus_quality"),
+  clvConsensusSources: jsonb("clv_consensus_sources"),
   betfairImpliedProbability: numeric("betfair_implied_probability", {
     precision: 8,
     scale: 6,
