@@ -2537,6 +2537,31 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("ClubElo scheduler active — daily 02:00 UTC");
 
+  // Task 15 startup self-seed: if club_elo_snapshots is empty (fresh deploy),
+  // fire one ingestion 60s after boot so the table populates immediately
+  // rather than waiting until tomorrow's 02:00 UTC cron. Fire-and-forget;
+  // failures log but don't block startup.
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const probe = await db.execute(
+          sql`SELECT 1 FROM club_elo_snapshots LIMIT 1`,
+        );
+        const hasRows = ((probe as unknown) as { rows?: unknown[] }).rows?.length ?? 0;
+        if (hasRows > 0) {
+          logger.debug("ClubElo startup self-seed skipped — table already has rows");
+          return;
+        }
+        logger.info("ClubElo startup self-seed triggered (table empty)");
+        const { runClubEloIngestion } = await import("./clubElo");
+        const r = await runClubEloIngestion();
+        logger.info(r, "ClubElo startup self-seed complete");
+      } catch (err) {
+        logger.warn({ err }, "ClubElo startup self-seed failed");
+      }
+    })();
+  }, 60 * 1000);
+
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {
