@@ -272,6 +272,110 @@ export async function runStorageCleanup(opts: {
 }
 
 /**
+ * Phase 6 housekeeping (2026-05-11) — retention for the analytics &
+ * observability tables landed during the theory-plan rebake. Each table
+ * here is a low-volume cron output, append-only, that grows linearly
+ * over time. Without trimming, the smallest of them (kelly_fraction_lookup,
+ * 1 row/day) is trivial; the largest (sharp_consensus_snapshots, fed by
+ * Smarkets every 15 min × hundreds of fixtures × markets) would balloon
+ * fast. Conservative retention windows below — each well above any read
+ * surface that currently exists, so it's safe to extend later if needed.
+ *
+ * All tables are append-only with a timestamp column — DELETE by simple
+ * predicate is enough. No batching needed at these sizes; each DELETE
+ * comfortably fits in the 60s statement_timeout.
+ *
+ * Tables and their reasons:
+ *   sharp_consensus_snapshots   60d  — multi-source CLV joins to bets;
+ *                                       closing windows we may revisit.
+ *   club_elo_snapshots         180d  — historical Elo backfill walks
+ *                                       distinct match dates; keep
+ *                                       enough to cover the longest
+ *                                       settled-bet window.
+ *   analysis_segment_stats      30d  — nightly recompute, idempotent.
+ *   analysis_signal_strength    30d  — nightly recompute, idempotent.
+ *   kelly_fraction_lookup      365d  — 1 row/day; trivial growth.
+ *   shap_drift_runs            365d  — 1 row/day × markets; trivial.
+ *   feature_attribution         24mo — monthly; long history is valuable.
+ *   market_correlation_matrix   12mo — monthly snapshots; matrices are
+ *                                       small but readable history helps.
+ *   calibration_buckets         90d  on inactive only — active rows
+ *                                       always retained (drives live
+ *                                       inference).
+ *
+ * Returns per-table delete counts so the operator can see the impact.
+ */
+export interface AnalyticsCleanupResult {
+  evaluatedAt: string;
+  deleted: Record<string, number>;
+  totalRowsDeleted: number;
+  errors: Array<{ table: string; error: string }>;
+}
+
+export async function runAnalyticsTablesCleanup(): Promise<AnalyticsCleanupResult> {
+  const evaluatedAt = new Date().toISOString();
+  const deleted: Record<string, number> = {};
+  const errors: Array<{ table: string; error: string }> = [];
+
+  async function trim(table: string, predicate: string): Promise<void> {
+    try {
+      const res = (await db.execute(
+        sql.raw(`DELETE FROM ${table} WHERE ${predicate}`),
+      )) as unknown as { rowCount?: number };
+      const n = res.rowCount ?? 0;
+      if (n > 0) deleted[table] = n;
+    } catch (err) {
+      errors.push({ table, error: String(err) });
+      logger.warn({ err, table }, "Analytics cleanup: DELETE failed");
+    }
+  }
+
+  await trim(
+    "sharp_consensus_snapshots",
+    "snapshot_at < NOW() - INTERVAL '60 days'",
+  );
+  await trim(
+    "club_elo_snapshots",
+    "date < (NOW() - INTERVAL '180 days')::date",
+  );
+  await trim(
+    "analysis_segment_stats",
+    "computed_at < NOW() - INTERVAL '30 days'",
+  );
+  await trim(
+    "analysis_signal_strength",
+    "computed_at < NOW() - INTERVAL '30 days'",
+  );
+  await trim(
+    "kelly_fraction_lookup",
+    "computed_at < NOW() - INTERVAL '365 days'",
+  );
+  await trim(
+    "shap_drift_runs",
+    "run_at < NOW() - INTERVAL '365 days'",
+  );
+  await trim(
+    "feature_attribution",
+    "computed_at < NOW() - INTERVAL '24 months'",
+  );
+  await trim(
+    "market_correlation_matrix",
+    "computed_at < NOW() - INTERVAL '12 months'",
+  );
+  await trim(
+    "calibration_buckets",
+    "active = false AND fitted_at < NOW() - INTERVAL '90 days'",
+  );
+
+  const totalRowsDeleted = Object.values(deleted).reduce((a, b) => a + b, 0);
+  logger.info(
+    { evaluatedAt, deleted, totalRowsDeleted, errors },
+    "Analytics tables cleanup complete",
+  );
+  return { evaluatedAt, deleted, totalRowsDeleted, errors };
+}
+
+/**
  * Compact + reclaim: VACUUM ANALYZE on tables that just had bulk deletes.
  * Postgres marks dead rows as reusable space but does NOT return disk
  * to the OS / object store. For Neon this means the logical-storage

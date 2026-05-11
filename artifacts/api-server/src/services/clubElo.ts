@@ -24,7 +24,11 @@ import { db, clubEloSnapshotsTable, matchesTable, featuresTable } from "@workspa
 import { and, eq, gte, lte, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { resilientFetch } from "./resilientFetch";
-import { getClubEloForTeam } from "./clubEloLookup";
+import {
+  getClubEloForTeam,
+  getClubEloForTeamAtDate,
+  invalidateClubEloCaches,
+} from "./clubEloLookup";
 
 const BASE_URL = "http://api.clubelo.com";
 
@@ -294,6 +298,137 @@ export async function runClubEloFeatureBackfill(): Promise<EloFeatureBackfillRes
 
   result.durationMs = Date.now() - startedAt;
   logger.info(result, "ClubElo feature backfill complete");
+  return result;
+}
+
+/**
+ * Phase 4a.3 — historical Elo backfill for settled matches that lack
+ * the new home_clubelo / away_clubelo / elo_diff features. Drives the
+ * retraining surface: until settled matches have real Elo, training
+ * uses ELO_BASELINE (1500) imputation and Elo coefficients converge to
+ * zero. This job walks distinct kickoff dates, fetches the ClubElo
+ * daily snapshot for each (idempotent — composite PK), then resolves
+ * each match's home + away team against the date-specific snapshot.
+ *
+ * Rate-limited at ~1 fetch/s on ClubElo to stay within hobbyist usage.
+ * Caps to MAX_DATES_PER_RUN to bound a single cron invocation; the cron
+ * runs every 6h so coverage builds up over a day or two.
+ *
+ * Lookup order:
+ *  1. Find distinct kickoff dates (UTC) that have settled matches with
+ *     no home_clubelo feature row.
+ *  2. For each date, ensure club_elo_snapshots has rows for that date
+ *     (fetch + upsert if not).
+ *  3. For each match on that date, resolve home/away against the
+ *     date-specific snapshot and upsert the three feature rows.
+ */
+export interface HistoricalBackfillResult {
+  dates_scanned: number;
+  dates_fetched: number;
+  matches_resolved: number;
+  features_written: number;
+  durationMs: number;
+}
+
+const MAX_DATES_PER_RUN = 10;
+const FETCH_DELAY_MS = 1000;
+
+export async function runClubEloHistoricalBackfill(): Promise<HistoricalBackfillResult> {
+  const startedAt = Date.now();
+  const result: HistoricalBackfillResult = {
+    dates_scanned: 0,
+    dates_fetched: 0,
+    matches_resolved: 0,
+    features_written: 0,
+    durationMs: 0,
+  };
+
+  // Find settled matches that have a final score but no home_clubelo.
+  // ORDER BY date ASC so historical-ingest progresses chronologically.
+  const datesResult = await db.execute(sql`
+    SELECT DISTINCT (kickoff_time AT TIME ZONE 'UTC')::date AS d
+    FROM matches m
+    WHERE home_score IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM features f
+        WHERE f.match_id = m.id AND f.feature_name = 'home_clubelo'
+      )
+    ORDER BY d ASC
+    LIMIT ${MAX_DATES_PER_RUN}
+  `);
+  const dates = (((datesResult as unknown) as { rows?: Array<{ d: string }> }).rows ?? [])
+    .map((r) => (typeof r.d === "string" ? r.d.slice(0, 10) : new Date(r.d).toISOString().slice(0, 10)));
+
+  result.dates_scanned = dates.length;
+  if (dates.length === 0) {
+    result.durationMs = Date.now() - startedAt;
+    return result;
+  }
+
+  for (const dateIso of dates) {
+    // Ensure we have a snapshot for this date. Idempotent — if the
+    // row already exists (e.g. from a prior daily ingestion) the
+    // upsert is a no-op.
+    const probe = await db.execute(sql`
+      SELECT 1 AS present FROM club_elo_snapshots WHERE date = ${dateIso}::date LIMIT 1
+    `);
+    const present = ((probe as unknown) as { rows?: unknown[] }).rows?.length ?? 0;
+    if (!present) {
+      // Sleep briefly between fetches to be a polite ClubElo client.
+      if (result.dates_fetched > 0) {
+        await new Promise((r) => setTimeout(r, FETCH_DELAY_MS));
+      }
+      try {
+        await runClubEloIngestion({ dateOverride: dateIso });
+        result.dates_fetched += 1;
+      } catch (err) {
+        logger.warn({ err, dateIso }, "Historical ClubElo ingestion failed — skipping date");
+        continue;
+      }
+    }
+
+    // Refresh the date-specific candidate cache (in case the ingestion
+    // just populated it). Cheap.
+    invalidateClubEloCaches();
+
+    // Pull all settled matches on this date that still need Elo.
+    const matchRows = await db.execute(sql`
+      SELECT m.id, m.home_team AS home_team, m.away_team AS away_team
+      FROM matches m
+      WHERE (kickoff_time AT TIME ZONE 'UTC')::date = ${dateIso}::date
+        AND home_score IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM features f
+          WHERE f.match_id = m.id AND f.feature_name = 'home_clubelo'
+        )
+    `);
+    const matches = (((matchRows as unknown) as { rows?: Array<{
+      id: number;
+      home_team: string;
+      away_team: string;
+    }> }).rows ?? []);
+
+    for (const m of matches) {
+      const homeRes = await getClubEloForTeamAtDate(m.home_team, dateIso);
+      const awayRes = await getClubEloForTeamAtDate(m.away_team, dateIso);
+      if (homeRes.elo != null) {
+        await upsertFeature(m.id, "home_clubelo", homeRes.elo);
+        result.features_written += 1;
+      }
+      if (awayRes.elo != null) {
+        await upsertFeature(m.id, "away_clubelo", awayRes.elo);
+        result.features_written += 1;
+      }
+      if (homeRes.elo != null && awayRes.elo != null) {
+        await upsertFeature(m.id, "elo_diff", homeRes.elo - awayRes.elo);
+        result.features_written += 1;
+        result.matches_resolved += 1;
+      }
+    }
+  }
+
+  result.durationMs = Date.now() - startedAt;
+  logger.info(result, "ClubElo historical backfill complete");
   return result;
 }
 

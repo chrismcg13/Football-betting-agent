@@ -18,6 +18,12 @@ import {
 
 // ===================== Feature ordering =====================
 // This order MUST be consistent across training and prediction.
+// Phase 4a.3 (2026-05-11): home_clubelo, away_clubelo, elo_diff appended.
+// Historical coverage is ~0% on settled matches at first deploy — the
+// historical Elo backfill cron walks distinct kickoff dates over the
+// following days. Until then the new positions resolve to ELO_BASELINE
+// (1500) via imputeMissingFeature so training and inference share the
+// same defaults; Elo coefficients converge as real data populates.
 export const FEATURE_NAMES = [
   "home_form_last5",
   "away_form_last5",
@@ -31,14 +37,33 @@ export const FEATURE_NAMES = [
   "away_btts_rate",
   "home_over25_rate",
   "away_over25_rate",
+  "home_clubelo",
+  "away_clubelo",
+  "elo_diff",
 ] as const;
 
 type FeatureName = (typeof FEATURE_NAMES)[number];
 
-// Feature index subsets for each model
-const OUTCOME_IDX = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] as const;
-const BTTS_IDX = [0, 1, 2, 3, 4, 5, 8, 9] as const;
-const OVER_UNDER_IDX = [0, 1, 2, 3, 4, 5, 10, 11] as const;
+// ClubElo's effective league mean sits in the 1500–1600 band; we use
+// 1500 as the "no information" anchor for both training and inference
+// imputation. elo_diff defaults to 0 (matched teams).
+const ELO_BASELINE = 1500;
+
+function imputeMissingFeature(name: FeatureName): number {
+  if (name === "home_clubelo" || name === "away_clubelo") return ELO_BASELINE;
+  if (name === "elo_diff") return 0;
+  return 0;
+}
+
+// Feature index subsets for each model. Elo positions (12,13,14) are
+// included in all three: team strength is informative for outcome,
+// goals-scored shape (Elo gap drives both BTTS rate and total goals),
+// and over/under.
+const OUTCOME_IDX = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+] as const;
+const BTTS_IDX = [0, 1, 2, 3, 4, 5, 8, 9, 12, 13, 14] as const;
+const OVER_UNDER_IDX = [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14] as const;
 
 // Outcome class labels
 const OUTCOME_HOME = 0;
@@ -245,6 +270,13 @@ function buildInDatasetFeatureVector(
     awayBtts,
     homeOver25,
     awayOver25,
+    // Elo features — FD bootstrap has no resolver, fall back to the
+    // shared imputation baseline. Real ClubElo data flows in via
+    // buildSamplesFromDb once the historical backfill cron populates
+    // the features table for settled matches.
+    ELO_BASELINE,
+    ELO_BASELINE,
+    0,
   ];
 }
 
@@ -443,6 +475,26 @@ export async function loadLatestModel(): Promise<boolean> {
     trainingSize: number;
   };
 
+  // Phase 4a.3 (2026-05-11): FEATURE_NAMES grew from 12 → 15 with the
+  // ClubElo wire-in. A persisted model whose featureMeans/Stds were
+  // sized for the old vector cannot score new feature rows — refuse
+  // to load and let the startup path fall through to bootstrapModels,
+  // which retrains with the current feature shape.
+  if (
+    !Array.isArray(w.featureMeans) ||
+    w.featureMeans.length !== FEATURE_NAMES.length
+  ) {
+    logger.warn(
+      {
+        version: row.modelVersion,
+        persistedFeatures: w.featureMeans?.length ?? null,
+        currentFeatures: FEATURE_NAMES.length,
+      },
+      "Persisted model feature count is stale — triggering retrain via bootstrap",
+    );
+    return false;
+  }
+
   try {
     currentModel = {
       outcomeModel: LogisticRegression.load(w.outcomeModel),
@@ -563,7 +615,7 @@ export function predictOutcome(
 ): { home: number; draw: number; away: number } | null {
   if (!currentModel) return null;
   const fullRow = FEATURE_NAMES.map(
-    (n) => featureMap[n as FeatureName] ?? 0,
+    (n) => featureMap[n as FeatureName] ?? imputeMissingFeature(n as FeatureName),
   );
   const normRow = normalizeRow(
     fullRow,
@@ -584,7 +636,7 @@ export function predictBtts(
 ): { yes: number; no: number } | null {
   if (!currentModel) return null;
   const fullRow = FEATURE_NAMES.map(
-    (n) => featureMap[n as FeatureName] ?? 0,
+    (n) => featureMap[n as FeatureName] ?? imputeMissingFeature(n as FeatureName),
   );
   const normRow = normalizeRow(
     fullRow,
@@ -604,7 +656,7 @@ export function predictOverUnder(
 ): { over: number; under: number } | null {
   if (!currentModel) return null;
   const fullRow = FEATURE_NAMES.map(
-    (n) => featureMap[n as FeatureName] ?? 0,
+    (n) => featureMap[n as FeatureName] ?? imputeMissingFeature(n as FeatureName),
   );
   const normRow = normalizeRow(
     fullRow,
@@ -1013,7 +1065,7 @@ export async function buildSamplesFromDb(): Promise<DbTrainingSample[]> {
     }
 
     const featureVector = FEATURE_NAMES.map(
-      (name) => featureMap[name as FeatureName] ?? 0,
+      (name) => featureMap[name as FeatureName] ?? imputeMissingFeature(name as FeatureName),
     );
 
     let outcomeLabel: number;
@@ -1311,7 +1363,7 @@ export async function retrainIfNeeded(): Promise<boolean> {
     }
 
     const featureVector = FEATURE_NAMES.map(
-      (name) => featureMap[name as FeatureName] ?? 0,
+      (name) => featureMap[name as FeatureName] ?? imputeMissingFeature(name as FeatureName),
     );
 
     let outcomeLabel: number;

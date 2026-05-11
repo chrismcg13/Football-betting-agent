@@ -23,7 +23,7 @@
  */
 
 import { db, clubEloSnapshotsTable } from "@workspace/db";
-import { eq, sql } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 interface CacheEntry {
@@ -182,7 +182,66 @@ export async function getClubEloForTeam(
     return { elo: cached.elo, matchedName: cached.matchedName };
   }
 
-  let candidates = await loadCurrentCandidates();
+  const candidates = await loadCurrentCandidates();
+  const result = resolveAgainstCandidates(teamName, candidates, countryHint);
+  return persist(cacheKey, result.elo, result.matchedName);
+}
+
+/**
+ * Phase 4a.3 — date-aware variant for historical Elo backfill on
+ * settled matches. Uses the club_elo_snapshots row for `snapshotDate`
+ * (or the closest earlier date) as the candidate pool. Bypasses the
+ * 30-min in-process resolution cache because the historical backfill
+ * iterates many (team, date) pairs and the cache would balloon — the
+ * caller batches by date so a second-level (date → rows) cache keeps
+ * round-trips low.
+ */
+const dateCandidatesCache = new Map<string, CandidateRow[]>();
+
+async function loadCandidatesForDate(
+  snapshotDate: string,
+): Promise<CandidateRow[]> {
+  const cached = dateCandidatesCache.get(snapshotDate);
+  if (cached) return cached;
+  const result = await db.execute(sql`
+    SELECT team_name, elo::text AS elo, country
+    FROM club_elo_snapshots
+    WHERE date = (
+      SELECT MAX(date) FROM club_elo_snapshots WHERE date <= ${snapshotDate}::date
+    )
+  `);
+  const rows = (((result as unknown) as { rows?: Array<{
+    team_name: string;
+    elo: string;
+    country: string | null;
+  }> }).rows ?? []).map((r) => ({
+    teamName: r.team_name,
+    elo: r.elo,
+    country: r.country,
+  }));
+  // Cap the cache to avoid an unbounded grow in long-running workers.
+  if (dateCandidatesCache.size > 200) dateCandidatesCache.clear();
+  dateCandidatesCache.set(snapshotDate, rows);
+  return rows;
+}
+
+export async function getClubEloForTeamAtDate(
+  teamName: string,
+  snapshotDate: string,
+  countryHint?: string,
+): Promise<{ elo: number | null; matchedName: string | null }> {
+  if (!teamName) return { elo: null, matchedName: null };
+  const candidates = await loadCandidatesForDate(snapshotDate);
+  if (candidates.length === 0) return { elo: null, matchedName: null };
+  return resolveAgainstCandidates(teamName, candidates, countryHint);
+}
+
+function resolveAgainstCandidates(
+  teamName: string,
+  candidatesIn: CandidateRow[],
+  countryHint?: string,
+): { elo: number | null; matchedName: string | null } {
+  let candidates = candidatesIn;
   if (countryHint) {
     const hint = countryHint.toUpperCase();
     const filtered = candidates.filter((c) => c.country?.toUpperCase() === hint);
@@ -199,27 +258,27 @@ export async function getClubEloForTeam(
   // 1. Exact case-insensitive
   for (const c of candidates) {
     if (c.teamName.toLowerCase() === teamLower) {
-      return persist(cacheKey, Number(c.elo), c.teamName);
+      return { elo: Number(c.elo), matchedName: c.teamName };
     }
   }
   // 2. Normalised match
   for (const c of candidates) {
     if (normalise(c.teamName) === teamNorm) {
-      return persist(cacheKey, Number(c.elo), c.teamName);
+      return { elo: Number(c.elo), matchedName: c.teamName };
     }
   }
   // 3. Token-prefix match (catches "Manchester City" → "ManCity",
   // "Real Madrid" → "RealMadrid", "Bayern Munich" → "Bayern").
   for (const c of candidates) {
     if (tokenPrefixMatch(teamName, c.teamName)) {
-      return persist(cacheKey, Number(c.elo), c.teamName);
+      return { elo: Number(c.elo), matchedName: c.teamName };
     }
   }
   // 4. Single-token match (catches "Spartak Moscow" → "Spartak",
   // "CSKA Moscow" → "CSKA", "Shakhtar Donetsk" → "Shakhtar").
   for (const c of candidates) {
     if (anyTokenEquals(teamName, c.teamName)) {
-      return persist(cacheKey, Number(c.elo), c.teamName);
+      return { elo: Number(c.elo), matchedName: c.teamName };
     }
   }
   // 5. Substring containment (either direction). Require >=4 chars
@@ -228,12 +287,11 @@ export async function getClubEloForTeam(
     const cNorm = normalise(c.teamName);
     if (cNorm.length >= 4 && teamNorm.length >= 4) {
       if (cNorm.includes(teamNorm) || teamNorm.includes(cNorm)) {
-        return persist(cacheKey, Number(c.elo), c.teamName);
+        return { elo: Number(c.elo), matchedName: c.teamName };
       }
     }
   }
   // 6. Levenshtein ≤ 2 on normalised names with length ≥ 5.
-  // Computed only when prior passes failed — keeps per-call cost low.
   let bestDist = Infinity;
   let bestMatch: CandidateRow | null = null;
   for (const c of candidates) {
@@ -246,10 +304,10 @@ export async function getClubEloForTeam(
     }
   }
   if (bestMatch && bestDist <= 2) {
-    return persist(cacheKey, Number(bestMatch.elo), bestMatch.teamName);
+    return { elo: Number(bestMatch.elo), matchedName: bestMatch.teamName };
   }
 
-  return persist(cacheKey, null, null);
+  return { elo: null, matchedName: null };
 }
 
 function persist(
@@ -265,4 +323,5 @@ function persist(
 export function invalidateClubEloCaches(): void {
   cache.clear();
   candidatesCache = null;
+  dateCandidatesCache.clear();
 }

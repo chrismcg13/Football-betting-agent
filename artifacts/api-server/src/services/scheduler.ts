@@ -2558,6 +2558,26 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("ClubElo feature backfill scheduler active — every 3h at :45");
 
+  // Phase 4a.3 (2026-05-11) — historical ClubElo backfill for settled
+  // matches. Walks distinct UTC kickoff dates that have settled matches
+  // missing home_clubelo, fetches each date's ClubElo snapshot, then
+  // resolves the home/away teams against the date-specific candidate
+  // pool. Capped to 10 dates per run (~10s per run with the rate-limit
+  // sleeps). Every 6h pulls the historical coverage up to 100%
+  // gradually, while polite to the ClubElo public API.
+  cron.schedule("35 */6 * * *", () => {
+    void (async () => {
+      try {
+        const { runClubEloHistoricalBackfill } = await import("./clubElo");
+        const r = await runClubEloHistoricalBackfill();
+        if (r.dates_scanned > 0) logger.info(r, "ClubElo historical backfill complete");
+      } catch (err) {
+        logger.error({ err }, "ClubElo historical backfill failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("ClubElo historical backfill scheduler active — every 6h at :35");
+
   // Task 19 (Phase 4b) — stadium geocode backfill + travel features.
   // Geocoder runs every 6h, geocodes up to 50 new venues per tick
   // (rate-limited to ~1 req/s on OSM Nominatim). Travel-feature
@@ -2696,6 +2716,15 @@ export function startSettlementCron(): void {
         }
         const bf = await runClubEloFeatureBackfill();
         logger.info(bf, "ClubElo startup feature backfill complete");
+        // Phase 4a.3 startup self-seed: also fire one historical
+        // backfill pass at boot so the next retrain has some real
+        // Elo training data on settled matches. The 6-hourly cron
+        // continues the chronological walk from there.
+        const { runClubEloHistoricalBackfill } = await import("./clubElo");
+        const hist = await runClubEloHistoricalBackfill();
+        if (hist.dates_scanned > 0) {
+          logger.info(hist, "ClubElo historical startup backfill complete");
+        }
       } catch (err) {
         logger.warn({ err }, "ClubElo startup self-seed failed");
       }
@@ -2865,9 +2894,22 @@ export function startSettlementCron(): void {
     logger.info("Storage cleanup cron triggered (daily 05:00 UTC)");
     void (async () => {
       try {
-        const { runStorageCleanup, vacuumCleanedTables } = await import("./storageCleanup");
+        const {
+          runStorageCleanup,
+          vacuumCleanedTables,
+          runAnalyticsTablesCleanup,
+        } = await import("./storageCleanup");
         const r = await runStorageCleanup();
         logger.info(r, "Storage cleanup complete");
+        // Phase 6 housekeeping (2026-05-11) — retention pass on the
+        // analytics + observability tables added during the theory-plan
+        // rebake (sharp_consensus_snapshots, club_elo_snapshots,
+        // analysis_*, kelly_fraction_lookup, shap_drift_runs, feature_*,
+        // market_correlation_matrix, calibration_buckets). Each has a
+        // conservative retention window; deletes are append-only so a
+        // single DELETE comfortably fits in statement_timeout.
+        const a = await runAnalyticsTablesCleanup();
+        logger.info(a, "Analytics tables cleanup complete");
         const v = await vacuumCleanedTables();
         logger.info(v, "Storage VACUUM complete");
       } catch (err) {
