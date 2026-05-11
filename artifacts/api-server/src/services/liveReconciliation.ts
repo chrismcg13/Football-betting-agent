@@ -319,10 +319,67 @@ export async function reconcileLiveAccountStatement(
     // value to itself. agg.totalAmount sums every wallet line for this refId
     // (win credit, commission debit, voids, refunds), so it is the true
     // independent Betfair-of-record value the drift detector needs.
-    await db
-      .update(paperBetsTable)
-      .set({ betfairPnl: agg.totalAmount.toFixed(2) })
-      .where(eq(paperBetsTable.id, local.id));
+    //
+    // 2026-05-11: per Chris — "settlement must trust betfair pnl service".
+    // When wallet impact disagrees with our local net_pnl beyond tolerance,
+    // OVERWRITE net_pnl (and status, if the sign disagrees) so the local
+    // ledger matches Betfair's authoritative record. Catches two failure
+    // modes seen in production: (a) status='won' but Betfair returned the
+    // full stake as loss (settlement-classification bug from runner-id
+    // mismapping), and (b) status='lost' but Betfair voided the bet.
+    // Per memory `feedback_settlement_audit_after_logic_changes`: Betfair
+    // wins every disagreement; we backfill the local row + log to
+    // compliance_logs for audit.
+    const newStatusFromBetfair: "won" | "lost" | "void" =
+      agg.totalAmount > 0.50 ? "won"
+      : agg.totalAmount < -0.50 ? "lost"
+      : "void";
+    const statusChanged = newStatusFromBetfair !== local.status;
+    const pnlChanged = Math.abs(drift) > PNL_DRIFT_TOLERANCE_GBP;
+
+    if (statusChanged || pnlChanged) {
+      const updates: { betfairPnl: string; netPnl: string; status?: string } = {
+        betfairPnl: agg.totalAmount.toFixed(2),
+        netPnl: agg.totalAmount.toFixed(2),
+      };
+      if (statusChanged) updates.status = newStatusFromBetfair;
+      await db
+        .update(paperBetsTable)
+        .set(updates)
+        .where(eq(paperBetsTable.id, local.id));
+      await db.insert(complianceLogsTable).values({
+        actionType: "settlement_autocorrected_from_betfair",
+        details: {
+          betId: local.id,
+          refId,
+          previousStatus: local.status,
+          newStatus: statusChanged ? newStatusFromBetfair : local.status,
+          previousNetPnl: localNetPnl,
+          newNetPnl: agg.totalAmount,
+          drift,
+          itemCount: agg.itemCount,
+        },
+        timestamp: new Date(),
+      });
+      logger.warn(
+        {
+          betId: local.id,
+          refId,
+          previousStatus: local.status,
+          newStatus: statusChanged ? newStatusFromBetfair : local.status,
+          previousNetPnl: localNetPnl,
+          newNetPnl: agg.totalAmount,
+          drift,
+        },
+        "Settlement auto-corrected from Betfair authoritative wallet",
+      );
+    } else {
+      // Within tolerance — only sync betfair_pnl (drift-detector input).
+      await db
+        .update(paperBetsTable)
+        .set({ betfairPnl: agg.totalAmount.toFixed(2) })
+        .where(eq(paperBetsTable.id, local.id));
+    }
     betfairPnlBackfilled++;
   }
 
