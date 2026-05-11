@@ -3398,6 +3398,37 @@ export async function runMigrations() {
 
     logger.info("SHAP drift runs ready (Task 21)");
 
+    // Task 17 — Monte-Carlo lookup table for drawdown-targeted Kelly
+    // fractions. Daily simulation row; reader picks the latest
+    // selected_fraction. Stake-sizing wire-in is Phase 5b.2.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS kelly_fraction_lookup (
+        id                SERIAL PRIMARY KEY,
+        computed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        realised_roi      NUMERIC(10,6) NOT NULL,
+        realised_stdev    NUMERIC(10,6) NOT NULL,
+        sample_n          INTEGER NOT NULL,
+        target_p1_pct     NUMERIC(6,3) NOT NULL,
+        selected_fraction NUMERIC(5,4) NOT NULL,
+        curve             JSONB NOT NULL,
+        paths             INTEGER NOT NULL,
+        bets_per_path     INTEGER NOT NULL
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS kelly_fraction_lookup_recent
+        ON kelly_fraction_lookup(computed_at DESC)
+    `);
+
+    logger.info("Kelly fraction lookup ready (Task 17)");
+
+    // Seed the target_p1_pct config key so the first sim run has a value.
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value, updated_at)
+      VALUES ('drawdown_target_p1_pct', '15', NOW())
+      ON CONFLICT (key) DO NOTHING
+    `);
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

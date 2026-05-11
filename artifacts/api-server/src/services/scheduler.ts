@@ -2599,6 +2599,26 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("SHAP drift detector scheduler active — daily 03:30 UTC");
 
+  // Task 17 (Phase 5b) — Kelly Monte-Carlo lookup. Daily at 03:15 UTC,
+  // before the SHAP drift detector (03:30) so the curve uses the same
+  // realised-return window the drift check sees. Stake-sizing wire-in
+  // is Phase 5b.2 — for now this just populates the lookup table for
+  // operator review.
+  cron.schedule("15 3 * * *", () => {
+    logger.info("Kelly Monte-Carlo lookup triggered (daily 03:15 UTC)");
+    void (async () => {
+      try {
+        const { runKellyLookupSimulation } = await import("./dynamicKelly");
+        const r = await runKellyLookupSimulation();
+        if (r) logger.info({ selectedFraction: r.selectedFraction, mu: r.realisedRoi, sigma: r.realisedStdev },
+          "Kelly Monte-Carlo lookup complete");
+      } catch (err) {
+        logger.error({ err }, "Kelly Monte-Carlo lookup failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Kelly Monte-Carlo scheduler active — daily 03:15 UTC");
+
   // Phase 4b startup self-seed: kick off a first geocode pass + travel
   // backfill at T+120s. The 120s offset puts it after the ClubElo
   // self-seed and the trading-cycle warmup so we don't fight for IO.

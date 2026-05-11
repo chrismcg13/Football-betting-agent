@@ -39,3 +39,4 @@ export * from "./sharpConsensusSnapshots";
 export * from "./clubEloSnapshots";
 export * from "./stadiumCoordinates";
 export * from "./shapDriftRuns";
+export * from "./kellyFractionLookup";
