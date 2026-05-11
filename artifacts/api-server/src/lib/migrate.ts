@@ -47,6 +47,18 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   // and can override retrospectively per the "autonomy with audit"
   // pattern. Set to "false" to disable and run only the standard path.
   { key: "adaptive_sample_size_gates_enabled", value: "true" },
+  // Task 24 Part B (2026-05-11): edge-aware tick chase config. minResidualEdge
+  // is the model-edge floor we must keep after drift; maxDriftPct caps the
+  // tolerable drift fraction in odds units (default 15%).
+  { key: "edge_aware_chase_min_residual_edge", value: "0.01" },
+  { key: "edge_aware_chase_max_drift_pct", value: "0.15" },
+  // Task 24 Part C (2026-05-11): take-best-back placement for high-edge bets.
+  // When calculatedEdge >= take_best_back_min_edge, the placement picks the
+  // current best back price instead of the target — accepting up to
+  // take_best_back_slippage_tolerance worth of price haircut to guarantee
+  // a match. Below the slippage tolerance, demote to shadow.
+  { key: "take_best_back_min_edge", value: "0.10" },
+  { key: "take_best_back_slippage_tolerance", value: "0.05" },
 ];
 
 export async function runMigrations() {

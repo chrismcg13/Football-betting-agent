@@ -1,5 +1,5 @@
 import { logger } from "../lib/logger";
-import { db, paperBetsTable } from "@workspace/db";
+import { db, paperBetsTable, agentConfigTable } from "@workspace/db";
 import { eq, and, isNotNull, sql } from "drizzle-orm";
 import {
   isRelayConfigured,
@@ -12,8 +12,67 @@ const FILL_ACCEPT_PCT = 70;
 const FILL_WAIT_PCT = 30;
 const WAIT_DURATION_MS = 5 * 60 * 1000;
 const CANCEL_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_TICK_CHASE = 2;
 const REASSESS_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+// Task 24 Part B — edge-aware tick chase (replaces fixed MAX_TICK_CHASE=2).
+// At each near-kickoff reassessment, the tolerable downward drift from target
+// is the price drop that leaves the model with at least `minResidualEdge`
+// remaining. Formula derives from edge = modelProb - 1/odds — solving for the
+// odds at which residual edge equals the floor.
+//
+// Worked example (AH edge=0.30 at odds=3.50, minResidual=0.01):
+//   modelProb = 1/3.50 + 0.30 = 0.586
+//   newProbCap = 0.586 - 0.01 = 0.576 → newOddsMin = 1.737
+//   drift = (3.50 - 1.737)/3.50 = 50.4% — capped to maxDriftPct (default 15%)
+//
+// For low-edge bets (edge=0.005), the cap is effectively zero — the model has
+// no headroom to absorb price drift, so we cancel quickly.
+const DEFAULT_MIN_RESIDUAL_EDGE = 0.01;
+const DEFAULT_MAX_DRIFT_PCT = 0.15;
+
+interface ChaseConfig {
+  minResidualEdge: number;
+  maxDriftPct: number;
+}
+
+let cachedChaseConfig: { value: ChaseConfig; fetchedAt: number } | null = null;
+const CHASE_CONFIG_TTL_MS = 60 * 1000;
+
+async function getChaseConfig(): Promise<ChaseConfig> {
+  const now = Date.now();
+  if (cachedChaseConfig && now - cachedChaseConfig.fetchedAt < CHASE_CONFIG_TTL_MS) {
+    return cachedChaseConfig.value;
+  }
+  const rows = await db
+    .select({ key: agentConfigTable.key, value: agentConfigTable.value })
+    .from(agentConfigTable)
+    .where(
+      sql`${agentConfigTable.key} IN ('edge_aware_chase_min_residual_edge','edge_aware_chase_max_drift_pct')`,
+    );
+  const map = new Map(rows.map((r) => [r.key, r.value]));
+  const value: ChaseConfig = {
+    minResidualEdge: Number(map.get("edge_aware_chase_min_residual_edge") ?? DEFAULT_MIN_RESIDUAL_EDGE),
+    maxDriftPct: Number(map.get("edge_aware_chase_max_drift_pct") ?? DEFAULT_MAX_DRIFT_PCT),
+  };
+  cachedChaseConfig = { value, fetchedAt: now };
+  return value;
+}
+
+export function maxAllowedDownwardDrift(
+  modelEdge: number,
+  targetOdds: number,
+  cfg: ChaseConfig = { minResidualEdge: DEFAULT_MIN_RESIDUAL_EDGE, maxDriftPct: DEFAULT_MAX_DRIFT_PCT },
+): number {
+  if (!Number.isFinite(modelEdge) || modelEdge <= 0) return 0;
+  if (!Number.isFinite(targetOdds) || targetOdds <= 1) return 0;
+  const modelProb = 1 / targetOdds + modelEdge;
+  const newProbCap = modelProb - cfg.minResidualEdge;
+  if (newProbCap <= 0) return 0;
+  const newOddsMin = 1 / newProbCap;
+  if (newOddsMin >= targetOdds) return 0;
+  const driftFraction = (targetOdds - newOddsMin) / targetOdds;
+  return Math.min(driftFraction, cfg.maxDriftPct);
+}
 
 export const BETFAIR_TICKS = [
   1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09, 1.10,
@@ -248,17 +307,21 @@ export async function runOrderManagement(): Promise<{
       if (kickoffTime && kickoffTime - Date.now() < REASSESS_WINDOW_MS && status.sizeRemaining > 0) {
         const targetOdds = Number(bet.oddsAtPlacement);
         const bestBackPrice = await getBestBackPrice(bet, targetOdds);
-        const tickDistance = ticksAway(targetOdds, bestBackPrice);
+        const modelEdge = Number(bet.calculatedEdge ?? 0);
+        const chaseCfg = await getChaseConfig();
+        const maxDrift = maxAllowedDownwardDrift(modelEdge, targetOdds, chaseCfg);
+        // Adverse drift only: positive when bestBack < target (market hasn't reached us).
+        const driftFraction = bestBackPrice >= targetOdds ? 0 : (targetOdds - bestBackPrice) / targetOdds;
 
-        if (tickDistance <= MAX_TICK_CHASE) {
+        if (driftFraction <= maxDrift) {
           logger.debug(
-            { betId: betfairBetId, targetOdds, bestBackPrice, tickDistance },
-            "Order near kickoff but within tick chase limit — leaving open",
+            { betId: betfairBetId, targetOdds, bestBackPrice, driftFraction, maxDrift, modelEdge },
+            "Order near kickoff within edge-aware drift tolerance — leaving open",
           );
         } else {
           logger.info(
-            { betId: betfairBetId, targetOdds, bestBackPrice, tickDistance, kickoffIn: Math.round((kickoffTime - Date.now()) / 60000) + "min" },
-            "Unmatched order near kickoff — cancelling (exceeds 2-tick chase limit)",
+            { betId: betfairBetId, targetOdds, bestBackPrice, driftFraction, maxDrift, modelEdge, kickoffIn: Math.round((kickoffTime - Date.now()) / 60000) + "min" },
+            "Unmatched order near kickoff — cancelling (drift exceeds edge-aware tolerance)",
           );
           const cancelResult = await tryCancelAndVerify(betfairBetId);
           if (!cancelResult.cancelled) {

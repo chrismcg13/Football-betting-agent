@@ -2193,6 +2193,16 @@ export async function placePaperBet(
           // guarantees liveGates.kellyFractionOverride is null. Stake comes
           // straight from the upstream Kelly calc.
           const liveStake = stake;
+          // Task 24 Part C — pick placement mode based on edge. High-edge bets
+          // (>= take_best_back_min_edge, default 10%) ride the current best
+          // back to guarantee a match; below the threshold, LIMIT at target
+          // (legacy behaviour).
+          const tbbMinEdgeRaw = await getConfigValue("take_best_back_min_edge");
+          const tbbMinEdge = tbbMinEdgeRaw != null ? Number(tbbMinEdgeRaw) : 0.10;
+          const tbbSlippageRaw = await getConfigValue("take_best_back_slippage_tolerance");
+          const tbbSlippage = tbbSlippageRaw != null ? Number(tbbSlippageRaw) : 0.05;
+          const placementMode: "TARGET" | "TAKE_BEST_BACK" =
+            Number.isFinite(edge) && edge >= tbbMinEdge ? "TAKE_BEST_BACK" : "TARGET";
           const liveResult = await placeLiveBetOnBetfair({
             internalBetId: bet.id,
             betfairEventId: match.betfairEventId,
@@ -2202,6 +2212,8 @@ export async function placePaperBet(
             stake: liveStake,
             homeTeam: match.homeTeam,
             awayTeam: match.awayTeam,
+            placementMode,
+            slippageTolerance: tbbSlippage,
           });
 
           if (!liveResult.success) {
@@ -2218,10 +2230,12 @@ export async function placePaperBet(
             // sit forever, contributing nothing. Demoting to shadow ensures
             // every value-identified bet still settles and feeds learning.
             // The fallthrough flag is retained as a kill-switch.
+            const isBestBackOutOfRange = errLower.includes("best_back_below_tolerance") || errLower.includes("best_back_unavailable");
             const errCategory = isMarketUnavailable ? "market_unavailable"
               : isInsufficientFunds ? "insufficient_funds"
               : isStakeBelowMin ? "stake_below_min"
               : isAccount ? "account_issue"
+              : isBestBackOutOfRange ? "best_back_drift"
               : "transient_or_unknown";
             if (await isLiveToShadowFallthroughEnabled()) {
               const intendedKellyStake = liveStake;

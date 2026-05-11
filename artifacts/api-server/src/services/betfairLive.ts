@@ -4,6 +4,9 @@ import { db } from "@workspace/db";
 import { paperBetsTable, complianceLogsTable, oddsSnapshotsTable } from "@workspace/db";
 import { eq, and, isNotNull, isNull, sql, desc, inArray } from "drizzle-orm";
 import { BETFAIR_TICKS } from "./orderManager";
+import { relayGetLiquidity } from "./vpsRelay";
+
+export type PlacementMode = "TARGET" | "TAKE_BEST_BACK";
 
 function roundDownToTick(price: number): number {
   let best = BETFAIR_TICKS[0];
@@ -1593,6 +1596,13 @@ export async function placeLiveBetOnBetfair(params: {
   stake: number;
   homeTeam: string;
   awayTeam: string;
+  // Task 24 Part C — when 'TAKE_BEST_BACK', resolve the current best back
+  // price for the runner and use it as the placement price (rounded down to
+  // a valid Betfair tick). Honoured only if the best back is within
+  // `slippageTolerance` of `odds`. Default 'TARGET' preserves legacy
+  // limit-at-target behaviour for low-edge / lazy-promoted bets.
+  placementMode?: PlacementMode;
+  slippageTolerance?: number;
 }): Promise<{
   success: boolean;
   betfairBetId?: string;
@@ -1611,6 +1621,8 @@ export async function placeLiveBetOnBetfair(params: {
     stake,
     homeTeam,
     awayTeam,
+    placementMode = "TARGET",
+    slippageTolerance = 0.05,
   } = params;
 
   if (NON_EXCHANGE_MARKETS.has(marketType)) {
@@ -1670,12 +1682,47 @@ export async function placeLiveBetOnBetfair(params: {
     return { success: false, error: msg };
   }
 
-  const roundedOdds = roundDownToTick(odds);
+  // Task 24 Part C — resolve placement price. In TAKE_BEST_BACK mode, snap to
+  // the current top-of-book back price (within slippage tolerance) so the
+  // order matches immediately. The target price `odds` is the model's
+  // theoretical fair entry; for high-edge bets the model has already proven
+  // the bet is +EV, so a small slippage haircut beats letting the order
+  // expire unmatched (see Task 24 finding: ~£999 of foregone AH EV from
+  // unmatched LIMIT orders since 2026-05-03).
+  let placementPrice = odds;
+  if (placementMode === "TAKE_BEST_BACK") {
+    try {
+      const liquidity = await relayGetLiquidity(market.marketId);
+      const runner = liquidity?.runners?.find((r) => r.selectionId === selectionId);
+      const bestBack = runner?.backPrices?.[0]?.price;
+      if (!bestBack || bestBack <= 1) {
+        const msg = `TAKE_BEST_BACK: no back price available on market ${market.marketId}`;
+        logger.warn({ internalBetId, marketId: market.marketId, selectionId }, msg);
+        return { success: false, error: "BEST_BACK_UNAVAILABLE" };
+      }
+      const minAcceptable = odds * (1 - slippageTolerance);
+      if (bestBack < minAcceptable) {
+        const msg = `TAKE_BEST_BACK: best back ${bestBack} below tolerance ${minAcceptable.toFixed(2)} (target ${odds}, slippage ${slippageTolerance})`;
+        logger.info({ internalBetId, target: odds, bestBack, minAcceptable }, msg);
+        return { success: false, error: "BEST_BACK_BELOW_TOLERANCE" };
+      }
+      placementPrice = bestBack;
+      logger.info(
+        { internalBetId, target: odds, placementPrice, marketId: market.marketId },
+        "TAKE_BEST_BACK placement — using current best back price",
+      );
+    } catch (err) {
+      logger.warn({ err, internalBetId, marketId: market.marketId }, "TAKE_BEST_BACK liquidity fetch failed — falling back to TARGET");
+      // Fall through to TARGET behaviour rather than fail outright.
+    }
+  }
+
+  const roundedOdds = roundDownToTick(placementPrice);
   const roundedStake = Math.round(stake * 100) / 100;
 
-  if (roundedOdds !== Math.round(odds * 100) / 100) {
+  if (roundedOdds !== Math.round(placementPrice * 100) / 100) {
     logger.info(
-      { internalBetId, requestedOdds: odds, tickOdds: roundedOdds },
+      { internalBetId, requestedOdds: placementPrice, tickOdds: roundedOdds, placementMode },
       "Odds rounded down to valid Betfair tick",
     );
   }
