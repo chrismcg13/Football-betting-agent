@@ -62,8 +62,12 @@ async function getConfigNumber(key: string, fallback: number): Promise<number> {
 }
 
 async function loadRealisedReturns(limit: number): Promise<number[]> {
-  // Use settled bets across all tracks; per-bet "return" = pnl / stake.
-  // For shadow track, treat shadow_stake/shadow_pnl as the unit.
+  // Use settled bets across the live + shadow tracks; per-bet
+  // "return" = pnl / stake. For shadow track, treat shadow_stake /
+  // shadow_pnl as the unit. Paper rail is deprecated post-2026-05-09
+  // and its residual rows are 100% wins on extreme +4 AH lines (Path
+  // P/S artefact) — they would massively bias the realised-return
+  // distribution that feeds the Monte-Carlo drawdown target.
   const result = await db.execute(sql`
     SELECT
       CASE WHEN bet_track = 'shadow' THEN COALESCE(shadow_stake, 0)
@@ -73,6 +77,7 @@ async function loadRealisedReturns(limit: number): Promise<number[]> {
     FROM paper_bets
     WHERE status IN ('won','lost')
       AND deleted_at IS NULL
+      AND bet_track IN ('live','shadow')
     ORDER BY placed_at DESC
     LIMIT ${limit}
   `);

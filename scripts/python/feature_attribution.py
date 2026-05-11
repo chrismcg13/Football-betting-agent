@@ -80,6 +80,7 @@ def fetch_bet_feature_clv(conn, market_type: str, feature_name: str) -> tuple[np
           AND pb.deleted_at IS NULL
           AND pb.clv_pct IS NOT NULL
           AND f.feature_value IS NOT NULL
+          AND pb.bet_track IN ('live', 'shadow')
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, (feature_name, market_type))
@@ -226,6 +227,7 @@ def main() -> int:
             FROM paper_bets
             WHERE status IN ('won','lost') AND deleted_at IS NULL
               AND clv_pct IS NOT NULL
+              AND bet_track IN ('live','shadow')
             GROUP BY market_type
             HAVING COUNT(*) >= 100
             ORDER BY n DESC

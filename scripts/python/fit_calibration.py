@@ -62,6 +62,14 @@ def fetch_settled(conn) -> list[dict]:
           AND pb.deleted_at IS NULL
           AND pb.status IN ('won', 'lost')
           AND pb.model_probability IS NOT NULL
+          -- Paper rail is deprecated post-2026-05-09 cutover. Its
+          -- residual rows are an artefact of the old Path P/S
+          -- codepath (every won AH bet on "away +4" at ~99% predicted
+          -- probability, 64/64 wins) which would make isotonic
+          -- regression report "perfectly calibrated at 0.99" — a
+          -- false signal that under-corrects predictions in the
+          -- 0.5–0.9 band where shadow + live actually bet.
+          AND pb.bet_track IN ('live', 'shadow')
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, (ANALYSIS_START_DATE,))

@@ -67,6 +67,11 @@ def fetch_pairs(conn) -> list[dict]:
           AND b.deleted_at IS NULL
           AND a.market_type != b.market_type
           AND a.placed_at >= %s::date
+          -- Exclude paper rail (deprecated post-2026-05-09 cutover).
+          -- Paper rows are 100% wins on extreme +4 AH lines and would
+          -- inflate any pairing involving ASIAN_HANDICAP.
+          AND a.bet_track IN ('live', 'shadow')
+          AND b.bet_track IN ('live', 'shadow')
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, (ANALYSIS_START_DATE,))

@@ -81,6 +81,13 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
     WHERE pb.placed_at >= ${analysisStart}::date
       AND pb.deleted_at IS NULL
       AND pb.status IN ('won', 'lost')
+      -- Paper rail is deprecated post-2026-05-09 cutover (per
+      -- project_paper_equals_live_eligibility). Its residual rows
+      -- carry an artefact of the old Path P/S codepath (every won
+      -- AH bet on "away +4" with model_probability ≈ 0.9881, 64/64
+      -- wins) which dominates the per-market priors CTE below and
+      -- inflates shrunk_roi for low-n shadow segments. Drop them.
+      AND pb.bet_track IN ('live', 'shadow')
     GROUP BY m.league, pb.market_type, pb.bet_track
   `);
   const segmentRows = (segmentInsert as { rowCount: number }).rowCount ?? 0;

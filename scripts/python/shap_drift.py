@@ -87,6 +87,10 @@ def fetch_window(conn, market_type: str, limit: int, offset: int = 0) -> dict[st
           WHERE market_type = %s
             AND status IN ('won','lost')
             AND deleted_at IS NULL
+            -- Paper rail deprecated 2026-05-09; mixing it into the
+            -- baseline (which has paper rows) vs recent (which does
+            -- not) creates artefactual drift on the cutover boundary.
+            AND bet_track IN ('live','shadow')
           ORDER BY placed_at DESC
           LIMIT %s OFFSET %s
         )
@@ -181,6 +185,7 @@ def main() -> int:
             SELECT market_type, COUNT(*) AS n
             FROM paper_bets
             WHERE status IN ('won','lost') AND deleted_at IS NULL
+              AND bet_track IN ('live','shadow')
             GROUP BY market_type
             HAVING COUNT(*) >= %s
             ORDER BY n DESC
