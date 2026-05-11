@@ -231,7 +231,7 @@ export async function runOrderManagement(): Promise<{
         } else {
           await db.update(paperBetsTable).set({
             betfairStatus: "CANCELLED_LOW_FILL",
-            status: "void",
+            status: "cancelled",
           }).where(eq(paperBetsTable.id, bet.id));
           cancelled++;
         }
@@ -277,7 +277,7 @@ export async function runOrderManagement(): Promise<{
           } else {
             await db.update(paperBetsTable).set({
               betfairStatus: "CANCELLED_NEAR_KICKOFF",
-              status: "void",
+              status: "cancelled",
             }).where(eq(paperBetsTable.id, bet.id));
             cancelled++;
           }

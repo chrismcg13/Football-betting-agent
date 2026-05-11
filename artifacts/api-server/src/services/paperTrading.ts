@@ -1445,7 +1445,7 @@ export async function placePaperBet(
         and(
           eq(paperBetsTable.matchId, matchId),
           sql`deleted_at IS NULL`,
-          sql`(${paperBetsTable.status} IN ('pending','pending_placement') OR (${paperBetsTable.status} = 'void' AND ${paperBetsTable.settledAt} >= ${recentVoidCutoff}))`,
+          sql`(${paperBetsTable.status} IN ('pending','pending_placement') OR (${paperBetsTable.status} IN ('void','cancelled') AND ${paperBetsTable.settledAt} >= ${recentVoidCutoff}))`,
         ),
       );
 

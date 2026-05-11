@@ -231,7 +231,7 @@ router.get("/dashboard/summary", async (_req, res) => {
         COUNT(*) FILTER (WHERE live_tier = 'tier1' AND (qualification_path = 'promoted' OR qualification_path IS NULL)) AS tier1_other,
         COUNT(*) FILTER (WHERE live_tier = 'tier1') AS betfair_live,
         COUNT(*) FILTER (WHERE (live_tier = 'tier2' OR live_tier IS NULL)) AS tier2,
-        COALESCE(SUM(stake::numeric) FILTER (WHERE live_tier = 'tier1' AND status != 'void'), 0) AS betfair_stake
+        COALESCE(SUM(stake::numeric) FILTER (WHERE live_tier = 'tier1' AND status NOT IN ('void','cancelled')), 0) AS betfair_stake
       FROM paper_bets_current
       WHERE placed_at >= ${todayStartUtc} AND deleted_at IS NULL
         AND betfair_bet_id IS NOT NULL
