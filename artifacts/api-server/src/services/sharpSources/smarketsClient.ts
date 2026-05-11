@@ -96,7 +96,11 @@ async function fetchJson<T>(path: string): Promise<T | null> {
  *  2026-05-11 — `/events/` returns "Football" with id=121005 at the
  *  top level. Competitions live as children of this node. */
 const FOOTBALL_ROOT_PARENT_ID = 121005;
-const COMPETITION_WALK_CAP = 60;
+// 2026-05-11 evening — live probing showed the Football category holds
+// 379 competition nodes. Bumping the walk cap to 200 captures the bulk
+// (Smarkets' /events page-size max). Per-competition cap stays 200; in
+// practice each league returns 1–20 fixtures.
+const COMPETITION_WALK_CAP = 200;
 const PER_COMPETITION_CAP = 200;
 
 export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 1000): Promise<SmarketsEvent[]> {
@@ -138,10 +142,18 @@ export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 10
   const compsResp = await fetchJson<{ events: SmarketsEvent[] }>(
     `/events/?parent_id=${FOOTBALL_ROOT_PARENT_ID}&limit=${COMPETITION_WALK_CAP}`,
   );
-  const competitions = compsResp?.events ?? [];
+  const allCompsAndEvents = compsResp?.events ?? [];
+  // Filter to genuine competitions. Smarkets returns Outright/Accumulator
+  // pseudo-events at the top of the Football node — they're dated 2015/2018
+  // and have no children. Competition nodes have start_datetime=null.
+  const competitions = allCompsAndEvents.filter(
+    (c) => c.start_datetime == null,
+  );
   logger.info(
     {
+      totalReturned: allCompsAndEvents.length,
       competitionsFound: competitions.length,
+      filteredOut: allCompsAndEvents.length - competitions.length,
       sample: competitions.slice(0, 5).map((c) => ({ id: c.id, name: c.name })),
     },
     "Smarkets: competitions under Football",

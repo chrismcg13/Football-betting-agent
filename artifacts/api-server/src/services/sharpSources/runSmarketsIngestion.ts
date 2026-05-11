@@ -36,7 +36,14 @@ import { persistSourceSnapshot } from "../sharpConsensus";
 import type { DevigMethod } from "../devig";
 import { teamNameMatch } from "../apiFootball";
 
-const LOOKAHEAD_MS = 48 * 60 * 60 * 1000;
+// 2026-05-11 evening — direct API probe revealed that Smarkets-listed
+// fixtures sit 3–30+ days out on most football competitions (e.g. UEFA
+// Champions League final 19 days out). The original 48-hour lookahead
+// dropped every event silently — 0 snapshots persisted across 1,500+
+// cron runs. 14 days covers the CLV-relevant horizon (sharp money
+// converges in the final ~96h pre-kickoff but the price drift starts
+// earlier on big fixtures).
+const LOOKAHEAD_MS = 14 * 24 * 60 * 60 * 1000;
 const SUPPORTED_MARKET_TYPES = new Set([
   "MATCH_ODDS",
   "BTTS",
