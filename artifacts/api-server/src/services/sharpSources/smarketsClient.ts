@@ -76,6 +76,21 @@ async function fetchJson<T>(path: string): Promise<T | null> {
 /**
  * Fetch upcoming football events from Smarkets. Returns events kicking off
  * within `[now, now + lookaheadMs]`.
+ *
+ * 2026-05-11 diagnostic note: the previous `type_scope=single_event`
+ * parameter is not actually a documented Smarkets v3 filter and the API
+ * may silently ignore it (or 400 — unverified from this environment).
+ * Live tests against /events/ show the basic response is paginated and
+ * mostly returns top-level sport categories. To reach individual matches
+ * the proper navigation is a three-step parent_id walk:
+ *   1. /events/ (root) -> "Football" category (id 121005)
+ *   2. /events/?parent_id=121005 -> competitions list
+ *   3. /events/?parent_id={competition_id}&state=upcoming -> matches
+ *
+ * The current single-call shortcut is a best-effort; we log the response
+ * size + first-event shape so the VPS logs reveal exactly what comes
+ * back. If `events.length === 0` consistently in production, the
+ * follow-up bundle should ship the parent_id walk.
  */
 export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 1000): Promise<SmarketsEvent[]> {
   const now = new Date().toISOString();
@@ -89,7 +104,18 @@ export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 10
     limit: "200",
   });
   const data = await fetchJson<{ events: SmarketsEvent[] }>(`/events/?${params}`);
-  return data?.events ?? [];
+  const events = data?.events ?? [];
+  logger.info(
+    {
+      url: `/events/?${params}`,
+      count: events.length,
+      firstName: events[0]?.name ?? null,
+      firstType: (events[0] as { type?: string } | undefined)?.type ?? null,
+      firstKeys: events[0] ? Object.keys(events[0] as object).slice(0, 15) : [],
+    },
+    "Smarkets listUpcomingFootballEvents response shape",
+  );
+  return events;
 }
 
 /** List markets for a given event. */

@@ -83,6 +83,21 @@ export async function runSmarketsIngestion(): Promise<SmarketsIngestResult> {
   // 1. Fetch upcoming Smarkets events.
   const events = await listUpcomingFootballEvents(LOOKAHEAD_MS);
   result.events_fetched = events.length;
+  // 2026-05-11 diagnostic: log a sample of the actual event shape because
+  // Smarkets v3 does NOT return home_team / away_team as top-level fields —
+  // the previous filter (line 124) silently dropped 100% of events for
+  // weeks. Sample lets us see the real field shape from VPS logs without
+  // adding an auth-required test path.
+  if (events.length > 0) {
+    const sample = events.slice(0, 3).map((e) => ({
+      id: e.id,
+      name: e.name,
+      type_domain: e.type_domain,
+      start: e.start_datetime,
+      keys: Object.keys(e as object).slice(0, 20),
+    }));
+    logger.info({ count: events.length, sample }, "Smarkets: events sample");
+  }
   if (events.length === 0) {
     logger.info({ result }, "Smarkets: no upcoming events returned");
     result.duration_ms = Date.now() - startedAt;
@@ -119,13 +134,22 @@ export async function runSmarketsIngestion(): Promise<SmarketsIngestResult> {
     devigCfgRows.map((r) => [r.name, (r.devigMethod ?? "power") as DevigMethod]),
   );
 
-  // 3. For each Smarkets event, find our match.
+  // 3. For each Smarkets event, find our match. Smarkets does not return
+  // home_team / away_team as top-level fields — instead the event `name`
+  // is a string like "Arsenal vs Chelsea" or "Real Madrid v Barcelona" or
+  // "Bayern Munich - Dortmund". Parse the two halves and run them through
+  // the same teamNameMatch fuzzy resolver we use for API-Football.
+  let parseAttempted = 0;
+  let parseSucceeded = 0;
   for (const ev of events) {
-    if (!ev.home_team || !ev.away_team) continue;
+    parseAttempted++;
+    const parsed = parseEventTeams(ev.name, ev.home_team, ev.away_team);
+    if (!parsed) continue;
+    parseSucceeded++;
     const matched = ourMatches.find(
       (m) =>
-        teamNameMatch(m.homeTeam, ev.home_team!) &&
-        teamNameMatch(m.awayTeam, ev.away_team!),
+        teamNameMatch(m.homeTeam, parsed.home) &&
+        teamNameMatch(m.awayTeam, parsed.away),
     );
     if (!matched) continue;
     result.events_matched++;
@@ -169,7 +193,52 @@ export async function runSmarketsIngestion(): Promise<SmarketsIngestResult> {
     }
   }
 
+  // Diagnostic counters surfaced alongside the standard result fields so
+  // the VPS logs show where the pipeline drops events on each run.
+  logger.info(
+    {
+      ...result,
+      parse_attempted: parseAttempted,
+      parse_succeeded: parseSucceeded,
+    },
+    "Smarkets ingestion complete",
+  );
   result.duration_ms = Date.now() - startedAt;
-  logger.info(result, "Smarkets ingestion complete");
   return result;
+}
+
+/**
+ * Parse home + away team names from a Smarkets event. Tries the
+ * (currently always-empty) top-level home_team / away_team fields
+ * first, then falls back to splitting the event `name` on common
+ * separators used by Smarkets' public listings:
+ *   "Arsenal vs Chelsea"
+ *   "Arsenal v Chelsea"
+ *   "Arsenal - Chelsea"
+ *   "Arsenal @ Chelsea"
+ * Returns null if no plausible split can be made (e.g. "Match Odds"
+ * which is a market label, not a fixture).
+ */
+function parseEventTeams(
+  name: string | null | undefined,
+  topHome: string | null | undefined,
+  topAway: string | null | undefined,
+): { home: string; away: string } | null {
+  if (topHome && topAway) return { home: topHome, away: topAway };
+  if (!name) return null;
+
+  const separators = [" vs ", " v ", " - ", " — ", " @ "];
+  for (const sep of separators) {
+    const idx = name.toLowerCase().indexOf(sep.toLowerCase());
+    if (idx > 0 && idx < name.length - sep.length) {
+      const home = name.slice(0, idx).trim();
+      const away = name.slice(idx + sep.length).trim();
+      // Require both halves to have at least one alphabetic char so we
+      // don't accept market labels like "0 - 1" as a fixture.
+      if (/[a-zA-Z]/.test(home) && /[a-zA-Z]/.test(away)) {
+        return { home, away };
+      }
+    }
+  }
+  return null;
 }
