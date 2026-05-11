@@ -6037,5 +6037,20 @@ router.post("/admin/run-bundle-b", async (_req, res) => {
   }
 });
 
+// 2026-05-11: manual trigger for the drawdown-targeted Kelly Monte-Carlo
+// (Task 17). Same code path as the daily 03:15 UTC cron, just run on
+// demand. Use after changing `drawdown_target_p1_pct` so the lookup
+// updates without waiting for the next cron tick. Idempotent.
+router.post("/admin/run-kelly-montecarlo", async (_req, res) => {
+  try {
+    const { runKellyLookupSimulation } = await import("../services/dynamicKelly");
+    const result = await runKellyLookupSimulation();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual Kelly Monte-Carlo run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 export default router;
 
