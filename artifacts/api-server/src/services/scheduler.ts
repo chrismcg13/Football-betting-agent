@@ -2619,6 +2619,25 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Kelly Monte-Carlo scheduler active — daily 03:15 UTC");
 
+  // Task 22 (Phase 5c) — feature attribution. Monthly on the 1st at
+  // 04:30 UTC. Runs after the daily SHAP drift detector (03:30) so any
+  // critical-drift flag this month is visible in feature_lifecycle
+  // alongside the attribution metrics. Lifecycle status drives
+  // operator review of FEATURE_NAMES — does NOT auto-remove features.
+  cron.schedule("30 4 1 * *", () => {
+    logger.info("Feature attribution triggered (monthly 1st at 04:30 UTC)");
+    void (async () => {
+      try {
+        const { runFeatureAttribution } = await import("./featureAttributionCron");
+        const r = await runFeatureAttribution();
+        logger.info(r, "Feature attribution complete");
+      } catch (err) {
+        logger.error({ err }, "Feature attribution failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Feature attribution scheduler active — monthly 1st 04:30 UTC");
+
   // Phase 4b startup self-seed: kick off a first geocode pass + travel
   // backfill at T+120s. The 120s offset puts it after the ClubElo
   // self-seed and the trading-cycle warmup so we don't fight for IO.

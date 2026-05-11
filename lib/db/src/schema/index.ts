@@ -40,3 +40,4 @@ export * from "./clubEloSnapshots";
 export * from "./stadiumCoordinates";
 export * from "./shapDriftRuns";
 export * from "./kellyFractionLookup";
+export * from "./featureAttribution";

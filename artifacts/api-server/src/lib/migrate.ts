@@ -3422,6 +3422,60 @@ export async function runMigrations() {
 
     logger.info("Kelly fraction lookup ready (Task 17)");
 
+    // Task 22 — feature attribution + lifecycle (Phase 5c).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS feature_attribution (
+        period_start          DATE NOT NULL,
+        feature_name          TEXT NOT NULL,
+        market_type           TEXT NOT NULL,
+        n_bets                INTEGER NOT NULL,
+        pearson_r             NUMERIC(8,6),
+        top_decile_clv_mean   NUMERIC(8,4),
+        bot_decile_clv_mean   NUMERIC(8,4),
+        incremental_clv       NUMERIC(8,4),
+        feature_min           NUMERIC(12,6),
+        feature_max           NUMERIC(12,6),
+        feature_mean          NUMERIC(12,6),
+        computed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (period_start, feature_name, market_type)
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS feature_attribution_recent
+        ON feature_attribution(period_start DESC)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS feature_lifecycle (
+        id                  SERIAL PRIMARY KEY,
+        feature_name        TEXT NOT NULL UNIQUE,
+        status              TEXT NOT NULL DEFAULT 'active',
+        weak_months_count   INTEGER NOT NULL DEFAULT 0,
+        last_evaluated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        notes               TEXT
+      )
+    `);
+
+    // Operator view: latest-period attribution sorted by weakest first
+    // (largest |incremental_clv| first, with sign preserved so the
+    // operator can see direction). No UI — Neon SQL editor only.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_feature_attribution_latest AS
+      SELECT fa.feature_name, fa.market_type, fa.n_bets,
+             fa.pearson_r,
+             fa.incremental_clv,
+             fa.top_decile_clv_mean, fa.bot_decile_clv_mean,
+             fa.period_start,
+             COALESCE(fl.status, 'active') AS lifecycle_status,
+             COALESCE(fl.weak_months_count, 0) AS weak_months_count
+      FROM feature_attribution fa
+      LEFT JOIN feature_lifecycle fl ON fl.feature_name = fa.feature_name
+      WHERE fa.period_start = (SELECT MAX(period_start) FROM feature_attribution)
+      ORDER BY ABS(COALESCE(fa.incremental_clv, 0)) DESC
+    `);
+
+    logger.info("Feature attribution + lifecycle ready (Task 22)");
+
     // Seed the target_p1_pct config key so the first sim run has a value.
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)
