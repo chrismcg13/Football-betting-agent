@@ -31,6 +31,12 @@ export const paperBetsTable = pgTable("paper_bets", {
   stake: numeric("stake", { precision: 12, scale: 2 }).notNull(),
   potentialProfit: numeric("potential_profit", { precision: 12, scale: 2 }),
   modelProbability: numeric("model_probability", { precision: 8, scale: 6 }),
+  // Task 12 (2026-05-11): preserves the pre-calibration sigmoid output for
+  // audit. NULL on legacy rows; populated on emission post-deploy. Always
+  // paired with model_probability (which holds the post-calibration value
+  // when a calibration_buckets entry exists for the (league, market_type)).
+  rawModelProbability: numeric("raw_model_probability", { precision: 8, scale: 6 }),
+  calibrationBucketId: integer("calibration_bucket_id"),
   betfairImpliedProbability: numeric("betfair_implied_probability", {
     precision: 8,
     scale: 6,

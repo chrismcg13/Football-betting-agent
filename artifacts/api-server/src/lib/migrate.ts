@@ -3205,6 +3205,49 @@ export async function runMigrations() {
 
     logger.info("Bundle B analytics tables ready");
 
+    // Task 12 — calibration_buckets. Per-(league × market_type) calibration
+    // params, fitted weekly by scripts/python/fit_calibration.py.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS calibration_buckets (
+        bucket_id     SERIAL PRIMARY KEY,
+        scope_league  TEXT,
+        market_type   TEXT NOT NULL,
+        method        TEXT NOT NULL,
+        fitted_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        n_samples     INTEGER NOT NULL,
+        params        JSONB NOT NULL,
+        brier_in      NUMERIC(10,6),
+        brier_out     NUMERIC(10,6),
+        ece_out       NUMERIC(10,6),
+        active        BOOLEAN NOT NULL DEFAULT TRUE
+      )
+    `);
+    // Active calibration lookup: hot-path read filters on (scope_league,
+    // market_type, active=true). Most buckets stay active for the week
+    // between fits, so the WHERE active=true partial index keeps it small.
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS calibration_buckets_active_lookup
+        ON calibration_buckets(scope_league, market_type)
+        WHERE active = TRUE
+    `);
+    // History scan for the weekly fitter (it deactivates prior actives and
+    // inserts a fresh row).
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS calibration_buckets_fitted_at
+        ON calibration_buckets(fitted_at DESC)
+    `);
+
+    // Task 12 — preserve pre-calibration model probability for audit, plus
+    // a backreference to the calibration_buckets row that was applied (NULL
+    // if no bucket was active for the scope at emission time).
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS raw_model_probability NUMERIC(8,6),
+        ADD COLUMN IF NOT EXISTS calibration_bucket_id INTEGER
+    `);
+
+    logger.info("Calibration buckets ready (Task 12)");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

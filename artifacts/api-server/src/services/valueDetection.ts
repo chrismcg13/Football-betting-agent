@@ -42,6 +42,7 @@ import {
 } from "./predictionEngine";
 import { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } from "./tournamentMode";
 import { commissionAdjustedEV, getCommissionRate } from "./commissionService";
+import { calibrate } from "./calibration";
 
 export interface ValueBet {
   matchId: number;
@@ -52,6 +53,11 @@ export interface ValueBet {
   marketType: string;
   selectionName: string;
   modelProbability: number;
+  // Task 12 (2026-05-11): pre-calibration sigmoid output, preserved for
+  // audit. Equal to modelProbability when no calibration_buckets row was
+  // active for the (league × market) at emission time.
+  rawModelProbability: number;
+  calibrationBucketId: number | null;
   impliedProbability: number;
   edge: number;
   backOdds: number;
@@ -1404,8 +1410,16 @@ export async function detectValueBets(options?: {
       // Minimum odds floor on the actionable (placed) price
       if (actionablePrice < minOddsThreshold) continue;
 
-      const modelProb = getModelProbability(marketType, selectionName, featureMap);
-      if (modelProb === null) continue;
+      const rawModelProb = getModelProbability(marketType, selectionName, featureMap);
+      if (rawModelProb === null) continue;
+
+      // Task 12 (2026-05-11): calibration layer. Raw sigmoid → calibrated
+      // probability via the active calibration_buckets row for
+      // (match.league, marketType) — falls back to market-type-global, then
+      // to passthrough if no bucket exists. Bucket id stored on the bet for
+      // audit + future recalibration analysis.
+      const { calibrated: modelProb, bucketId: calibrationBucketId } =
+        await calibrate(rawModelProb, match.league ?? null, marketType);
 
       selectionsEvaluated++;
 
@@ -1632,6 +1646,8 @@ export async function detectValueBets(options?: {
           marketType: oddsRow.marketType,
           selectionName: oddsRow.selectionName,
           modelProbability: modelProb,
+          rawModelProbability: rawModelProb,
+          calibrationBucketId,
           impliedProbability: impliedProb,
           edge,
           backOdds,

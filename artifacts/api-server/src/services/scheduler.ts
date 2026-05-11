@@ -1765,6 +1765,10 @@ export async function runTradingCycle(options?: {
           // signal — covers Tier A near-misses (which would otherwise fall
           // through the universeTier='A' check and become real-stake bets).
           placementTrack: order.placementTrack,
+          // Task 12 (2026-05-11): forward pre-calibration probability + bucket
+          // backreference for audit.
+          rawModelProbability: order.rawModelProbability,
+          calibrationBucketId: order.calibrationBucketId,
         },
       );
 
@@ -2402,6 +2406,24 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Bundle B analytics scheduler active — daily 02:30 UTC");
+
+  // Task 12 — weekly calibration fit. Mondays at 04:00 UTC, after the
+  // Sunday batch jobs finish. Spawns the Python fitter (one-shot,
+  // ~5-30s), which writes new active rows to calibration_buckets. The
+  // Node calibrate() function picks them up on its 5-min cache TTL.
+  cron.schedule("0 4 * * 1", () => {
+    logger.info("Calibration fitter triggered (Monday 04:00 UTC)");
+    void (async () => {
+      try {
+        const { runCalibrationFitter } = await import("./calibrationCron");
+        const r = await runCalibrationFitter();
+        logger.info(r, "Calibration fitter complete");
+      } catch (err) {
+        logger.error({ err }, "Calibration fitter failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Calibration fitter scheduler active — Mondays 04:00 UTC");
 
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");

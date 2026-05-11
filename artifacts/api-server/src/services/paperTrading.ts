@@ -852,6 +852,12 @@ export interface PaperBetOptions {
   // below production threshold but above shadow floor) as learning data.
   // When undefined, falls back to the universeTier-based check.
   placementTrack?: "production" | "shadow" | null;
+  // Task 12 (2026-05-11): pre-calibration sigmoid output (raw_model_probability)
+  // and a backreference to the calibration_buckets row applied. Both NULL on
+  // legacy emissions; populated post-deploy. modelProbability (positional arg
+  // to placePaperBet) carries the post-calibration value.
+  rawModelProbability?: number | null;
+  calibrationBucketId?: number | null;
 }
 
 export async function placePaperBet(
@@ -887,6 +893,8 @@ export async function placePaperBet(
     validatorBestOdds = null,
     universeTier = null,
     placementTrack = null,
+    rawModelProbability = null,
+    calibrationBucketId = null,
   } = options;
   // Phase 2.B.2 + B1/B2 (2026-05-07): shadow-bet flag. Tier B/C are always
   // shadow (no Pinnacle anchor by definition). Additionally, valueDetection
@@ -1924,6 +1932,9 @@ export async function placePaperBet(
         stake: String(stake),
         potentialProfit: String(potentialProfit),
         modelProbability: String(modelProbability),
+        rawModelProbability:
+          rawModelProbability != null ? String(rawModelProbability) : null,
+        calibrationBucketId: calibrationBucketId ?? null,
         betfairImpliedProbability: String(impliedProbability),
         calculatedEdge: String(edge),
         opportunityScore: String(score),
