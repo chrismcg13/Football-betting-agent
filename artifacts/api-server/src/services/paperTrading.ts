@@ -707,20 +707,17 @@ export function calculateDynamicKellyStake(
   maxStakePct: number,
   opportunityScore: number,
   marketType?: string,
-  applyMinStakeFloor: boolean = true,
 ): number {
-  // Floor rule: edge<=0 returns 0; edge>0 floors stake to £2 minimum WHEN
-  // applyMinStakeFloor is true.
+  // Returns raw Kelly stake (no £2 floor). Caller is responsible for routing
+  // sub-£2 results to the shadow rail — see the demote block in placePaperBet.
   //
-  // 2026-05-10: applyMinStakeFloor parameter added so placePaperBet can
-  // disable the early floor and apply it AFTER its downstream multipliers
-  // (live Kelly fraction, low-odds, segment, regime, tier). Pre-fix, the
-  // floor was unconditional here — the multipliers then reduced the
-  // post-floor stake below £2 and triggered demote-to-shadow at line 1648,
-  // making every direct-production live bet route through lazyPromote at
-  // exactly £2 instead of placing directly. paperToLiveCutover.ts continues
-  // to call with the default (floor on) because its conversion gate already
-  // pairs with this semantics.
+  // Task 2 (2026-05-11): removed the applyMinStakeFloor parameter and the
+  // Math.max(stake, 2) line. Flooring Kelly to the Betfair minimum contradicts
+  // Kelly theory (it over-bets every bet whose mathematical optimum is below
+  // the minimum), and the 163-of-280 live bets sitting in the £1.50–£2.50
+  // floor band carried -£3.09 PnL on £327 stake — break-even on volume with
+  // zero growth contribution. Demoting sub-£2 to shadow preserves the signal
+  // for learning without staking a wrong-sized bet.
   if (edge <= 0 || backOdds <= 1) return 0;
 
   const fraction = kellyFractionForScore(opportunityScore, marketType);
@@ -728,9 +725,6 @@ export function calculateDynamicKellyStake(
   let stake = bankroll * kellyFull * fraction;
 
   stake = Math.min(stake, bankroll * maxStakePct);
-  if (applyMinStakeFloor) {
-    stake = Math.max(stake, 2);
-  }
 
   return Math.round(stake * 100) / 100;
 }
@@ -1549,7 +1543,6 @@ export async function placePaperBet(
     maxStakePct,
     score,
     marketType,
-    false, // floor deferred — applied after downstream multipliers (line 1648)
   );
 
   if (liveLimits) {
@@ -1689,47 +1682,35 @@ export async function placePaperBet(
   // live bankroll, every direct-production live bet got demoted; lazyPromote
   // then rescued at exactly £2 — making every live bet appear as
   // qualification_path = 'lazy_promoted_to_live' since cutover.
+  // Task 2 (2026-05-11): Kelly < £2 → demote to shadow unconditionally.
+  // The previous "eligibleForFloor" branch floored sub-£2 Kelly stakes to
+  // exactly £2 when edge >= min_edge_threshold AND bankroll >= £2. That
+  // contradicted Kelly theory by over-betting every bet whose mathematical
+  // optimum was below the Betfair minimum. The 163 live bets in the
+  // £1.50–£2.50 floor band over 2026-05-03→2026-05-11 carried just
+  // -£3.09 PnL on £327 stake — break-even on volume with zero growth
+  // contribution. The signal lives in shadow now; the lazyPromote service
+  // rescues bets back to live if Kelly recovers above £2 before kickoff.
   if (!isShadowBet && stake < 2) {
-    const minEdgeForMinStakeRaw = await getConfigValue("min_edge_threshold");
-    const minEdgeForMinStake = minEdgeForMinStakeRaw != null
-      ? Number(minEdgeForMinStakeRaw)
-      : 0.005;
-    const effectiveBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
-    const eligibleForFloor = edge >= minEdgeForMinStake && effectiveBankroll >= 2;
-
-    if (eligibleForFloor) {
-      const preFloorStake = stake;
-      stake = 2;
-      logger.info(
-        {
-          matchId, marketType, universeTier,
-          preFloorStake, postFloorStake: stake,
-          edge, minEdgeForMinStake, effectiveBankroll,
-        },
-        "Min-stake floor applied — direct-production placement at £2 minimum",
-      );
-    } else {
-      const fullKellyStake = stake;
-      const SHADOW_KELLY_FRACTION = 0.25;
-      shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
-      shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
-      stake = 0;
-      isShadowBet = true;
-      await logShadowGateExemption(
-        "min_stake_fallthrough",
-        experimentTag ?? null,
-        `Production-track Kelly-stake £${fullKellyStake} below £2 floor (edge ${edge} < threshold ${minEdgeForMinStake} or bankroll £${effectiveBankroll} < £2) — captured as shadow`,
-        shadowStake,
-      );
-      logger.info(
-        {
-          matchId, marketType, universeTier,
-          fullKellyStake, shadowStake, shadowStakeKellyFraction,
-          edge, minEdgeForMinStake, effectiveBankroll,
-        },
-        "Min-stake fallthrough — converted production-track to shadow capture (edge below threshold or bankroll < £2)",
-      );
-    }
+    const fullKellyStake = stake;
+    const SHADOW_KELLY_FRACTION = 0.25;
+    shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+    shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+    stake = 0;
+    isShadowBet = true;
+    await logShadowGateExemption(
+      "kelly_below_min_stake",
+      experimentTag ?? null,
+      `Production-track Kelly-stake £${fullKellyStake} below £2 Betfair minimum — demoted to shadow per Task 2 (floor removed 2026-05-11)`,
+      shadowStake,
+    );
+    logger.info(
+      {
+        matchId, marketType, universeTier,
+        fullKellyStake, shadowStake, shadowStakeKellyFraction, edge,
+      },
+      "Kelly below £2 — demoted to shadow (Task 2: £2 floor removed)",
+    );
   }
 
   if (isLiveMode()) {

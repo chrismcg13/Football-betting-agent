@@ -127,19 +127,12 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   const maxStakePct = maxStakePctStr != null ? Number(maxStakePctStr) : 0.02;
   let maxStake = Math.round(bankroll * maxStakePct * 100) / 100;
 
-  // 2026-05-10: small-bankroll min-stake fallback. With a £4-£50 live
-  // bankroll, true Kelly almost always computes < £2 (Betfair minimum)
-  // because max_stake_pct=0.02 caps stake at 2% of bankroll. To enable
-  // initial growth from a small starting cash position, fall back to
-  // exactly £2 (Betfair minimum) when:
-  //   1. Kelly stake < £2 (would otherwise be skipped)
-  //   2. edge meets the same min_edge_threshold valueDetection uses for
-  //      paper-track emission — so we're not forcing min-stake on noise
-  //   3. bankroll >= £2 (so the bet can actually be placed)
-  // As bankroll grows past ~£100, real Kelly produces stakes >= £2 on
-  // its own and this branch becomes unreachable.
-  const minEdgeStr = await getConfig("min_edge_threshold");
-  const minEdgeForMinStake = minEdgeStr != null ? Number(minEdgeStr) : 0.005;
+  // Task 2 (2026-05-11): the small-bankroll £2 min-stake fallback was removed
+  // from this path along with the direct-emission path in paperTrading.ts.
+  // Kelly-below-£2 stakes stay shadow until the market moves enough to push
+  // Kelly above £2 on a later lazy-promote pass. min_edge_threshold remains
+  // a separate emission-time floor in valueDetection; it no longer gates the
+  // min-stake decision here.
 
   // Cutover state: post-cutover, promote shadow→live (real Betfair placement).
   // Pre-cutover: legacy shadow→paper. The §3 trigger forbids paper INSERTs
@@ -273,18 +266,14 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       let stake = bankroll * kellyFraction * edge / (odds - 1);
       stake = Math.min(stake, maxStake);
       stake = Math.round(stake * 100) / 100;
-      let usedMinStakeFallback = false;
+      // Task 2 (2026-05-11): no min-stake floor. If lazy-recomputed Kelly is
+      // below the Betfair minimum, leave the row as shadow — the next pass
+      // will retry as the market moves. Flooring to £2 contradicted Kelly
+      // theory and broke long-term log-growth; see paperTrading.ts:1700
+      // for the matching change on the direct-emission path.
       if (stake < BETFAIR_MIN_STAKE) {
-        // Small-bankroll fallback (see hoisted comment above): force £2
-        // minimum on opportunities that meet the configured edge floor and
-        // when the account can actually cover £2. Otherwise skip.
-        if (edge >= minEdgeForMinStake && bankroll >= BETFAIR_MIN_STAKE) {
-          stake = BETFAIR_MIN_STAKE;
-          usedMinStakeFallback = true;
-        } else {
-          result.skipped_kelly_below_min++;
-          continue;
-        }
+        result.skipped_kelly_below_min++;
+        continue;
       }
       const potentialProfit = Math.round(stake * (odds - 1) * 100) / 100;
 
@@ -365,14 +354,13 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
             selectionName: r.selection_name,
             betfairBetId: placeResult.betfairBetId,
             score, edge, odds, newStake: stake, kellyFraction, bankroll,
-            usedMinStakeFallback,
           } as Record<string, unknown>,
           timestamp: new Date(),
         } as any);
 
         result.promoted++;
         logger.info(
-          { betId: r.id, matchId: r.match_id, marketType: r.market_type, selection: r.selection_name, stake, usedMinStakeFallback, betfairBetId: placeResult.betfairBetId },
+          { betId: r.id, matchId: r.match_id, marketType: r.market_type, selection: r.selection_name, stake, betfairBetId: placeResult.betfairBetId },
           "lazyPromote: shadow bet promoted to LIVE on Betfair",
         );
 

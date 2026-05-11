@@ -21,9 +21,10 @@
  *
  * Stake sizing IS the same as new live emissions: the cutover calls
  * calculateDynamicKellyStake() exported from paperTrading.ts. That helper
- * encodes the £2 floor rule (paperTrading.ts:718): edge<=0 returns 0
- * (we shadow-demote 'edge_collapsed'); edge>0 floors stake to £2 minimum.
- * No conversion-specific staking rules are introduced.
+ * returns 0 when edge<=0 (we shadow-demote 'edge_collapsed') and raw
+ * Kelly stake otherwise. Sub-£2 raw Kelly demotes to shadow with reason
+ * 'stake_below_minimum' (Task 2: £2 floor removed 2026-05-11; flooring
+ * to the Betfair minimum contradicted Kelly theory).
  *
  * Drift tolerance (Option (i) per plan §B): max(3 ticks, 1.5% × paper_price).
  * Edge floor: agent_config.min_edge_threshold (default 0.03), recomputed
@@ -453,6 +454,20 @@ export async function runCutoverConversion(opts: { dryRun: boolean }): Promise<C
       if (!opts.dryRun) await shadowDemote(bet, "edge_collapsed", {
         paper_odds: bet.odds_at_placement, current_back_odds: currentBack,
         edge_at_current_price: edgeAtCurrentPrice, min_edge_threshold: minEdge,
+      });
+      continue;
+    }
+
+    // Gate 3.5 (Task 2, 2026-05-11): raw Kelly < £2 Betfair minimum →
+    // demote to shadow. Previously the helper floored to £2 internally;
+    // now it returns raw Kelly and the caller must route sub-minimum
+    // stakes to shadow.
+    if (stake > 0 && stake < 2) {
+      recordOutcome(bet, { currentBackOdds: currentBack, edgeAtCurrentPrice, computedStake: stake },
+        "shadow_demoted", "stake_below_minimum", null);
+      if (!opts.dryRun) await shadowDemote(bet, "stake_below_minimum", {
+        paper_odds: bet.odds_at_placement, current_back_odds: currentBack,
+        edge_at_current_price: edgeAtCurrentPrice, kelly_stake: stake,
       });
       continue;
     }
