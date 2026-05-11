@@ -227,12 +227,36 @@ export async function getDynamicKellyFraction(): Promise<number | null> {
   if (cachedFraction && Date.now() - cachedFraction.fetchedAt < READER_TTL_MS) {
     return cachedFraction.value;
   }
-  const rows = await db
-    .select({ selectedFraction: kellyFractionLookupTable.selectedFraction })
-    .from(kellyFractionLookupTable)
-    .orderBy(sql`${kellyFractionLookupTable.computedAt} DESC`)
-    .limit(1);
-  const value = rows[0]?.selectedFraction != null ? Number(rows[0].selectedFraction) : null;
+  const [latestRow, floorRow] = await Promise.all([
+    db
+      .select({ selectedFraction: kellyFractionLookupTable.selectedFraction })
+      .from(kellyFractionLookupTable)
+      .orderBy(sql`${kellyFractionLookupTable.computedAt} DESC`)
+      .limit(1),
+    db.execute(
+      sql`SELECT value FROM agent_config WHERE key = 'dynamic_kelly_min_fraction' LIMIT 1`,
+    ),
+  ]);
+  const monteCarloValue =
+    latestRow[0]?.selectedFraction != null ? Number(latestRow[0].selectedFraction) : null;
+  // 2026-05-11: operator-set floor that survives nightly Monte-Carlo
+  // recomputation. If the daily cron picks a fraction smaller than the
+  // operator floor (e.g. Monte Carlo says 0.05 but operator wants 0.25
+  // quarter-Kelly scaling), the reader returns max(monte_carlo, floor).
+  // Default floor is 0 (no clamp). Set via:
+  //   INSERT INTO agent_config (key, value, updated_at)
+  //   VALUES ('dynamic_kelly_min_fraction', '0.25', NOW())
+  //   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW();
+  const floorRaw = (floorRow as any).rows?.[0]?.value;
+  const floor = floorRaw != null ? Number(floorRaw) : 0;
+  const minFraction = Number.isFinite(floor) && floor >= 0 && floor <= 1 ? floor : 0;
+
+  let value: number | null;
+  if (monteCarloValue == null) {
+    value = minFraction > 0 ? minFraction : null;
+  } else {
+    value = Math.max(monteCarloValue, minFraction);
+  }
   cachedFraction = { value, fetchedAt: Date.now() };
   return value;
 }

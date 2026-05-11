@@ -3210,6 +3210,16 @@ export async function runMigrations() {
 
     // Operator view — latest live-eligibility candidates, sorted by strength.
     // No UI consumer (per project memory); read via SQL editor.
+    // 2026-05-11 (Task 20 partial — women's football bundle): expose
+    // `is_womens_league` flag so operator can see at a glance which
+    // qualifying scopes are women's leagues. Pattern-match on the league
+    // name covers the common naming conventions (Women / WSL / NWSL /
+    // Femenina / Féminine / Frauen / Damallsvenskan / Toppserien etc.)
+    // without needing a join (analysis_signal_strength.league is the
+    // canonical name; competition_config.gender carries the same info but
+    // joining duplicates leagues with both male+female entries).
+    // Shin de-vig is already pre-seeded for women's leagues at
+    // migrate.ts:1116-1121 (gender='female' rows in competition_config).
     await db.execute(sql`
       CREATE OR REPLACE VIEW v_live_eligibility_candidates AS
       SELECT
@@ -3225,6 +3235,8 @@ export async function runMigrations() {
         s.clv_t_stat,
         s.qualifies_live,
         s.qualification_basis,
+        (s.league ~* '\\m(women|wsl|nwsl|femenina|féminine|feminina|frauen|damallsvenskan|toppserien|kvindeligaen)\\M')
+          AS is_womens_league,
         s.computed_at
       FROM analysis_signal_strength s
       WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
