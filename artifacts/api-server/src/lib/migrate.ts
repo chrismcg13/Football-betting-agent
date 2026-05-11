@@ -1077,7 +1077,19 @@ export async function runMigrations() {
         ADD COLUMN IF NOT EXISTS warmup_started_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS warmup_completed_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS universe_tier_decided_at TIMESTAMPTZ,
-        ADD COLUMN IF NOT EXISTS settlement_bias_index NUMERIC(6,4)
+        ADD COLUMN IF NOT EXISTS settlement_bias_index NUMERIC(6,4),
+        ADD COLUMN IF NOT EXISTS devig_method TEXT NOT NULL DEFAULT 'power'
+    `);
+    // Task 14 (2026-05-11): seed Shin only for women's leagues — wider bookmaker
+    // margins on women's football make adverse-selection bias the dominant
+    // source of overround. Lower-tier men's leagues stay on 'power' until the
+    // backtest evidence flips them. Idempotent — only touches rows still on
+    // the 'power' default.
+    await db.execute(sql`
+      UPDATE competition_config
+         SET devig_method = 'shin'
+       WHERE devig_method = 'power'
+         AND gender = 'female'
     `);
     await db.execute(sql`
       DO $$

@@ -50,6 +50,11 @@ export const competitionConfigTable = pgTable("competition_config", {
   warmupCompletedAt: timestamp("warmup_completed_at", { withTimezone: true }),
   universeTierDecidedAt: timestamp("universe_tier_decided_at", { withTimezone: true }),
   settlementBiasIndex: numeric("settlement_bias_index", { precision: 6, scale: 4 }),
+  // Task 14 (2026-05-11): per-league de-vig method selection. Defaults to
+  // 'power' (Newton-solved Σπ_i^k = 1). Backtest can flip a league to 'shin'
+  // for insider-info adjustment or back to 'proportional' for the legacy
+  // baseline. See services/devig.ts for the implementations.
+  devigMethod: text("devig_method").notNull().default("power"),
 });
 
 export const insertCompetitionConfigSchema = createInsertSchema(competitionConfigTable).omit({

@@ -30,6 +30,7 @@ import {
 import { eq, and, gte, lte, sql, like, inArray, ne, desc } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { resilientFetch, isCircuitOpen } from "./resilientFetch";
+import { devig, type DevigMethod } from "./devig";
 
 const BASE_URL = "https://api.oddspapi.io/v4";
 const ODDSPAPI_SERVICE = "oddspapi";
@@ -4124,6 +4125,7 @@ export async function derivePinnacleDCFromMatchOdds(): Promise<{
       selectionName: oddsSnapshotsTable.selectionName,
       backOdds: oddsSnapshotsTable.backOdds,
       snapshotTime: oddsSnapshotsTable.snapshotTime,
+      league: matchesTable.league,
     })
     .from(oddsSnapshotsTable)
     .innerJoin(matchesTable, eq(oddsSnapshotsTable.matchId, matchesTable.id))
@@ -4136,6 +4138,20 @@ export async function derivePinnacleDCFromMatchOdds(): Promise<{
     )
     .orderBy(desc(oddsSnapshotsTable.snapshotTime));
 
+  // Task 14 (2026-05-11): load per-league de-vig method choice. competition_config
+  // is small (~1k rows) so we pull all-in-one and cache as a Map. Falls back to
+  // 'power' for any league not in competition_config (no match by name).
+  const devigCfgRows = await db
+    .select({
+      name: competitionConfigTable.name,
+      devigMethod: competitionConfigTable.devigMethod,
+    })
+    .from(competitionConfigTable);
+  const devigByLeague = new Map<string, DevigMethod>(
+    devigCfgRows.map((r) => [r.name, (r.devigMethod ?? "power") as DevigMethod]),
+  );
+
+  const matchLeagueMap = new Map<number, string>();
   const matchMap = new Map<number, { home: number; draw: number; away: number }>();
   const matchSeen = new Map<number, Set<string>>();
   for (const row of pinnMO) {
@@ -4155,6 +4171,7 @@ export async function derivePinnacleDCFromMatchOdds(): Promise<{
 
     if (!matchMap.has(row.matchId)) matchMap.set(row.matchId, { home: 0, draw: 0, away: 0 });
     matchMap.get(row.matchId)![canonical] = odds;
+    if (row.league) matchLeagueMap.set(row.matchId, row.league);
   }
 
   let matchesProcessed = 0;
@@ -4180,13 +4197,14 @@ export async function derivePinnacleDCFromMatchOdds(): Promise<{
   for (const matchId of allMatchIds) {
     const mo = matchMap.get(matchId)!;
 
-    const implHome = 1 / mo.home;
-    const implDraw = 1 / mo.draw;
-    const implAway = 1 / mo.away;
-    const totalImplied = implHome + implDraw + implAway;
-    const fairHome = implHome / totalImplied;
-    const fairDraw = implDraw / totalImplied;
-    const fairAway = implAway / totalImplied;
+    // Task 14 (2026-05-11): replaces the inline proportional de-vig with the
+    // per-league configured method (power-Newton or Shin). Defaults to 'power'
+    // for any league missing from competition_config. The de-vig service
+    // falls back to proportional internally if Newton/bisection fails to
+    // converge, so the output vector is always valid.
+    const league = matchLeagueMap.get(matchId);
+    const method = (league && devigByLeague.get(league)) ?? "power";
+    const [fairHome, fairDraw, fairAway] = devig([mo.home, mo.draw, mo.away], method);
 
     const dcOdds = {
       "1X": 1 / (fairHome + fairDraw),
