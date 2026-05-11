@@ -1806,17 +1806,35 @@ export async function placeLiveBetOnBetfair(params: {
       const runner = liquidity?.runners?.find((r) => r.selectionId === selectionId);
       const bestBack = runner?.backPrices?.[0]?.price;
       if (!bestBack || bestBack <= 1) {
-        const msg = `TAKE_BEST_BACK: no back price available on market ${market.marketId}`;
-        logger.warn({ internalBetId, marketId: market.marketId, selectionId }, msg);
-        return { success: false, error: "BEST_BACK_UNAVAILABLE" };
+        // 2026-05-11: was return-fail. Niche AH sub-lines (Away+0.75 etc.)
+        // often have no current back-side liquidity. Falling back to LIMIT-at-
+        // target lets the order sit on the book until it matches OR persists
+        // to SP at kickoff (if ah_persist_enabled). Either outcome is strictly
+        // better than abandoning the bet. Theory: a positive-EV bet that sits
+        // unmatched preserves option value; demoting to shadow throws away the
+        // entire EV.
+        logger.info(
+          { internalBetId, marketId: market.marketId, selectionId, target: odds },
+          "TAKE_BEST_BACK: no back-side liquidity — falling back to LIMIT at target",
+        );
+        // placementPrice stays at `odds` (initial value); LIMIT order at target
+        // is the fallback behaviour.
+      } else {
+        const minAcceptable = odds * (1 - slippageTolerance);
+        if (bestBack < minAcceptable) {
+          // 2026-05-11: same fallback rationale as above. Betfair's current
+          // price has drifted away from our target by more than tolerance —
+          // taking the drifted price would crystallise slippage, so instead
+          // we LIMIT at target and let the order ride.
+          logger.info(
+            { internalBetId, target: odds, bestBack, minAcceptable, slippageTolerance },
+            "TAKE_BEST_BACK: best back below tolerance — falling back to LIMIT at target",
+          );
+          // placementPrice stays at `odds` (target).
+        } else {
+          placementPrice = bestBack;
+        }
       }
-      const minAcceptable = odds * (1 - slippageTolerance);
-      if (bestBack < minAcceptable) {
-        const msg = `TAKE_BEST_BACK: best back ${bestBack} below tolerance ${minAcceptable.toFixed(2)} (target ${odds}, slippage ${slippageTolerance})`;
-        logger.info({ internalBetId, target: odds, bestBack, minAcceptable }, msg);
-        return { success: false, error: "BEST_BACK_BELOW_TOLERANCE" };
-      }
-      placementPrice = bestBack;
       logger.info(
         { internalBetId, target: odds, placementPrice, marketId: market.marketId },
         "TAKE_BEST_BACK placement — using current best back price",
