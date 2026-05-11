@@ -1963,21 +1963,22 @@ export async function placePaperBet(
   try {
     await pgClient.query("BEGIN");
 
-    // DEBUG (2026-05-11): trace why raw_model_probability lands NULL in DB.
-    // Remove once verified.
-    logger.info(
-      {
-        matchId,
-        marketType,
-        selectionName,
-        rawModelProbability,
-        calibrationBucketId,
-        modelProbability,
-        rawType: typeof rawModelProbability,
-        bucketType: typeof calibrationBucketId,
-      },
-      "DBG_T12: placePaperBet insert values",
-    );
+    // Task 2 follow-up (2026-05-11): skip ghost emissions where both stake
+    // and shadow_stake are zero — they carry no financial signal AND no
+    // £0 shadow-track signal. Happens when commission-aware Kelly returns 0
+    // for sub-marginal edges (Kelly = 0 → full_kelly = 0 → shadow_stake =
+    // 0 × 0.25 = 0). Without this guard, the bet lands on bet_track='live'
+    // (because the bet_track decision tree checks shadowStake > 0, not
+    // isShadowBet) and pollutes reporting with phantom rows. Rolls back the
+    // BEGIN we just opened so the connection returns to the pool clean.
+    if (stake === 0 && (shadowStake == null || shadowStake === 0)) {
+      await pgClient.query("ROLLBACK");
+      logger.info(
+        { matchId, marketType, selectionName, edge },
+        "Ghost emission skipped — both stake and shadow_stake are 0 (sub-marginal Kelly)",
+      );
+      return { placed: false, reason: "ghost_zero_stake" };
+    }
     const betResult = await db
       .insert(paperBetsTable)
       .values({
