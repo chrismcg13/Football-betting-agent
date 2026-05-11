@@ -2371,6 +2371,10 @@ export async function placePaperBet(
             awayTeam: match.awayTeam,
             placementMode,
             slippageTolerance: tbbSlippage,
+            // Task 24 Part D — flag-gated PERSIST for high-edge AH.
+            // The resolver reads agent_config.ah_persist_enabled and the
+            // ah_persist_min_edge threshold; when off, this is a no-op.
+            edge,
           });
 
           if (!liveResult.success) {

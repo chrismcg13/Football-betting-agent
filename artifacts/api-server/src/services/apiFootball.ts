@@ -748,7 +748,17 @@ export async function fetchApiFootball<T = unknown>(
 // ─── Fixture discovery ────────────────────────────────────────────────────────
 
 interface ApiFixture {
-  fixture: { id: number; date: string; status: { short: string; long: string } };
+  fixture: {
+    id: number;
+    date: string;
+    status: { short: string; long: string };
+    // Phase 4b.2 (2026-05-11) — API-Football returns venue here on
+    // /fixtures responses; the lineup-capture path already consumes it
+    // (apiFootball.ts:2229) but discoverFixtureMappings didn't, so the
+    // back-reference matches.venue_api_id stayed NULL for 99.8% of rows
+    // until a lineup arrived (often never for non-headline leagues).
+    venue?: { id?: number | null; name?: string | null; city?: string | null } | null;
+  };
   league: { id: number; name: string; country: string };
   teams: {
     home: { id: number; name: string };
@@ -985,6 +995,26 @@ export async function discoverFixtureMappings(): Promise<FixtureMatch[]> {
     if (matched.teams?.home?.id && matched.teams?.away?.id) {
       await upsertFeature(match.id, "_af_home_team_id", matched.teams.home.id);
       await upsertFeature(match.id, "_af_away_team_id", matched.teams.away.id);
+    }
+
+    // Phase 4b.2 (2026-05-11) — capture venue at mapping time, not only
+    // on lineup arrival. The AF /fixtures response already carries
+    // venue.id; previously discoverFixtureMappings dropped it, leaving
+    // matches.venue_api_id NULL until a lineup capture path fired
+    // (which never happens for many non-headline leagues). One-shot
+    // cost: a JSON field read we were already paying for.
+    if (matched.fixture.venue?.id) {
+      try {
+        const { captureVenueFromFixture } = await import("./venueIngestionService");
+        await captureVenueFromFixture(
+          match.id,
+          matched.fixture.venue,
+          matched.league?.country ?? null,
+        );
+      } catch (err) {
+        logger.warn({ err, matchId: match.id, venueId: matched.fixture.venue.id },
+          "Venue capture on discovery failed (non-fatal)");
+      }
     }
 
     mappings.push({

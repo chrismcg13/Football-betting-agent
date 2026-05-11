@@ -1,10 +1,52 @@
 import axios, { type AxiosInstance } from "axios";
 import { logger } from "../lib/logger";
-import { db } from "@workspace/db";
+import { db, agentConfigTable } from "@workspace/db";
 import { paperBetsTable, complianceLogsTable, oddsSnapshotsTable } from "@workspace/db";
 import { eq, and, isNotNull, isNull, sql, desc, inArray } from "drizzle-orm";
 import { BETFAIR_TICKS } from "./orderManager";
 import { relayGetLiquidity } from "./vpsRelay";
+
+/**
+ * Task 24 Part D — persistence-type resolver. Reads two config keys
+ * with a 60s cache so cron-rate placements don't hammer the DB:
+ *   ah_persist_enabled      ('true' | 'false', default 'false')
+ *   ah_persist_min_edge     (number,         default 0.15)
+ *
+ * Returns 'PERSIST' only for ASIAN_HANDICAP bets with edge above the
+ * threshold when the flag is on. Everything else gets 'LAPSE'.
+ */
+const PERSIST_CFG_TTL_MS = 60 * 1000;
+let cachedPersistCfg: { enabled: boolean; minEdge: number; fetchedAt: number } | null = null;
+
+async function loadPersistCfg(): Promise<{ enabled: boolean; minEdge: number }> {
+  const now = Date.now();
+  if (cachedPersistCfg && now - cachedPersistCfg.fetchedAt < PERSIST_CFG_TTL_MS) {
+    return { enabled: cachedPersistCfg.enabled, minEdge: cachedPersistCfg.minEdge };
+  }
+  const rows = await db
+    .select({ key: agentConfigTable.key, value: agentConfigTable.value })
+    .from(agentConfigTable)
+    .where(inArray(agentConfigTable.key, ["ah_persist_enabled", "ah_persist_min_edge"]));
+  const byKey = new Map(rows.map((r) => [r.key, r.value]));
+  const enabled = byKey.get("ah_persist_enabled") === "true";
+  const minEdgeRaw = byKey.get("ah_persist_min_edge");
+  const minEdgeNum = minEdgeRaw != null ? Number(minEdgeRaw) : 0.15;
+  const minEdge = Number.isFinite(minEdgeNum) && minEdgeNum > 0 ? minEdgeNum : 0.15;
+  cachedPersistCfg = { enabled, minEdge, fetchedAt: now };
+  return { enabled, minEdge };
+}
+
+async function resolvePersistenceType(args: {
+  marketType: string;
+  edge?: number;
+}): Promise<BetfairPersistenceType> {
+  if (args.marketType !== "ASIAN_HANDICAP") return "LAPSE";
+  if (args.edge == null || !Number.isFinite(args.edge)) return "LAPSE";
+  const { enabled, minEdge } = await loadPersistCfg();
+  if (!enabled) return "LAPSE";
+  if (args.edge < minEdge) return "LAPSE";
+  return "PERSIST";
+}
 
 export type PlacementMode = "TARGET" | "TAKE_BEST_BACK";
 
@@ -467,6 +509,8 @@ export async function getLiveBankroll(): Promise<number> {
   }
 }
 
+export type BetfairPersistenceType = "LAPSE" | "PERSIST" | "MARKET_ON_CLOSE";
+
 export interface PlaceInstruction {
   orderType: "LIMIT";
   selectionId: number;
@@ -475,7 +519,7 @@ export interface PlaceInstruction {
   limitOrder: {
     size: number;
     price: number;
-    persistenceType: "LAPSE";
+    persistenceType: BetfairPersistenceType;
   };
 }
 
@@ -1603,6 +1647,12 @@ export async function placeLiveBetOnBetfair(params: {
   // limit-at-target behaviour for low-edge / lazy-promoted bets.
   placementMode?: PlacementMode;
   slippageTolerance?: number;
+  // Task 24 Part D (2026-05-11) — bet's calculated edge. Only used to decide
+  // persistenceType: when edge ≥ ah_persist_min_edge (default 0.15) AND
+  // market is ASIAN_HANDICAP AND agent_config.ah_persist_enabled='true',
+  // unmatched portion goes to Starting Price at in-play instead of lapsing.
+  // Default undefined → legacy LAPSE behaviour for all markets.
+  edge?: number;
 }): Promise<{
   success: boolean;
   betfairBetId?: string;
@@ -1623,6 +1673,7 @@ export async function placeLiveBetOnBetfair(params: {
     awayTeam,
     placementMode = "TARGET",
     slippageTolerance = 0.05,
+    edge,
   } = params;
 
   if (NON_EXCHANGE_MARKETS.has(marketType)) {
@@ -1765,6 +1816,23 @@ export async function placeLiveBetOnBetfair(params: {
       "Slippage guard threw — proceeding at intended stake");
   }
 
+  // Task 24 Part D — persistence type. The unmatched portion of a LIMIT
+  // order normally LAPSEs at in-play (refunded, never settles). For
+  // high-edge ASIAN_HANDICAP bets the model has already identified the
+  // mispricing; on average the price tightens by kick-off and the
+  // matched portion is profitable, but the unmatched residual is dead
+  // EV under LAPSE. Switching to PERSIST sends the residual to Starting
+  // Price at in-play — Betfair's SP auction at kick-off — which closes
+  // the EV gap on the residual.
+  //
+  // Gated behind agent_config.ah_persist_enabled (default 'false') as a
+  // money-guardrail change — operator must explicitly opt in. Threshold
+  // controlled by ah_persist_min_edge (default 0.15).
+  const persistenceType = await resolvePersistenceType({
+    marketType,
+    edge,
+  });
+
   // Idempotent on retry — Betfair rejects DUPLICATE_TRANSACTION; do NOT add a timestamp.
   const customerRef = `BAO-${internalBetId}`;
 
@@ -1779,7 +1847,7 @@ export async function placeLiveBetOnBetfair(params: {
           limitOrder: {
             size: finalStake,
             price: roundedOdds,
-            persistenceType: "LAPSE",
+            persistenceType,
           },
         },
       ],

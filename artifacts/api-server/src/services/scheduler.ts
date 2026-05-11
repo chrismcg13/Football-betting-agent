@@ -2621,6 +2621,27 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Stadium geocode + travel feature scheduler active — every 6h at :20");
 
+  // Phase 4b.2 (2026-05-11) — venue_api_id backfill. Walks settled
+  // matches that have a cached _af_fixture_id but never had venue
+  // captured (lineup-arrival path only fires for headline leagues
+  // close to kickoff). Fetches up to 400 fixtures per run via the
+  // AF /fixtures?ids endpoint (~20 API calls per tick) and persists
+  // venue_api_id back to matches. Feeds the stadium geocoder cron
+  // immediately above — they share the 6h cadence so newly-captured
+  // venues get geocoded on the next tick.
+  cron.schedule("10 */6 * * *", () => {
+    void (async () => {
+      try {
+        const { runVenueIdBackfill } = await import("./venueIdBackfill");
+        const r = await runVenueIdBackfill();
+        if (r.candidates > 0) logger.info(r, "venue_api_id backfill complete");
+      } catch (err) {
+        logger.error({ err }, "venue_api_id backfill failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("venue_api_id backfill scheduler active — every 6h at :10");
+
   // Task 21 (Phase 5a) — SHAP-on-residuals drift detector. Daily at
   // 03:30 UTC, after the Bundle B analytics (02:30) and before the
   // weekly calibration fit (Mon 04:00). Computes per-feature K-S
@@ -2703,16 +2724,24 @@ export function startSettlementCron(): void {
   // Phase 4b startup self-seed: kick off a first geocode pass + travel
   // backfill at T+120s. The 120s offset puts it after the ClubElo
   // self-seed and the trading-cycle warmup so we don't fight for IO.
+  // Phase 4b.2 (2026-05-11): venue_api_id backfill runs FIRST so the
+  // geocoder has new venue_ids to chew on. Sequenced (await) so the
+  // geocoder sees freshly-captured venues on the same tick.
   setTimeout(() => {
     void (async () => {
       try {
+        const { runVenueIdBackfill } = await import("./venueIdBackfill");
+        const v = await runVenueIdBackfill();
+        if (v.candidates > 0) {
+          logger.info(v, "venue_api_id startup backfill complete");
+        }
         const { runStadiumGeocodeBackfill, runTravelFeatureBackfill } = await import("./stadiumGeocoder");
         const geo = await runStadiumGeocodeBackfill();
         logger.info(geo, "Stadium geocode startup self-seed complete");
         const travel = await runTravelFeatureBackfill();
         logger.info(travel, "Travel feature startup backfill complete");
       } catch (err) {
-        logger.warn({ err }, "Stadium / travel startup self-seed failed");
+        logger.warn({ err }, "Stadium / travel / venue_id startup self-seed failed");
       }
     })();
   }, 120 * 1000);

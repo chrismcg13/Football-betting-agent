@@ -59,6 +59,15 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   // a match. Below the slippage tolerance, demote to shadow.
   { key: "take_best_back_min_edge", value: "0.10" },
   { key: "take_best_back_slippage_tolerance", value: "0.05" },
+  // Task 24 Part D (2026-05-11): PERSIST persistence type for high-edge
+  // ASIAN_HANDICAP. When enabled, unmatched portion goes to Starting
+  // Price at in-play instead of LAPSE. Gated default OFF — this is a
+  // money-guardrail change (exposes the residual to SP execution risk)
+  // and needs explicit operator approval per feedback_autonomy_and_guardrails.
+  // Flip to 'true' after observing Part C fill-rate uplift on the AH
+  // segment for at least a few days.
+  { key: "ah_persist_enabled", value: "false" },
+  { key: "ah_persist_min_edge", value: "0.15" },
   // Task 11 (2026-05-11): synthetic CLV consensus. Phase 3d.1 ships the
   // Smarkets fetcher only; gated behind a flag so the first deploy is a
   // no-op until the operator flips it. Matchbook + Betfair SP fetchers

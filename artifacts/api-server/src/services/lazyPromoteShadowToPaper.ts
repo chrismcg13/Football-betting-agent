@@ -308,6 +308,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
         }
 
         const { placeLiveBetOnBetfair } = await import("./betfairLive");
+        const promoteEdge = Number(r.edge);
         const placeResult = await placeLiveBetOnBetfair({
           internalBetId: r.id,
           betfairEventId: m.betfair_event_id,
@@ -317,6 +318,9 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           stake,
           homeTeam: m.home_team,
           awayTeam: m.away_team,
+          // Task 24 Part D — pass edge so the persistence-type resolver
+          // can opt into PERSIST for high-edge AH (flag-gated).
+          edge: Number.isFinite(promoteEdge) ? promoteEdge : undefined,
         });
 
         if (!placeResult.success || !placeResult.betfairBetId) {
