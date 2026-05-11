@@ -73,9 +73,16 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
       SUM(CASE WHEN pb.bet_track = 'shadow'
                THEN COALESCE(pb.shadow_pnl, 0)
                ELSE COALESCE(pb.net_pnl, pb.settlement_pnl, 0) END)::numeric AS pnl,
-      AVG(pb.clv_pct)::numeric                                     AS avg_clv,
-      STDDEV(pb.clv_pct)::numeric                                  AS sd_clv,
-      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL)::int          AS clv_n
+      -- 2026-05-11 evening: CLV now uses COALESCE(pinnacle_clv, synthetic_clv).
+      -- The clv_pct column is Pinnacle-anchored only — leagues without Pinnacle
+      -- coverage (most of the non-tier-1 universe) were structurally blocked
+      -- from the t-stat qualification path. Synthetic CLV from Smarkets +
+      -- Matchbook + Betfair-SP weighted consensus (sharpConsensus.ts) is now
+      -- a valid fallback. Per the back-to-theory plan Task 11, this is the
+      -- "synthetic sharp consensus" closing-line anchor for non-Pinnacle scopes.
+      AVG(COALESCE(pb.clv_pct, pb.synthetic_clv_pct))::numeric      AS avg_clv,
+      STDDEV(COALESCE(pb.clv_pct, pb.synthetic_clv_pct))::numeric   AS sd_clv,
+      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL OR pb.synthetic_clv_pct IS NOT NULL)::int AS clv_n
     FROM paper_bets pb
     LEFT JOIN matches m ON pb.match_id = m.id
     WHERE pb.placed_at >= ${analysisStart}::date

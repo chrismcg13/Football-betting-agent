@@ -973,6 +973,50 @@ export async function placePaperBet(
   // Live eligibility is now governed entirely by v_live_eligibility_candidates
   // (Wilson lower-95 on win-rate AND/OR t-stat on CLV at n>=30). Any market
   // whose (league, market_type) qualifies there may route to live.
+  //
+  // 2026-05-11 evening: ENFORCE the eligibility view as a placement gate
+  // (previously it was informational only). If the bet's (league, market_type)
+  // is not in v_live_eligibility_candidates, demote to shadow. Kelly theory:
+  // a scope must have demonstrated edge (Wilson lower-95 > 50% win rate, or
+  // t-stat > 1.96 on CLV, at n >= 30 settled bets) before real capital flows
+  // to it. Scopes below the threshold remain in shadow to keep accumulating
+  // settlement data without bankroll exposure.
+  if (!isShadowBet) {
+    try {
+      const matchLeague = await db
+        .select({ league: matchesTable.league })
+        .from(matchesTable)
+        .where(eq(matchesTable.id, matchId))
+        .limit(1);
+      const league = matchLeague[0]?.league;
+      if (league) {
+        const eligibilityRow = await db.execute(sql`
+          SELECT qualifies_live, qualification_basis, n
+          FROM v_live_eligibility_candidates
+          WHERE league = ${league} AND market_type = ${marketType}
+          LIMIT 1
+        `);
+        const eligibility = ((eligibilityRow as any).rows ?? [])[0] as
+          | { qualifies_live: boolean; qualification_basis: string; n: number }
+          | undefined;
+        if (!eligibility?.qualifies_live) {
+          await logShadowGateExemption(
+            "scope_not_in_live_eligibility",
+            experimentTag ?? null,
+            `Scope ${league}:${marketType} not in v_live_eligibility_candidates (needs Wilson lower-95 win-rate > 50% AND/OR t-stat on CLV > 1.96 at n>=30 settled bets) — demoting to shadow to keep accumulating data`,
+            null,
+            universeTier,
+          );
+          isShadowBet = true;
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err, matchId, marketType, selectionName },
+        "Live eligibility lookup failed — proceeding without scope gate (fail-open to preserve placement)",
+      );
+    }
+  }
 
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;
@@ -1618,31 +1662,39 @@ export async function placePaperBet(
     commissionRate,
   );
 
+  // 2026-05-11 — REMOVED: prior live-Kelly multiplier (level-based Kelly
+  // fraction × no-Pinnacle 0.5x haircut, lines pre-this-commit).
+  //
+  // Theory rationale for removal:
+  //   - kellyFractionForScore (0.125 → 0.50) inside calculateDynamicKellyStake
+  //     ALREADY applies confidence-aware Kelly fractioning. This is the
+  //     score-based heuristic.
+  //   - tierKellyFraction (dynamic Kelly from Monte-Carlo drawdown target,
+  //     applied at line ~1700) is the THEORY-pure Kelly fraction control,
+  //     calibrated against realised return/variance to target a 1st-pctile
+  //     drawdown ≤ operator setting.
+  //   - dynamic_kelly_min_fraction (operator floor on dynamicKelly reader)
+  //     gives the operator a single explicit Kelly-aggression knob.
+  //   - The level-based multiplier here added a THIRD layer of Kelly
+  //     compression on top, producing eighth/sixteenth-Kelly effective
+  //     fractions on small bankrolls. Evidence: 402 of 738 bets in the
+  //     last 12h had >15% edge yet ALL demoted to shadow because cumulative
+  //     compression squashed stakes to <£2. That's not Kelly conservatism,
+  //     it's redundant compounded discounting.
+  //
+  // Kelly theory says: ONE fractional Kelly per bet, optimally chosen.
+  // We now have dynamic Kelly (Monte Carlo) as that single fraction,
+  // operator-floorable via dynamic_kelly_min_fraction. Score-based
+  // confidence multiplier kept (it's a calibration aid, not redundant
+  // Kelly compression). Level-based multiplier gone.
+  //
+  // The no-Pinnacle haircut also removed — synthetic CLV from Smarkets/
+  // Matchbook/Betfair-SP now provides a sharp anchor for non-Pinnacle
+  // scopes (Phase 2 wire-in below in analysisJobs.ts).
   if (liveLimits) {
-    const liveKelly = getLiveKellyFraction(
-      liveLimits.level,
-      !!(pinnacleOdds && pinnacleOdds > 0),
-    );
-    // 2026-05-11 BUG FIX: the prior multiplier `(liveKelly / 0.25)` assumed
-    // calculateDynamicKellyStake's base fraction was always 0.25, which was
-    // true when kellyFractionForScore returned a constant 0.25 across the
-    // board. After kellyFractionForScore was changed to score-variable
-    // (0.125 / 0.25 / 0.375 / 0.50 in paperTrading.ts:576-585) the multiplier
-    // stopped converting "intended live fraction" into "scale factor on
-    // applied base fraction" — it just amplified or shrank by liveKelly/0.25
-    // regardless of what kellyFractionForScore actually returned. Effective
-    // applied fraction was kellyFractionForScore(score) * (liveKelly / 0.25),
-    // not liveKelly. Concrete impact: score=80 (base 0.50), live level=DEFAULT
-    // (Kelly 0.25) → applied 0.50 * 1.0 = 0.50 of full Kelly, double the
-    // intended cap. Fix: divide by the actual base fraction so the net
-    // effective fraction equals liveKelly.
-    const appliedBaseFraction = kellyFractionForScore(score, marketType);
-    if (appliedBaseFraction > 0) {
-      stake = Math.round(stake * (liveKelly / appliedBaseFraction) * 100) / 100;
-    }
     logger.info(
-      { matchId, marketType, liveLevel: liveLimits.level, liveKelly, appliedBaseFraction, hasPinnacle: !!(pinnacleOdds && pinnacleOdds > 0) },
-      "Live Kelly fraction applied",
+      { matchId, marketType, liveLevel: liveLimits.level, note: "live-Kelly level multiplier removed 2026-05-11; dynamic Kelly is now the sole fraction control" },
+      "Live mode stake — Kelly compression chain simplified",
     );
   }
 
