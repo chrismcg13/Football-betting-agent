@@ -2519,6 +2519,24 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Synthetic CLV backfill scheduler active — every 15 min");
 
+  // Task 15 (Phase 4a) — daily ClubElo ingestion. Fetches yesterday's
+  // snapshot at 02:00 UTC (yesterday = stable, today's Elo can revise
+  // as match results roll in). ~3,300 rows per fetch; upsert is
+  // idempotent on the (date, team_name) PK.
+  cron.schedule("0 2 * * *", () => {
+    logger.info("ClubElo ingestion triggered (daily 02:00 UTC)");
+    void (async () => {
+      try {
+        const { runClubEloIngestion } = await import("./clubElo");
+        const r = await runClubEloIngestion();
+        logger.info(r, "ClubElo ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "ClubElo ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("ClubElo scheduler active — daily 02:00 UTC");
+
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {

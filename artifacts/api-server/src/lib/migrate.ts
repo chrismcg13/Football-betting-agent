@@ -3314,6 +3314,32 @@ export async function runMigrations() {
 
     logger.info("Sharp consensus snapshots ready (Task 11)");
 
+    // Task 15 — daily ClubElo snapshots (Phase 4a). ~3,300 rows/day,
+    // primary-key (date, team_name) for idempotent upsert.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS club_elo_snapshots (
+        date        DATE NOT NULL,
+        team_name   TEXT NOT NULL,
+        country     TEXT,
+        level       SMALLINT,
+        elo         NUMERIC(8,3) NOT NULL,
+        rank        INTEGER,
+        from_date   DATE,
+        to_date     DATE,
+        PRIMARY KEY (date, team_name)
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS club_elo_team_recent
+        ON club_elo_snapshots(team_name, date DESC)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS club_elo_country_level
+        ON club_elo_snapshots(country, level, date DESC)
+    `);
+
+    logger.info("ClubElo snapshots ready (Task 15)");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
