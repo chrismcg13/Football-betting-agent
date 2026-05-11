@@ -50,20 +50,26 @@ export async function runVenueIdBackfill(): Promise<VenueIdBackfillResult> {
   // Find candidates: matches lacking venue_api_id but with a cached AF
   // fixture ID. Order by kickoff_time DESC to prioritise recent matches
   // (their venue is most relevant for upcoming-bet feature engineering).
+  //
+  // features.feature_value is NUMERIC, not TEXT — the ~ regex operator
+  // doesn't work on numeric. Cast directly to integer with a NULL/zero
+  // guard. (Initial deploy 2026-05-11 18:17 failed on the regex check;
+  // diagnosed via the new cron_health observability.)
   const rows = await db.execute(sql`
     SELECT m.id::int AS match_id,
-           f.feature_value AS fixture_id_str
+           f.feature_value::bigint AS fixture_id
     FROM matches m
     JOIN features f
       ON f.match_id = m.id AND f.feature_name = '_af_fixture_id'
     WHERE m.venue_api_id IS NULL
-      AND f.feature_value ~ '^[0-9]+$'
+      AND f.feature_value IS NOT NULL
+      AND f.feature_value > 0
     ORDER BY m.kickoff_time DESC NULLS LAST
     LIMIT ${MAX_MATCHES_PER_RUN}
   `);
   const candidates = (((rows as unknown) as { rows?: Array<{
     match_id: number;
-    fixture_id_str: string;
+    fixture_id: number | string;
   }> }).rows ?? []);
   result.candidates = candidates.length;
   if (candidates.length === 0) {
@@ -77,8 +83,8 @@ export async function runVenueIdBackfill(): Promise<VenueIdBackfillResult> {
   const fixtureToMatches = new Map<number, number[]>();
   const fixtureIds: number[] = [];
   for (const c of candidates) {
-    const fid = Number.parseInt(c.fixture_id_str, 10);
-    if (!Number.isFinite(fid)) continue;
+    const fid = typeof c.fixture_id === "number" ? c.fixture_id : Number(c.fixture_id);
+    if (!Number.isFinite(fid) || fid <= 0) continue;
     fixtureIds.push(fid);
     const arr = fixtureToMatches.get(fid) ?? [];
     arr.push(c.match_id);

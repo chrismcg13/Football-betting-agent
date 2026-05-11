@@ -92,30 +92,94 @@ async function fetchJson<T>(path: string): Promise<T | null> {
  * back. If `events.length === 0` consistently in production, the
  * follow-up bundle should ship the parent_id walk.
  */
+/** Smarkets root Football category. Confirmed via live API probe
+ *  2026-05-11 — `/events/` returns "Football" with id=121005 at the
+ *  top level. Competitions live as children of this node. */
+const FOOTBALL_ROOT_PARENT_ID = 121005;
+const COMPETITION_WALK_CAP = 60;
+const PER_COMPETITION_CAP = 200;
+
 export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 1000): Promise<SmarketsEvent[]> {
-  const now = new Date().toISOString();
-  const until = new Date(Date.now() + lookaheadMs).toISOString();
-  const params = new URLSearchParams({
+  const now = new Date();
+  const until = new Date(Date.now() + lookaheadMs);
+  const nowIso = now.toISOString();
+  const untilIso = until.toISOString();
+
+  // Attempt 1 — legacy single-call shortcut. `type_scope=single_event`
+  // is the original code path; live verification 2026-05-11 showed it
+  // returns 0 events, but we keep it in case Smarkets fixes it server-side.
+  const legacy = new URLSearchParams({
     type_scope: "single_event",
     type_domain: "sport-soccer",
     state: "upcoming",
-    start_datetime_min: now,
-    start_datetime_max: until,
+    start_datetime_min: nowIso,
+    start_datetime_max: untilIso,
     limit: "200",
   });
-  const data = await fetchJson<{ events: SmarketsEvent[] }>(`/events/?${params}`);
-  const events = data?.events ?? [];
+  const legacyResp = await fetchJson<{ events: SmarketsEvent[] }>(`/events/?${legacy}`);
+  const legacyEvents = legacyResp?.events ?? [];
+  if (legacyEvents.length > 0) {
+    logger.info(
+      { count: legacyEvents.length, path: "legacy_single_call" },
+      "Smarkets: legacy filter returned events",
+    );
+    return legacyEvents;
+  }
+
+  // Attempt 2 — parent_id walk. Smarkets v3 organises events as a tree:
+  //   Football (121005)
+  //   └── competitions (Premier League, Liga 1, …)
+  //       └── individual matches (the rows we want)
+  // Iterate competitions under Football, then matches under each.
+  logger.info(
+    "Smarkets: legacy filter returned 0 — falling back to parent_id walk under Football category",
+  );
+
+  const compsResp = await fetchJson<{ events: SmarketsEvent[] }>(
+    `/events/?parent_id=${FOOTBALL_ROOT_PARENT_ID}&limit=${COMPETITION_WALK_CAP}`,
+  );
+  const competitions = compsResp?.events ?? [];
   logger.info(
     {
-      url: `/events/?${params}`,
-      count: events.length,
-      firstName: events[0]?.name ?? null,
-      firstType: (events[0] as { type?: string } | undefined)?.type ?? null,
-      firstKeys: events[0] ? Object.keys(events[0] as object).slice(0, 15) : [],
+      competitionsFound: competitions.length,
+      sample: competitions.slice(0, 5).map((c) => ({ id: c.id, name: c.name })),
     },
-    "Smarkets listUpcomingFootballEvents response shape",
+    "Smarkets: competitions under Football",
   );
-  return events;
+  if (competitions.length === 0) return [];
+
+  const allMatches: SmarketsEvent[] = [];
+  for (const comp of competitions) {
+    const matchesResp = await fetchJson<{ events: SmarketsEvent[] }>(
+      `/events/?parent_id=${comp.id}&state=upcoming&limit=${PER_COMPETITION_CAP}`,
+    );
+    const matches = matchesResp?.events ?? [];
+    if (matches.length === 0) continue;
+
+    // Filter to events kicking off within the lookahead window. Smarkets
+    // returns start_datetime on the event row.
+    for (const m of matches) {
+      const startStr = m.start_datetime ?? null;
+      if (!startStr) continue;
+      const startMs = Date.parse(startStr);
+      if (!Number.isFinite(startMs)) continue;
+      if (startMs >= now.getTime() && startMs <= until.getTime()) {
+        allMatches.push(m);
+      }
+    }
+  }
+
+  logger.info(
+    {
+      path: "parent_id_walk",
+      competitionsScanned: competitions.length,
+      matchesInWindow: allMatches.length,
+      firstName: allMatches[0]?.name ?? null,
+      firstKeys: allMatches[0] ? Object.keys(allMatches[0] as object).slice(0, 15) : [],
+    },
+    "Smarkets listUpcomingFootballEvents (parent_id walk) complete",
+  );
+  return allMatches;
 }
 
 /** List markets for a given event. */
