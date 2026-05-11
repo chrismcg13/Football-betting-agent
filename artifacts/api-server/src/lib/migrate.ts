@@ -1403,7 +1403,9 @@ export async function runMigrations() {
     await db.execute(sql`DROP VIEW IF EXISTS paper_bets_current`);
     await db.execute(sql`
       CREATE VIEW paper_bets_current AS
-        SELECT * FROM paper_bets WHERE legacy_regime = false
+        SELECT * FROM paper_bets
+        WHERE legacy_regime = false
+          AND deleted_at IS NULL
     `);
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS idx_paper_bets_current_placed_at
@@ -2381,7 +2383,9 @@ export async function runMigrations() {
     await db.execute(sql`DROP VIEW IF EXISTS paper_bets_current`);
     await db.execute(sql`
       CREATE VIEW paper_bets_current AS
-        SELECT * FROM paper_bets WHERE legacy_regime = false
+        SELECT * FROM paper_bets
+        WHERE legacy_regime = false
+          AND deleted_at IS NULL
     `);
 
     // ────────────────────────────────────────────────────────────────────

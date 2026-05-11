@@ -114,10 +114,18 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
       s.bet_track,
       s.n,
       (s.w::numeric / NULLIF(s.n, 0))                                          AS win_rate,
-      -- Wilson 95% lower bound on win rate
+      -- Wilson 95% lower bound on win rate.
+      -- 2026-05-11 BUG FIX: prior formula had an extra division by (n+3.84)
+      -- INSIDE the SQRT *as well as* outside, producing margin ≈ correct/10
+      -- on n=100 and making lo95 ≈ centre — the bound was essentially the
+      -- point estimate. That made qualifies_live fire on segments whose true
+      -- Wilson lo95 was well below the threshold, over-promoting marginal
+      -- scopes. Standard form: centre = (w + z²/2)/(n + z²);
+      -- margin = z × SQRT(w(n-w)/n + z²/4) / (n + z²); lower = centre − margin.
+      -- z=1.96, z²=3.8416, z²/2=1.9208, z²/4=0.9604.
       ((s.w + 1.92) / (s.n + 3.84)
-        - 1.96 * SQRT((s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
-                      / (s.n + 3.84)) / (s.n + 3.84))                          AS wilson_lo95_winrate,
+        - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
+                / (s.n + 3.84))                                                AS wilson_lo95_winrate,
       (s.pnl / NULLIF(s.stake, 0))                                             AS roi,
       -- Bayesian shrunk ROI: weight observed ROI vs market-global prior
       CASE
@@ -137,9 +145,10 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
         s.n >= ${N_FLOOR}
         AND s.pnl > 0
         AND (
+          -- Wilson lo95 (corrected formula — see comment above)
           ((s.w + 1.92) / (s.n + 3.84)
-            - 1.96 * SQRT((s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
-                          / (s.n + 3.84)) / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
+            - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
+                    / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
           OR (
             s.sd_clv IS NOT NULL AND s.sd_clv > 0 AND s.clv_n >= 2
             AND (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv > ${CLV_T_THRESHOLD}
@@ -154,17 +163,19 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
         ELSE
           CASE
             WHEN
+              -- Wilson lo95 (corrected)
               ((s.w + 1.92) / (s.n + 3.84)
-                - 1.96 * SQRT((s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
-                              / (s.n + 3.84)) / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
+                - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
+                        / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
               AND s.sd_clv IS NOT NULL AND s.sd_clv > 0 AND s.clv_n >= 2
               AND (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv > ${CLV_T_THRESHOLD}
               AND s.avg_clv > 0
             THEN 'both'
             WHEN
+              -- Wilson lo95 (corrected)
               ((s.w + 1.92) / (s.n + 3.84)
-                - 1.96 * SQRT((s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
-                              / (s.n + 3.84)) / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
+                - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
+                        / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
             THEN 'roi'
             WHEN
               s.sd_clv IS NOT NULL AND s.sd_clv > 0 AND s.clv_n >= 2

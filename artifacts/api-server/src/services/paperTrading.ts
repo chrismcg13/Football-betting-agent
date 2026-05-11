@@ -1586,9 +1586,25 @@ export async function placePaperBet(
       liveLimits.level,
       !!(pinnacleOdds && pinnacleOdds > 0),
     );
-    stake = Math.round(stake * (liveKelly / 0.25) * 100) / 100;
+    // 2026-05-11 BUG FIX: the prior multiplier `(liveKelly / 0.25)` assumed
+    // calculateDynamicKellyStake's base fraction was always 0.25, which was
+    // true when kellyFractionForScore returned a constant 0.25 across the
+    // board. After kellyFractionForScore was changed to score-variable
+    // (0.125 / 0.25 / 0.375 / 0.50 in paperTrading.ts:576-585) the multiplier
+    // stopped converting "intended live fraction" into "scale factor on
+    // applied base fraction" — it just amplified or shrank by liveKelly/0.25
+    // regardless of what kellyFractionForScore actually returned. Effective
+    // applied fraction was kellyFractionForScore(score) * (liveKelly / 0.25),
+    // not liveKelly. Concrete impact: score=80 (base 0.50), live level=DEFAULT
+    // (Kelly 0.25) → applied 0.50 * 1.0 = 0.50 of full Kelly, double the
+    // intended cap. Fix: divide by the actual base fraction so the net
+    // effective fraction equals liveKelly.
+    const appliedBaseFraction = kellyFractionForScore(score, marketType);
+    if (appliedBaseFraction > 0) {
+      stake = Math.round(stake * (liveKelly / appliedBaseFraction) * 100) / 100;
+    }
     logger.info(
-      { matchId, marketType, liveLevel: liveLimits.level, liveKelly, hasPinnacle: !!(pinnacleOdds && pinnacleOdds > 0) },
+      { matchId, marketType, liveLevel: liveLimits.level, liveKelly, appliedBaseFraction, hasPinnacle: !!(pinnacleOdds && pinnacleOdds > 0) },
       "Live Kelly fraction applied",
     );
   }
@@ -3852,12 +3868,23 @@ export async function deduplicatePendingBets(): Promise<{
     }
   }
 
-  // 3. Void all marked bets in one batch
+  // 3. Void all marked bets in one batch.
+  // 2026-05-11 BUG FIX: prior writer set only status + settlementPnl, leaving
+  // gross_pnl/commission_amount/net_pnl with whatever they were pre-void
+  // (NULL on pending bets — harmless; but inconsistent shape risks future
+  // aggregation bugs). Zero all P&L columns for void.
   if (toVoid.size > 0) {
     const idsToVoid = [...toVoid];
     await db
       .update(paperBetsTable)
-      .set({ status: "void", settlementPnl: "0", settledAt: new Date() })
+      .set({
+        status: "void",
+        settlementPnl: "0",
+        grossPnl: "0",
+        commissionAmount: "0",
+        netPnl: "0",
+        settledAt: new Date(),
+      })
       .where(inArray(paperBetsTable.id, idsToVoid));
 
     logger.info({ count: toVoid.size, removedByReason }, "deduplicatePendingBets: voided correlated duplicate pending bets");
@@ -3924,9 +3951,17 @@ export async function voidBetsOnBannedMarkets(): Promise<{
     byMarket[bet.marketType] = (byMarket[bet.marketType] ?? 0) + 1;
     totalStakeRefunded += stake;
 
+    // 2026-05-11 BUG FIX: zero ALL P&L columns on void, not just settlement_pnl.
     await db
       .update(paperBetsTable)
-      .set({ status: "void", settlementPnl: "0", settledAt: new Date() })
+      .set({
+        status: "void",
+        settlementPnl: "0",
+        grossPnl: "0",
+        commissionAmount: "0",
+        netPnl: "0",
+        settledAt: new Date(),
+      })
       .where(eq(paperBetsTable.id, bet.id));
   }
 
