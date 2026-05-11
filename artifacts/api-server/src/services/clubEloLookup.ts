@@ -45,6 +45,63 @@ function normalise(name: string): string {
     .trim();
 }
 
+/**
+ * Tokenise a name: lowercase, NFD-strip diacritics, drop short prefixes,
+ * split on non-alphanumerics, drop empties.
+ */
+function tokenise(name: string): string[] {
+  return name
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\b(fc|cf|sc|afc|ac|sv|vfb|vfl|tsv|ssc|us|as|asd|asl|aek|sk|sp|csd|club|ii|iii)\b/g, " ")
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/**
+ * Token-prefix match — does `short` factor as a concatenation of
+ * non-empty prefixes of the tokens of `longName`?
+ *
+ * Catches "Manchester City" → "ManCity":
+ *   tokens=["manchester","city"], short="mancity"
+ *   take "man" + "city" = "mancity" ✓
+ *
+ * Backtracks to find any valid splitting.
+ */
+function tokenPrefixMatch(longName: string, short: string): boolean {
+  const tokens = tokenise(longName);
+  const target = short.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (tokens.length === 0 || target.length === 0) return false;
+
+  const dfs = (tokIdx: number, remaining: string): boolean => {
+    if (tokIdx === tokens.length) return remaining.length === 0;
+    if (remaining.length === 0) return false;
+    const tok = tokens[tokIdx]!;
+    for (let i = 1; i <= tok.length && i <= remaining.length; i++) {
+      if (remaining.slice(0, i) === tok.slice(0, i)) {
+        if (dfs(tokIdx + 1, remaining.slice(i))) return true;
+      } else {
+        break; // prefixes must match contiguously from i=1
+      }
+    }
+    return false;
+  };
+
+  return dfs(0, target);
+}
+
+/**
+ * Single-token match — does `short` equal any single token of `longName`?
+ * Catches "Spartak Moscow" → "Spartak" (drop the city qualifier).
+ */
+function anyTokenEquals(longName: string, short: string): boolean {
+  const tokens = tokenise(longName);
+  const target = short.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (target.length < 4) return false; // avoid trivial matches like "fc"
+  return tokens.some((t) => t === target);
+}
+
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -151,7 +208,21 @@ export async function getClubEloForTeam(
       return persist(cacheKey, Number(c.elo), c.teamName);
     }
   }
-  // 3. Substring containment (either direction). Require >=4 chars
+  // 3. Token-prefix match (catches "Manchester City" → "ManCity",
+  // "Real Madrid" → "RealMadrid", "Bayern Munich" → "Bayern").
+  for (const c of candidates) {
+    if (tokenPrefixMatch(teamName, c.teamName)) {
+      return persist(cacheKey, Number(c.elo), c.teamName);
+    }
+  }
+  // 4. Single-token match (catches "Spartak Moscow" → "Spartak",
+  // "CSKA Moscow" → "CSKA", "Shakhtar Donetsk" → "Shakhtar").
+  for (const c of candidates) {
+    if (anyTokenEquals(teamName, c.teamName)) {
+      return persist(cacheKey, Number(c.elo), c.teamName);
+    }
+  }
+  // 5. Substring containment (either direction). Require >=4 chars
   // on the shorter string to avoid trivial matches.
   for (const c of candidates) {
     const cNorm = normalise(c.teamName);
@@ -161,7 +232,7 @@ export async function getClubEloForTeam(
       }
     }
   }
-  // 4. Levenshtein ≤ 2 on normalised names with length ≥ 5.
+  // 6. Levenshtein ≤ 2 on normalised names with length ≥ 5.
   // Computed only when prior passes failed — keeps per-call cost low.
   let bestDist = Infinity;
   let bestMatch: CandidateRow | null = null;
