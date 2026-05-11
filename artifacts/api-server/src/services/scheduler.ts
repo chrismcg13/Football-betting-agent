@@ -1474,19 +1474,30 @@ export async function runTradingCycle(options?: {
     // batched query — cheap relative to the per-cycle Betfair API spend.
     const exchangeAhMatchIds = new Set<number>();
     if (selectedBets.length > 0) {
-      const candidateMatchIds = Array.from(new Set(selectedBets.map((b) => b.matchId)));
-      try {
-        const result = await db.execute(sql`
-          SELECT DISTINCT match_id::int AS match_id FROM odds_snapshots
-          WHERE match_id = ANY(${candidateMatchIds})
-            AND market_type = 'ASIAN_HANDICAP'
-            AND source = 'betfair_exchange'
-            AND snapshot_time > NOW() - INTERVAL '24 hours'
-        `);
-        const rows = (result as unknown as { rows?: Array<{ match_id: number }> }).rows ?? [];
-        for (const r of rows) exchangeAhMatchIds.add(Number(r.match_id));
-      } catch (err) {
-        logger.warn({ err }, "AH unblock pre-fetch failed — gate falls back to deny");
+      // 2026-05-11: was `ANY(${candidateMatchIds})` which Drizzle expanded as a
+      // positional record `($1, $2, …, $n)` — Postgres rejected with
+      // "op ANY/ALL (array) requires array on right side", and the catch fell
+      // back to deny, killing every cycle's AH emissions (betsPlaced=0 across
+      // 4 consecutive cycles). Fix: sanitize to ints and inline as a PG array
+      // literal via sql.raw. Source is our own matches.id column so the
+      // integer-cast filter is sufficient SQL-injection defence.
+      const candidateMatchIds = Array.from(new Set(selectedBets.map((b) => b.matchId)))
+        .filter((n) => Number.isInteger(n) && n > 0);
+      if (candidateMatchIds.length > 0) {
+        try {
+          const idList = candidateMatchIds.join(",");
+          const result = await db.execute(sql.raw(`
+            SELECT DISTINCT match_id::int AS match_id FROM odds_snapshots
+            WHERE match_id IN (${idList})
+              AND market_type = 'ASIAN_HANDICAP'
+              AND source = 'betfair_exchange'
+              AND snapshot_time > NOW() - INTERVAL '24 hours'
+          `));
+          const rows = (result as unknown as { rows?: Array<{ match_id: number }> }).rows ?? [];
+          for (const r of rows) exchangeAhMatchIds.add(Number(r.match_id));
+        } catch (err) {
+          logger.warn({ err }, "AH unblock pre-fetch failed — gate falls back to deny");
+        }
       }
     }
 
