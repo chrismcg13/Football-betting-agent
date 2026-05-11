@@ -1,4 +1,12 @@
 /**
+ * NOTE (2026-05-11 — terminology): the filename and function name preserve
+ * the historical "ToPaper" suffix even though post-cutover (2026-05-09)
+ * this service only ever promotes to LIVE. A full rename to
+ * `lazyPromoteShadowToLive` + `runLazyPromoteShadowToLive` is scoped as a
+ * separate low-risk PR — touching 4 files but mechanical — deferred so the
+ * back-to-theory rebake push stays cohesive. Operators reading this file
+ * should mentally substitute "Live" wherever "Paper" appears.
+ *
  * Phase 3 Path C+ (2026-05-08): lazy shadow → paper / live promotion.
  *
  * Pre-fix: when valueDetection emits a bet but no recent betfair_exchange
@@ -141,25 +149,12 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   const cutoverCompletedAtRaw = await getConfig("cutover_completed_at");
   const cutoverActive = !!cutoverCompletedAtRaw && cutoverCompletedAtRaw.trim() !== "";
 
-  // 2026-05-10 staged re-enable: while `live_strict_ah_only_mode` is true,
-  // only AH score ≥ 60 candidates with Pinnacle data are eligible for rescue.
-  // Mirrors the same gate applied at placePaperBet AH override.
-  //
-  // Pinnacle requirement (2026-05-11) is the phantom filter. Pre-fix, this
-  // gate only checked AH + score≥60, allowing the Bundle 6.5 phantom Away+4
-  // bets (fair_value_source = 'betfair_exchange', no Pinnacle data) to be
-  // promoted. Result tonight: 64 of 83 live bets today were phantom Away+4
-  // promotions burning ~£300 of stake on lines that don't have real edge.
-  // Adding the fair_value_source ILIKE '%pinnacle%' filter blocks these.
-  //
-  // Set live_strict_ah_only_mode='false' to allow any-market rescues again
-  // (also drops the Pinnacle requirement — operator opens the gate fully).
-  const strictAhOnly = (await getConfig("live_strict_ah_only_mode")) === "true";
-  const strictAhFilter = strictAhOnly
-    ? sql`AND pb.market_type = 'ASIAN_HANDICAP'
-          AND pb.opportunity_score::numeric >= 60
-          AND COALESCE(pb.fair_value_source, '') ILIKE '%pinnacle%'`
-    : sql``;
+  // 2026-05-11 (Task 7 — back-to-theory plan): AH-only rescue gate removed.
+  // Lazy promotion now accepts any market whose (league, market_type) scope
+  // qualifies for live per v_live_eligibility_candidates. The qualification
+  // check happens at promotion time via a join below — no per-market filter
+  // here.
+  const strictAhFilter = sql``;
 
   // Find candidates: pending Tier A shadow bets, kickoff within KICKOFF_LOOKAHEAD_HOURS.
   const candidates = await db.execute(sql`

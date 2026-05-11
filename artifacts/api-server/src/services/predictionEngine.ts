@@ -1000,17 +1000,36 @@ export function predictCards(featureMap: Record<string, number>): {
   };
 }
 
+// Task 8 (2026-05-11 — back-to-theory plan): phantom corners root-cause.
+// Prior implementation defaulted missing home/away corner averages to 5.2/4.8.
+// Result: ANY match without computed corner features got λ ≈ 9.5 — the
+// Poisson over-9.5 probability landed ~0.50, and downstream value detection
+// found "edge" against any priced line, flooding the queue. 90 settled
+// TOTAL_CORNERS_75 bets accumulated −42.5% ROI before the blanket ban.
+// New rule: refuse to emit a corners probability unless BOTH team-corner
+// averages exist as observed features (no defaulting). Caller (valueDetection)
+// receives null → market is skipped for that fixture. Once corner features
+// are reliably backfilled, this returns real probabilities and the market
+// re-emits, gated by the standard live-eligibility view.
 export function predictCorners(featureMap: Record<string, number>): {
   over95: number; under95: number;
   over105: number; under105: number;
 } | null {
   const homeCorners = featureMap["home_corners_avg"];
   const awayCorners = featureMap["away_corners_avg"];
-  if (homeCorners === undefined && awayCorners === undefined) return null;
-
-  const hCorners = homeCorners ?? 5.2;
-  const aCorners = awayCorners ?? 4.8;
-  const lambda = hCorners + aCorners;
+  // Strict: both teams must have real, non-zero corner averages. A zero
+  // value here is the imputeMissingFeature default — treat as missing.
+  if (
+    homeCorners === undefined || awayCorners === undefined ||
+    homeCorners <= 0 || awayCorners <= 0
+  ) {
+    return null;
+  }
+  const lambda = homeCorners + awayCorners;
+  // Bound λ within plausible football corners range. Pathological inputs
+  // (e.g. youth-tournament fixtures with 2 corners/game or extreme attacks
+  // with 15+) should not produce extremes — clip to keep Poisson regular.
+  if (lambda < 4 || lambda > 16) return null;
 
   const over95 = poissonOver(lambda, 9.5);
   const over105 = poissonOver(lambda, 10.5);

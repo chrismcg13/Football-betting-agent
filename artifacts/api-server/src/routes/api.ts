@@ -5977,5 +5977,47 @@ router.post("/alerts/run-detection", async (_req, res) => {
   }
 });
 
+// Task 10 (2026-05-11 — back-to-theory plan): cumulative realised P&L over
+// an operator-specified window. Commission is baked into `net_pnl` at
+// settlement time (paperTrading.calculateSettlementWithCommission), so this
+// is the true performance baseline. Default window starts 2026-05-03 (the
+// theory-plan baseline). Default track is 'live'; 'shadow' and 'paper'
+// also supported for cross-rail comparison.
+router.get("/reports/pnl-since", async (req, res) => {
+  const since = typeof req.query.since === "string" ? req.query.since : "2026-05-03";
+  const track = typeof req.query.track === "string" ? req.query.track : "live";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+    res.status(400).json({ error: "since must be YYYY-MM-DD" });
+    return;
+  }
+  if (!["live", "shadow", "paper"].includes(track)) {
+    res.status(400).json({ error: "track must be one of live|shadow|paper" });
+    return;
+  }
+  try {
+    const rows = await db.execute(sql`
+      SELECT COUNT(*)::int                                                       AS n_bets,
+             COUNT(*) FILTER (WHERE status='won')::int                           AS won,
+             COUNT(*) FILTER (WHERE status='lost')::int                          AS lost,
+             COUNT(*) FILTER (WHERE status='void')::int                          AS void,
+             COUNT(*) FILTER (WHERE status='cancelled')::int                     AS cancelled,
+             COUNT(*) FILTER (WHERE status='pending')::int                       AS pending,
+             ROUND(COALESCE(SUM(stake), 0)::numeric, 2)                          AS total_stake,
+             ROUND(COALESCE(SUM(gross_pnl), 0)::numeric, 2)                      AS gross_pnl,
+             ROUND(COALESCE(SUM(commission_amount), 0)::numeric, 2)              AS commission_paid,
+             ROUND(COALESCE(SUM(net_pnl), 0)::numeric, 2)                        AS net_pnl
+      FROM paper_bets
+      WHERE bet_track = ${track}
+        AND placed_at >= ${since}::timestamptz
+        AND deleted_at IS NULL
+    `);
+    const row = ((rows as any).rows ?? [])[0] ?? {};
+    res.json({ since, track, ...row });
+  } catch (err) {
+    logger.error({ err, since, track }, "/reports/pnl-since failed");
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 export default router;
 

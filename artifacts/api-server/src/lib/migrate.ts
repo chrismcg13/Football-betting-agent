@@ -3231,6 +3231,76 @@ export async function runMigrations() {
         s.shrunk_roi DESC NULLS LAST
     `);
 
+    // Task 7 / F.7 (2026-05-11 — back-to-theory plan): pre-aggregated
+    // eligibility views by market and by league. These give the operator
+    // a one-glance view of which scopes qualify without GROUP BY-ing the
+    // raw signal-strength table by hand.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_live_eligibility_markets AS
+      SELECT
+        s.market_type,
+        COUNT(*) FILTER (WHERE s.qualifies_live) AS n_leagues_qualifying,
+        SUM(s.n)                                  AS n_bets,
+        AVG(s.shrunk_roi)                         AS avg_shrunk_roi,
+        AVG(s.avg_clv)                            AS avg_clv_pct,
+        COUNT(*) FILTER (WHERE s.qualification_basis = 'both') AS n_both,
+        COUNT(*) FILTER (WHERE s.qualification_basis = 'roi')  AS n_roi_only,
+        COUNT(*) FILTER (WHERE s.qualification_basis = 'clv')  AS n_clv_only
+      FROM analysis_signal_strength s
+      WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+      GROUP BY s.market_type
+      ORDER BY n_leagues_qualifying DESC, n_bets DESC
+    `);
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_live_eligibility_leagues AS
+      SELECT
+        s.league,
+        COUNT(*) FILTER (WHERE s.qualifies_live) AS n_markets_qualifying,
+        SUM(s.n)                                 AS n_bets,
+        AVG(s.shrunk_roi)                        AS avg_shrunk_roi,
+        AVG(s.avg_clv)                           AS avg_clv_pct
+      FROM analysis_signal_strength s
+      WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+      GROUP BY s.league
+      ORDER BY n_markets_qualifying DESC, n_bets DESC
+    `);
+
+    // Task 4 / F.4 (2026-05-11 — back-to-theory plan): banned-market
+    // review view. Joins the BANNED_MARKETS list (kept as a static CTE
+    // here — single source of truth still lives in paperTrading.ts but
+    // this view exists so the operator can sanity-check ban rationale
+    // against the latest segment signal). Any market whose
+    // any_scope_qualifies=true is a candidate for removal from the
+    // BANNED_MARKETS set.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_banned_market_review AS
+      WITH banned (market_type, reason) AS (
+        VALUES
+          ('OVER_UNDER_05',   '>92% win rate near-cert no edge'),
+          ('OVER_UNDER_15',   '~75% win rate near-cert no edge'),
+          ('TOTAL_CARDS_55',  '~85% win rate ref variance dominates'),
+          ('TOTAL_CARDS_45',  'near-certainty unreliable settlement'),
+          ('FIRST_HALF_OU_05','too easy; OU_15 retained'),
+          ('OVER_UNDER_25',   'quarantined 2026-04-20 pricing-pipeline'),
+          ('OVER_UNDER_35',   'quarantined 2026-04-20 pricing-pipeline'),
+          ('FIRST_HALF_RESULT','quarantined 2026-04-20 pricing-pipeline'),
+          ('DOUBLE_CHANCE',   'correlated with MATCH_ODDS')
+      )
+      SELECT
+        b.market_type,
+        b.reason,
+        COALESCE(SUM(s.n), 0)                       AS n_settled_since_eval_start,
+        ROUND(AVG(s.roi)::numeric, 3)               AS avg_roi,
+        ROUND(AVG(s.avg_clv)::numeric, 2)           AS avg_clv_pct,
+        BOOL_OR(s.qualifies_live)                   AS any_scope_qualifies
+      FROM banned b
+      LEFT JOIN analysis_signal_strength s
+        ON s.market_type = b.market_type
+       AND s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+      GROUP BY b.market_type, b.reason
+      ORDER BY b.market_type
+    `);
+
     logger.info("Bundle B analytics tables ready");
 
     // Task 12 — calibration_buckets. Per-(league × market_type) calibration

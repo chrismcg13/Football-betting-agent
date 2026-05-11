@@ -113,8 +113,9 @@ export async function runStorageCleanup(opts: {
 
   // ─── (1a) odds_snapshots non-essential bookmakers — aggressive cleanup ──
   // Non-essentials we no longer write at all (apiFootball.ts filter) AND
-  // never read. 14-day retention is just safety buffer for unexpected
-  // backfill. Per-source loop with small batches.
+  // never read. Retention tightened from 14d → 7d on 2026-05-11
+  // (back-to-theory plan §H) to reclaim the ~2.6 GB of stale index/toast
+  // pressure on odds_snapshots. Per-source loop with small batches.
   let oddsSnapshotsDeleted = 0;
   for (const source of NON_ESSENTIAL_AF_BOOKMAKERS) {
     let perSource = 0;
@@ -124,7 +125,7 @@ export async function runStorageCleanup(opts: {
           SELECT ctid
           FROM odds_snapshots
           WHERE source = ${source}
-            AND snapshot_time < NOW() - INTERVAL '14 days'
+            AND snapshot_time < NOW() - INTERVAL '7 days'
           LIMIT ${oddsSnapshotsBatchSize}
         )
         DELETE FROM odds_snapshots WHERE ctid IN (SELECT ctid FROM deletable)

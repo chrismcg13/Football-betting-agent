@@ -117,6 +117,7 @@ interface SegmentStats {
   losses: number;
   totalPnl: number;
   roi: number;
+  avgOdds: number;
 }
 
 async function getSegmentStats(
@@ -129,6 +130,7 @@ async function getSegmentStats(
       stake: paperBetsTable.stake,
       settlementPnl: paperBetsTable.settlementPnl,
       status: paperBetsTable.status,
+      oddsAtPlacement: paperBetsTable.oddsAtPlacement,
     })
     .from(paperBetsTable)
     .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
@@ -143,7 +145,7 @@ async function getSegmentStats(
     (b) => b.status === "won" || b.status === "lost",
   );
   if (finalBets.length === 0) {
-    return { betCount: 0, wins: 0, losses: 0, totalPnl: 0, roi: 0 };
+    return { betCount: 0, wins: 0, losses: 0, totalPnl: 0, roi: 0, avgOdds: 0 };
   }
 
   const wins = finalBets.filter((b) => b.status === "won").length;
@@ -157,8 +159,15 @@ async function getSegmentStats(
     0,
   );
   const roi = totalStake > 0 ? (totalPnl / totalStake) * 100 : 0;
+  // Average back odds across settled bets, weighted equally (per-bet).
+  // Used by the cold-market gate to derive segment-implied breakeven.
+  const oddsBets = finalBets.filter((b) => b.oddsAtPlacement != null);
+  const avgOdds =
+    oddsBets.length > 0
+      ? oddsBets.reduce((sum, b) => sum + Number(b.oddsAtPlacement), 0) / oddsBets.length
+      : 0;
 
-  return { betCount: finalBets.length, wins, losses, totalPnl, roi };
+  return { betCount: finalBets.length, wins, losses, totalPnl, roi, avgOdds };
 }
 
 // ─── League edge score lookup ─────────────────────────────────────────────────
@@ -181,9 +190,31 @@ export async function getLeagueEdgeScore(league: string): Promise<number> {
 }
 
 // ─── Cold-market exclusion ────────────────────────────────────────────────────
+//
+// Task 6 (2026-05-11): the prior point-estimate gate (`stats.roi < threshold`
+// on n>=10) was firing on noise — Wilson interval was never consulted, so
+// segments with high realised variance got demoted before their true rate
+// could stabilise. New gate: n>=30 AND Wilson 95% upper bound on observed
+// win-rate is strictly below segment-implied breakeven minus a 2pp buffer.
+// If we lack avg odds we fall back to a conservative AH-style breakeven of
+// 0.50 (treating any market with no priced odds as a coin-flip baseline).
+//
+// Source of Wilson formula matches the standard form:
+//   centre = (w + z²/2) / (n + z²)
+//   margin = z * sqrt(w*(n-w)/n + z²/4) / (n + z²)
+// with z = 1.96 → z² = 3.8416, z²/2 = 1.9208, z²/4 = 0.9604.
 
 interface ColdMarketEntry { excludedUntil: Date }
 const coldMarketCache = new Map<string, ColdMarketEntry>();
+
+function wilsonUpper95(wins: number, n: number): number {
+  if (n <= 0) return 1;
+  const w = wins;
+  const denom = n + 3.8416;
+  const centre = (w + 1.9208) / denom;
+  const margin = 1.96 * Math.sqrt((w * (n - w)) / n + 0.9604) / denom;
+  return Math.min(1, centre + margin);
+}
 
 async function isColdMarket(
   league: string,
@@ -200,15 +231,34 @@ async function isColdMarket(
     coldMarketCache.delete(key);
   }
 
-  if (stats.betCount >= minBets && stats.roi < threshold) {
+  // Hard sample-size floor — never demote before n>=30, regardless of ROI.
+  if (stats.betCount < Math.max(30, minBets)) return false;
+
+  const winRate = stats.wins / stats.betCount;
+  const wilsonUpper = wilsonUpper95(stats.wins, stats.betCount);
+  // Segment-implied breakeven: 1 / avgOdds. Fallback 0.50 when avgOdds
+  // missing or implausible (preserves conservative "coin-flip" baseline).
+  const breakeven = stats.avgOdds && stats.avgOdds > 1.01 ? 1 / stats.avgOdds : 0.50;
+  const isColdByWilson = wilsonUpper < breakeven - 0.02;
+  // Also retain the ROI fallback at a tightened threshold so deeply
+  // unprofitable segments with low odds still demote. ROI here is in %.
+  const isColdByRoi = stats.roi < threshold;
+
+  if (isColdByWilson && isColdByRoi) {
     const excludedUntil = new Date();
     excludedUntil.setDate(excludedUntil.getDate() + cooldownDays);
     coldMarketCache.set(key, { excludedUntil });
 
     await db.insert(learningNarrativesTable).values({
       narrativeType: "strategy_shift",
-      narrativeText: `Pausing ${league} ${marketType} after ${stats.betCount} bets at ${stats.roi.toFixed(1)}% ROI. Reassessing in ${cooldownDays} days.`,
-      relatedData: { league, marketType, betCount: stats.betCount, roi: stats.roi, excludedUntil },
+      narrativeText:
+        `Pausing ${league} ${marketType} after ${stats.betCount} bets. ` +
+        `Wilson upper-95 ${(wilsonUpper * 100).toFixed(1)}% < breakeven ${(breakeven * 100).toFixed(1)}% − 2pp, ` +
+        `ROI ${stats.roi.toFixed(1)}% < ${threshold}%. Reassessing in ${cooldownDays} days.`,
+      relatedData: {
+        league, marketType, betCount: stats.betCount,
+        winRate, wilsonUpper, breakeven, roi: stats.roi, excludedUntil,
+      },
       createdAt: new Date(),
     });
     await db.insert(complianceLogsTable).values({
@@ -541,13 +591,24 @@ function getModelProbability(
     if (selectionName.startsWith("Under")) return cornersPreds.under105;
   }
   if (marketType === "TOTAL_CORNERS_85" && cornersPreds) {
-    const lambda = (enriched["home_corners_avg"] ?? 5.0) + (enriched["away_corners_avg"] ?? 4.5);
+    // Task 8 fix: re-use the strict-gated cornersPreds. The prior inline
+    // fallback defaults (5.0 / 4.5) bypassed the strict guard in
+    // predictCorners and re-introduced the phantom-signal class.
+    const home = enriched["home_corners_avg"];
+    const away = enriched["away_corners_avg"];
+    if (home === undefined || away === undefined || home <= 0 || away <= 0) return null;
+    const lambda = home + away;
+    if (lambda < 4 || lambda > 16) return null;
     const under85 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 8)));
     if (selectionName.startsWith("Over")) return 1 - under85;
     if (selectionName.startsWith("Under")) return under85;
   }
   if (marketType === "TOTAL_CORNERS_115" && cornersPreds) {
-    const lambda = (enriched["home_corners_avg"] ?? 5.0) + (enriched["away_corners_avg"] ?? 4.5);
+    const home = enriched["home_corners_avg"];
+    const away = enriched["away_corners_avg"];
+    if (home === undefined || away === undefined || home <= 0 || away <= 0) return null;
+    const lambda = home + away;
+    if (lambda < 4 || lambda > 16) return null;
     const under115 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 11)));
     if (selectionName.startsWith("Over")) return 1 - under115;
     if (selectionName.startsWith("Under")) return under115;
@@ -1133,7 +1194,8 @@ export async function detectValueBets(options?: {
            COUNT(*) FILTER (WHERE pb.status = 'won') AS wins,
            COUNT(*) FILTER (WHERE pb.status = 'lost') AS losses,
            COALESCE(SUM(CASE WHEN pb.status IN ('won','lost') THEN pb.settlement_pnl::numeric ELSE 0 END), 0) AS total_pnl,
-           COALESCE(SUM(CASE WHEN pb.status IN ('won','lost') THEN pb.stake::numeric ELSE 0 END), 0) AS total_stake
+           COALESCE(SUM(CASE WHEN pb.status IN ('won','lost') THEN pb.stake::numeric ELSE 0 END), 0) AS total_stake,
+           AVG(CASE WHEN pb.status IN ('won','lost') THEN pb.odds_at_placement::numeric ELSE NULL END) AS avg_odds
     FROM paper_bets pb
     JOIN matches m ON pb.match_id = m.id
     GROUP BY m.league, pb.market_type
@@ -1151,6 +1213,7 @@ export async function detectValueBets(options?: {
       losses: Number(row.losses ?? 0),
       totalPnl,
       roi,
+      avgOdds: row.avg_odds != null ? Number(row.avg_odds) : 0,
     });
   }
 
@@ -1210,37 +1273,60 @@ export async function detectValueBets(options?: {
   // 7. Commission rate — fetch once
   const commRate = await getCommissionRate("betfair");
 
-  // 8. Cold-market exclusions evaluated up-front from segmentStatsMap
+  // 8. Cold-market exclusions evaluated up-front from segmentStatsMap.
+  // Task 6 (2026-05-11): point-estimate gate replaced with Wilson upper-95
+  // on win-rate plus a hard n>=30 floor and a tightened ROI fallback. Both
+  // signals must agree before the segment is demoted (avoids single-axis
+  // false positives that the old gate produced on small samples).
   const coldMarkets = new Set<string>();
+  const minBetsFloor = Math.max(30, coldMinBets);
   for (const [key, stats] of segmentStatsMap) {
-    if (stats.betCount >= coldMinBets && stats.roi < coldThreshold) {
-      const cached = coldMarketCache.get(key);
-      if (cached && new Date() < cached.excludedUntil) {
-        coldMarkets.add(key);
-        continue;
-      }
-      const excludedUntil = new Date();
-      excludedUntil.setDate(excludedUntil.getDate() + coldCooldownDays);
-      coldMarketCache.set(key, { excludedUntil });
+    const cached = coldMarketCache.get(key);
+    if (cached && new Date() < cached.excludedUntil) {
       coldMarkets.add(key);
-      const [league, marketType] = key.split("::");
-      await db.insert(learningNarrativesTable).values({
-        narrativeType: "strategy_shift",
-        narrativeText: `Pausing ${league} ${marketType} after ${stats.betCount} bets at ${stats.roi.toFixed(1)}% ROI. Reassessing in ${coldCooldownDays} days.`,
-        relatedData: { league, marketType, betCount: stats.betCount, roi: stats.roi, excludedUntil },
-        createdAt: new Date(),
-      });
-      complianceBuffer.push({
-        actionType: "decision",
-        details: { action: "cold_market_excluded", league, marketType, betCount: stats.betCount, roi: stats.roi, excludedUntil },
-        timestamp: new Date(),
-      });
-      logger.warn({ league, marketType, roi: stats.roi }, "Cold market excluded");
-    } else {
-      // Re-include if previously cold but cooldown expired
-      const cached = coldMarketCache.get(key);
-      if (cached && new Date() < cached.excludedUntil) coldMarkets.add(key);
+      continue;
     }
+    if (stats.betCount < minBetsFloor) continue;
+    const wilsonUpper = wilsonUpper95(stats.wins, stats.betCount);
+    const breakeven = stats.avgOdds && stats.avgOdds > 1.01 ? 1 / stats.avgOdds : 0.50;
+    const isColdByWilson = wilsonUpper < breakeven - 0.02;
+    const isColdByRoi = stats.roi < coldThreshold;
+    if (!(isColdByWilson && isColdByRoi)) continue;
+
+    const excludedUntil = new Date();
+    excludedUntil.setDate(excludedUntil.getDate() + coldCooldownDays);
+    coldMarketCache.set(key, { excludedUntil });
+    coldMarkets.add(key);
+    const [league, marketType] = key.split("::");
+    await db.insert(learningNarrativesTable).values({
+      narrativeType: "strategy_shift",
+      narrativeText:
+        `Pausing ${league} ${marketType} after ${stats.betCount} bets. ` +
+        `Wilson upper-95 ${(wilsonUpper * 100).toFixed(1)}% < breakeven ${(breakeven * 100).toFixed(1)}% − 2pp, ` +
+        `ROI ${stats.roi.toFixed(1)}% < ${coldThreshold}%. Reassessing in ${coldCooldownDays} days.`,
+      relatedData: {
+        league, marketType, betCount: stats.betCount,
+        wilsonUpper, breakeven, roi: stats.roi, excludedUntil,
+      },
+      createdAt: new Date(),
+    });
+    complianceBuffer.push({
+      actionType: "decision",
+      details: {
+        action: "cold_market_excluded",
+        league, marketType, betCount: stats.betCount,
+        wilsonUpper, breakeven, roi: stats.roi, excludedUntil,
+      },
+      timestamp: new Date(),
+    });
+    logger.warn(
+      { league, marketType, n: stats.betCount, wilsonUpper, breakeven, roi: stats.roi },
+      "Cold market excluded (Wilson + ROI both confirm)",
+    );
+  }
+  // Carry over any still-active cold-market entries that didn't appear in stats
+  for (const [key, entry] of coldMarketCache) {
+    if (new Date() < entry.excludedUntil) coldMarkets.add(key);
   }
   // Also carry over any still-active cold-market entries that didn't appear in stats
   for (const [key, entry] of coldMarketCache) {
@@ -1487,7 +1573,7 @@ export async function detectValueBets(options?: {
       }
 
       const segKey = `${match.league}::${oddsRow.marketType}`;
-      const segmentStats = segmentStatsMap.get(segKey) ?? { betCount: 0, wins: 0, losses: 0, totalPnl: 0, roi: 0 };
+      const segmentStats = segmentStatsMap.get(segKey) ?? { betCount: 0, wins: 0, losses: 0, totalPnl: 0, roi: 0, avgOdds: 0 };
 
       // B1+B2 (2026-05-07): cold-market cooldown moved to AFTER the
       // placement-track decision below. The cooldown is a capital-risk

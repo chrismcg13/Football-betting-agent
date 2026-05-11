@@ -448,20 +448,43 @@ export async function runTradingCycle(options?: {
     let forceShadowOnly = false;
     const reducedModeReasons: string[] = [];
 
-    // 1. Settle any finished bets first
-    const settlement = await settleBets();
-    logger.info(
-      {
-        settled: settlement.settled,
-        won: settlement.won,
-        lost: settlement.lost,
-        pnl: settlement.totalPnl,
-        paper_bets_pending_retry: settlement.paperPendingRetry,
-        paper_bets_timeout_lost: settlement.paperTimeoutLoss,
-        paper_bets_abandonment_void: settlement.paperAbandonmentVoid,
-      },
-      "Settlement complete",
-    );
+    // 1. Settle any finished bets first. Wrapped in its own try/catch so a
+    //    settlement error does NOT abort placement (F.11 decoupling — pre-fix
+    //    a Betfair-API hiccup at settlement time would kill the entire cycle
+    //    and silently miss the placement window). Defaults preserve the
+    //    downstream contract.
+    let settlement: Awaited<ReturnType<typeof settleBets>> = {
+      settled: 0,
+      won: 0,
+      lost: 0,
+      totalPnl: 0,
+      paperPendingRetry: 0,
+      paperTimeoutLoss: 0,
+      paperAbandonmentVoid: 0,
+    };
+    try {
+      settlement = await settleBets();
+      logger.info(
+        {
+          settled: settlement.settled,
+          won: settlement.won,
+          lost: settlement.lost,
+          pnl: settlement.totalPnl,
+          paper_bets_pending_retry: settlement.paperPendingRetry,
+          paper_bets_timeout_lost: settlement.paperTimeoutLoss,
+          paper_bets_abandonment_void: settlement.paperAbandonmentVoid,
+        },
+        "Settlement complete",
+      );
+    } catch (settleErr) {
+      logger.error(
+        { err: settleErr, tier },
+        "Settlement leg failed — continuing cycle so placement still runs",
+      );
+      reducedModeReasons.push(
+        `settle_error:${settleErr instanceof Error ? settleErr.message.slice(0, 80) : String(settleErr).slice(0, 80)}`,
+      );
+    }
 
     // 2. Run risk checks (gates production track only — shadow continues)
     const riskResult = await runAllRiskChecks();
@@ -2405,6 +2428,34 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Live auto-revert scheduler active — every 5 minutes UTC");
 
+  // I — Python-subprocess serialisation. Each Python cron (SHAP drift,
+  // feature attribution, market correlations, calibration fitter) spawns
+  // a child process that can peak 0.4–1.0 GB RAM. The 4 GB VPS has
+  // api-server (~600 MB) + worker-data (~400 MB) baseline; two Python
+  // jobs running concurrently can push the box past PM2 max_memory_restart
+  // (2 GB) and trigger a restart loop. The crons are staggered at 15-min
+  // boundaries, but if any of them run long (>15 min) they could overlap.
+  // This lock makes overlap impossible — second arrivals log and skip.
+  // Module-level via the IIFE module closure so it survives reschedules.
+  const pythonCronLock = { running: false as boolean, owner: null as string | null };
+  async function runPythonCron<T>(name: string, fn: () => Promise<T>): Promise<T | { skipped: string }> {
+    if (pythonCronLock.running) {
+      logger.warn(
+        { skipped: name, currentlyRunning: pythonCronLock.owner },
+        "Python cron skipped — another Python job in flight (RAM serialisation)",
+      );
+      return { skipped: pythonCronLock.owner ?? "unknown" };
+    }
+    pythonCronLock.running = true;
+    pythonCronLock.owner = name;
+    try {
+      return await fn();
+    } finally {
+      pythonCronLock.running = false;
+      pythonCronLock.owner = null;
+    }
+  }
+
   // 2026-05-08 (post-RCA): generalised data-quality monitor. Daily 02:00
   // UTC. Tracks every external data source's daily volume vs 30-day
   // baseline (excluding last 5 days). Inserts data_quality_alerts row on
@@ -2436,8 +2487,10 @@ export function startSettlementCron(): void {
     logger.info("Calibration fitter triggered (Monday 04:00 UTC)");
     void (async () => {
       try {
-        const { runCalibrationFitter } = await import("./calibrationCron");
-        const r = await runCalibrationFitter();
+        const r = await runPythonCron("calibration_fitter", async () => {
+          const { runCalibrationFitter } = await import("./calibrationCron");
+          return runCalibrationFitter();
+        });
         logger.info(r, "Calibration fitter complete");
       } catch (err) {
         logger.error({ err }, "Calibration fitter failed");
@@ -2609,9 +2662,14 @@ export function startSettlementCron(): void {
   cron.schedule("20 */6 * * *", () => {
     void (async () => {
       try {
-        const { runStadiumGeocodeBackfill, runTravelFeatureBackfill } = await import("./stadiumGeocoder");
+        const { runStadiumGeocodeBackfill, runTravelFeatureBackfill, runStadiumAltitudeBackfill } = await import("./stadiumGeocoder");
         const geo = await runStadiumGeocodeBackfill();
         if (geo.candidates > 0) logger.info(geo, "Stadium geocode backfill complete");
+        // Task 19 (2026-05-11): retroactive altitude fill for the 60+ rows
+        // that have lat/lon but no altitude. Runs after the geocoder so
+        // newly-geocoded rows get altitude on this same tick.
+        const altitude = await runStadiumAltitudeBackfill();
+        if (altitude.candidates > 0) logger.info(altitude, "Stadium altitude backfill complete");
         const travel = await runTravelFeatureBackfill();
         if (travel.resolved > 0) logger.info(travel, "Travel feature backfill complete");
       } catch (err) {
@@ -2654,8 +2712,10 @@ export function startSettlementCron(): void {
     logger.info("SHAP drift detector triggered (daily 03:30 UTC)");
     void (async () => {
       try {
-        const { runShapDrift } = await import("./shapDriftCron");
-        const r = await runShapDrift();
+        const r = await runPythonCron("shap_drift", async () => {
+          const { runShapDrift } = await import("./shapDriftCron");
+          return runShapDrift();
+        });
         logger.info(r, "SHAP drift detector complete");
       } catch (err) {
         logger.error({ err }, "SHAP drift detector failed");
@@ -2693,8 +2753,10 @@ export function startSettlementCron(): void {
     logger.info("Feature attribution triggered (monthly 1st at 04:30 UTC)");
     void (async () => {
       try {
-        const { runFeatureAttribution } = await import("./featureAttributionCron");
-        const r = await runFeatureAttribution();
+        const r = await runPythonCron("feature_attribution", async () => {
+          const { runFeatureAttribution } = await import("./featureAttributionCron");
+          return runFeatureAttribution();
+        });
         logger.info(r, "Feature attribution complete");
       } catch (err) {
         logger.error({ err }, "Feature attribution failed");
@@ -2711,8 +2773,10 @@ export function startSettlementCron(): void {
     logger.info("Market correlation computation triggered (monthly 1st at 04:45 UTC)");
     void (async () => {
       try {
-        const { runMarketCorrelations } = await import("./marketCorrelationCron");
-        const r = await runMarketCorrelations();
+        const r = await runPythonCron("market_correlations", async () => {
+          const { runMarketCorrelations } = await import("./marketCorrelationCron");
+          return runMarketCorrelations();
+        });
         logger.info(r, "Market correlation computation complete");
       } catch (err) {
         logger.error({ err }, "Market correlation computation failed");

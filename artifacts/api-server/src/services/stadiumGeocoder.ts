@@ -25,10 +25,38 @@ import { and, eq, gte, lte, isNotNull, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
+const OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup";
 const USER_AGENT = "BetAgentOS/1.0 (research; chris.mcg@hotmail.co.uk)";
 const NOMINATIM_RATE_LIMIT_MS = 1100; // 1 req/s per usage policy + buffer
 
 let lastNominatimCall = 0;
+
+// Task 19 (2026-05-11): Open-Elevation lookup. Free public API, no auth.
+// We rate-limit modestly (no published cap) — share the Nominatim rate
+// limiter to keep total outbound to <2 req/s on the geocode hot path.
+async function fetchAltitude(lat: number, lon: number): Promise<number | null> {
+  const wait = lastNominatimCall + NOMINATIM_RATE_LIMIT_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastNominatimCall = Date.now();
+  const url = `${OPEN_ELEVATION_URL}?locations=${lat},${lon}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { results?: Array<{ elevation?: number }> };
+    const elev = body?.results?.[0]?.elevation;
+    return typeof elev === "number" && Number.isFinite(elev) ? elev : null;
+  } catch (err) {
+    logger.debug({ err, lat, lon }, "Open-Elevation fetch failed");
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 interface NominatimHit {
   lat: string;
@@ -146,11 +174,18 @@ export async function runStadiumGeocodeBackfill(opts: { maxPerRun?: number } = {
       result.failed++;
       continue;
     }
+    // Task 19 (2026-05-11): fetch altitude immediately after coords resolve.
+    // Open-Elevation is best-effort; a null result is fine and will be
+    // re-attempted on the next geocode pass for this venue (the row will
+    // already exist with altitude_m=null, so a separate backfill pass
+    // would be needed to refill — see runStadiumAltitudeBackfill).
+    const altitudeM = await fetchAltitude(hit.lat, hit.lon);
     await db.insert(stadiumCoordinatesTable).values({
       venueApiId: row.venue_api_id,
       country: row.country,
       lat: String(hit.lat),
       lon: String(hit.lon),
+      altitudeM: altitudeM != null ? String(altitudeM) : null,
       source: hit.source,
     }).onConflictDoNothing();
     result.geocoded++;
@@ -158,6 +193,52 @@ export async function runStadiumGeocodeBackfill(opts: { maxPerRun?: number } = {
 
   result.durationMs = Date.now() - startedAt;
   logger.info(result, "Stadium geocode backfill complete");
+  return result;
+}
+
+/**
+ * Task 19 (2026-05-11): retroactively fill altitude_m for existing
+ * stadium_coordinates rows that have lat/lon but no altitude. Open-
+ * Elevation is rate-shared with Nominatim (1 req/s), so per-run cap
+ * keeps the loop polite. Idempotent — only touches rows where
+ * altitude_m IS NULL.
+ */
+export async function runStadiumAltitudeBackfill(opts: { maxPerRun?: number } = {}): Promise<{
+  candidates: number;
+  filled: number;
+  failed: number;
+  durationMs: number;
+}> {
+  const startedAt = Date.now();
+  const maxPerRun = opts.maxPerRun ?? 40;
+  const result = { candidates: 0, filled: 0, failed: 0, durationMs: 0 };
+
+  const candidates = await db.execute(sql`
+    SELECT venue_api_id, lat::float8 AS lat, lon::float8 AS lon
+    FROM stadium_coordinates
+    WHERE lat IS NOT NULL AND lon IS NOT NULL AND altitude_m IS NULL
+    LIMIT ${maxPerRun}
+  `);
+  const rows = (((candidates as unknown) as {
+    rows?: Array<{ venue_api_id: number; lat: number; lon: number }>;
+  }).rows ?? []);
+  result.candidates = rows.length;
+
+  for (const row of rows) {
+    const altitude = await fetchAltitude(row.lat, row.lon);
+    if (altitude == null) {
+      result.failed++;
+      continue;
+    }
+    await db
+      .update(stadiumCoordinatesTable)
+      .set({ altitudeM: String(altitude) })
+      .where(eq(stadiumCoordinatesTable.venueApiId, row.venue_api_id));
+    result.filled++;
+  }
+
+  result.durationMs = Date.now() - startedAt;
+  logger.info(result, "Stadium altitude backfill complete");
   return result;
 }
 

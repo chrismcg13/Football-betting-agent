@@ -556,11 +556,12 @@ export const BANNED_MARKETS: ReadonlySet<string> = new Set([
   "OVER_UNDER_15",     // ~75% win rate — no edge signal
   "TOTAL_CARDS_55",    // ~85% win rate — no edge signal
   "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
-  "TOTAL_CORNERS_75",  // Edge concentration: ALL corners suspended — 90 bets, -42.5% ROI
-  "TOTAL_CORNERS_85",  // Edge concentration: ALL corners suspended
-  "TOTAL_CORNERS_95",  // Edge concentration: ALL corners suspended
-  "TOTAL_CORNERS_105", // Edge concentration: ALL corners suspended
-  "TOTAL_CORNERS_115", // Edge concentration: ALL corners suspended
+  // Task 8 (2026-05-11): TOTAL_CORNERS_* unbanned. Phantom-signal root-cause
+  // patched in predictCorners (strict feature gate, no defaulting). Corners
+  // now flow through the normal eligibility ladder — shadow-only until they
+  // accrue n>=30 with Wilson lower-95 > breakeven; auto-promotes via
+  // v_live_eligibility_candidates. Wilson cold-market gate demotes any
+  // scope that fails to hold an edge.
   "FIRST_HALF_OU_05",  // Too easy; FIRST_HALF_OU_15 retained instead
   // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
   "OVER_UNDER_25",
@@ -931,26 +932,10 @@ export async function placePaperBet(
   // shadow_stake.
   let isShadowBet = placementTrack === "shadow" || universeTier === "B" || universeTier === "C";
 
-  // 2026-05-10 staged re-enable: while `live_strict_ah_only_mode` is true,
-  // only AH bets with score ≥ 60 are allowed to go live. Everything else
-  // demotes to shadow regardless of how the candidate would otherwise route.
-  // Set live_strict_ah_only_mode='false' in agent_config to re-open all
-  // paths (Path 2 direct production for non-AH, lazyPromote any-market
-  // rescue). Both paths read the same config — no code change required.
-  const strictAhOnly = (await getConfigValue("live_strict_ah_only_mode")) === "true";
-  if (strictAhOnly && !isShadowBet) {
-    const isAhAndScored = marketType === "ASIAN_HANDICAP" && score >= 60;
-    if (!isAhAndScored) {
-      await logShadowGateExemption(
-        "strict_ah_only_mode",
-        experimentTag ?? null,
-        `live_strict_ah_only_mode active — only AH score≥60 may go live. ${marketType}:${selectionName} (score ${score}) demoted to shadow`,
-        null,
-        universeTier,
-      );
-      isShadowBet = true;
-    }
-  }
+  // 2026-05-11 (Task 7 — back-to-theory plan): AH-only live exception removed.
+  // Live eligibility is now governed entirely by v_live_eligibility_candidates
+  // (Wilson lower-95 on win-rate AND/OR t-stat on CLV at n>=30). Any market
+  // whose (league, market_type) qualifies there may route to live.
 
   // Mutable: boosted bets that qualify for Tier 1B get a 0.5x stake multiplier.
   let stakeMultiplier = options.stakeMultiplier ?? 1.0;

@@ -494,11 +494,43 @@ export async function runAutonomousTierLadderV2(): Promise<TierLadderV2Result> {
   for (const [k, v] of byMarketType) allScopes.push({ type: "market_type", value: k, growths: v });
   for (const [k, v] of byLeagueMarket) allScopes.push({ type: "league_market", value: k, growths: v });
 
+  // F.5 (2026-05-11 — back-to-theory plan): cross-check V2 demotion
+  // decisions against analysis_signal_strength. If a scope V2 wants to
+  // demote is actually flagged qualifies_live=TRUE by the Bundle B
+  // analytics (Wilson lower-95 on win-rate AND/OR t-stat on CLV at
+  // n>=30), prefer Bundle B's verdict and skip the demotion. Promotion
+  // gates are already strict; corroboration there would only block them
+  // unnecessarily.
+  const bundleBQualifying = new Set<string>();
+  try {
+    const qualRows = await db.execute(sql`
+      SELECT league, market_type
+      FROM v_live_eligibility_candidates
+    `);
+    for (const row of ((qualRows as any).rows ?? []) as Array<{ league: string; market_type: string }>) {
+      bundleBQualifying.add(`${row.league}:${row.market_type}`);
+      bundleBQualifying.add(row.market_type);
+    }
+  } catch (err) {
+    logger.warn({ err }, "Z4-v2: failed to load Bundle B eligibility cross-check — proceeding without corroboration");
+  }
+
   for (const scope of allScopes) {
     result.scopesEvaluated++;
     const stats = computePosterior(scope.growths);
     const currentTier = await getCurrentTier(scope.type, scope.value);
-    const decision = decideTransition(currentTier, stats);
+    let decision = decideTransition(currentTier, stats);
+
+    if (decision.direction === "demotion" && bundleBQualifying.has(scope.value)) {
+      logger.info(
+        {
+          scope_type: scope.type, scope_value: scope.value,
+          posterior: stats, bundleBVerdict: "qualifies_live",
+        },
+        "Z4-v2 demotion suppressed: Bundle B qualifies this scope for live",
+      );
+      decision = { direction: "none", toTier: null };
+    }
 
     if (decision.direction === "none" || !decision.toTier) {
       result.unchanged++;
