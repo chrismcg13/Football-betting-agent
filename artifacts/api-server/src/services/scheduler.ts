@@ -3920,9 +3920,10 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Stale-pending escalation active — hourly (warn at +4h, auto-void at +24h)");
 
-  // Live balance + statement reconciliation: daily at 05:00 UTC. Two checks
-  // running back-to-back so a balance drift can be diagnosed against the
-  // statement walk in the same window. No-ops outside live mode.
+  // Live balance + statement reconciliation: daily at 05:00 UTC. Balance
+  // check is the heavy one (full account-statement walk via Betfair API);
+  // statement reconciliation also runs here for the headline daily report.
+  // No-ops outside live mode.
   cron.schedule("0 5 * * *", () => {
     void (async () => {
       try {
@@ -3941,6 +3942,28 @@ export function startScheduler(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Live balance + statement reconciliation active — daily 05:00 UTC");
+
+  // 2026-05-11 (post-go-live drift fix): statement-only reconciliation
+  // every hour. Daily 05:00 UTC was too infrequent — the auto-revert
+  // drift detector (every 5 min, 24h window) fires when accumulated
+  // settle-vs-betfair divergence on new settlements crosses £50 abs +
+  // 1% rel. Running the statement reconciliation hourly keeps the
+  // 24h window's drift bounded to at most 1h of new settlement noise.
+  // The heavy daily run at 05:00 still does both balance + statement.
+  cron.schedule("17 * * * *", () => {
+    void (async () => {
+      try {
+        const { reconcileLiveAccountStatement } = await import("./liveReconciliation");
+        const r = await reconcileLiveAccountStatement(2); // 2h lookback (covers gap + buffer)
+        if (r && (r.betfairPnlBackfilled > 0 || r.pnlDrifts > 0 || r.orphans > 0)) {
+          logger.info(r, "Hourly live statement reconciliation — drift caught + corrected");
+        }
+      } catch (err) {
+        logger.error({ err }, "Hourly live statement reconciliation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Hourly live statement reconciliation active — :17 past the hour");
 
   // Alert detection: every 5 minutes — check for critical/warning conditions
   cron.schedule("*/5 * * * *", () => {

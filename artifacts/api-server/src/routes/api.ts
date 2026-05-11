@@ -6052,5 +6052,27 @@ router.post("/admin/run-kelly-montecarlo", async (_req, res) => {
   }
 });
 
+// 2026-05-11: manual trigger for live account-statement reconciliation
+// (clears net_pnl vs betfair_pnl drift). Same code path as the daily 05:00
+// UTC cron and the new hourly cron. Use after the auto-revert kill switch
+// fires on Trigger C (drift) — runs the statement walk, auto-corrects all
+// drifted rows, then operator can flip live_placement_enabled back to
+// true. Optional `?hours=N` query param for the lookback window (default
+// 24h, used by daily; pass 48 to catch older bets etc.).
+router.post("/admin/reconcile-live-statement", async (req, res) => {
+  try {
+    const hoursRaw = req.query.hours;
+    const hours = typeof hoursRaw === "string" && Number.isFinite(Number(hoursRaw))
+      ? Math.max(1, Math.min(168, Number(hoursRaw)))
+      : 24;
+    const { reconcileLiveAccountStatement } = await import("../services/liveReconciliation");
+    const result = await reconcileLiveAccountStatement(hours);
+    res.json({ ok: true, lookback_hours: hours, result });
+  } catch (err) {
+    logger.error({ err }, "Manual live statement reconciliation failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 export default router;
 
