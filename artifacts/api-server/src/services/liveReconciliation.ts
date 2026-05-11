@@ -338,9 +338,50 @@ export async function reconcileLiveAccountStatement(
     const pnlChanged = Math.abs(drift) > PNL_DRIFT_TOLERANCE_GBP;
 
     if (statusChanged || pnlChanged) {
-      const updates: { betfairPnl: string; netPnl: string; status?: string } = {
-        betfairPnl: agg.totalAmount.toFixed(2),
-        netPnl: agg.totalAmount.toFixed(2),
+      // 2026-05-11 v2: write ALL P&L columns consistently from Betfair's
+      // authoritative wallet amount. Previously only net_pnl + status got
+      // overwritten — leaving gross_pnl, commission_amount and
+      // settlement_pnl stale. That broke (a) downstream reporting that
+      // sums gross − commission and expected it to equal net, and
+      // (b) the risk manager which reads settlement_pnl for daily/weekly
+      // loss checks.
+      //
+      // Derivation from net_pnl (= betfair_pnl = wallet impact):
+      //   status=won  → gross = net / (1-commRate); commission = gross - net
+      //   status=lost → gross = net (full stake loss); commission = 0
+      //   status=void → gross = 0; commission = 0; net = 0
+      const COMMISSION_RATE = 0.05; // Betfair standard until £25k lifetime profit
+      const newNet = agg.totalAmount;
+      let newGross: number;
+      let newCommission: number;
+      let newSettlementPnl: number;
+      if (newStatusFromBetfair === "won") {
+        newGross = Math.round((newNet / (1 - COMMISSION_RATE)) * 100) / 100;
+        newCommission = Math.round((newGross - newNet) * 100) / 100;
+        newSettlementPnl = newNet;
+      } else if (newStatusFromBetfair === "lost") {
+        newGross = newNet;
+        newCommission = 0;
+        newSettlementPnl = newNet;
+      } else {
+        newGross = 0;
+        newCommission = 0;
+        newSettlementPnl = 0;
+      }
+
+      const updates: {
+        betfairPnl: string;
+        netPnl: string;
+        grossPnl: string;
+        commissionAmount: string;
+        settlementPnl: string;
+        status?: string;
+      } = {
+        betfairPnl: newNet.toFixed(2),
+        netPnl: newNet.toFixed(2),
+        grossPnl: newGross.toFixed(2),
+        commissionAmount: newCommission.toFixed(2),
+        settlementPnl: newSettlementPnl.toFixed(2),
       };
       if (statusChanged) updates.status = newStatusFromBetfair;
       await db
@@ -355,7 +396,9 @@ export async function reconcileLiveAccountStatement(
           previousStatus: local.status,
           newStatus: statusChanged ? newStatusFromBetfair : local.status,
           previousNetPnl: localNetPnl,
-          newNetPnl: agg.totalAmount,
+          newNetPnl: newNet,
+          newGrossPnl: newGross,
+          newCommission,
           drift,
           itemCount: agg.itemCount,
         },
@@ -368,10 +411,12 @@ export async function reconcileLiveAccountStatement(
           previousStatus: local.status,
           newStatus: statusChanged ? newStatusFromBetfair : local.status,
           previousNetPnl: localNetPnl,
-          newNetPnl: agg.totalAmount,
+          newNetPnl: newNet,
+          newGrossPnl: newGross,
+          newCommission,
           drift,
         },
-        "Settlement auto-corrected from Betfair authoritative wallet",
+        "Settlement auto-corrected from Betfair authoritative wallet (all P&L columns)",
       );
     } else {
       // Within tolerance — only sync betfair_pnl (drift-detector input).

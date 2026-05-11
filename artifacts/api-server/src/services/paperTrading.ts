@@ -2746,10 +2746,31 @@ export async function reconcileStalePending(): Promise<StalePendingResult> {
               const outcome = String(order.betOutcome ?? "").toUpperCase();
               const profit = Number(order.profit ?? 0);
               const newStatus = outcome === "WON" ? "won" : outcome === "LOST" ? "lost" : "void";
+              // 2026-05-11: Betfair's `profit` field is the post-commission
+              // wallet impact. Write it to ALL P&L columns consistently so
+              // gross − commission = net (the prior writer just stored
+              // profit in gross+settlement and left commission/net stale,
+              // breaking aggregations and the risk manager's daily-loss
+              // query that reads settlement_pnl).
+              const COMMISSION_RATE = 0.05;
+              let recGross: number;
+              let recCommission: number;
+              if (newStatus === "won") {
+                recGross = Math.round((profit / (1 - COMMISSION_RATE)) * 100) / 100;
+                recCommission = Math.round((recGross - profit) * 100) / 100;
+              } else if (newStatus === "lost") {
+                recGross = profit;
+                recCommission = 0;
+              } else {
+                recGross = 0;
+                recCommission = 0;
+              }
               await db.update(paperBetsTable).set({
                 status: newStatus,
-                settlementPnl: String(profit),
-                grossPnl: String(profit),
+                settlementPnl: String(newStatus === "void" ? 0 : profit),
+                grossPnl: String(recGross),
+                commissionAmount: String(recCommission),
+                netPnl: String(newStatus === "void" ? 0 : profit),
                 betfairStatus: `RECONCILED_VIA_TIMEOUT:${status}`,
                 settledAt: new Date(),
               }).where(eq(paperBetsTable.id, bet.id));
