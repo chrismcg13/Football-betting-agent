@@ -1674,7 +1674,28 @@ export async function placePaperBet(
   if (experimentTag) {
     tierKellyFraction = await getTierKellyFractionForTag(experimentTag);
   } else if (dataTier === "candidate") {
-    tierKellyFraction = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");
+    // Phase 5b.2 (Task 17 wire-in, 2026-05-11): replace the fixed 0.25
+    // candidate-tier multiplier with the drawdown-targeted dynamic
+    // fraction from kelly_fraction_lookup. Falls back to env / 0.25
+    // when no row exists yet (cron hasn't run) and logs a compliance
+    // entry so we can audit the fallback frequency.
+    try {
+      const { getDynamicKellyFraction } = await import("./dynamicKelly");
+      const dynamicF = await getDynamicKellyFraction();
+      if (dynamicF != null && Number.isFinite(dynamicF) && dynamicF > 0 && dynamicF <= 1) {
+        tierKellyFraction = dynamicF;
+      } else {
+        tierKellyFraction = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");
+        await db.insert(complianceLogsTable).values({
+          actionType: "dynamic_kelly_fallback",
+          details: { matchId, marketType, dataTier, fallback: tierKellyFraction },
+          timestamp: new Date(),
+        });
+      }
+    } catch (err) {
+      logger.warn({ err, matchId }, "Dynamic Kelly fraction lookup failed — using fallback");
+      tierKellyFraction = parseFloat(process.env["CANDIDATE_STAKE_MULTIPLIER"] ?? "0.25");
+    }
   }
   if (tierKellyFraction < 1.0) {
     const originalStake = stake;
@@ -1683,6 +1704,91 @@ export async function placePaperBet(
       { matchId, marketType, experimentTag, dataTier, originalStake, reducedStake: stake, tierKellyFraction },
       "Tier kelly_fraction multiplier applied (sub-phase 9)",
     );
+  }
+
+  // Phase 5d.2 (Task 13 wire-in, 2026-05-11): portfolio correlation
+  // shrinkage. Treats this new candidate plus any already-pending bets
+  // on the same fixture as a basket and shrinks each leg's fraction by
+  // its correlated load. Default fixtureCap = 5% of bankroll across
+  // the basket (operator-tunable via agent_config.portfolio_fixture_cap).
+  // Order matters: applied AFTER the tier multiplier (so we're shrinking
+  // the already-tier-discounted candidate stake) but BEFORE the
+  // liveLimits hard cap (so the cap is the final upper bound).
+  try {
+    const portfolioBankroll = stakingBankroll;
+    if (portfolioBankroll > 0 && stake > 0) {
+      const pendingOnFixture = await db
+        .select({
+          marketType: paperBetsTable.marketType,
+          selectionName: paperBetsTable.selectionName,
+          stake: paperBetsTable.stake,
+          shadowStake: paperBetsTable.shadowStake,
+        })
+        .from(paperBetsTable)
+        .where(
+          and(
+            eq(paperBetsTable.matchId, matchId),
+            sql`${paperBetsTable.status} IN ('pending','pending_placement')`,
+            sql`${paperBetsTable.deletedAt} IS NULL`,
+          ),
+        );
+      // Build basket: existing pending + this new candidate (last).
+      const matchRowForLeague = await db
+        .select({ league: matchesTable.league })
+        .from(matchesTable)
+        .where(eq(matchesTable.id, matchId))
+        .limit(1);
+      const leagueForCorr = matchRowForLeague[0]?.league ?? "";
+      const fixtureCapStr = await getConfigValue("portfolio_fixture_cap");
+      const fixtureCap = fixtureCapStr != null ? Number(fixtureCapStr) : 0.05;
+      const basket = pendingOnFixture
+        .map((b) => {
+          const s = Number(b.stake);
+          const ss = Number(b.shadowStake);
+          const effectiveStake = s > 0 ? s : ss > 0 ? ss : 0;
+          return effectiveStake > 0
+            ? {
+                marketType: b.marketType,
+                selectionName: b.selectionName,
+                rawFraction: effectiveStake / portfolioBankroll,
+              }
+            : null;
+        })
+        .filter((b): b is { marketType: string; selectionName: string; rawFraction: number } => b !== null);
+      basket.push({
+        marketType,
+        selectionName,
+        rawFraction: stake / portfolioBankroll,
+      });
+      const { applyPortfolioCorrelationShrinkage } = await import("./portfolioKelly");
+      const portfolio = await applyPortfolioCorrelationShrinkage({
+        league: leagueForCorr,
+        bets: basket,
+        fixtureCap,
+      });
+      // The new candidate is the last item in the basket.
+      const newBetOutput = portfolio.bets[portfolio.bets.length - 1];
+      if (newBetOutput && Number.isFinite(newBetOutput.shrunkFraction)) {
+        const shrunkStake = Math.round(newBetOutput.shrunkFraction * portfolioBankroll * 100) / 100;
+        if (shrunkStake < stake) {
+          logger.info(
+            {
+              matchId, marketType, selectionName, leagueForCorr,
+              originalStake: stake,
+              shrunkStake,
+              correlatedLoad: newBetOutput.correlatedLoad,
+              shrinkageFactor: newBetOutput.shrinkageFactor,
+              basketSize: basket.length,
+              capApplied: portfolio.capApplied,
+            },
+            "Portfolio correlation shrinkage applied",
+          );
+          stake = shrunkStake;
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, matchId, marketType }, "Portfolio Kelly shrinkage failed — proceeding at pre-shrinkage stake");
   }
 
   if (liveLimits) {

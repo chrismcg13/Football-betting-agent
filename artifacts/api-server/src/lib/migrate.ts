@@ -3521,6 +3521,16 @@ export async function runMigrations() {
 
     logger.info("Slippage guard config seeded (Task 23)");
 
+    // Phase 5d.2 (Task 13 wire-in) — portfolio Kelly fixture cap.
+    // Default 5% of bankroll across all bets on a single fixture.
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value, updated_at)
+      VALUES ('portfolio_fixture_cap', '0.05', NOW())
+      ON CONFLICT (key) DO NOTHING
+    `);
+
+    logger.info("Portfolio Kelly fixture-cap seeded (Task 13)");
+
     // Seed the target_p1_pct config key so the first sim run has a value.
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)
