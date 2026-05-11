@@ -6019,5 +6019,23 @@ router.get("/reports/pnl-since", async (req, res) => {
   }
 });
 
+// 2026-05-11: manual trigger for Bundle B nightly analytics. The cron runs
+// at 02:30 UTC daily but the operator needs to force-recompute after a
+// formula change (e.g. the Wilson lower-bound fix shipped today) without
+// waiting for the next nightly tick. Idempotent — repeated calls just
+// recompute analysis_segment_stats + analysis_signal_strength at the
+// current timestamp. Not gated by ENVIRONMENT because the cron runs in
+// production already; this is the same code path.
+router.post("/admin/run-bundle-b", async (_req, res) => {
+  try {
+    const { runBundleBAnalytics } = await import("../services/analysisJobs");
+    const result = await runBundleBAnalytics();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "Manual Bundle B run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 export default router;
 
