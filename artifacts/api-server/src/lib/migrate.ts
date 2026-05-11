@@ -3476,6 +3476,42 @@ export async function runMigrations() {
 
     logger.info("Feature attribution + lifecycle ready (Task 22)");
 
+    // Task 13 — market correlation matrix (Phase 5d). One row per
+    // (league, market_a, market_b). league='' is the global fallback
+    // used when a league lacks per-pair data.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS market_correlation_matrix (
+        league       TEXT NOT NULL,
+        market_a     TEXT NOT NULL,
+        market_b     TEXT NOT NULL,
+        correlation  NUMERIC(6,4) NOT NULL,
+        n_pairs      INTEGER NOT NULL,
+        computed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (league, market_a, market_b)
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS market_correlation_pair_lookup
+        ON market_correlation_matrix(market_a, market_b)
+    `);
+
+    // Operator view — strongest correlations first (top of book for
+    // recognising portfolio risks). Surfaces both per-league and global.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_market_correlations_strongest AS
+      SELECT CASE WHEN league = '' THEN '<global>' ELSE league END AS scope,
+             market_a, market_b,
+             correlation,
+             n_pairs,
+             computed_at
+      FROM market_correlation_matrix
+      WHERE ABS(correlation) >= 0.10
+        AND n_pairs >= 30
+      ORDER BY ABS(correlation) DESC
+    `);
+
+    logger.info("Market correlation matrix ready (Task 13)");
+
     // Seed the target_p1_pct config key so the first sim run has a value.
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)

@@ -2638,6 +2638,24 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Feature attribution scheduler active — monthly 1st 04:30 UTC");
 
+  // Task 13 (Phase 5d) — market correlation matrix. Monthly on the 1st
+  // at 04:45 UTC, after the feature attribution job (04:30). Cache
+  // invalidates on completion so portfolio-Kelly callers pick up the
+  // new matrix without waiting for the 15-min TTL.
+  cron.schedule("45 4 1 * *", () => {
+    logger.info("Market correlation computation triggered (monthly 1st at 04:45 UTC)");
+    void (async () => {
+      try {
+        const { runMarketCorrelations } = await import("./marketCorrelationCron");
+        const r = await runMarketCorrelations();
+        logger.info(r, "Market correlation computation complete");
+      } catch (err) {
+        logger.error({ err }, "Market correlation computation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Market correlation scheduler active — monthly 1st 04:45 UTC");
+
   // Phase 4b startup self-seed: kick off a first geocode pass + travel
   // backfill at T+120s. The 120s offset puts it after the ClubElo
   // self-seed and the trading-cycle warmup so we don't fight for IO.
