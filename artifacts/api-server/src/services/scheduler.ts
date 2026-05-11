@@ -2802,6 +2802,39 @@ export function startSettlementCron(): void {
     })();
   }, 90 * 1000);
 
+  // Task 17 startup self-seed (2026-05-11) — bootstrap Kelly Monte-Carlo
+  // lookup at T+180s if kelly_fraction_lookup is empty. The daily cron
+  // is 03:15 UTC; without this, the stake engine's getDynamicKellyFraction
+  // returns null and callers fall back to the fixed 0.25 default until
+  // tomorrow morning. Self-seed gets the drawdown-targeted Kelly active
+  // immediately and validates the simulator on the current return
+  // distribution. Idempotent — runs only on empty-table boot.
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const probe = await db.execute(sql`SELECT 1 FROM kelly_fraction_lookup LIMIT 1`);
+        const hasRows = ((probe as unknown) as { rows?: unknown[] }).rows?.length ?? 0;
+        if (hasRows > 0) {
+          logger.debug("Kelly Monte-Carlo startup self-seed skipped — already populated");
+          return;
+        }
+        logger.info("Kelly Monte-Carlo startup self-seed triggered (table empty)");
+        const { runKellyLookupSimulation } = await import("./dynamicKelly");
+        const r = await runKellyLookupSimulation();
+        if (r) {
+          logger.info(
+            { selectedFraction: r.selectedFraction, mu: r.realisedRoi, sigma: r.realisedStdev },
+            "Kelly Monte-Carlo startup self-seed complete",
+          );
+        } else {
+          logger.warn("Kelly Monte-Carlo startup self-seed returned null — < 50 settled bets or degenerate distribution");
+        }
+      } catch (err) {
+        logger.warn({ err }, "Kelly Monte-Carlo startup self-seed failed");
+      }
+    })();
+  }, 180 * 1000);
+
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {
