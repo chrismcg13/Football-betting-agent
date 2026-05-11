@@ -1963,6 +1963,21 @@ export async function placePaperBet(
   try {
     await pgClient.query("BEGIN");
 
+    // DEBUG (2026-05-11): trace why raw_model_probability lands NULL in DB.
+    // Remove once verified.
+    logger.info(
+      {
+        matchId,
+        marketType,
+        selectionName,
+        rawModelProbability,
+        calibrationBucketId,
+        modelProbability,
+        rawType: typeof rawModelProbability,
+        bucketType: typeof calibrationBucketId,
+      },
+      "DBG_T12: placePaperBet insert values",
+    );
     const betResult = await db
       .insert(paperBetsTable)
       .values({
