@@ -2578,6 +2578,30 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("ClubElo historical backfill scheduler active — every 6h at :35");
 
+  // Phase 4a follow-up (2026-05-11) — local Elo for ClubElo-uncovered
+  // leagues. ClubElo is European-only (~630 clubs across 53 European
+  // countries); J1/J2-J3, MLS, Liga Profesional Argentina, K-League,
+  // Botola Pro, Premier Soccer League etc. resolve to 0% and would
+  // train on imputed 1500 forever without this. Computes per-league
+  // chronological Elo with goal-diff K-scaling and writes features
+  // ONLY where ClubElo did not. Runs every 12h at :50 (one hour
+  // after the 6-hourly historical backfill kicks at :35, so ClubElo
+  // values always land first and win).
+  cron.schedule("50 */12 * * *", () => {
+    void (async () => {
+      try {
+        const { runLocalEloBackfill } = await import("./localElo");
+        const r = await runLocalEloBackfill();
+        if (r.features_written > 0 || r.leagues_processed > 0) {
+          logger.info(r, "Local Elo backfill complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Local Elo backfill failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Local Elo backfill scheduler active — every 12h at :50");
+
   // Task 19 (Phase 4b) — stadium geocode backfill + travel features.
   // Geocoder runs every 6h, geocodes up to 50 new venues per tick
   // (rate-limited to ~1 req/s on OSM Nominatim). Travel-feature
@@ -2730,6 +2754,24 @@ export function startSettlementCron(): void {
       }
     })();
   }, 60 * 1000);
+
+  // Phase 4a follow-up startup self-seed: local Elo backfill at T+90s,
+  // after the ClubElo historical backfill at T+60s. ClubElo values
+  // land first and the local Elo only fills gaps (existence check
+  // per match × feature). Lifts coverage from the European-only
+  // ceiling (~50%) toward ~95% across J-League, MLS, Argentine,
+  // Korean, Moroccan and other ClubElo-uncovered leagues.
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const { runLocalEloBackfill } = await import("./localElo");
+        const r = await runLocalEloBackfill();
+        logger.info(r, "Local Elo startup backfill complete");
+      } catch (err) {
+        logger.warn({ err }, "Local Elo startup self-seed failed");
+      }
+    })();
+  }, 90 * 1000);
 
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
