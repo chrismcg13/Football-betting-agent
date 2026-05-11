@@ -64,6 +64,13 @@ const DEFAULT_AGENT_CONFIG: Array<{ key: string; value: string }> = [
   // no-op until the operator flips it. Matchbook + Betfair SP fetchers
   // arrive in Phase 3d.2 with their own flags.
   { key: "smarkets_ingestion_enabled", value: "false" },
+  // Phase 3d.2 (2026-05-11): Matchbook + Betfair-SP fetchers. Same gating
+  // pattern as smarkets — default false, operator flips via Neon when
+  // ready. Matchbook polls every 15 min (same shape as Smarkets);
+  // Betfair-SP polls every 60 sec to catch matches in their 90s post-
+  // kickoff capture window.
+  { key: "matchbook_ingestion_enabled", value: "false" },
+  { key: "betfair_sp_ingestion_enabled", value: "false" },
   // Per-source trust weights for the weighted geometric-mean consensus.
   // JSON keyed by source name. Overrides the in-code defaults
   // (pinnacle=1.0, smarkets=0.8, matchbook=0.7, betfair_sp=0.9).

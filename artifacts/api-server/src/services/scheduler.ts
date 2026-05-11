@@ -2464,6 +2464,43 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Smarkets ingestion scheduler active — every 15 min (gated on agent_config.smarkets_ingestion_enabled)");
 
+  // Task 11 (Phase 3d.2) — Matchbook ingestion. Offset off Smarkets cron
+  // (8,23,38,53 vs 3,18,33,48) so the two sources don't compete for
+  // outbound bandwidth in the same second.
+  cron.schedule("8,23,38,53 * * * *", () => {
+    void (async () => {
+      try {
+        const { runMatchbookIngestion } = await import("./sharpSources/runMatchbookIngestion");
+        const r = await runMatchbookIngestion();
+        if (r.enabled) logger.info(r, "Matchbook ingestion complete");
+      } catch (err) {
+        logger.error({ err }, "Matchbook ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Matchbook ingestion scheduler active — every 15 min (gated on agent_config.matchbook_ingestion_enabled)");
+
+  // Task 11 (Phase 3d.2) — Betfair SP / closing-book ingestion. Runs every
+  // minute because the capture window is the 90s immediately post-kickoff;
+  // any wider cadence misses matches. Per-match cost is one relay call
+  // for market list + N calls for liquidity per market type traded.
+  // Gated; on a flat schedule with no matches kicking off, it's a single
+  // SELECT that returns 0 rows and exits immediately.
+  cron.schedule("* * * * *", () => {
+    void (async () => {
+      try {
+        const { runBetfairSpIngestion } = await import("./sharpSources/runBetfairSpIngestion");
+        const r = await runBetfairSpIngestion();
+        if (r.enabled && r.matches_in_window > 0) {
+          logger.info(r, "Betfair SP ingestion complete");
+        }
+      } catch (err) {
+        logger.error({ err }, "Betfair SP ingestion failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Betfair SP ingestion scheduler active — every 1 min (gated on agent_config.betfair_sp_ingestion_enabled)");
+
   cron.schedule("0 2 * * *", () => {
     logger.info("Data quality monitor triggered (daily 02:00 UTC)");
     void (async () => {
