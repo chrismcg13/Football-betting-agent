@@ -2558,6 +2558,42 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("ClubElo feature backfill scheduler active — every 3h at :45");
 
+  // Task 19 (Phase 4b) — stadium geocode backfill + travel features.
+  // Geocoder runs every 6h, geocodes up to 50 new venues per tick
+  // (rate-limited to ~1 req/s on OSM Nominatim). Travel-feature
+  // backfill runs straight after to use any new coordinates.
+  cron.schedule("20 */6 * * *", () => {
+    void (async () => {
+      try {
+        const { runStadiumGeocodeBackfill, runTravelFeatureBackfill } = await import("./stadiumGeocoder");
+        const geo = await runStadiumGeocodeBackfill();
+        if (geo.candidates > 0) logger.info(geo, "Stadium geocode backfill complete");
+        const travel = await runTravelFeatureBackfill();
+        if (travel.resolved > 0) logger.info(travel, "Travel feature backfill complete");
+      } catch (err) {
+        logger.error({ err }, "Stadium geocode / travel feature backfill failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Stadium geocode + travel feature scheduler active — every 6h at :20");
+
+  // Phase 4b startup self-seed: kick off a first geocode pass + travel
+  // backfill at T+120s. The 120s offset puts it after the ClubElo
+  // self-seed and the trading-cycle warmup so we don't fight for IO.
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const { runStadiumGeocodeBackfill, runTravelFeatureBackfill } = await import("./stadiumGeocoder");
+        const geo = await runStadiumGeocodeBackfill();
+        logger.info(geo, "Stadium geocode startup self-seed complete");
+        const travel = await runTravelFeatureBackfill();
+        logger.info(travel, "Travel feature startup backfill complete");
+      } catch (err) {
+        logger.warn({ err }, "Stadium / travel startup self-seed failed");
+      }
+    })();
+  }, 120 * 1000);
+
   // Task 15 startup self-seed: at T+60s after boot:
   //   1. If club_elo_snapshots is empty (fresh deploy), fire one ingestion
   //   2. ALWAYS run the feature backfill — it's idempotent (skips matches

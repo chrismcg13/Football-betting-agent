@@ -3340,6 +3340,32 @@ export async function runMigrations() {
 
     logger.info("ClubElo snapshots ready (Task 15)");
 
+    // Task 19 — stadium coordinates for travel/altitude/timezone features.
+    // Keyed on matches.venue_api_id. Backfilled via stadiumGeocoder
+    // (OSM Nominatim, 1 req/s). Altitude + timezone left NULL for now;
+    // filled in follow-up PRs.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS stadium_coordinates (
+        venue_api_id    INTEGER PRIMARY KEY,
+        stadium_name    TEXT,
+        city            TEXT,
+        country         TEXT,
+        lat             NUMERIC(10,6),
+        lon             NUMERIC(10,6),
+        altitude_m      NUMERIC(8,1),
+        timezone_iana   TEXT,
+        source          TEXT,
+        geocoded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS stadium_coords_with_position
+        ON stadium_coordinates(venue_api_id)
+        WHERE lat IS NOT NULL AND lon IS NOT NULL
+    `);
+
+    logger.info("Stadium coordinates ready (Task 19)");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

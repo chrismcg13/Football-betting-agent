@@ -37,3 +37,4 @@ export * from "./analysisSignalStrength";
 export * from "./calibrationBuckets";
 export * from "./sharpConsensusSnapshots";
 export * from "./clubEloSnapshots";
+export * from "./stadiumCoordinates";
