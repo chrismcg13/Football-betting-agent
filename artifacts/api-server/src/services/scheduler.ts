@@ -2577,6 +2577,28 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Stadium geocode + travel feature scheduler active — every 6h at :20");
 
+  // Task 21 (Phase 5a) — SHAP-on-residuals drift detector. Daily at
+  // 03:30 UTC, after the Bundle B analytics (02:30) and before the
+  // weekly calibration fit (Mon 04:00). Computes per-feature K-S
+  // tests between recent (last 500 settled) and baseline (prior
+  // 1,500 settled) windows per market_type. ≥2 features drifted at
+  // p<0.01 → alert_warning; ≥3 → alert_critical. Subsequent
+  // calibration cron reads action_taken to decide whether to refit
+  // affected market_types early.
+  cron.schedule("30 3 * * *", () => {
+    logger.info("SHAP drift detector triggered (daily 03:30 UTC)");
+    void (async () => {
+      try {
+        const { runShapDrift } = await import("./shapDriftCron");
+        const r = await runShapDrift();
+        logger.info(r, "SHAP drift detector complete");
+      } catch (err) {
+        logger.error({ err }, "SHAP drift detector failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("SHAP drift detector scheduler active — daily 03:30 UTC");
+
   // Phase 4b startup self-seed: kick off a first geocode pass + travel
   // backfill at T+120s. The 120s offset puts it after the ClubElo
   // self-seed and the trading-cycle warmup so we don't fight for IO.

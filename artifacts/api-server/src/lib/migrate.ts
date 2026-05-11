@@ -3366,6 +3366,38 @@ export async function runMigrations() {
 
     logger.info("Stadium coordinates ready (Task 19)");
 
+    // Task 21 — SHAP-on-residuals drift runs. One row per (market_type ×
+    // detection run). Per-feature K-S test results in drifted_features
+    // jsonb. action_taken drives whether downstream cron triggers a
+    // calibration refit.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS shap_drift_runs (
+        id                 SERIAL PRIMARY KEY,
+        run_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        market_type        TEXT NOT NULL,
+        recent_n           INTEGER NOT NULL,
+        baseline_n         INTEGER NOT NULL,
+        features_analysed  INTEGER NOT NULL,
+        features_drifted   INTEGER NOT NULL,
+        drifted_features   JSONB,
+        ks_max_stat        NUMERIC(8,6),
+        ks_min_pvalue      NUMERIC(10,8),
+        action_taken       TEXT NOT NULL,
+        notes              TEXT
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS shap_drift_runs_recent
+        ON shap_drift_runs(run_at DESC)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS shap_drift_runs_alerts
+        ON shap_drift_runs(action_taken, run_at DESC)
+        WHERE action_taken IN ('alert_warning', 'alert_critical', 'recalibration_triggered')
+    `);
+
+    logger.info("SHAP drift runs ready (Task 21)");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
