@@ -2453,13 +2453,13 @@ export function startSettlementCron(): void {
   // this is a no-op.
   cron.schedule("3,18,33,48 * * * *", () => {
     void (async () => {
-      try {
+      const { runCronWithHealthLog } = await import("./cronHealthLog");
+      await runCronWithHealthLog("smarkets_ingestion", async () => {
         const { runSmarketsIngestion } = await import("./sharpSources/runSmarketsIngestion");
         const r = await runSmarketsIngestion();
         if (r.enabled) logger.info(r, "Smarkets ingestion complete");
-      } catch (err) {
-        logger.error({ err }, "Smarkets ingestion failed");
-      }
+        return r;
+      });
     })();
   }, { timezone: "UTC" });
   logger.info("Smarkets ingestion scheduler active — every 15 min (gated on agent_config.smarkets_ingestion_enabled)");
@@ -2567,13 +2567,13 @@ export function startSettlementCron(): void {
   // gradually, while polite to the ClubElo public API.
   cron.schedule("35 */6 * * *", () => {
     void (async () => {
-      try {
+      const { runCronWithHealthLog } = await import("./cronHealthLog");
+      await runCronWithHealthLog("clubelo_historical_backfill", async () => {
         const { runClubEloHistoricalBackfill } = await import("./clubElo");
         const r = await runClubEloHistoricalBackfill();
         if (r.dates_scanned > 0) logger.info(r, "ClubElo historical backfill complete");
-      } catch (err) {
-        logger.error({ err }, "ClubElo historical backfill failed");
-      }
+        return r;
+      });
     })();
   }, { timezone: "UTC" });
   logger.info("ClubElo historical backfill scheduler active — every 6h at :35");
@@ -2589,15 +2589,15 @@ export function startSettlementCron(): void {
   // values always land first and win).
   cron.schedule("50 */12 * * *", () => {
     void (async () => {
-      try {
+      const { runCronWithHealthLog } = await import("./cronHealthLog");
+      await runCronWithHealthLog("local_elo_backfill", async () => {
         const { runLocalEloBackfill } = await import("./localElo");
         const r = await runLocalEloBackfill();
         if (r.features_written > 0 || r.leagues_processed > 0) {
           logger.info(r, "Local Elo backfill complete");
         }
-      } catch (err) {
-        logger.error({ err }, "Local Elo backfill failed");
-      }
+        return r;
+      });
     })();
   }, { timezone: "UTC" });
   logger.info("Local Elo backfill scheduler active — every 12h at :50");
@@ -2631,13 +2631,13 @@ export function startSettlementCron(): void {
   // venues get geocoded on the next tick.
   cron.schedule("10 */6 * * *", () => {
     void (async () => {
-      try {
+      const { runCronWithHealthLog } = await import("./cronHealthLog");
+      await runCronWithHealthLog("venue_id_backfill", async () => {
         const { runVenueIdBackfill } = await import("./venueIdBackfill");
         const r = await runVenueIdBackfill();
         if (r.candidates > 0) logger.info(r, "venue_api_id backfill complete");
-      } catch (err) {
-        logger.error({ err }, "venue_api_id backfill failed");
-      }
+        return r;
+      });
     })();
   }, { timezone: "UTC" });
   logger.info("venue_api_id backfill scheduler active — every 6h at :10");
@@ -2729,20 +2729,23 @@ export function startSettlementCron(): void {
   // geocoder sees freshly-captured venues on the same tick.
   setTimeout(() => {
     void (async () => {
-      try {
+      const { runCronWithHealthLog } = await import("./cronHealthLog");
+      await runCronWithHealthLog("venue_id_backfill:startup", async () => {
         const { runVenueIdBackfill } = await import("./venueIdBackfill");
         const v = await runVenueIdBackfill();
         if (v.candidates > 0) {
           logger.info(v, "venue_api_id startup backfill complete");
         }
+        return v;
+      });
+      await runCronWithHealthLog("stadium_geocode:startup", async () => {
         const { runStadiumGeocodeBackfill, runTravelFeatureBackfill } = await import("./stadiumGeocoder");
         const geo = await runStadiumGeocodeBackfill();
         logger.info(geo, "Stadium geocode startup self-seed complete");
         const travel = await runTravelFeatureBackfill();
         logger.info(travel, "Travel feature startup backfill complete");
-      } catch (err) {
-        logger.warn({ err }, "Stadium / travel / venue_id startup self-seed failed");
-      }
+        return { geo, travel };
+      });
     })();
   }, 120 * 1000);
 
@@ -2811,12 +2814,12 @@ export function startSettlementCron(): void {
   // distribution. Idempotent — runs only on empty-table boot.
   setTimeout(() => {
     void (async () => {
-      try {
+      const { runCronWithHealthLog } = await import("./cronHealthLog");
+      await runCronWithHealthLog("kelly_montecarlo:startup", async () => {
         const probe = await db.execute(sql`SELECT 1 FROM kelly_fraction_lookup LIMIT 1`);
         const hasRows = ((probe as unknown) as { rows?: unknown[] }).rows?.length ?? 0;
         if (hasRows > 0) {
-          logger.debug("Kelly Monte-Carlo startup self-seed skipped — already populated");
-          return;
+          return { skipped: true, reason: "already_populated" };
         }
         logger.info("Kelly Monte-Carlo startup self-seed triggered (table empty)");
         const { runKellyLookupSimulation } = await import("./dynamicKelly");
@@ -2826,12 +2829,10 @@ export function startSettlementCron(): void {
             { selectedFraction: r.selectedFraction, mu: r.realisedRoi, sigma: r.realisedStdev },
             "Kelly Monte-Carlo startup self-seed complete",
           );
-        } else {
-          logger.warn("Kelly Monte-Carlo startup self-seed returned null — < 50 settled bets or degenerate distribution");
+          return r;
         }
-      } catch (err) {
-        logger.warn({ err }, "Kelly Monte-Carlo startup self-seed failed");
-      }
+        return { skipped: true, reason: "insufficient_returns_or_degenerate" };
+      });
     })();
   }, 180 * 1000);
 

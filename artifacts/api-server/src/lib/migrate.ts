@@ -3521,6 +3521,47 @@ export async function runMigrations() {
 
     logger.info("Market correlation matrix ready (Task 13)");
 
+    // Cron-health observability view (2026-05-11). Surfaces structured
+    // success/failure for each cron run via compliance_logs rows with
+    // action_type='cron_health'. Read via SQL editor when a scheduled
+    // task appears to be silently failing — last_error reveals the
+    // exception without needing VPS log access.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_cron_health_24h AS
+      WITH runs AS (
+        SELECT
+          (details->>'cron')        AS cron_name,
+          (details->>'status')      AS status,
+          (details->>'duration_ms')::int AS duration_ms,
+          details->>'error'         AS error_msg,
+          timestamp                 AS ran_at
+        FROM compliance_logs
+        WHERE action_type = 'cron_health'
+          AND timestamp >= NOW() - INTERVAL '24 hours'
+      )
+      SELECT
+        cron_name,
+        COUNT(*) FILTER (WHERE status = 'success')              AS success_24h,
+        COUNT(*) FILTER (WHERE status = 'error')                AS errors_24h,
+        MAX(ran_at) FILTER (WHERE status = 'success')           AS last_success_at,
+        MAX(ran_at) FILTER (WHERE status = 'error')             AS last_failure_at,
+        (
+          SELECT error_msg
+          FROM runs r2
+          WHERE r2.cron_name = runs.cron_name AND r2.status = 'error'
+          ORDER BY ran_at DESC LIMIT 1
+        )                                                       AS last_error,
+        AVG(duration_ms) FILTER (WHERE status = 'success')::int AS avg_success_ms
+      FROM runs
+      WHERE cron_name IS NOT NULL
+      GROUP BY cron_name
+      ORDER BY
+        CASE WHEN MAX(ran_at) FILTER (WHERE status = 'error') > COALESCE(MAX(ran_at) FILTER (WHERE status = 'success'), '1970-01-01') THEN 0 ELSE 1 END,
+        MAX(ran_at) DESC
+    `);
+
+    logger.info("Cron-health view ready");
+
     // Task 23 (Phase 6a) — slippage guard depth-cushion config.
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)
