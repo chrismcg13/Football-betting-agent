@@ -102,6 +102,44 @@ function anyTokenEquals(longName: string, short: string): boolean {
   return tokens.some((t) => t === target);
 }
 
+/**
+ * Bidirectional token-prefix match — same token count on both sides, and
+ * every token in one list is a prefix of (or equal to) some unused token
+ * in the other list. Catches the case where the api-football name and
+ * the ClubElo short form are BOTH multi-token but one side abbreviates
+ * each token:
+ *   "Manchester City" tokens=["manchester","city"] vs
+ *   "Man City"        tokens=["man","city"]
+ *   pair "manchester"↔"man" (man is prefix of manchester) ✓
+ *   pair "city"↔"city" ✓
+ * Symmetric — works for either direction of abbreviation.
+ */
+function bidirectionalTokenPrefixMatch(a: string, b: string): boolean {
+  const tokensA = tokenise(a);
+  const tokensB = tokenise(b);
+  if (tokensA.length === 0 || tokensB.length === 0) return false;
+  if (tokensA.length !== tokensB.length) return false;
+  const used = new Array(tokensB.length).fill(false);
+  for (const ta of tokensA) {
+    let found = false;
+    for (let j = 0; j < tokensB.length; j++) {
+      if (used[j]) continue;
+      const tb = tokensB[j];
+      // Require ≥3 chars on the shorter side to keep "St" from greedy
+      // matching every two-letter prefix in the candidate set.
+      const minLen = Math.min(ta.length, tb.length);
+      if (minLen < 3) continue;
+      if (ta.startsWith(tb) || tb.startsWith(ta)) {
+        used[j] = true;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -271,6 +309,14 @@ function resolveAgainstCandidates(
   // "Real Madrid" → "RealMadrid", "Bayern Munich" → "Bayern").
   for (const c of candidates) {
     if (tokenPrefixMatch(teamName, c.teamName)) {
+      return { elo: Number(c.elo), matchedName: c.teamName };
+    }
+  }
+  // 3b. Bidirectional token-prefix match — same token count and each
+  // token is a prefix of its counterpart. Catches "Manchester City" ↔
+  // "Man City", "Borussia Mönchengladbach" ↔ "Bor M'gladbach", etc.
+  for (const c of candidates) {
+    if (bidirectionalTokenPrefixMatch(teamName, c.teamName)) {
       return { elo: Number(c.elo), matchedName: c.teamName };
     }
   }
