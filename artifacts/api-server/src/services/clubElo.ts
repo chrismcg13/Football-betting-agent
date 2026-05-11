@@ -44,6 +44,15 @@ interface ParsedRow {
   toDate: string | null;
 }
 
+/** Coerce a CSV cell to an integer, returning null if blank, "NaN", or non-finite. */
+function intOrNull(cell: string | undefined): number | null {
+  if (!cell) return null;
+  const trimmed = cell.trim();
+  if (!trimmed || trimmed === "NaN" || trimmed === "None") return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
 function parseCsvRow(line: string): ParsedRow | null {
   // CSV from ClubElo is comma-separated, no embedded commas, no quoting.
   const parts = line.split(",");
@@ -53,10 +62,13 @@ function parseCsvRow(line: string): ParsedRow | null {
   const eloNum = Number(elo);
   if (!Number.isFinite(eloNum)) return null;
   return {
-    rank: rank && rank.trim() ? Number(rank) : null,
+    // ClubElo returns "NaN" for retired/inactive clubs and some
+    // transitional rows. Drop those to null rather than pass through
+    // a JS NaN — Postgres rejects NaN on the integer column.
+    rank: intOrNull(rank),
     teamName: club.trim(),
     country: country?.trim() || null,
-    level: level && level.trim() ? Number(level) : null,
+    level: intOrNull(level),
     elo: eloNum,
     fromDate: fromDate?.trim() || null,
     toDate: toDate?.trim() || null,
