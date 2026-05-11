@@ -701,6 +701,43 @@ async function logShadowGateExemption(
   }
 }
 
+// 2026-05-11 — single source of truth for the Kelly fraction used when
+// recording shadow_stake. Mirrors the candidate-tier flow at
+// paperTrading.ts:1683 so shadow_pnl is computed against the SAME Kelly
+// fraction a real candidate-tier bet would have used (drawdown-targeted
+// dynamic Kelly from kelly_fraction_lookup, computed by the daily
+// Monte-Carlo cron in dynamicKelly.ts). Falls back to 0.25 with a
+// compliance log if the lookup hasn't populated yet — same fallback as
+// the live candidate-tier path.
+export async function getShadowKellyFraction(
+  matchId: number,
+  marketType: string,
+): Promise<number> {
+  try {
+    const { getDynamicKellyFraction } = await import("./dynamicKelly");
+    const dynamicF = await getDynamicKellyFraction();
+    if (dynamicF != null && Number.isFinite(dynamicF) && dynamicF > 0 && dynamicF <= 1) {
+      return dynamicF;
+    }
+  } catch (err) {
+    logger.warn(
+      { err, matchId, marketType },
+      "Shadow Kelly fraction: getDynamicKellyFraction failed — using fallback",
+    );
+  }
+  const fallback = 0.25;
+  try {
+    await db.insert(complianceLogsTable).values({
+      actionType: "shadow_dynamic_kelly_fallback",
+      details: { matchId, marketType, fallback, reason: "kelly_fraction_lookup empty or invalid" },
+      timestamp: new Date(),
+    });
+  } catch {
+    // Non-fatal — fallback still returned
+  }
+  return fallback;
+}
+
 export function calculateDynamicKellyStake(
   bankroll: number,
   pFair: number,
@@ -1804,25 +1841,30 @@ export async function placePaperBet(
   }
 
   // ── Phase 2.B.2: shadow-stake branch ──────────────────────────────────
-  // For Tier B/C candidates: capture what 0.25× full Kelly would have been
-  // (matches the candidate-tier multiplier so experiment-phase shadow ROI
-  // and candidate-phase real ROI are apples-to-apples for the edge-
-  // survival graduation gate), then set actual stake to 0. Subsequent
-  // gates (min-stake, exposure, live-concentration) are bypassed because
-  // a £0 bet contributes nothing to exposure and the min-stake guard is
-  // for protecting against tiny accidental stakes, not legitimate £0
-  // shadow bets.
+  // For Tier B/C candidates we capture "what a candidate-tier real-money
+  // bet would have staked" — the experiment-phase analogue of
+  // settlement_pnl, feeding the edge-survival graduation gate.
+  //
+  // 2026-05-11 BUG FIX: previously this used a hardcoded 0.25 (the old
+  // candidate-tier multiplier). After Task 17 wired drawdown-targeted
+  // dynamic Kelly into the candidate-tier flow (paperTrading.ts:1683),
+  // the candidate-tier fraction is no longer fixed — it's a Monte-Carlo
+  // lookup from kelly_fraction_lookup targeting a 15% 1st-percentile
+  // drawdown over a 450-bet horizon. Hardcoding 0.25 here makes shadow
+  // sizing diverge from the candidate-tier sizing it's meant to mirror.
+  // Read the same dynamic fraction; fall back to 0.25 with a compliance
+  // log if the lookup is missing.
   let shadowStake: number | null = null;
   let shadowStakeKellyFraction: number | null = null;
   if (isShadowBet) {
-    const SHADOW_KELLY_FRACTION = 0.25;
+    const shadowFraction = await getShadowKellyFraction(matchId, marketType);
     const fullKellyStake = stake;
-    shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
-    shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+    shadowStakeKellyFraction = shadowFraction;
+    shadowStake = Math.round(fullKellyStake * shadowFraction * 100) / 100;
     stake = 0;
     logger.info(
       { matchId, marketType, universeTier, fullKellyStake, shadowStake, shadowStakeKellyFraction },
-      "Phase 2.B.2 shadow bet — actual stake = 0; shadow_stake recorded",
+      "Phase 2.B.2 shadow bet — actual stake = 0; shadow_stake recorded (theory-driven Kelly fraction)",
     );
   }
 
@@ -1851,7 +1893,9 @@ export async function placePaperBet(
   // rescues bets back to live if Kelly recovers above £2 before kickoff.
   if (!isShadowBet && stake < 2) {
     const fullKellyStake = stake;
-    const SHADOW_KELLY_FRACTION = 0.25;
+    // 2026-05-11: same theory-driven Kelly fraction as the primary shadow
+    // branch — drawdown-targeted dynamic Kelly, not the legacy 0.25.
+    const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
     shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
     shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
     stake = 0;

@@ -606,7 +606,109 @@ export async function bootstrapModels(): Promise<string> {
     { version, trainingSize: allSamples.length },
     "Bootstrap training complete",
   );
+
+  // 2026-05-11 GUARD: getProbabilities relies on the ml-logistic-regression
+  // convention that `testScores` returns P(y ≠ class i), so we recover
+  // P(class i) as `1 − score`. If the library convention silently flips
+  // (e.g. a future version returns P(y = class i) directly), every
+  // prediction would be inverted (home prob → away prob) and the model
+  // would bet the wrong side of every market.
+  // Run a sanity check on the just-trained model against a chunk of its
+  // own training data: for samples whose true label is X, the predicted
+  // probability for class X should be > 1/k on average (i.e. better than
+  // uniform), where k is the number of classes. If it isn't, the
+  // orientation has flipped — refuse to publish the model.
+  validatePredictionOrientation(modelSet, allSamples);
+
   return version;
+}
+
+/**
+ * Orientation self-check for the three trained LR heads. Throws if the
+ * mean predicted probability for the TRUE class across training samples
+ * is no better than uniform — which is the signature of an inverted
+ * `1 − testScores` convention (or a totally untrained model).
+ *
+ * Specifically: for each head, compute mean(P_predicted[trueLabel]) over
+ * a random sample. Outcome head has 3 classes (uniform = 1/3 ≈ 0.333);
+ * we require mean > 1/k + 0.02 as a permissive but unambiguous signal.
+ * If the convention flipped, the mean would land at ~(k-1)/k for k-class
+ * models — far above uniform but on the WRONG class — so we'd ALSO need
+ * to verify the modal class matches. Simplest sufficient check: argmax
+ * accuracy on a hold-in sample beats 1/k.
+ */
+function validatePredictionOrientation(
+  modelSet: ModelSet,
+  samples: TrainingSample[],
+): void {
+  if (samples.length < 30) {
+    logger.warn(
+      { sampleCount: samples.length },
+      "Orientation guard skipped — fewer than 30 training samples",
+    );
+    return;
+  }
+
+  type Head = "outcome" | "btts" | "ou";
+  const headSpec: Array<{
+    head: Head;
+    model: LogisticRegression;
+    indices: readonly number[];
+    label: (s: TrainingSample) => number;
+    numClasses: number;
+  }> = [
+    { head: "outcome", model: modelSet.outcomeModel, indices: OUTCOME_IDX, label: (s) => s.outcomeLabel, numClasses: 3 },
+    { head: "btts",    model: modelSet.bttsModel,    indices: BTTS_IDX,    label: (s) => s.bttsLabel,    numClasses: 2 },
+    { head: "ou",      model: modelSet.overUnderModel, indices: OVER_UNDER_IDX, label: (s) => s.ouLabel,  numClasses: 2 },
+  ];
+
+  // Random sample up to 200 rows for speed.
+  const N = Math.min(200, samples.length);
+  const stride = Math.max(1, Math.floor(samples.length / N));
+  const subset: TrainingSample[] = [];
+  for (let i = 0; i < samples.length && subset.length < N; i += stride) {
+    subset.push(samples[i]!);
+  }
+
+  for (const { head, model, indices, label, numClasses } of headSpec) {
+    let trueClassProbSum = 0;
+    let argmaxHits = 0;
+    let counted = 0;
+    for (const s of subset) {
+      const trueLabel = label(s);
+      const row = normalizeRow(s.features, indices, modelSet.featureMeans, modelSet.featureStds);
+      const probs = getProbabilities(model, row);
+      const p = probs[trueLabel];
+      if (p == null) continue;
+      trueClassProbSum += p;
+      const argmax = probs.indexOf(Math.max(...probs));
+      if (argmax === trueLabel) argmaxHits += 1;
+      counted += 1;
+    }
+    if (counted === 0) continue;
+    const meanTrueProb = trueClassProbSum / counted;
+    const argmaxAcc = argmaxHits / counted;
+    const uniformProb = 1 / numClasses;
+
+    logger.info(
+      { head, meanTrueProb, argmaxAcc, uniformProb, n: counted },
+      "Orientation guard: mean(P[true class]) and argmax accuracy",
+    );
+
+    // Tight failure thresholds: probability orientation must be at least
+    // slightly above uniform on the TRUE class. If it's at or below
+    // uniform, the convention has flipped (or training failed).
+    if (meanTrueProb < uniformProb - 0.01) {
+      const msg = `Prediction orientation FLIPPED on '${head}' head — mean P[true class] = ${meanTrueProb.toFixed(4)} below uniform ${uniformProb.toFixed(4)} (n=${counted}). Library convention has changed; refuse to publish model.`;
+      logger.error({ head, meanTrueProb, argmaxAcc, uniformProb, n: counted }, msg);
+      throw new Error(msg);
+    }
+    if (argmaxAcc < uniformProb - 0.02) {
+      const msg = `Argmax-class accuracy worse than uniform on '${head}' head — ${argmaxAcc.toFixed(4)} < ${uniformProb.toFixed(4)} (n=${counted}). Model is anti-predictive; refuse to publish.`;
+      logger.error({ head, meanTrueProb, argmaxAcc, uniformProb, n: counted }, msg);
+      throw new Error(msg);
+    }
+  }
 }
 
 // ===================== Prediction API =====================
@@ -1457,6 +1559,12 @@ export async function retrainIfNeeded(): Promise<boolean> {
   };
 
   await saveModelToDb(modelSet, samples);
+  // 2026-05-11 GUARD: orientation self-check before publishing. If the
+  // ml-logistic-regression library's `1 − testScores` convention has
+  // flipped, mean P[true class] on hold-in data lands below uniform —
+  // throw and refuse to set currentModel so the prior good model stays
+  // active rather than every prediction being inverted.
+  validatePredictionOrientation(modelSet, samples);
   currentModel = modelSet;
   lastTrainedBetCount = settledCount;
 

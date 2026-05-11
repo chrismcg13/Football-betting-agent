@@ -110,8 +110,9 @@ export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 10
   const untilIso = until.toISOString();
 
   // Attempt 1 — legacy single-call shortcut. `type_scope=single_event`
-  // is the original code path; live verification 2026-05-11 showed it
-  // returns 0 events, but we keep it in case Smarkets fixes it server-side.
+  // combined with `type_domain=sport-soccer` returns HTTP 400 (confirmed
+  // via live probe 2026-05-11 evening). Kept here for the day Smarkets
+  // restores that combination.
   const legacy = new URLSearchParams({
     type_scope: "single_event",
     type_domain: "sport-soccer",
@@ -130,7 +131,62 @@ export async function listUpcomingFootballEvents(lookaheadMs = 48 * 60 * 60 * 10
     return legacyEvents;
   }
 
-  // Attempt 2 — parent_id walk. Smarkets v3 organises events as a tree:
+  // Attempt 2 (NEW 2026-05-11 evening) — top-level single_event walk with
+  // client-side type_domain filter. Live probe revealed:
+  //   - `type_scope=single_event&state=upcoming&type_domain=sport-soccer` → HTTP 400
+  //   - `type_scope=single_event&state=upcoming` (no domain) → 100+ events across all sports
+  //   - Each event row carries `type_domain`, so we filter client-side.
+  // This is the cheapest path that actually returns football fixtures.
+  // Pagination is supported via `pagination.next_page`.
+  try {
+    const topLevelParams = new URLSearchParams({
+      type_scope: "single_event",
+      state: "upcoming",
+      start_datetime_min: nowIso,
+      start_datetime_max: untilIso,
+      limit: "200",
+    });
+    const collected: SmarketsEvent[] = [];
+    let nextPath: string | null = `/events/?${topLevelParams.toString()}`;
+    let pageCount = 0;
+    const MAX_PAGES = 8; // 8 × 200 = 1,600 events ceiling — well above any 14-day all-sports window
+    while (nextPath && pageCount < MAX_PAGES) {
+      // Smarkets returns next_page either as a full path (/v3/events/?…) or
+      // as a query-only fragment. Strip /v3 prefix so our /events/ prefix
+      // in fetchJson handles both.
+      const requestPath = nextPath.startsWith("/v3/")
+        ? nextPath.slice(3) // "/v3" prefix
+        : nextPath;
+      const pageResp = await fetchJson<{
+        events: SmarketsEvent[];
+        pagination?: { next_page: string | null };
+      }>(requestPath);
+      if (!pageResp) break;
+      collected.push(...(pageResp.events ?? []));
+      nextPath = pageResp.pagination?.next_page ?? null;
+      pageCount++;
+    }
+    const footballEvents = collected.filter(
+      (e) => e.type_domain === "sport-soccer",
+    );
+    logger.info(
+      {
+        path: "top_level_single_event_walk",
+        pagesFetched: pageCount,
+        totalReturned: collected.length,
+        footballCount: footballEvents.length,
+        firstFootballName: footballEvents[0]?.name ?? null,
+      },
+      "Smarkets: top-level single_event walk",
+    );
+    if (footballEvents.length > 0) {
+      return footballEvents;
+    }
+  } catch (err) {
+    logger.warn({ err }, "Smarkets: top-level single_event walk failed — falling back to parent_id walk");
+  }
+
+  // Attempt 3 — parent_id walk. Smarkets v3 organises events as a tree:
   //   Football (121005)
   //   └── competitions (Premier League, Liga 1, …)
   //       └── individual matches (the rows we want)

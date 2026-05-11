@@ -1436,20 +1436,79 @@ export async function findEventIdByTeamNames(
       },
       3,
     );
+    const homeFirst = shortHome.toLowerCase().split(/\s+/)[0] ?? "";
     const awayTokens = awayTeam.toLowerCase()
       .replace(/\b(FC|SC|CF|AC|AS|US|SS|SSC|Borussia|TSG)\b/gi, "")
       .trim().split(/\s+/);
-    const awayFirst = awayTokens[0];
-    const match = markets.find(m => (m.event?.name ?? "").toLowerCase().includes(awayFirst));
-    if (match) {
-      logger.info({ eventId: match.event.id, eventName: match.event.name, shortHome }, "Resolved Betfair event ID via MATCH_ODDS search");
-      return match.event.id;
+    const awayFirst = awayTokens[0] ?? "";
+
+    // 2026-05-11 BUG FIX: cross-validate BOTH team names against the
+    // resolved event name. Pre-fix, the away-team filter found matches
+    // by awayFirst alone — and the single-result fallback below skipped
+    // the away check entirely. Consequence: ambiguous home-team text
+    // queries (e.g. "Real" matching both Real Madrid and Real Salt Lake)
+    // could resolve to the wrong fixture. The PSG-vs-Arsenal / Liverpool-
+    // vs-Arsenal class of error is the root cause we believe drove the
+    // id=6044 won-marked-but-Betfair-lost row.
+    const eventNameContains = (eventName: string | undefined, token: string): boolean => {
+      if (!token) return false;
+      return (eventName ?? "").toLowerCase().includes(token);
+    };
+
+    // Strict pass: event name contains BOTH home AND away tokens.
+    if (homeFirst && awayFirst) {
+      const strictMatch = markets.find((m) =>
+        eventNameContains(m.event?.name, homeFirst) &&
+        eventNameContains(m.event?.name, awayFirst),
+      );
+      if (strictMatch) {
+        logger.info(
+          {
+            eventId: strictMatch.event.id,
+            eventName: strictMatch.event.name,
+            shortHome,
+            awayFirst,
+          },
+          "Resolved Betfair event ID via strict home+away cross-validation",
+        );
+        return strictMatch.event.id;
+      }
     }
-    if (markets.length === 1) {
-      logger.info({ eventId: markets[0].event.id, eventName: markets[0].event.name }, "Resolved Betfair event ID (single result)");
-      return markets[0].event.id;
+
+    // Permissive fallback: at least the away token must appear (the
+    // original behaviour). Logged at WARN so operator can audit if this
+    // path produces drift.
+    const awayOnlyMatch = markets.find((m) =>
+      eventNameContains(m.event?.name, awayFirst),
+    );
+    if (awayOnlyMatch) {
+      logger.warn(
+        {
+          eventId: awayOnlyMatch.event.id,
+          eventName: awayOnlyMatch.event.name,
+          shortHome,
+          awayFirst,
+          note: "home token did not match event name — using away-only fallback",
+        },
+        "Resolved Betfair event ID via permissive away-only fallback",
+      );
+      return awayOnlyMatch.event.id;
     }
-    logger.warn({ shortHome, awayFirst, resultCount: markets.length, eventNames: markets.map(m => m.event?.name) }, "Could not match Betfair event from results");
+
+    // Single-result fallback DELETED 2026-05-11. The prior code returned
+    // the sole result without cross-checking either team — this was the
+    // wrong-fixture vector. If neither strict nor permissive matches, we
+    // refuse to resolve rather than gamble on the wrong fixture.
+    logger.warn(
+      {
+        shortHome,
+        homeFirst,
+        awayFirst,
+        resultCount: markets.length,
+        eventNames: markets.map((m) => m.event?.name),
+      },
+      "Could not match Betfair event — refusing single-result fallback (would risk wrong fixture)",
+    );
     return null;
   } catch (err) {
     logger.error({ err, homeTeam, awayTeam }, "Failed to resolve Betfair event ID");
