@@ -2527,20 +2527,43 @@ export function startSettlementCron(): void {
     logger.info("ClubElo ingestion triggered (daily 02:00 UTC)");
     void (async () => {
       try {
-        const { runClubEloIngestion } = await import("./clubElo");
+        const { runClubEloIngestion, runClubEloFeatureBackfill } = await import("./clubElo");
         const r = await runClubEloIngestion();
         logger.info(r, "ClubElo ingestion complete");
+        // Chain the feature backfill — fresh Elo data is most useful
+        // immediately propagated to upcoming-match features.
+        const bf = await runClubEloFeatureBackfill();
+        logger.info(bf, "ClubElo feature backfill complete (post-ingestion)");
       } catch (err) {
-        logger.error({ err }, "ClubElo ingestion failed");
+        logger.error({ err }, "ClubElo ingestion or backfill failed");
       }
     })();
   }, { timezone: "UTC" });
   logger.info("ClubElo scheduler active — daily 02:00 UTC");
 
-  // Task 15 startup self-seed: if club_elo_snapshots is empty (fresh deploy),
-  // fire one ingestion 60s after boot so the table populates immediately
-  // rather than waiting until tomorrow's 02:00 UTC cron. Fire-and-forget;
-  // failures log but don't block startup.
+  // Phase 4a.2 — between daily ingestions, re-run the feature backfill every
+  // 3h to pick up newly-scheduled matches. Cheap (one bulk SELECT + cached
+  // resolver). Offset 45min off the ClubElo daily cron and feature-engine's
+  // 6-hour cycle.
+  cron.schedule("45 */3 * * *", () => {
+    void (async () => {
+      try {
+        const { runClubEloFeatureBackfill } = await import("./clubElo");
+        const r = await runClubEloFeatureBackfill();
+        if (r.needing_elo > 0) logger.info(r, "ClubElo feature backfill complete");
+      } catch (err) {
+        logger.error({ err }, "ClubElo feature backfill failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("ClubElo feature backfill scheduler active — every 3h at :45");
+
+  // Task 15 startup self-seed: at T+60s after boot:
+  //   1. If club_elo_snapshots is empty (fresh deploy), fire one ingestion
+  //   2. ALWAYS run the feature backfill — it's idempotent (skips matches
+  //      whose home_clubelo is already present in features) and the only
+  //      way to populate Elo features for matches whose other features
+  //      are still inside the 2h freshness window.
   setTimeout(() => {
     void (async () => {
       try {
@@ -2548,14 +2571,16 @@ export function startSettlementCron(): void {
           sql`SELECT 1 FROM club_elo_snapshots LIMIT 1`,
         );
         const hasRows = ((probe as unknown) as { rows?: unknown[] }).rows?.length ?? 0;
-        if (hasRows > 0) {
-          logger.debug("ClubElo startup self-seed skipped — table already has rows");
-          return;
+        const { runClubEloIngestion, runClubEloFeatureBackfill } = await import("./clubElo");
+        if (hasRows === 0) {
+          logger.info("ClubElo startup self-seed triggered (table empty)");
+          const r = await runClubEloIngestion();
+          logger.info(r, "ClubElo startup self-seed complete");
+        } else {
+          logger.debug("ClubElo startup ingestion skipped — table already has rows");
         }
-        logger.info("ClubElo startup self-seed triggered (table empty)");
-        const { runClubEloIngestion } = await import("./clubElo");
-        const r = await runClubEloIngestion();
-        logger.info(r, "ClubElo startup self-seed complete");
+        const bf = await runClubEloFeatureBackfill();
+        logger.info(bf, "ClubElo startup feature backfill complete");
       } catch (err) {
         logger.warn({ err }, "ClubElo startup self-seed failed");
       }

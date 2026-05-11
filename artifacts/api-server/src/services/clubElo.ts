@@ -20,9 +20,11 @@
  * top tier in the team's country.
  */
 
-import { db, clubEloSnapshotsTable } from "@workspace/db";
+import { db, clubEloSnapshotsTable, matchesTable, featuresTable } from "@workspace/db";
+import { and, eq, gte, lte, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { resilientFetch } from "./resilientFetch";
+import { getClubEloForTeam } from "./clubEloLookup";
 
 const BASE_URL = "http://api.clubelo.com";
 
@@ -190,4 +192,132 @@ export async function runClubEloIngestion(opts: {
   result.durationMs = Date.now() - startedAt;
   logger.info(result, "ClubElo ingestion complete");
   return result;
+}
+
+/**
+ * Phase 4a.2 — Elo-only feature backfill for upcoming matches.
+ *
+ * The main featureEngine.runFeatureEngineForUpcomingMatches applies a
+ * 2-hour freshness filter keyed on `home_form_last5`. Matches whose
+ * form features are fresh get the entire feature computation skipped,
+ * including the new Elo block. To populate Elo on those matches without
+ * re-running the full pipeline, this lightweight job:
+ *
+ *   1. SELECTs upcoming matches (kickoff in next 7 days, status='scheduled')
+ *      where `home_clubelo` is not present in features table
+ *   2. For each, calls getClubEloForTeam(home) and (away)
+ *   3. Upserts home_clubelo / away_clubelo / elo_diff into features
+ *
+ * Cost: one batched SELECT + N small upserts. Cached resolver makes
+ * repeat calls free. Caps to 1000 matches per run to bound DB load.
+ */
+export interface EloFeatureBackfillResult {
+  upcoming_matches: number;
+  needing_elo: number;
+  home_resolved: number;
+  away_resolved: number;
+  full_pairs: number;
+  durationMs: number;
+}
+
+export async function runClubEloFeatureBackfill(): Promise<EloFeatureBackfillResult> {
+  const startedAt = Date.now();
+  const result: EloFeatureBackfillResult = {
+    upcoming_matches: 0,
+    needing_elo: 0,
+    home_resolved: 0,
+    away_resolved: 0,
+    full_pairs: 0,
+    durationMs: 0,
+  };
+
+  // Upcoming matches in the next 7 days.
+  const now = new Date();
+  const until = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  const upcoming = await db
+    .select({
+      id: matchesTable.id,
+      homeTeam: matchesTable.homeTeam,
+      awayTeam: matchesTable.awayTeam,
+    })
+    .from(matchesTable)
+    .where(
+      and(
+        gte(matchesTable.kickoffTime, now),
+        lte(matchesTable.kickoffTime, until),
+        eq(matchesTable.status, "scheduled"),
+      ),
+    )
+    .limit(1000);
+
+  result.upcoming_matches = upcoming.length;
+  if (upcoming.length === 0) {
+    result.durationMs = Date.now() - startedAt;
+    return result;
+  }
+
+  // One bulk SELECT to find which matches already have home_clubelo.
+  const matchIds = upcoming.map((m) => m.id);
+  const haveHome = await db.execute(sql`
+    SELECT DISTINCT match_id
+    FROM features
+    WHERE feature_name = 'home_clubelo'
+      AND match_id IN (${sql.raw(matchIds.join(","))})
+  `);
+  const haveHomeSet = new Set<number>(
+    (((haveHome as unknown) as { rows?: Array<{ match_id: number }> }).rows ?? []).map((r) => Number(r.match_id)),
+  );
+
+  const needing = upcoming.filter((m) => !haveHomeSet.has(m.id));
+  result.needing_elo = needing.length;
+  if (needing.length === 0) {
+    result.durationMs = Date.now() - startedAt;
+    return result;
+  }
+
+  for (const match of needing) {
+    const homeRes = await getClubEloForTeam(match.homeTeam);
+    const awayRes = await getClubEloForTeam(match.awayTeam);
+    if (homeRes.elo != null) {
+      await upsertFeature(match.id, "home_clubelo", homeRes.elo);
+      result.home_resolved++;
+    }
+    if (awayRes.elo != null) {
+      await upsertFeature(match.id, "away_clubelo", awayRes.elo);
+      result.away_resolved++;
+    }
+    if (homeRes.elo != null && awayRes.elo != null) {
+      await upsertFeature(match.id, "elo_diff", homeRes.elo - awayRes.elo);
+      result.full_pairs++;
+    }
+  }
+
+  result.durationMs = Date.now() - startedAt;
+  logger.info(result, "ClubElo feature backfill complete");
+  return result;
+}
+
+// Mini-copy of the upsertFeature helper from featureEngine.ts. Inlined
+// here to avoid an import cycle (clubEloLookup -> featureEngine would
+// pull the whole feature pipeline into this module).
+async function upsertFeature(matchId: number, name: string, value: number): Promise<void> {
+  const rounded = String(Math.round(value * 1_000_000) / 1_000_000);
+  const existing = await db
+    .select({ id: featuresTable.id })
+    .from(featuresTable)
+    .where(and(eq(featuresTable.matchId, matchId), eq(featuresTable.featureName, name)))
+    .limit(1);
+  if (existing.length > 0 && existing[0]) {
+    await db
+      .update(featuresTable)
+      .set({ featureValue: rounded, computedAt: new Date() })
+      .where(eq(featuresTable.id, existing[0].id));
+  } else {
+    await db.insert(featuresTable).values({
+      matchId,
+      featureName: name,
+      featureValue: rounded,
+      computedAt: new Date(),
+    });
+  }
 }
