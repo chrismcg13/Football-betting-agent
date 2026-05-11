@@ -3512,6 +3512,15 @@ export async function runMigrations() {
 
     logger.info("Market correlation matrix ready (Task 13)");
 
+    // Task 23 (Phase 6a) — slippage guard depth-cushion config.
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value, updated_at)
+      VALUES ('slippage_depth_cushion', '3', NOW())
+      ON CONFLICT (key) DO NOTHING
+    `);
+
+    logger.info("Slippage guard config seeded (Task 23)");
+
     // Seed the target_p1_pct config key so the first sim run has a value.
     await db.execute(sql`
       INSERT INTO agent_config (key, value, updated_at)

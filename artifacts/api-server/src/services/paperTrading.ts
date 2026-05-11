@@ -2282,11 +2282,13 @@ export async function placePaperBet(
             // every value-identified bet still settles and feeds learning.
             // The fallthrough flag is retained as a kill-switch.
             const isBestBackOutOfRange = errLower.includes("best_back_below_tolerance") || errLower.includes("best_back_unavailable");
+            const isSlippage = errLower.startsWith("slippage_");
             const errCategory = isMarketUnavailable ? "market_unavailable"
               : isInsufficientFunds ? "insufficient_funds"
               : isStakeBelowMin ? "stake_below_min"
               : isAccount ? "account_issue"
               : isBestBackOutOfRange ? "best_back_drift"
+              : isSlippage ? "slippage_blocked"
               : "transient_or_unknown";
             if (await isLiveToShadowFallthroughEnabled()) {
               const intendedKellyStake = liveStake;

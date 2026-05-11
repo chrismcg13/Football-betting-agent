@@ -1733,6 +1733,38 @@ export async function placeLiveBetOnBetfair(params: {
     return { success: false, error: msg };
   }
 
+  // Task 23 — order-book depth + slippage guard. After TAKE_BEST_BACK
+  // has resolved the placement price, check the depth at that price.
+  // If the available size is less than 3× our intended stake, cut
+  // the stake to depth/3. If the resulting stake is below £2, return
+  // SLIPPAGE_DEPTH_TOO_THIN and let the caller demote to shadow.
+  let finalStake = roundedStake;
+  try {
+    const { checkOrderBookDepth } = await import("./slippageGuard");
+    const slip = await checkOrderBookDepth({
+      marketId: market.marketId,
+      selectionId,
+      intendedStake: roundedStake,
+      intendedPrice: roundedOdds,
+    });
+    if (slip.adjustedStake === 0) {
+      logger.info({ internalBetId, marketId: market.marketId, reason: slip.reason },
+        "Slippage guard blocked placement");
+      return { success: false, error: `SLIPPAGE_${slip.reason.toUpperCase()}` };
+    }
+    if (slip.wasReduced && slip.adjustedStake < finalStake) {
+      logger.info(
+        { internalBetId, originalStake: finalStake, adjustedStake: slip.adjustedStake,
+          depthAtPrice: slip.depthAtPrice },
+        "Slippage guard reduced stake to fit available depth",
+      );
+      finalStake = slip.adjustedStake;
+    }
+  } catch (err) {
+    logger.warn({ err, internalBetId, marketId: market.marketId },
+      "Slippage guard threw — proceeding at intended stake");
+  }
+
   // Idempotent on retry — Betfair rejects DUPLICATE_TRANSACTION; do NOT add a timestamp.
   const customerRef = `BAO-${internalBetId}`;
 
@@ -1745,7 +1777,7 @@ export async function placeLiveBetOnBetfair(params: {
           selectionId,
           side: "BACK",
           limitOrder: {
-            size: roundedStake,
+            size: finalStake,
             price: roundedOdds,
             persistenceType: "LAPSE",
           },
