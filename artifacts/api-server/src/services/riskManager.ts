@@ -6,7 +6,7 @@ import {
   agentConfigTable,
   drawdownEventsTable,
 } from "@workspace/db";
-import { eq, inArray, desc, gte, sql } from "drizzle-orm";
+import { eq, inArray, desc, gte, sql, and } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
   getConfigValue,
@@ -131,6 +131,18 @@ async function getTotalWealthForRisk(): Promise<number> {
   return await getBankroll();
 }
 
+// 2026-05-11 BUG FIX: all four functions previously summed settlement_pnl
+// across paperBetsCurrentView with NO bet_track filter. Paper-rail history
+// (£7,750+ of pre-cutover paper-bet losses on a virtual bankroll) was
+// being counted as if it were live loss — the weekly check at 19:10 UTC
+// fired WEEKLY_LOSS_HIT alleging £9,570 of weekly loss when the actual
+// live loss was ~£100. The breaker subsequently flipped live_placement_
+// enabled to false at 20:15 UTC, four minutes after the operator turned
+// live on. Paper rail is deprecated (cutover 2026-05-09); live-mode risk
+// must only consider live bets. Adding bet_track='live' filter to all
+// loss/pnl queries restores correct semantics.
+const LIVE_TRACK_FILTER = eq(paperBetsCurrentView.betTrack, "live");
+
 async function getTodaysSettledLoss(): Promise<number> {
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
@@ -139,7 +151,7 @@ async function getTodaysSettledLoss(): Promise<number> {
       total: sql<number>`COALESCE(ABS(SUM(${paperBetsCurrentView.settlementPnl}::numeric) FILTER (WHERE ${paperBetsCurrentView.settlementPnl}::numeric < 0)), 0)`,
     })
     .from(paperBetsCurrentView)
-    .where(gte(paperBetsCurrentView.settledAt, todayStart));
+    .where(and(gte(paperBetsCurrentView.settledAt, todayStart), LIVE_TRACK_FILTER));
   return result[0]?.total ?? 0;
 }
 
@@ -154,7 +166,7 @@ async function getWeeklySettledLoss(): Promise<number> {
       total: sql<number>`COALESCE(ABS(SUM(${paperBetsCurrentView.settlementPnl}::numeric) FILTER (WHERE ${paperBetsCurrentView.settlementPnl}::numeric < 0)), 0)`,
     })
     .from(paperBetsCurrentView)
-    .where(gte(paperBetsCurrentView.settledAt, weekStart));
+    .where(and(gte(paperBetsCurrentView.settledAt, weekStart), LIVE_TRACK_FILTER));
   return result[0]?.total ?? 0;
 }
 
@@ -166,7 +178,7 @@ async function getTodaysNetPnl(): Promise<number> {
       total: sql<number>`COALESCE(SUM(${paperBetsCurrentView.settlementPnl}::numeric), 0)`,
     })
     .from(paperBetsCurrentView)
-    .where(gte(paperBetsCurrentView.settledAt, todayStart));
+    .where(and(gte(paperBetsCurrentView.settledAt, todayStart), LIVE_TRACK_FILTER));
   return Number(result[0]?.total ?? 0);
 }
 
@@ -181,7 +193,7 @@ async function getWeeklyNetPnl(): Promise<number> {
       total: sql<number>`COALESCE(SUM(${paperBetsCurrentView.settlementPnl}::numeric), 0)`,
     })
     .from(paperBetsCurrentView)
-    .where(gte(paperBetsCurrentView.settledAt, weekStart));
+    .where(and(gte(paperBetsCurrentView.settledAt, weekStart), LIVE_TRACK_FILTER));
   return Number(result[0]?.total ?? 0);
 }
 
@@ -351,13 +363,15 @@ async function getConsecutiveLossesThreshold(): Promise<number> {
 
 export async function checkConsecutiveLosses(): Promise<boolean> {
   const threshold = await getConsecutiveLossesThreshold();
+  // 2026-05-11 BUG FIX: filter to live track only — paper-rail losing
+  // streaks from pre-cutover history were being counted as if live.
   const lastN = await db
     .select({
       settlementPnl: paperBetsCurrentView.settlementPnl,
       status: paperBetsCurrentView.status,
     })
     .from(paperBetsCurrentView)
-    .where(inArray(paperBetsCurrentView.status, ["won", "lost"]))
+    .where(and(inArray(paperBetsCurrentView.status, ["won", "lost"]), LIVE_TRACK_FILTER))
     .orderBy(desc(paperBetsCurrentView.settledAt))
     .limit(threshold);
 
