@@ -30,6 +30,15 @@ const N_FLOOR = 30;
 const SHRINKAGE_N_PRIOR = 30;
 const CLV_T_THRESHOLD = 1.96;
 const WILSON_WINRATE_THRESHOLD = 0.50;
+// 2026-05-12: third qualification path — Bayesian-shrunk realised ROI.
+// Wilson on raw win-rate is the wrong dimension for AH-with-variable-odds
+// (47% win rate at avg odds 2.5 = +18% per bet; Wilson rejects, ROI proves).
+// shrunk_roi already pulls toward the market prior at n_prior=30, so a
+// shrunk_roi > 0.20 on n >= 50 represents statistically-meaningful +EV
+// after conservative shrinkage. Same evidence bar as Wilson, applied to
+// the dimension Kelly actually maximises (log-growth = realised ROI).
+const SHRUNK_ROI_THRESHOLD = 0.20;
+const SHRUNK_ROI_N_FLOOR = 50;
 
 async function getAnalysisStartDate(): Promise<string> {
   const rows = await db
@@ -148,11 +157,18 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
         ELSE (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv
       END                                                                     AS clv_t_stat,
       -- Qualifies live?
+      -- Three independent paths (n>=30 AND pnl>0 are common floors):
+      --   1. Wilson lo95 on raw win-rate > 0.50           (1:1-payout proof)
+      --   2. CLV t-stat > 1.96 with avg_clv > 0           (closing-line proof)
+      --   3. Shrunk ROI > 0.20 with n >= 50              (realised-growth proof)
+      -- Path 3 added 2026-05-12 to catch AH scopes where variable odds make
+      -- raw win-rate the wrong dimension. shrunk_roi at n_prior=30 pre-pulls
+      -- toward the market mean ROI, so 0.20 represents conservative empirical
+      -- proof of +EV growth — exactly what Kelly maximises.
       (
         s.n >= ${N_FLOOR}
         AND s.pnl > 0
         AND (
-          -- Wilson lo95 (corrected formula — see comment above)
           ((s.w + 1.92) / (s.n + 3.84)
             - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
                     / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
@@ -161,16 +177,23 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
             AND (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv > ${CLV_T_THRESHOLD}
             AND s.avg_clv > 0
           )
+          OR (
+            s.n >= ${SHRUNK_ROI_N_FLOOR}
+            AND s.stake IS NOT NULL AND s.stake > 0
+            AND (
+              (s.n::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * (s.pnl / NULLIF(s.stake, 0))
+              + (${SHRINKAGE_N_PRIOR}::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * COALESCE(p.mean_roi, 0)
+            ) > ${SHRUNK_ROI_THRESHOLD}
+          )
         )
       )                                                                       AS qualifies_live,
-      -- Basis label
+      -- Basis label — preferred order: combo > single signals
       CASE
         WHEN s.n < ${N_FLOOR} THEN 'insufficient'
         WHEN s.pnl <= 0 THEN 'insufficient'
         ELSE
           CASE
             WHEN
-              -- Wilson lo95 (corrected)
               ((s.w + 1.92) / (s.n + 3.84)
                 - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
                         / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
@@ -179,7 +202,6 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
               AND s.avg_clv > 0
             THEN 'both'
             WHEN
-              -- Wilson lo95 (corrected)
               ((s.w + 1.92) / (s.n + 3.84)
                 - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
                         / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
@@ -189,6 +211,14 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
               AND (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv > ${CLV_T_THRESHOLD}
               AND s.avg_clv > 0
             THEN 'clv'
+            WHEN
+              s.n >= ${SHRUNK_ROI_N_FLOOR}
+              AND s.stake IS NOT NULL AND s.stake > 0
+              AND (
+                (s.n::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * (s.pnl / NULLIF(s.stake, 0))
+                + (${SHRINKAGE_N_PRIOR}::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * COALESCE(p.mean_roi, 0)
+              ) > ${SHRUNK_ROI_THRESHOLD}
+            THEN 'shrunk_roi'
             ELSE 'insufficient'
           END
       END                                                                     AS qualification_basis

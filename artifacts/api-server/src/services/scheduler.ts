@@ -1524,6 +1524,23 @@ export async function runTradingCycle(options?: {
       }
     }
 
+    // 2026-05-12: pre-fetch eligibility-view scopes once per cycle. Used by
+    // the Pinnacle-pre-bet-filter gate below to skip the filter for scopes
+    // that have already proven themselves empirically (Wilson winrate,
+    // CLV t-stat, or shrunk ROI). For such scopes the eligibility view IS
+    // the proof; demanding Pinnacle coverage on top is redundant and would
+    // block proven scopes that happen to have thin Pinnacle data.
+    const eligibilityViewScopes = new Set<string>();
+    try {
+      const elig = await db.execute(sql`
+        SELECT league, market_type FROM v_live_eligibility_candidates
+      `);
+      const eligRows = (elig as unknown as { rows?: Array<{ league: string; market_type: string }> }).rows ?? [];
+      for (const r of eligRows) eligibilityViewScopes.add(`${r.league}::${r.market_type}`);
+    } catch (err) {
+      logger.warn({ err }, "Eligibility-view pre-fetch failed — Pinnacle gate falls back to default behaviour");
+    }
+
     for (const candidate of selectedBets) {
       const extra = candidate as BetCandidate & Record<string, unknown>;
       const validation = extra._validation as Awaited<ReturnType<typeof getOddspapiValidation>> | null;
@@ -1533,22 +1550,23 @@ export async function runTradingCycle(options?: {
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
-      // 2026-05-12 (REVERT of earlier same-day change): Tier B/C bets still
-      // skip the Pinnacle pre-bet filter. Reason: the filter at
-      // oddsPapi.ts:4917+ REJECTS bets when Pinnacle has no data on the
-      // scope (data-coverage gate, prevents unanchored BTTS-style edge
-      // claims). Many Tier B/C scopes prove their edge via Wilson winrate
-      // ROI alone (no Pinnacle coverage on niche leagues); subjecting them
-      // to a filter that requires Pinnacle data would reject scopes the
-      // empirical eligibility view already validated. The eligibility view
-      // at paperTrading.ts:984 is the authoritative gate for Tier B/C —
-      // Pinnacle validation is Tier-A-specific by infrastructure (Pinnacle
-      // coverage), not by policy.
+      // Pinnacle pre-bet filter is skipped when:
+      //  - bet is shadow-tracked (Pinnacle disagreement IS the learning signal)
+      //  - tier is B/C (lack reliable Pinnacle coverage by infrastructure;
+      //    these prove via Wilson winrate / shrunk ROI without Pinnacle)
+      //  - 2026-05-12: scope is already in the eligibility view (empirical
+      //    proof exists at the league × market_type level; additional
+      //    Pinnacle validation is redundant and would block proven scopes
+      //    that happen to have thin Pinnacle coverage on individual bets).
+      // Otherwise the filter runs: Pinnacle data required for Tier A bets
+      // in unproven scopes, where Pinnacle is the only outside anchor.
       const candidateTrack = (candidate as { placementTrack?: "production" | "shadow" }).placementTrack;
+      const inEligibilityView = eligibilityViewScopes.has(`${candidate.league}::${candidate.marketType}`);
       const isShadowBet =
         candidateTrack === "shadow" ||
         candidate.universeTier === "B" ||
-        candidate.universeTier === "C";
+        candidate.universeTier === "C" ||
+        inEligibilityView;
 
       // B3 (2026-05-07): filterPassed removed — Pinnacle rejection now
       // downgrades to shadow rather than dropping the bet entirely.
