@@ -4,10 +4,14 @@ import { logger } from "../lib/logger";
 import { getConfigValue, setConfigValue } from "./paperTrading";
 import { isLiveMode, getLiveBankroll, getAccountFunds } from "./betfairLive";
 
-// Hardcoded absolute emergency stop. If Betfair available cash drops below
-// this, all betting halts. Replaces the percentage-based bankroll floor as
-// the primary kill-switch (Apr 17 2026 authorisation).
-export const ABSOLUTE_BANKROLL_FLOOR_GBP = 50;
+// 2026-05-12: hardcoded absolute floor decommissioned. Kelly is self-throttling
+// — as bankroll shrinks, stakes shrink proportionally, and the £2 Betfair
+// minimum acts as the natural ruin floor. An additional absolute-cash gate was
+// duplicative and was halting placement when bankroll dipped below £50 even
+// when daily/weekly drawdown was within limits. Single source of truth is now:
+// daily/weekly loss-limit drawdown + the 7-loss-streak halt.
+// Export retained at 0 for backwards-compat with the kept import in scheduler.ts.
+export const ABSOLUTE_BANKROLL_FLOOR_GBP = 0;
 import { getMarketFamily } from "./edgeConcentration";
 
 export interface LiveRiskLevel {
@@ -513,9 +517,14 @@ export async function checkLiveCircuitBreakers(): Promise<LiveCircuitBreakerResu
     }
   }
 
+  // 2026-05-12: single loss-streak guard. The prior three-tier escalation
+  // (3-loss 1hr pause / 5-loss 6hr pause / 8-loss halt) was over-engineered —
+  // bad-luck streaks of 3-5 fire on noise, not model-broken signal. Kelly
+  // growth theory says the only legitimate exit is "model has gone bad",
+  // which 7 consecutive losses captures cleanly. Daily/weekly drawdown
+  // limits remain in force as the other dimension of model-broken detection.
   const consecutiveLosses = await getConsecutiveLiveLosses();
-
-  if (consecutiveLosses >= 8) {
+  if (consecutiveLosses >= 7) {
     return {
       triggered: true,
       action: "halt",
@@ -524,56 +533,10 @@ export async function checkLiveCircuitBreakers(): Promise<LiveCircuitBreakerResu
     };
   }
 
-  if (consecutiveLosses >= 5) {
-    const resumeAt = new Date(Date.now() + 6 * 60 * 60 * 1000);
-    await setConfigValue("live_breaker_paused_until", resumeAt.toISOString());
-    logger.warn({ consecutiveLosses, resumeAt: resumeAt.toISOString() }, "Circuit breaker: 6hr pause persisted");
-    return {
-      triggered: true,
-      action: "pause_6hr",
-      reason: `${consecutiveLosses} consecutive live losses — pausing until ${resumeAt.toISOString()}`,
-      autoResumeAt: resumeAt,
-    };
-  }
-
-  if (consecutiveLosses >= 3) {
-    // Strategy override (today-only, self-expiring) bypasses the 3-loss 1hr pause
-    // ONLY when it would block a corrected strategy. The 5+ and 8+ guards above
-    // remain in force as catastrophic stops. Daily/weekly drawdown caps still apply.
-    const stratExpiresStr = await getConfigValue("strategy_overrides_expire_at");
-    const stratActive = stratExpiresStr ? new Date(stratExpiresStr).getTime() > Date.now() : false;
-    const bypassStreakGuard = stratActive && (await getConfigValue("strategy_bypass_loss_streak_guard")) === "true";
-    if (bypassStreakGuard) {
-      logger.warn(
-        { consecutiveLosses, expiresAt: stratExpiresStr },
-        "Strategy override: bypassing 3-loss 1hr pause (5+ and 8+ guards still active, daily/weekly caps still apply)",
-      );
-    } else {
-      const resumeAt = new Date(Date.now() + 60 * 60 * 1000);
-      await setConfigValue("live_breaker_paused_until", resumeAt.toISOString());
-      logger.warn({ consecutiveLosses, resumeAt: resumeAt.toISOString() }, "Circuit breaker: 1hr pause persisted");
-      return {
-        triggered: true,
-        action: "pause_1hr",
-        reason: `${consecutiveLosses} consecutive live losses — pausing until ${resumeAt.toISOString()}`,
-        autoResumeAt: resumeAt,
-      };
-    }
-  }
-
-  // Absolute £50 floor (Apr 17 2026 authorisation). Compares Betfair AVAILABLE
-  // cash — not total wealth — against a hardcoded £50. This is the primary
-  // emergency stop. The percentage-based bankroll floor is retained only as
-  // a secondary alert in alertDetection.ts, not a kill-switch.
-  const available = await getAvailableBalance();
-  if (available < ABSOLUTE_BANKROLL_FLOOR_GBP) {
-    return {
-      triggered: true,
-      action: "floor_halt",
-      reason: `CRITICAL: Available cash £${available.toFixed(2)} below absolute floor £${ABSOLUTE_BANKROLL_FLOOR_GBP}. ALL betting halted.`,
-      autoResumeAt: null,
-    };
-  }
+  // 2026-05-12: absolute-cash floor decommissioned. Kelly is self-throttling
+  // (stakes shrink with bankroll); the £2 Betfair minimum is the natural ruin
+  // floor; daily/weekly loss limits catch model-broken drawdowns. An extra
+  // cash-level halt was duplicative and pre-empted those checks.
 
   return { triggered: false, action: "none", reason: "All checks passed", autoResumeAt: null };
 }

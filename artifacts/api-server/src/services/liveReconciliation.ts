@@ -69,6 +69,13 @@ async function readDriftThreshold(key: string, defaultValue: number): Promise<nu
 export async function reconcileLiveBalance(): Promise<BalanceReconcileResult | null> {
   if (!isLiveMode()) return null;
 
+  // 2026-05-12: settledNetPnl is computed over bets placed on or after the
+  // live cutover (2026-05-09). Anything before that was pre-cutover Replit-
+  // era / paper-rail data that doesn't represent real Betfair P&L — including
+  // it in the drift calc was producing a £1,110+ phantom drift even though
+  // every actual live bet was correctly reconciled. The `betfair_bet_id IS
+  // NOT NULL` filter alone isn't sufficient because some pre-cutover paper
+  // rows carry stale Betfair IDs from earlier experimentation.
   const [funds, startingDeposit, pnlSumRows] = await Promise.all([
     getAccountFunds(),
     getStartingDeposit(),
@@ -80,6 +87,7 @@ export async function reconcileLiveBalance(): Promise<BalanceReconcileResult | n
       .where(
         and(
           isNotNull(paperBetsTable.betfairBetId),
+          sql`${paperBetsTable.placedAt} >= '2026-05-09'::timestamptz`,
           sql`${paperBetsTable.status} IN ('won','lost','void')`,
           sql`${paperBetsTable.deletedAt} IS NULL`,
         ),

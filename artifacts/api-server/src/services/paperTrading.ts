@@ -1444,30 +1444,13 @@ export async function placePaperBet(
   const liveLimits = isLiveMode() ? await getEffectiveLimits() : null;
 
   if (!isDev) {
-    const effectiveBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
-    // Apr 17 2026: percentage-based bankroll floor decommissioned for live mode.
-    // The sole emergency stop is the absolute £50 floor on AVAILABLE cash, enforced
-    // by checkLiveCircuitBreakers() above (already evaluated this cycle). Paper mode
-    // retains the legacy configurable floor.
-    if (!liveLimits) {
-      const bankrollFloor = Number((await getConfigValue("bankroll_floor")) ?? "200");
-      if (effectiveBankroll <= bankrollFloor) {
-        const reason = `Bankroll £${effectiveBankroll.toFixed(2)} at or below paper floor £${bankrollFloor}`;
-        if (isShadowBet) {
-          // Wave 1: shadow bets carry stake=0 and cannot affect bankroll, so
-          // the paper floor doesn't apply. Audit-log the exemption.
-          await logShadowGateExemption(
-            "paper_bankroll_floor",
-            experimentTag ?? null,
-            reason,
-            null,
-            universeTier,
-          );
-        } else {
-          return logReject(reason);
-        }
-      }
-    }
+    // 2026-05-12: bankroll_floor check removed. Per Kelly growth theory the
+    // only legitimate exits are model-broken signals (loss streak + daily/
+    // weekly drawdown). A separate absolute bankroll floor is duplicative —
+    // Kelly stakes shrink with bankroll, the £2 Betfair minimum is the
+    // natural ruin floor. Was blocking all direct emission when liveBalance
+    // dipped below £100 (= the prior config floor value) on 2026-05-12,
+    // despite drawdown being within daily/weekly limits.
 
     // Strategy override (today-only, self-expiring at strategy_overrides_expire_at)
     // lets us raise the hardcoded RISK_LEVELS daily cap without editing the table.
