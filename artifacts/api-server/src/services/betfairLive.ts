@@ -1800,6 +1800,11 @@ export async function placeLiveBetOnBetfair(params: {
   // expire unmatched (see Task 24 finding: ~£999 of foregone AH EV from
   // unmatched LIMIT orders since 2026-05-03).
   let placementPrice = odds;
+  // True only when we are consuming a real top-of-book back price. The two
+  // LIMIT-fallback branches below keep this false so the slippage guard at
+  // ~L1864 doesn't run on LIMIT-at-target orders (we're providing liquidity,
+  // not consuming it).
+  let consumingLiquidity = false;
   if (placementMode === "TAKE_BEST_BACK") {
     try {
       const liquidity = await relayGetLiquidity(market.marketId);
@@ -1833,6 +1838,7 @@ export async function placeLiveBetOnBetfair(params: {
           // placementPrice stays at `odds` (target).
         } else {
           placementPrice = bestBack;
+          consumingLiquidity = true;
         }
       }
       logger.info(
@@ -1861,36 +1867,42 @@ export async function placeLiveBetOnBetfair(params: {
     return { success: false, error: msg };
   }
 
-  // Task 23 — order-book depth + slippage guard. After TAKE_BEST_BACK
-  // has resolved the placement price, check the depth at that price.
-  // If the available size is less than 3× our intended stake, cut
-  // the stake to depth/3. If the resulting stake is below £2, return
-  // SLIPPAGE_DEPTH_TOO_THIN and let the caller demote to shadow.
+  // Task 23 — order-book depth + slippage guard. Only meaningful when we
+  // are CONSUMING liquidity (TAKE_BEST_BACK): there, depth-at-or-better
+  // is the actual slippage risk between fetch and place. For TARGET mode
+  // we are PROVIDING liquidity at our edge price — the order sits on the
+  // book until matched or persists to SP at kickoff. There is no slippage
+  // to guard against; the "no depth at our price or better" condition is
+  // the normal state for a LIMIT order on a thin AH sub-line, not a
+  // failure. Running the guard there demoted ~63 Tier A LIMIT orders/12h
+  // on 2026-05-12 with SLIPPAGE_NO_LIQUIDITY.
   let finalStake = roundedStake;
-  try {
-    const { checkOrderBookDepth } = await import("./slippageGuard");
-    const slip = await checkOrderBookDepth({
-      marketId: market.marketId,
-      selectionId,
-      intendedStake: roundedStake,
-      intendedPrice: roundedOdds,
-    });
-    if (slip.adjustedStake === 0) {
-      logger.info({ internalBetId, marketId: market.marketId, reason: slip.reason },
-        "Slippage guard blocked placement");
-      return { success: false, error: `SLIPPAGE_${slip.reason.toUpperCase()}` };
+  if (consumingLiquidity) {
+    try {
+      const { checkOrderBookDepth } = await import("./slippageGuard");
+      const slip = await checkOrderBookDepth({
+        marketId: market.marketId,
+        selectionId,
+        intendedStake: roundedStake,
+        intendedPrice: roundedOdds,
+      });
+      if (slip.adjustedStake === 0) {
+        logger.info({ internalBetId, marketId: market.marketId, reason: slip.reason },
+          "Slippage guard blocked placement");
+        return { success: false, error: `SLIPPAGE_${slip.reason.toUpperCase()}` };
+      }
+      if (slip.wasReduced && slip.adjustedStake < finalStake) {
+        logger.info(
+          { internalBetId, originalStake: finalStake, adjustedStake: slip.adjustedStake,
+            depthAtPrice: slip.depthAtPrice },
+          "Slippage guard reduced stake to fit available depth",
+        );
+        finalStake = slip.adjustedStake;
+      }
+    } catch (err) {
+      logger.warn({ err, internalBetId, marketId: market.marketId },
+        "Slippage guard threw — proceeding at intended stake");
     }
-    if (slip.wasReduced && slip.adjustedStake < finalStake) {
-      logger.info(
-        { internalBetId, originalStake: finalStake, adjustedStake: slip.adjustedStake,
-          depthAtPrice: slip.depthAtPrice },
-        "Slippage guard reduced stake to fit available depth",
-      );
-      finalStake = slip.adjustedStake;
-    }
-  } catch (err) {
-    logger.warn({ err, internalBetId, marketId: market.marketId },
-      "Slippage guard threw — proceeding at intended stake");
   }
 
   // Task 24 Part D — persistence type. The unmatched portion of a LIMIT
