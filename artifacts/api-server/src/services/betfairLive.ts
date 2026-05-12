@@ -1703,7 +1703,33 @@ export function findSelectionId(
     if (no) return no.selectionId;
   }
 
+  // OU lines: in 2-runner markets (OVER_UNDER_25 etc.) the line is encoded in
+  // the marketType, so a single Over/Under runner per market is fine. In
+  // multi-line markets (ALT_TOTAL_GOALS, Betfair returns Over/Under runners
+  // at every line in ONE market), falling back to "first Over runner" would
+  // collapse every internal "Over X.5" bet onto the same Betfair selection —
+  // the exact bug class that crippled AH placement. If the selectionName
+  // carries a line digit (e.g. "Over 2.5"), require it to appear in the
+  // runner name; refuse to fall through to sortPriority.
+  const ouLineMatch = sel.match(/^(over|under)\s*([0-9]+(?:\.[0-9]+)?)/);
+  if (ouLineMatch) {
+    const dir = ouLineMatch[1];
+    const line = ouLineMatch[2];
+    const exact = runners.find((r) => {
+      const rn = r.runnerName.toLowerCase();
+      return rn.includes(dir) && rn.includes(line);
+    });
+    if (exact) return exact.selectionId;
+    // Fallback to direction-only ONLY when the market has exactly 2 runners
+    // (i.e. line is implicit in marketType, not encoded per-runner).
+    if (runners.length === 2) {
+      const dirOnly = runners.find((r) => r.runnerName.toLowerCase().includes(dir));
+      if (dirOnly) return dirOnly.selectionId;
+    }
+    return null;
+  }
   if (sel.includes("over")) {
+    if (runners.length !== 2) return null; // refuse first-runner fallback in multi-line markets
     const over = runners.find(
       (r) =>
         r.runnerName.toLowerCase().includes("over") || r.sortPriority === 1,
@@ -1711,6 +1737,7 @@ export function findSelectionId(
     if (over) return over.selectionId;
   }
   if (sel.includes("under")) {
+    if (runners.length !== 2) return null;
     const under = runners.find(
       (r) =>
         r.runnerName.toLowerCase().includes("under") || r.sortPriority === 2,
@@ -2041,6 +2068,93 @@ export async function placeLiveBetOnBetfair(params: {
     edge,
   });
 
+  // 2026-05-12 universal collapse-bug guard. THIS IS A LAST-LINE SAFETY NET.
+  // The original AH bug fired because `findMarketForBet` collapsed multiple
+  // internal lines onto a single Betfair (marketId, selectionId) pair.
+  // Regardless of WHERE the upstream collapse comes from (wrong market
+  // lookup, wrong runner resolution, fuzzy-match misfire, future market type
+  // we haven't audited), the symptom is always: two internal bets resolve
+  // to the same Betfair (marketId, selectionId). Check that triple here, in
+  // one place, for every placement. If any other internal bet for this
+  // match already has a live Betfair position on (marketId, selectionId),
+  // refuse — full stop. This catches the entire bug class once and for all.
+  try {
+    const selfRow = await db
+      .select({ matchId: paperBetsTable.matchId })
+      .from(paperBetsTable)
+      .where(eq(paperBetsTable.id, internalBetId))
+      .limit(1);
+    const selfMatchId = selfRow[0]?.matchId ?? null;
+    if (selfMatchId != null) {
+      const collisions = await db
+        .select({
+          id: paperBetsTable.id,
+          betfairBetId: paperBetsTable.betfairBetId,
+          betfairStatus: paperBetsTable.betfairStatus,
+          selectionName: paperBetsTable.selectionName,
+        })
+        .from(paperBetsTable)
+        .where(
+          and(
+            eq(paperBetsTable.matchId, selfMatchId),
+            eq(paperBetsTable.betfairMarketId, market.marketId),
+            eq(paperBetsTable.betfairSelectionId, String(selectionId)),
+            isNotNull(paperBetsTable.betfairBetId),
+          ),
+        );
+      const liveStatuses = new Set([
+        "EXECUTABLE",
+        "EXECUTION_COMPLETE",
+        "PARTIAL_ACCEPTED",
+        "MATCHED",
+        "STATUS_UNKNOWN",
+      ]);
+      const collision = collisions.find(
+        (c) =>
+          c.id !== internalBetId &&
+          c.betfairStatus != null &&
+          liveStatuses.has(c.betfairStatus),
+      );
+      if (collision) {
+        const msg = `COLLAPSE_GUARD: Betfair (market ${market.marketId}, selection ${selectionId}) already open on internal bet #${collision.id} (selection "${collision.selectionName}") for match ${selfMatchId} — refusing placement`;
+        logger.error(
+          {
+            internalBetId,
+            matchId: selfMatchId,
+            marketId: market.marketId,
+            selectionId,
+            collidingBetId: collision.id,
+            collidingBetfairBetId: collision.betfairBetId,
+            collidingSelectionName: collision.selectionName,
+            ourSelectionName: selectionName,
+          },
+          msg,
+        );
+        await db.insert(complianceLogsTable).values({
+          actionType: "live_bet_placement_collapse_guard",
+          details: {
+            internalBetId,
+            matchId: selfMatchId,
+            marketType,
+            ourSelectionName: selectionName,
+            betfairMarketId: market.marketId,
+            betfairSelectionId: selectionId,
+            collidingInternalBetId: collision.id,
+            collidingSelectionName: collision.selectionName,
+            collidingBetfairBetId: collision.betfairBetId,
+          },
+          timestamp: new Date(),
+        });
+        return { success: false, error: msg };
+      }
+    }
+  } catch (err) {
+    // Guard query failure is non-fatal — log and proceed. We prefer to place
+    // the bet than to block on a transient DB hiccup; the AH-specific guard
+    // upstream still gates the most-likely collapse case.
+    logger.warn({ err, internalBetId }, "COLLAPSE_GUARD: pre-flight check threw — proceeding");
+  }
+
   // Idempotent on retry — Betfair rejects DUPLICATE_TRANSACTION; do NOT add a timestamp.
   const customerRef = `BAO-${internalBetId}`;
 
@@ -2112,6 +2226,7 @@ export async function placeLiveBetOnBetfair(params: {
       .set({
         betfairBetId: report.betId ?? null,
         betfairMarketId: market.marketId,
+        betfairSelectionId: String(selectionId),
         betfairStatus: report.orderStatus ?? "EXECUTABLE",
         betfairSizeMatched: report.sizeMatched != null ? String(report.sizeMatched) : "0",
         betfairAvgPriceMatched:
