@@ -1516,11 +1516,47 @@ export async function findEventIdByTeamNames(
   }
 }
 
+// 2026-05-12: AH line-aware market selection. For ASIAN_HANDICAP, Betfair
+// returns ONE market per LINE per event — each with 2 runners (Home/Away)
+// carrying a `handicap` value. Picking markets[0] silently collapsed every
+// "Home +0.25" / "Home +0.5" / "Home +1" etc. onto whichever AH market
+// happened to come back first, so 7 distinct lines stacked on the SAME
+// Betfair selection at the SAME matched price. Mirrors the logic in
+// paperTrading.ts findAhMarketByLine (which was patched for capture in 4.A
+// but never wired into the LIVE placement path).
+function pickAhMarketForLine(
+  markets: MarketCatalogueItem[],
+  selectionName: string | undefined,
+  homeTeam: string | undefined,
+  awayTeam: string | undefined,
+): MarketCatalogueItem | null {
+  if (!selectionName) return null;
+  const m = selectionName.trim().match(/^(Home|Away)\s*([+-]?\d+(?:\.\d+)?)$/i);
+  if (!m) return null;
+  const side = m[1]!.toLowerCase() === "home" ? "home" : "away";
+  const line = parseFloat(m[2]!);
+  if (!Number.isFinite(line)) return null;
+
+  for (const market of markets) {
+    const runners = market.runners ?? [];
+    if (runners.length < 2) continue;
+    const sideRunner = runners.find((r) => {
+      const rn = r.runnerName.toLowerCase();
+      if (side === "home") return rn === (homeTeam ?? "").toLowerCase() || r.sortPriority === 1;
+      return rn === (awayTeam ?? "").toLowerCase() || r.sortPriority === 2;
+    });
+    if (!sideRunner || sideRunner.handicap == null) continue;
+    if (Math.abs(sideRunner.handicap - line) < 1e-6) return market;
+  }
+  return null;
+}
+
 export async function findMarketForBet(
   betfairEventId: string,
   internalMarketType: string,
   homeTeam?: string,
   awayTeam?: string,
+  selectionName?: string,
 ): Promise<MarketCatalogueItem | null> {
   const bfMarketType = MARKET_TYPE_MAP[internalMarketType];
   if (!bfMarketType) return null;
@@ -1533,6 +1569,8 @@ export async function findMarketForBet(
 
   try {
     if (resolvedEventId) {
+      // For AH, request enough markets to cover every line on the event.
+      const ahWidenedCap = bfMarketType === "ASIAN_HANDICAP" ? 50 : 10;
       const markets = await apiRequest<MarketCatalogueItem[]>(
         "betting",
         "/listMarketCatalogue/",
@@ -1546,11 +1584,36 @@ export async function findMarketForBet(
             "MARKET_DESCRIPTION",
             "MARKET_START_TIME",
           ],
-          maxResults: 10,
+          maxResults: ahWidenedCap,
         },
         3,
       );
       if (markets.length > 0) {
+        if (bfMarketType === "ASIAN_HANDICAP") {
+          const lineMatch = pickAhMarketForLine(markets, selectionName, homeTeam, awayTeam);
+          if (lineMatch) {
+            logger.info(
+              { marketId: lineMatch.marketId, eventId: resolvedEventId, marketType: bfMarketType, selectionName },
+              "Found Betfair AH market via line-aware lookup",
+            );
+            return lineMatch;
+          }
+          // Refuse to place when the line cannot be matched — better to skip
+          // than to fire onto the wrong Betfair selection.
+          logger.warn(
+            {
+              eventId: resolvedEventId,
+              selectionName,
+              ahCandidateCount: markets.length,
+              availableLines: markets.map((m) => ({
+                marketId: m.marketId,
+                runners: (m.runners ?? []).map((r) => ({ side: r.sortPriority, handicap: r.handicap })),
+              })),
+            },
+            "AH line-aware match failed — refusing fallback to first market (would place onto wrong line)",
+          );
+          return null;
+        }
         logger.info({ marketId: markets[0].marketId, eventId: resolvedEventId, marketType: bfMarketType }, "Found Betfair market via eventId lookup");
         return markets[0];
       }
@@ -1759,11 +1822,67 @@ export async function placeLiveBetOnBetfair(params: {
     return { success: false, error: msg };
   }
 
-  const market = await findMarketForBet(betfairEventId, marketType, homeTeam, awayTeam);
+  // 2026-05-12 dedup guard: refuse to place a second AH bet for the same
+  // (match, market_type, side) when an existing bet on that side is already
+  // open at Betfair. Multiple "Home +0.25" / "Home +0.5" / "Home +1" rows
+  // from the same recommendation cycle are highly correlated — placing all
+  // of them stacks exposure on (effectively) one position. Even with line-
+  // aware market selection now in place, two distinct lines on the same
+  // side still represent correlated risk we don't want to double-stake.
+  if (marketType === "ASIAN_HANDICAP") {
+    const sideMatch = selectionName.trim().match(/^(Home|Away)\b/i);
+    const sideToken = sideMatch ? sideMatch[1]!.toLowerCase() : null;
+    if (sideToken) {
+      const selfRow = await db
+        .select({ matchId: paperBetsTable.matchId })
+        .from(paperBetsTable)
+        .where(eq(paperBetsTable.id, internalBetId))
+        .limit(1);
+      const selfMatchId = selfRow[0]?.matchId ?? null;
+      if (selfMatchId != null) {
+        const peerRows = await db
+          .select({
+            id: paperBetsTable.id,
+            selectionName: paperBetsTable.selectionName,
+            betfairBetId: paperBetsTable.betfairBetId,
+            betfairStatus: paperBetsTable.betfairStatus,
+          })
+          .from(paperBetsTable)
+          .where(
+            and(
+              eq(paperBetsTable.matchId, selfMatchId),
+              eq(paperBetsTable.marketType, "ASIAN_HANDICAP"),
+              isNotNull(paperBetsTable.betfairBetId),
+            ),
+          );
+        const liveStatuses = new Set([
+          "EXECUTABLE",
+          "EXECUTION_COMPLETE",
+          "PARTIAL_ACCEPTED",
+          "MATCHED",
+          "STATUS_UNKNOWN",
+        ]);
+        const sideAlreadyOpen = peerRows.some(
+          (r) =>
+            r.id !== internalBetId &&
+            (r.selectionName ?? "").trim().toLowerCase().startsWith(sideToken) &&
+            r.betfairStatus != null &&
+            liveStatuses.has(r.betfairStatus),
+        );
+        if (sideAlreadyOpen) {
+          const msg = `AH side ${sideToken} already has an open Betfair bet for match ${selfMatchId} — skipping correlated placement`;
+          logger.warn({ internalBetId, matchId: selfMatchId, selectionName, sideToken }, msg);
+          return { success: false, error: msg };
+        }
+      }
+    }
+  }
+
+  const market = await findMarketForBet(betfairEventId, marketType, homeTeam, awayTeam, selectionName);
   if (!market) {
     const bfType = MARKET_TYPE_MAP[marketType] ?? marketType;
     const msg = `${bfType} market unavailable on Betfair Exchange for this event`;
-    logger.warn({ internalBetId, betfairEventId, marketType, bfType, homeTeam, awayTeam }, msg);
+    logger.warn({ internalBetId, betfairEventId, marketType, bfType, homeTeam, awayTeam, selectionName }, msg);
     return { success: false, error: msg, unavailableOnExchange: true };
   }
 
