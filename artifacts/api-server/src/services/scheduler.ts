@@ -1533,18 +1533,15 @@ export async function runTradingCycle(options?: {
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
-      // Phase 2.B.2 + B1/B2 (2026-05-07): shadow bets bypass the Pinnacle
-      // pre-bet filter. Tier B/C lack reliable Pinnacle pricing by definition,
-      // and Tier A near-miss shadow bets are exactly the case where Pinnacle
-      // disagreement IS the learning signal — we want those captured at £0
-      // so the tier-ladder accumulates evidence on whether the model or
-      // Pinnacle is correct on borderline calls. Production-track Tier A bets
-      // continue through the filter unchanged.
+      // 2026-05-12: Pinnacle pre-bet filter now keyed strictly on placement
+      // track, not tier. Tier B/C in proven scopes deploy capital under the
+      // same gates as Tier A — that includes Pinnacle validation. When
+      // Pinnacle has no data on a niche-league scope, the filter passes
+      // through; when it disagrees, it downgrades to shadow (safer). Shadow
+      // bets (placementTrack='shadow') continue to skip the filter because
+      // Pinnacle disagreement IS the learning signal for shadow capture.
       const candidateTrack = (candidate as { placementTrack?: "production" | "shadow" }).placementTrack;
-      const isShadowBet =
-        candidateTrack === "shadow" ||
-        candidate.universeTier === "B" ||
-        candidate.universeTier === "C";
+      const isShadowBet = candidateTrack === "shadow";
 
       // B3 (2026-05-07): filterPassed removed — Pinnacle rejection now
       // downgrades to shadow rather than dropping the bet entirely.
@@ -1672,6 +1669,14 @@ export async function runTradingCycle(options?: {
         //   - 60-69: 839 decided, 68.9% WR, +45.9% ROI, +8.63% CLV (t = 5.29/2.79)
         //   - 70-79: 383 decided, 85.4% WR, +34.1% ROI, +6.27% CLV (t = 3.68/3.27)
         //   - 80-89: 107 decided, 85.0% WR, +30.6% ROI, +10.20% CLV (t = 3.68/2.31)
+        // 2026-05-12: routing fallback no longer hardcodes Tier-A-only to
+        // production. Any candidate that isn't explicitly shadow-tracked is
+        // emitted as "production"; the placement function's eligibility-view
+        // gate (paperTrading.ts:984+) demotes (tier, scope) combinations that
+        // haven't proven Wilson+CLV. The strict-production override (Tier A
+        // AH + Pinnacle + Exchange snapshot) is retained as a fast-path
+        // bypass for the highest-conviction Tier A AH flow — it pre-locks
+        // production routing without the eligibility-view DB round-trip.
         placementTrack: forceShadowOnly
           ? "shadow"
           : (
@@ -1682,9 +1687,7 @@ export async function runTradingCycle(options?: {
                 && (candidate.fairValueSource ?? "").toLowerCase().includes("pinnacle")
                 && exchangeAhMatchIds.has(candidate.matchId)
               ? "production"
-              : ((candidate as { placementTrack?: "production" | "shadow" }).placementTrack ?? (
-                  candidate.universeTier === "A" ? "production" : "shadow"
-                ))
+              : ((candidate as { placementTrack?: "production" | "shadow" }).placementTrack ?? "production")
             ),
       });
     }

@@ -1657,24 +1657,21 @@ export async function detectValueBets(options?: {
       }
       const syncEligible = dataTier === "promoted";
 
-      // B1+B2 (2026-05-07): tier-aware placement-track decision. Every
-      // positive-EV opportunity above the shadow floor flows through —
-      // production-rail bets must be Tier A AND meet full production
-      // thresholds; everything else (Tier A near-misses + any Tier B/C bet
-      // that cleared the shadow floor) routes to £0 shadow capture so the
-      // tier-ladder gets continuous learning evidence.
-      // Z1+Z5 (2026-05-07): use scoped threshold (per-league > per-market >
-      // global). Auto-tuned by Z3 weekly retrospective cron.
-      // Sub-phase 4.B (2026-05-08): when actionable price comes from a
-      // non-exchange source (shadowOnly=true), the bet has no real-stake
-      // placement path — force placementTrack='shadow' regardless of tier
-      // or score. The graduation pathway is preserved because the
-      // marketType is in MARKET_TYPE_MAP (gate enforced by
-      // selectPricingSources).
+      // 2026-05-12: tier-agnostic production gating. Production-track no
+      // longer requires Tier A — any candidate that meets the per-scope
+      // score+edge thresholds flows through to production routing. The
+      // downstream placement function's eligibility-view check
+      // (paperTrading.ts:984+) demotes any (tier, scope) combination that
+      // hasn't proven Wilson+CLV at n>=30 settled bets, so Tier B/C bets
+      // in unproven scopes still correctly land as shadow. This change
+      // unblocks Tier B/C in scopes that ARE proven, which is the design
+      // intent — the eligibility view is the empirical proof gate.
+      //
+      // shadowOnly is still honoured: non-exchange price sources can't
+      // place real money, so we force shadow regardless of tier or score.
       const effectiveMinScore = resolveScoped("min_opportunity_score", match.league ?? "", oddsRow.marketType, minOppScore);
       const meetsProduction =
         !shadowOnly &&
-        matchUniverseTier === "A" &&
         opportunityScore >= effectiveMinScore &&
         edge >= effectiveMinEdge;
       const meetsShadow = opportunityScore >= shadowMinOppScore;

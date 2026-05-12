@@ -960,14 +960,21 @@ export async function placePaperBet(
     rawModelProbability = null,
     calibrationBucketId = null,
   } = options;
-  // Phase 2.B.2 + B1/B2 (2026-05-07): shadow-bet flag. Tier B/C are always
-  // shadow (no Pinnacle anchor by definition). Additionally, valueDetection
-  // can set placementTrack='shadow' for Tier A near-misses (positive-EV
-  // candidates below production threshold) — those are captured as £0
-  // learning bets too. When either trigger fires, placement bypasses
-  // min-stake / exposure / live-concentration gates and writes stake=0 +
-  // shadow_stake.
-  let isShadowBet = placementTrack === "shadow" || universeTier === "B" || universeTier === "C";
+  // 2026-05-12: Tier B/C are no longer structurally shadow. The eligibility
+  // view (v_live_eligibility_candidates) is the empirical proof gate — when
+  // a scope has demonstrated Wilson lower-95 winrate > 50% AND/OR CLV t-stat
+  // > 1.96 at n>=30 settled bets, ANY tier in that scope earns the right to
+  // deploy capital under the same risk gates as Tier A. The eligibility
+  // check at L984 below demotes any (tier, scope) combination that hasn't
+  // proven itself. Shadow bets in non-eligible scopes still bypass
+  // capital-risk gates via the existing `if (isShadowBet)` branches
+  // downstream — those checks correctly key on "is this bet shadow?", not
+  // "is this Tier B/C?".
+  //
+  // placementTrack='shadow' is still honoured — valueDetection can force
+  // shadow for Tier A near-misses (positive-EV candidates below production
+  // threshold). That path is unchanged.
+  let isShadowBet = placementTrack === "shadow";
 
   // 2026-05-11 (Task 7 — back-to-theory plan): AH-only live exception removed.
   // Live eligibility is now governed entirely by v_live_eligibility_candidates
