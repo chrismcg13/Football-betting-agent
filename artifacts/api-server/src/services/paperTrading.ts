@@ -1451,6 +1451,7 @@ export async function placePaperBet(
     // natural ruin floor. Was blocking all direct emission when liveBalance
     // dipped below £100 (= the prior config floor value) on 2026-05-12,
     // despite drawdown being within daily/weekly limits.
+    const effectiveBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
 
     // Strategy override (today-only, self-expiring at strategy_overrides_expire_at)
     // lets us raise the hardcoded RISK_LEVELS daily cap without editing the table.
