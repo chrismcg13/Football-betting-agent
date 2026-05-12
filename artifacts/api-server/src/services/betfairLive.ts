@@ -1876,61 +1876,23 @@ export async function placeLiveBetOnBetfair(params: {
     return { success: false, error: msg };
   }
 
-  // 2026-05-12 dedup guard: refuse to place a second AH bet for the same
-  // (match, market_type, side) when an existing bet on that side is already
-  // open at Betfair. Multiple "Home +0.25" / "Home +0.5" / "Home +1" rows
-  // from the same recommendation cycle are highly correlated — placing all
-  // of them stacks exposure on (effectively) one position. Even with line-
-  // aware market selection now in place, two distinct lines on the same
-  // side still represent correlated risk we don't want to double-stake.
-  if (marketType === "ASIAN_HANDICAP") {
-    const sideMatch = selectionName.trim().match(/^(Home|Away)\b/i);
-    const sideToken = sideMatch ? sideMatch[1]!.toLowerCase() : null;
-    if (sideToken) {
-      const selfRow = await db
-        .select({ matchId: paperBetsTable.matchId })
-        .from(paperBetsTable)
-        .where(eq(paperBetsTable.id, internalBetId))
-        .limit(1);
-      const selfMatchId = selfRow[0]?.matchId ?? null;
-      if (selfMatchId != null) {
-        const peerRows = await db
-          .select({
-            id: paperBetsTable.id,
-            selectionName: paperBetsTable.selectionName,
-            betfairBetId: paperBetsTable.betfairBetId,
-            betfairStatus: paperBetsTable.betfairStatus,
-          })
-          .from(paperBetsTable)
-          .where(
-            and(
-              eq(paperBetsTable.matchId, selfMatchId),
-              eq(paperBetsTable.marketType, "ASIAN_HANDICAP"),
-              isNotNull(paperBetsTable.betfairBetId),
-            ),
-          );
-        const liveStatuses = new Set([
-          "EXECUTABLE",
-          "EXECUTION_COMPLETE",
-          "PARTIAL_ACCEPTED",
-          "MATCHED",
-          "STATUS_UNKNOWN",
-        ]);
-        const sideAlreadyOpen = peerRows.some(
-          (r) =>
-            r.id !== internalBetId &&
-            (r.selectionName ?? "").trim().toLowerCase().startsWith(sideToken) &&
-            r.betfairStatus != null &&
-            liveStatuses.has(r.betfairStatus),
-        );
-        if (sideAlreadyOpen) {
-          const msg = `AH side ${sideToken} already has an open Betfair bet for match ${selfMatchId} — skipping correlated placement`;
-          logger.warn({ internalBetId, matchId: selfMatchId, selectionName, sideToken }, msg);
-          return { success: false, error: msg };
-        }
-      }
-    }
-  }
+  // 2026-05-12 (afternoon): AH side-dedup guard removed. Different AH lines
+  // on the same side (Home -0.25 / Home -0.5 / Home -1) are correlated but
+  // NOT identical — each has its own break-even point, edge, odds, and
+  // realised PnL. The empirical record shows multi-line-per-side wins
+  // settling to distinct PnL (e.g. Celta v Levante 2026-05-10/11/12 four
+  // Away-side AH lines, all matched, all won at different stakes).
+  //
+  // Kelly already prices correlation correctly when bets are placed
+  // sequentially against a shrinking bankroll: the Nth line sees the
+  // post-prior-bet balance and is sized down accordingly. The Wilson + CLV
+  // t-stat gate in v_live_eligibility_candidates is calibrated against
+  // historical multi-line placements, so the gate's assumption matches the
+  // production behaviour.
+  //
+  // The actual mapping bug (multiple internal bets collapsed onto one
+  // Betfair (market_id, selection_id)) is caught by line-aware market
+  // selection above + the universal collapse guard at L2098+ below.
 
   const market = await findMarketForBet(betfairEventId, marketType, homeTeam, awayTeam, selectionName);
   if (!market) {
