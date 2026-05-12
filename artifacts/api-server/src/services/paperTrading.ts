@@ -2023,36 +2023,14 @@ export async function placePaperBet(
     }
   }
 
-  // ── Live concentration limits (per-league, per-market-type, per-fixture) ──
-  // Phase 2.B.2: shadow bets bypass — they don't go to Betfair and have no
-  // real-money concentration implications.
-  // 2026-05-09 (no-bet-dropped): demote production bets that hit a live
-  // concentration cap rather than dropping them.
-  if (isLiveMode() && !isShadowBet) {
-    const concentrationCheck = await runLiveConcentrationChecks(matchId, marketType, stake);
-    if (!concentrationCheck.passed) {
-      if (await isLiveToShadowFallthroughEnabled()) {
-        const fullKellyStake = stake;
-        shadowStakeKellyFraction = 0.25;
-        shadowStake = Math.round(fullKellyStake * 0.25 * 100) / 100;
-        stake = 0;
-        isShadowBet = true;
-        await logShadowGateExemption(
-          "paper_live_concentration",
-          experimentTag ?? null,
-          `Live concentration limit (${concentrationCheck.reason}) — demoted to shadow`,
-          shadowStake,
-          universeTier,
-        );
-        logger.info(
-          { matchId, marketType, fullKellyStake, shadowStake, reason: concentrationCheck.reason },
-          "Live concentration limit hit — production bet demoted to shadow rail",
-        );
-      } else {
-        return logReject(`Live concentration limit: ${concentrationCheck.reason}`);
-      }
-    }
-  }
+  // 2026-05-12: per-market-type / per-league / per-fixture exposure caps
+  // removed. They are heuristic ("no eggs in one basket") not Kelly-derived,
+  // and double-count risk that Kelly already sizes for. Statistical risk
+  // signals retained: v_live_eligibility_candidates (Wilson lower-95 winrate
+  // > 50% AND/OR CLV t-stat > 1.96), daily/weekly drawdown ratios,
+  // edge-concentration odds floor, 7-loss halt, Kelly £2-minimum demote.
+  // See CLAUDE.md §7 ("No exposure caps"). runLiveConcentrationChecks
+  // retained in liveRiskManager.ts for audit-only callers (launchActivation).
 
   // ── Pinnacle DB fallback ─────────────────────────────────────────────────
   // If the trading-cycle cache didn't supply Pinnacle odds, look them up from
