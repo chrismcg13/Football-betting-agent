@@ -148,14 +148,22 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   const cutoverCompletedAtRaw = await getConfig("cutover_completed_at");
   const cutoverActive = !!cutoverCompletedAtRaw && cutoverCompletedAtRaw.trim() !== "";
 
-  // 2026-05-11 (Task 7 — back-to-theory plan): AH-only rescue gate removed.
-  // Lazy promotion now accepts any market whose (league, market_type) scope
-  // qualifies for live per v_live_eligibility_candidates. The qualification
-  // check happens at promotion time via a join below — no per-market filter
-  // here.
-  const strictAhFilter = sql``;
-
-  // Find candidates: pending Tier A shadow bets, kickoff within KICKOFF_LOOKAHEAD_HOURS.
+  // 2026-05-12: tier hardcode replaced with eligibility-view gate. Previously
+  // `universe_tier_at_placement = 'A'` rejected Tier B/C bets regardless of
+  // scope. The eligibility view (v_live_eligibility_candidates) is the
+  // empirical proof gate — n>=30 settled bets with Wilson lo95 winrate > 50%
+  // AND/OR CLV t-stat > 1.96. Tier is an emission-time a priori signal;
+  // when empirical data proves a scope is +EV, the a priori conservatism
+  // should not override the empirical proof.
+  //
+  // Bundle B groups by (league, market_type, bet_track) — the Wilson + CLV
+  // numbers it produces already average across the tier mix in that scope.
+  // Promoting any tier in an eligible scope is consistent with the proof.
+  //
+  // Per project_shadow_bets_principle: previously Tier B/C £0 bets bypassed
+  // every capital-risk gate. That made sense when there was no empirical
+  // signal to override the tier ladder. With Bundle B + the eligibility
+  // view, the data-driven gate exists and supersedes.
   const candidates = await db.execute(sql`
     SELECT pb.id, pb.match_id, pb.market_type, pb.selection_name,
            pb.selection_canonical, pb.opportunity_score::numeric AS score,
@@ -167,10 +175,11 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       AND pb.status = 'pending'
       AND pb.legacy_regime = false
       AND pb.deleted_at IS NULL
-      AND pb.universe_tier_at_placement = 'A'
       AND pb.placed_at >= ${new Date(evalStartStr)}
       AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '${sql.raw(String(KICKOFF_LOOKAHEAD_HOURS))} hours'
-      ${strictAhFilter}
+      AND (m.league, pb.market_type) IN (
+        SELECT league, market_type FROM v_live_eligibility_candidates
+      )
     ORDER BY pb.calculated_edge DESC NULLS LAST
   `);
   const rows = (((candidates as any).rows ?? []) as Array<{
@@ -213,16 +222,17 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
         continue;
       }
 
-      // Check no paper bet already exists on the same canonical selection
-      // for this match — the unique partial index would error on conflict
-      // anyway, but checking up-front is cleaner than catching the error.
+      // Check no live (or legacy paper) bet already exists on the same
+      // canonical selection for this match. Post-cutover this branch promotes
+      // shadow→live, so the dup-check must include live; the unique partial
+      // index would error on conflict anyway but checking up-front is cleaner.
       if (r.selection_canonical) {
         const dup = await db.execute(sql`
           SELECT 1 FROM paper_bets
           WHERE match_id = ${r.match_id}
             AND market_type = ${r.market_type}
             AND selection_canonical = ${r.selection_canonical}
-            AND bet_track = 'paper'
+            AND bet_track IN ('paper', 'live')
             AND status IN ('pending','pending_placement')
             AND deleted_at IS NULL
           LIMIT 1
