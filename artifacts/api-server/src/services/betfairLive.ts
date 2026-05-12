@@ -873,18 +873,45 @@ export async function reconcileSettlements(): Promise<{
     CANCELLED: 2,
     LAPSED: 3,
   };
+  // 2026-05-12: Betfair caps listClearedOrders.betIds at 250 items per call.
+  // Pre-fix we passed the full pending-bet list in one request — any time we
+  // had >250 pending bets the API returned 400 Bad Request, the catch below
+  // returned {0,0,0,0}, and NO bets were reconciled. Result: matched bets
+  // sat on `status='pending'` indefinitely even though Betfair had settled
+  // them. Chunk the betIds and fetch each chunk independently; merge results.
+  const BETFAIR_CLEARED_ORDERS_BETIDS_CAP = 200; // conservative; docs say 250
+  const chunk = <T,>(arr: T[], size: number): T[][] => {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  };
+  const idChunks = chunk(betfairIds, BETFAIR_CLEARED_ORDERS_BETIDS_CAP);
   try {
     for (const status of ["SETTLED", "VOIDED", "LAPSED", "CANCELLED"] as const) {
-      const cleared = await listClearedOrders(dateRange, betfairIds, status);
-      for (const order of cleared) {
-        const existing = orderByBetId.get(order.betId);
-        if (!existing || statusPriority[status] < statusPriority[existing.betfairStatus]) {
-          orderByBetId.set(order.betId, { betfairStatus: status, order });
+      for (const idChunk of idChunks) {
+        const cleared = await listClearedOrders(dateRange, idChunk, status);
+        for (const order of cleared) {
+          const existing = orderByBetId.get(order.betId);
+          if (!existing || statusPriority[status] < statusPriority[existing.betfairStatus]) {
+            orderByBetId.set(order.betId, { betfairStatus: status, order });
+          }
         }
       }
     }
+    logger.info(
+      {
+        totalBets: betfairIds.length,
+        chunks: idChunks.length,
+        chunkSize: BETFAIR_CLEARED_ORDERS_BETIDS_CAP,
+        ordersResolved: orderByBetId.size,
+      },
+      "reconcileSettlements: chunked listClearedOrders complete",
+    );
   } catch (err) {
-    logger.error({ err }, "Failed to fetch cleared orders for reconciliation");
+    logger.error(
+      { err, totalBets: betfairIds.length, chunks: idChunks.length },
+      "Failed to fetch cleared orders for reconciliation",
+    );
     return { matched: 0, discrepancies: 0, unmatched: 0, voided: 0 };
   }
 
