@@ -1533,15 +1533,22 @@ export async function runTradingCycle(options?: {
       const effectiveScore = (extra._effectiveScore as number | undefined) ?? candidate.opportunityScore;
       const thesis = (extra._thesis as string | undefined) ?? undefined;
 
-      // 2026-05-12: Pinnacle pre-bet filter now keyed strictly on placement
-      // track, not tier. Tier B/C in proven scopes deploy capital under the
-      // same gates as Tier A — that includes Pinnacle validation. When
-      // Pinnacle has no data on a niche-league scope, the filter passes
-      // through; when it disagrees, it downgrades to shadow (safer). Shadow
-      // bets (placementTrack='shadow') continue to skip the filter because
-      // Pinnacle disagreement IS the learning signal for shadow capture.
+      // 2026-05-12 (REVERT of earlier same-day change): Tier B/C bets still
+      // skip the Pinnacle pre-bet filter. Reason: the filter at
+      // oddsPapi.ts:4917+ REJECTS bets when Pinnacle has no data on the
+      // scope (data-coverage gate, prevents unanchored BTTS-style edge
+      // claims). Many Tier B/C scopes prove their edge via Wilson winrate
+      // ROI alone (no Pinnacle coverage on niche leagues); subjecting them
+      // to a filter that requires Pinnacle data would reject scopes the
+      // empirical eligibility view already validated. The eligibility view
+      // at paperTrading.ts:984 is the authoritative gate for Tier B/C —
+      // Pinnacle validation is Tier-A-specific by infrastructure (Pinnacle
+      // coverage), not by policy.
       const candidateTrack = (candidate as { placementTrack?: "production" | "shadow" }).placementTrack;
-      const isShadowBet = candidateTrack === "shadow";
+      const isShadowBet =
+        candidateTrack === "shadow" ||
+        candidate.universeTier === "B" ||
+        candidate.universeTier === "C";
 
       // B3 (2026-05-07): filterPassed removed — Pinnacle rejection now
       // downgrades to shadow rather than dropping the bet entirely.
