@@ -66,7 +66,6 @@ function kellyFractionForScore(opportunityScore: number): number {
   return 0.125;
 }
 
-const FRESH_EXCHANGE_WINDOW_MIN = 30;
 // 2026-05-10: extended from 6h to 168h to match trading_far emission window.
 // Pre-fix, only bets within 6h of kickoff were lazy-promote eligible.
 // Today's analysis found 216 quality AH shadow bets (Tier A + score 70+ +
@@ -185,41 +184,29 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
 
   for (const r of rows) {
     try {
-      // Check fresh exchange data. Two modes:
+      // 2026-05-12: drop the strict/relaxed conditional. The strict variant
+      // (30-min exact-selection-name snapshot) structurally cannot lazy-
+      // promote any non-default AH sub-line because exchange_book_sweep only
+      // captures the ±4 default line per event (Bundle 6.5 finding). Most
+      // Tier A flow lives on Home +2 / Away +1.5 / etc. Use the relaxed
+      // 24h-any-selection-on-market check: Betfair will either match or
+      // reject with market_unavailable, and the demote handler in
+      // paperTrading handles rejections cleanly.
       //
-      // strictAhOnly mode (current default): only require Exchange has captured
-      // ANY snapshot for the (match, market_type) within last 24h — the EXACT
-      // selection_name doesn't have to be in our snapshot store. Reasoning:
-      // exchange_book_sweep currently captures only the ±4 default AH line per
-      // event (Bundle 6.5 finding), but Betfair Exchange does list other AH
-      // lines per event. By submitting the bet we let Betfair either match it
-      // or reject with market_unavailable. Rescues the ~190 stuck shadows
-      // sitting on lines like Home +2 / Away +1.5 / etc. that pass every
-      // override gate but exact-selection-snapshot doesn't exist.
-      // Bounded cost: rejected attempts caught by the existing demote handler.
-      //
-      // strictAhOnly OFF (any-market mode): retain the original tight
-      // exact-selection check (30 min window). Less aggressive when the
-      // operator widens the universe to all markets — minimises false attempts.
-      const exchangeCheckSql = strictAhOnly
-        ? sql`
-            SELECT 1 FROM odds_snapshots
-            WHERE match_id = ${r.match_id}
-              AND market_type = ${r.market_type}
-              AND source = 'betfair_exchange'
-              AND snapshot_time > NOW() - INTERVAL '24 hours'
-            LIMIT 1
-          `
-        : sql`
-            SELECT 1 FROM odds_snapshots
-            WHERE match_id = ${r.match_id}
-              AND market_type = ${r.market_type}
-              AND selection_name = ${r.selection_name}
-              AND source = 'betfair_exchange'
-              AND snapshot_time > NOW() - INTERVAL '${sql.raw(String(FRESH_EXCHANGE_WINDOW_MIN))} minutes'
-            LIMIT 1
-          `;
-      const fresh = await db.execute(exchangeCheckSql);
+      // Bug history: a `strictAhOnly` config flag governed this conditional
+      // until the AH-only mode was removed (commit 7d55f74, 2026-05-11). The
+      // variable definition was deleted but its reference at this line was
+      // not — every lazy-promote candidate threw ReferenceError silently for
+      // 24h before this fix. Lazy promotion was therefore 0/day from
+      // 2026-05-11 onward despite Tier A shadow bets accruing.
+      const fresh = await db.execute(sql`
+        SELECT 1 FROM odds_snapshots
+        WHERE match_id = ${r.match_id}
+          AND market_type = ${r.market_type}
+          AND source = 'betfair_exchange'
+          AND snapshot_time > NOW() - INTERVAL '24 hours'
+        LIMIT 1
+      `);
       const hasFreshExchange = (((fresh as any).rows ?? []) as unknown[]).length > 0;
       if (!hasFreshExchange) {
         result.skipped_no_exchange++;
