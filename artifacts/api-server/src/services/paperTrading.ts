@@ -3703,12 +3703,23 @@ const CORNERS_CARDS_MARKETS = new Set([
 ]);
 
 export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: number; betsResettled: number }> {
+  // 2026-05-13: HARD EXCLUDE live-rail bets. Per CLAUDE.md §11, betfair_pnl
+  // is the authoritative wallet impact for any bet routed through Betfair;
+  // re-deriving the outcome locally via determineBetWon() and overwriting
+  // status / net_pnl creates phantom PnL (the local ledger moves without a
+  // corresponding wallet event, tripping Trigger C reconciliation drift).
+  // Belt-and-braces: filter by bet_track AND by betfair_bet_id IS NULL so
+  // any bet that ever made it to Betfair stays untouched here. Live bets
+  // are settled by reconcileSettlements / live_statement_reconciliation,
+  // which pull the truth from Betfair's listClearedOrders feed.
   const allVoidedBets = await db
     .select()
     .from(paperBetsTable)
     .where(and(
       eq(paperBetsTable.status, "void"),
       eq(paperBetsTable.legacyRegime, false),
+      inArray(paperBetsTable.betTrack, ["paper", "shadow"]),
+      isNull(paperBetsTable.betfairBetId),
     ));
 
   if (allVoidedBets.length === 0) {
