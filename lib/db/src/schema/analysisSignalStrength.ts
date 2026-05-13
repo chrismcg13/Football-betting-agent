@@ -22,6 +22,7 @@ export const analysisSignalStrengthTable = pgTable(
     shrunkRoi: numeric("shrunk_roi"),
     avgClv: numeric("avg_clv"),
     clvTStat: numeric("clv_t_stat"),
+    bootstrapLo95Roi: numeric("bootstrap_lo95_roi"),
     qualifiesLive: boolean("qualifies_live").notNull().default(false),
     qualificationBasis: text("qualification_basis").notNull().default("insufficient"),
   },

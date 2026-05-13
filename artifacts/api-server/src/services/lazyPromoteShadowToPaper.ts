@@ -164,7 +164,25 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   // every capital-risk gate. That made sense when there was no empirical
   // signal to override the tier ladder. With Bundle B + the eligibility
   // view, the data-driven gate exists and supersedes.
+  // 2026-05-13 Lever A+G — selector now reads BOTH eligibility paths:
+  //   (a) per-scope qualification via v_live_eligibility_candidates, OR
+  //   (b) market_type aggregate qualification via v_live_eligibility_market_types
+  //       with three-signal disproof carve-out (n>=30 AND roi<0 AND clv_t_stat<0
+  //       at the per-(league × market) scope). Identical disjunction as the
+  //       placement gate in paperTrading.ts so shadow inventory can flow live
+  //       through the same statistical reasoning that authorises fresh
+  //       placements.
   const candidates = await db.execute(sql`
+    WITH latest_signal AS (
+      SELECT league, market_type, n, roi, clv_t_stat
+      FROM analysis_signal_strength
+      WHERE computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+        AND league <> '__market_type_aggregate__'
+    ),
+    disproven AS (
+      SELECT league, market_type FROM latest_signal
+      WHERE n >= 30 AND roi < 0 AND clv_t_stat < 0
+    )
     SELECT pb.id, pb.match_id, pb.market_type, pb.selection_name,
            pb.selection_canonical, pb.opportunity_score::numeric AS score,
            pb.calculated_edge::numeric AS edge,
@@ -177,8 +195,18 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       AND pb.deleted_at IS NULL
       AND pb.placed_at >= ${new Date(evalStartStr)}
       AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '${sql.raw(String(KICKOFF_LOOKAHEAD_HOURS))} hours'
-      AND (m.league, pb.market_type) IN (
-        SELECT league, market_type FROM v_live_eligibility_candidates
+      AND (
+        (m.league, pb.market_type) IN (
+          SELECT league, market_type FROM v_live_eligibility_candidates
+        )
+        OR (
+          pb.market_type IN (
+            SELECT market_type FROM v_live_eligibility_market_types
+          )
+          AND (m.league, pb.market_type) NOT IN (
+            SELECT league, market_type FROM disproven
+          )
+        )
       )
     ORDER BY pb.calculated_edge DESC NULLS LAST
   `);

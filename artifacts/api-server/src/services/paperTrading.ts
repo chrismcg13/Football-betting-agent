@@ -988,6 +988,21 @@ export async function placePaperBet(
   // t-stat > 1.96 on CLV, at n >= 30 settled bets) before real capital flows
   // to it. Scopes below the threshold remain in shadow to keep accumulating
   // settlement data without bankroll exposure.
+  // 2026-05-13 Lever A+G — placement gate combines two independent
+  // qualification paths:
+  //   (a) per-scope:  (league, market_type) is in v_live_eligibility_candidates
+  //                   (existing path; per-scope Wilson / CLV / shrunk_roi)
+  //   (b) aggregate:  market_type is in v_live_eligibility_market_types
+  //                   (Lever A+G; all three gates pass at the pooled level)
+  //                   AND this (league, market_type) is NOT empirically
+  //                   disproven (three-signal disproof: n>=30 AND roi<0
+  //                   AND clv_t_stat<0). The disproof carve-out mirrors the
+  //                   three-gate logic in reverse — one bad signal isn't
+  //                   enough to block a child league under a qualifying
+  //                   market_type, but three independent bad signals are.
+  // PASS_IF (a OR b). Failure demotes to shadow; the bet still records so
+  // the per-scope sample keeps accumulating.
+  let livePathTag: "per_scope" | "market_type_aggregate" | null = null;
   if (!isShadowBet) {
     try {
       const matchLeague = await db
@@ -997,20 +1012,59 @@ export async function placePaperBet(
         .limit(1);
       const league = matchLeague[0]?.league;
       if (league) {
-        const eligibilityRow = await db.execute(sql`
-          SELECT qualifies_live, qualification_basis, n
-          FROM v_live_eligibility_candidates
-          WHERE league = ${league} AND market_type = ${marketType}
-          LIMIT 1
+        const gateRow = await db.execute(sql`
+          WITH per_scope AS (
+            SELECT TRUE AS pass
+            FROM v_live_eligibility_candidates
+            WHERE league = ${league} AND market_type = ${marketType}
+            LIMIT 1
+          ),
+          aggregate AS (
+            SELECT TRUE AS pass
+            FROM v_live_eligibility_market_types
+            WHERE market_type = ${marketType}
+            LIMIT 1
+          ),
+          disproof AS (
+            -- Three-signal disproof on the per-(league × market) scope:
+            -- n>=30 AND realised ROI<0 AND CLV t-stat<0. Latest snapshot.
+            SELECT TRUE AS bad
+            FROM analysis_signal_strength s
+            WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+              AND s.league = ${league}
+              AND s.market_type = ${marketType}
+              AND s.n >= 30
+              AND s.roi < 0
+              AND s.clv_t_stat < 0
+            LIMIT 1
+          )
+          SELECT
+            (SELECT pass FROM per_scope) AS per_scope_pass,
+            (SELECT pass FROM aggregate) AS aggregate_pass,
+            (SELECT bad  FROM disproof)  AS disproof_bad
         `);
-        const eligibility = ((eligibilityRow as any).rows ?? [])[0] as
-          | { qualifies_live: boolean; qualification_basis: string; n: number }
+        const gate = ((gateRow as any).rows ?? [])[0] as
+          | {
+              per_scope_pass: boolean | null;
+              aggregate_pass: boolean | null;
+              disproof_bad: boolean | null;
+            }
           | undefined;
-        if (!eligibility?.qualifies_live) {
+        const perScopePass = gate?.per_scope_pass === true;
+        const aggregatePass = gate?.aggregate_pass === true && gate?.disproof_bad !== true;
+        if (perScopePass) {
+          livePathTag = "per_scope";
+        } else if (aggregatePass) {
+          livePathTag = "market_type_aggregate";
+        } else {
+          const detail =
+            gate?.aggregate_pass === true && gate?.disproof_bad === true
+              ? `market_type ${marketType} qualifies at aggregate but scope ${league}:${marketType} is empirically disproven (n>=30 AND roi<0 AND clv_t_stat<0) — three-signal disproof carve-out`
+              : `neither per-scope (Wilson lo95>0.50 / CLV t>1.96 / shrunk_roi>0.20 at n>=30) nor market_type aggregate (three-gate pass on pooled history) qualifies ${league}:${marketType}`;
           await logShadowGateExemption(
             "scope_not_in_live_eligibility",
             experimentTag ?? null,
-            `Scope ${league}:${marketType} not in v_live_eligibility_candidates (needs Wilson lower-95 win-rate > 50% AND/OR t-stat on CLV > 1.96 at n>=30 settled bets) — demoting to shadow to keep accumulating data`,
+            `Scope ${league}:${marketType} not live-eligible — ${detail} — demoting to shadow to keep accumulating data`,
             null,
             universeTier,
           );
@@ -2251,6 +2305,9 @@ export async function placePaperBet(
         kellyFraction,
         dynamicKellyFraction: kellyFraction,
         modelVersion,
+        // Lever A+G observability: which eligibility path authorised live
+        // placement (per_scope | market_type_aggregate | null for shadow).
+        liveEligibilityPath: isShadowBet ? null : livePathTag,
         exposureAtPlacement: {
           currentExposure: Math.round(exposureAtPlacement.current * 100) / 100,
           maxExposure: Math.round(exposureAtPlacement.max * 100) / 100,

@@ -3207,6 +3207,14 @@ export async function runMigrations() {
     `);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_analysis_signal_strength_recent ON analysis_signal_strength(computed_at DESC)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_analysis_signal_strength_qualifies ON analysis_signal_strength(qualifies_live, computed_at DESC) WHERE qualifies_live = TRUE`);
+    // 2026-05-13 (Lever A+G): bootstrap 95% lower bound on stake-weighted ROI
+    // (Efron-Tibshirani percentile method, B=10000). Populated only on the
+    // __market_type_aggregate__ rows by runBundleBAnalytics; NULL on every
+    // per-(league × market_type) row.
+    await db.execute(sql`
+      ALTER TABLE analysis_signal_strength
+        ADD COLUMN IF NOT EXISTS bootstrap_lo95_roi NUMERIC
+    `);
 
     // Operator view — latest live-eligibility candidates, sorted by strength.
     // No UI consumer (per project memory); read via SQL editor.
@@ -3284,6 +3292,36 @@ export async function runMigrations() {
       WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
       GROUP BY s.league
       ORDER BY n_markets_qualifying DESC, n_bets DESC
+    `);
+
+    // 2026-05-13 (Lever A+G unified): market_type aggregate eligibility view.
+    // Reads the __market_type_aggregate__ rows written by runBundleBAnalytics
+    // (one per market_type, pooling all leagues). A market_type qualifies live
+    // iff ALL THREE gates pass on the aggregate:
+    //   Gate 1: Wilson 95% lower bound on win-rate          > 0.50
+    //   Gate 2: bootstrap (B=10000) 95% lower bound on ROI  > 0
+    //   Gate 3: Student t-stat on mean CLV                  > 1.96
+    // Conjunction of three independent statistical proofs is strictly more
+    // conservative than any single 95% test; joint Type I error ≤ alpha each.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_live_eligibility_market_types AS
+      SELECT
+        s.market_type,
+        s.bet_track,
+        s.n,
+        s.win_rate,
+        s.wilson_lo95_winrate,
+        s.roi,
+        s.bootstrap_lo95_roi,
+        s.avg_clv,
+        s.clv_t_stat,
+        s.qualifies_live,
+        s.computed_at
+      FROM analysis_signal_strength s
+      WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+        AND s.league = '__market_type_aggregate__'
+        AND s.qualifies_live = TRUE
+      ORDER BY s.clv_t_stat DESC NULLS LAST, s.bootstrap_lo95_roi DESC NULLS LAST
     `);
 
     // Task 4 / F.4 (2026-05-11 — back-to-theory plan): banned-market
