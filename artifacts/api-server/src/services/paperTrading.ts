@@ -991,7 +991,7 @@ export async function placePaperBet(
   // 2026-05-13 Lever A+G — placement gate combines two independent
   // qualification paths:
   //   (a) per-scope:  (league, market_type) is in v_live_eligibility_candidates
-  //                   (existing path; per-scope Wilson / CLV / shrunk_roi)
+  //                   (existing path; per-scope Wilson OR CLV)
   //   (b) aggregate:  market_type is in v_live_eligibility_market_types
   //                   (Lever A+G; all three gates pass at the pooled level)
   //                   AND this (league, market_type) is NOT empirically
@@ -1060,7 +1060,7 @@ export async function placePaperBet(
           const detail =
             gate?.aggregate_pass === true && gate?.disproof_bad === true
               ? `market_type ${marketType} qualifies at aggregate but scope ${league}:${marketType} is empirically disproven (n>=30 AND roi<0 AND clv_t_stat<0) — three-signal disproof carve-out`
-              : `neither per-scope (Wilson lo95>0.50 / CLV t>1.96 / shrunk_roi>0.20 at n>=30) nor market_type aggregate (three-gate pass on pooled history) qualifies ${league}:${marketType}`;
+              : `neither per-scope (Wilson lo95>0.50 OR CLV t>1.96 at n>=30) nor market_type aggregate (three-gate pass on pooled history) qualifies ${league}:${marketType}`;
           await logShadowGateExemption(
             "scope_not_in_live_eligibility",
             experimentTag ?? null,

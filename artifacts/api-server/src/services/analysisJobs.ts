@@ -30,15 +30,19 @@ const N_FLOOR = 30;
 const SHRINKAGE_N_PRIOR = 30;
 const CLV_T_THRESHOLD = 1.96;
 const WILSON_WINRATE_THRESHOLD = 0.50;
-// 2026-05-12: third qualification path — Bayesian-shrunk realised ROI.
-// Wilson on raw win-rate is the wrong dimension for AH-with-variable-odds
-// (47% win rate at avg odds 2.5 = +18% per bet; Wilson rejects, ROI proves).
-// shrunk_roi already pulls toward the market prior at n_prior=30, so a
-// shrunk_roi > 0.20 on n >= 50 represents statistically-meaningful +EV
-// after conservative shrinkage. Same evidence bar as Wilson, applied to
-// the dimension Kelly actually maximises (log-growth = realised ROI).
-const SHRUNK_ROI_THRESHOLD = 0.20;
-const SHRUNK_ROI_N_FLOOR = 50;
+// 2026-05-13: shrunk_roi qualification path removed. The 0.20 threshold had
+// no statistical referent (Wilson 0.50 is the 1:1-payout break-even; CLV
+// 1.96 is the 95% z-score; 0.20 was a magic number). With the market_type
+// aggregate path (Lever A+G), any scope previously qualifying on shrunk_roi
+// alone is either (a) in a market_type that qualifies at aggregate and is
+// reached via that path, or (b) in a non-qualifying market_type, in which
+// case shrunk_roi was statistically thin evidence to override the
+// market-level rejection. Verified on Neon 2026-05-13: 3 scopes drop off
+// per-scope under the new rule (Allsvenskan/Eredivisie/K-League-2 AH); all
+// 3 are covered by the AH aggregate path; net emission impact zero. The
+// shrunk_roi COLUMN remains computed for operator diagnostics (view
+// exposure) — only the qualification disjunct is dropped.
+// SHRINKAGE_N_PRIOR retained because shrunk_roi is still computed.
 // 2026-05-13 Lever A+G — market_type aggregate qualification.
 // A market_type is live-eligible iff ALL THREE gates pass on its full pooled
 // settled-bet history: Wilson lo95 win-rate (1927), bootstrap percentile lo95
@@ -198,14 +202,12 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
         ELSE (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv
       END                                                                     AS clv_t_stat,
       -- Qualifies live?
-      -- Three independent paths (n>=30 AND pnl>0 are common floors):
-      --   1. Wilson lo95 on raw win-rate > 0.50           (1:1-payout proof)
-      --   2. CLV t-stat > 1.96 with avg_clv > 0           (closing-line proof)
-      --   3. Shrunk ROI > 0.20 with n >= 50              (realised-growth proof)
-      -- Path 3 added 2026-05-12 to catch AH scopes where variable odds make
-      -- raw win-rate the wrong dimension. shrunk_roi at n_prior=30 pre-pulls
-      -- toward the market mean ROI, so 0.20 represents conservative empirical
-      -- proof of +EV growth — exactly what Kelly maximises.
+      -- Two independent theory-pinned paths (n>=30 AND pnl>0 are common floors):
+      --   1. Wilson lo95 on raw win-rate > 0.50  (1:1-payout proof; Wilson 1927)
+      --   2. CLV t-stat > 1.96 with avg_clv > 0  (closing-line proof; Student 1908)
+      -- The shrunk_roi > 0.20 path was removed 2026-05-13: 0.20 had no
+      -- statistical referent and every scope that qualified on it alone is
+      -- now reachable via the market_type aggregate path (Lever A+G).
       (
         s.n >= ${N_FLOOR}
         AND s.pnl > 0
@@ -218,17 +220,10 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
             AND (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv > ${CLV_T_THRESHOLD}
             AND s.avg_clv > 0
           )
-          OR (
-            s.n >= ${SHRUNK_ROI_N_FLOOR}
-            AND s.stake IS NOT NULL AND s.stake > 0
-            AND (
-              (s.n::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * (s.pnl / NULLIF(s.stake, 0))
-              + (${SHRINKAGE_N_PRIOR}::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * COALESCE(p.mean_roi, 0)
-            ) > ${SHRUNK_ROI_THRESHOLD}
-          )
         )
       )                                                                       AS qualifies_live,
-      -- Basis label — preferred order: combo > single signals
+      -- Basis label — 'both' when both Wilson and CLV fire, otherwise the
+      -- single firing signal. 'insufficient' for any non-qualifier.
       CASE
         WHEN s.n < ${N_FLOOR} THEN 'insufficient'
         WHEN s.pnl <= 0 THEN 'insufficient'
@@ -252,14 +247,6 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
               AND (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv > ${CLV_T_THRESHOLD}
               AND s.avg_clv > 0
             THEN 'clv'
-            WHEN
-              s.n >= ${SHRUNK_ROI_N_FLOOR}
-              AND s.stake IS NOT NULL AND s.stake > 0
-              AND (
-                (s.n::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * (s.pnl / NULLIF(s.stake, 0))
-                + (${SHRINKAGE_N_PRIOR}::numeric / (s.n + ${SHRINKAGE_N_PRIOR})) * COALESCE(p.mean_roi, 0)
-              ) > ${SHRUNK_ROI_THRESHOLD}
-            THEN 'shrunk_roi'
             ELSE 'insufficient'
           END
       END                                                                     AS qualification_basis
