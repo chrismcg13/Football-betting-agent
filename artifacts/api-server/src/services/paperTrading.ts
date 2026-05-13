@@ -414,14 +414,33 @@ export async function applyBatchPnl(
   extraDetails?: Record<string, unknown>,
 ): Promise<{ before: number; after: number; delta: number }> {
   const before = await getConfigBankroll();
-  const after = Math.round((before + delta) * 100) / 100;
-  await setConfigValue("bankroll", String(after));
+  // 2026-05-13: post-cutover, agent_config.bankroll is FROZEN. It accumulated
+  // paper-era PnL through 2026-05-09 21:29 UTC and was then contaminated by
+  // post-cutover live writes (settleBets, backfill_corners_cards_resettle)
+  // until this freeze. Live PnL is now sourced only from paper_bets.betfair_pnl
+  // (per CLAUDE.md §11); shadow is £0 stake by construction; paper is dead.
+  // Nothing post-cutover legitimately mutates the paper-era ledger anymore.
+  //
+  // Continue to log the compliance row + bankroll_snapshot so audit trail
+  // captures what WOULD have changed, but skip the actual write. Callers see
+  // before === after === current frozen value, delta === 0.
+  const cutoverRaw = await getConfigValue("cutover_completed_at");
+  const postCutover = !!cutoverRaw && cutoverRaw.trim() !== "";
+  const applied = !postCutover;
+  const after = applied ? Math.round((before + delta) * 100) / 100 : before;
+
+  if (applied) {
+    await setConfigValue("bankroll", String(after));
+  }
   await db.insert(complianceLogsTable).values({
     actionType: "bankroll_updated",
     details: {
       bankrollBefore: before,
       bankrollAfter: after,
-      delta,
+      delta: applied ? delta : 0,
+      requestedDelta: delta,
+      bookkeepingOnly: !applied,
+      frozenReason: applied ? undefined : "post_cutover_paper_bankroll_frozen",
       reason,
       ...(extraDetails ?? {}),
     },
@@ -429,16 +448,19 @@ export async function applyBatchPnl(
   });
   // F1 (2026-05-07): bankroll snapshot AFTER batch PnL applied. Together
   // with pre-bet snapshots, lets us compute true LN(after/before) per bet
-  // for proper Kelly-growth-rate measurement (vs current proxy LN(1+pnl/stake)).
-  void db.execute(sql`
-    INSERT INTO bankroll_snapshots (paper_bankroll, source, notes, taken_at)
-    VALUES (${after}, ${reason}, ${JSON.stringify(extraDetails ?? {})}, NOW())
-  `).catch((err) => logger.warn({ err }, "F1 bankroll snapshot write failed (non-fatal)"));
+  // for proper Kelly-growth-rate measurement. Skipped when frozen — the
+  // snapshot would be identical to the previous one and just adds noise.
+  if (applied) {
+    void db.execute(sql`
+      INSERT INTO bankroll_snapshots (paper_bankroll, source, notes, taken_at)
+      VALUES (${after}, ${reason}, ${JSON.stringify(extraDetails ?? {})}, NOW())
+    `).catch((err) => logger.warn({ err }, "F1 bankroll snapshot write failed (non-fatal)"));
+  }
   logger.info(
-    { previous: before, delta, updated: after, reason },
-    "Bankroll updated via applyBatchPnl",
+    { previous: before, requestedDelta: delta, applied, updated: after, reason },
+    applied ? "Bankroll updated via applyBatchPnl" : "Bankroll write SKIPPED (post-cutover freeze) — audit logged",
   );
-  return { before, after, delta };
+  return { before, after, delta: applied ? delta : 0 };
 }
 
 /**
@@ -461,21 +483,45 @@ export { writePrePlacementSnapshot };
 
 /**
  * Set bankroll to an absolute value (used for explicit resets, e.g. £100 baseline).
- * Logs compliance with previous value for audit.
+ * 2026-05-13: post-cutover, this is a no-op — agent_config.bankroll is frozen
+ * (see applyBatchPnl comment). Operator overrides must go through a Neon UPDATE
+ * with explicit audit, not via this paper-era helper.
+ * Logs compliance with previous value for audit either way.
  */
 export async function setBankrollAbsolute(
   value: number,
   reason: string,
 ): Promise<{ before: number; after: number }> {
   const before = await getConfigBankroll();
-  const after = Math.round(value * 100) / 100;
-  await setConfigValue("bankroll", String(after));
+  const requestedAfter = Math.round(value * 100) / 100;
+  const cutoverRaw = await getConfigValue("cutover_completed_at");
+  const postCutover = !!cutoverRaw && cutoverRaw.trim() !== "";
+  const applied = !postCutover;
+  const after = applied ? requestedAfter : before;
+
+  if (applied) {
+    await setConfigValue("bankroll", String(after));
+  }
   await db.insert(complianceLogsTable).values({
     actionType: "bankroll_updated",
-    details: { bankrollBefore: before, bankrollAfter: after, delta: after - before, reason, source: "setBankrollAbsolute" },
+    details: {
+      bankrollBefore: before,
+      bankrollAfter: after,
+      delta: applied ? after - before : 0,
+      requestedAfter,
+      bookkeepingOnly: !applied,
+      frozenReason: applied ? undefined : "post_cutover_paper_bankroll_frozen",
+      reason,
+      source: "setBankrollAbsolute",
+    },
     timestamp: new Date(),
   });
-  logger.warn({ previous: before, updated: after, reason }, "Bankroll set to absolute value");
+  logger.warn(
+    { previous: before, requestedAfter, applied, updated: after, reason },
+    applied
+      ? "Bankroll set to absolute value"
+      : "Bankroll absolute-set SKIPPED (post-cutover freeze) — audit logged",
+  );
   return { before, after };
 }
 
