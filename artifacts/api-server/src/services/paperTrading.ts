@@ -656,6 +656,115 @@ async function getTierKellyFractionForTag(experimentTag: string | null | undefin
   }
 }
 
+// 2026-05-13: adaptive Kelly factor (Wilson-LCB / Kelly-LCB ratio).
+// Replaces the binary experiment_registry.warmup_completed_at gate with a
+// continuous, evidence-proportional Kelly multiplier.
+//
+// For a bet with decimal odds = b+1 in a scope with realised win-rate p̂ and
+// Wilson 95% lower bound p_lo:
+//   f̂   = p̂   − (1 − p̂)   / b       Kelly fraction at point estimate
+//   f_lo = p_lo − (1 − p_lo) / b       Kelly fraction at Wilson lower bound
+//   factor_raw = f_lo / f̂              ∈ (0, 1] when both > 0
+//
+// Then cap by qualification path: per-scope qualifiers get 1.0 ceiling
+// (factor only haircuts, never amplifies); aggregate-only qualifiers get
+// 0.33 ceiling (the AH/OU_15 *market* is proven but this specific scope
+// is statistically thin — quarter-to-third Kelly is the right discount).
+//
+// Returns null when:
+//   - scope has no analysis_signal_strength row (no evidence) → caller
+//     keeps existing behaviour (bet routes per the eligibility gate)
+//   - f̂ ≤ 0 (point-estimate Kelly is negative for this bet's odds) →
+//     caller demotes with reason 'scope_eligible_but_negative_kelly'
+//
+// Distinct from the eligibility gate: that says "is this scope live-eligible
+// at all". This says "given it IS eligible, how big a fraction of full Kelly
+// does the evidence warrant".
+interface AdaptiveKellyResult {
+  factor: number;         // capped factor applied to base Kelly fraction
+  fHat: number;           // f̂ at p̂
+  fLo: number;            // f_lo at p_lo
+  rawFactor: number;      // f_lo / f̂ before path cap
+  pHat: number;           // scope win-rate
+  pLo: number;            // Wilson lo95 win-rate
+  path: "per_scope" | "aggregate_only";
+}
+async function computeAdaptiveKellyFactor(
+  league: string,
+  marketType: string,
+  decimalOdds: number,
+): Promise<AdaptiveKellyResult | { factor: 0; reason: "negative_kelly" | "no_evidence" }> {
+  if (!Number.isFinite(decimalOdds) || decimalOdds <= 1) {
+    return { factor: 0, reason: "no_evidence" };
+  }
+  const b = decimalOdds - 1;
+  try {
+    const lookup = await db.execute(sql`
+      WITH latest AS (
+        SELECT MAX(computed_at) AS ts FROM analysis_signal_strength
+      ),
+      scope AS (
+        SELECT win_rate, wilson_lo95_winrate, qualifies_live
+        FROM analysis_signal_strength, latest
+        WHERE computed_at = latest.ts
+          AND league = ${league}
+          AND market_type = ${marketType}
+          AND bet_track <> 'aggregate'
+        ORDER BY (CASE WHEN qualifies_live THEN 0 ELSE 1 END), n DESC NULLS LAST
+        LIMIT 1
+      ),
+      aggregate AS (
+        SELECT TRUE AS pass FROM analysis_signal_strength, latest
+        WHERE computed_at = latest.ts
+          AND league = '__market_type_aggregate__'
+          AND market_type = ${marketType}
+          AND qualifies_live = TRUE
+        LIMIT 1
+      )
+      SELECT
+        (SELECT win_rate            FROM scope)     AS p_hat,
+        (SELECT wilson_lo95_winrate FROM scope)     AS p_lo,
+        (SELECT qualifies_live      FROM scope)     AS per_scope_qualifies,
+        (SELECT pass                FROM aggregate) AS aggregate_qualifies
+    `);
+    const row = (lookup as any).rows?.[0];
+    const pHatRaw = row?.p_hat;
+    const pLoRaw = row?.p_lo;
+    if (pHatRaw == null || pLoRaw == null) {
+      return { factor: 0, reason: "no_evidence" };
+    }
+    const pHat = Number(pHatRaw);
+    const pLo = Number(pLoRaw);
+    if (!Number.isFinite(pHat) || !Number.isFinite(pLo)) {
+      return { factor: 0, reason: "no_evidence" };
+    }
+    const fHat = pHat - (1 - pHat) / b;
+    const fLo  = pLo  - (1 - pLo)  / b;
+    if (fHat <= 0) {
+      // Bet's odds combined with scope win-rate yield non-positive expected
+      // log-growth at the point estimate. Caller demotes; distinct reason
+      // from "scope not eligible" so calibration drift can be tracked.
+      return { factor: 0, reason: "negative_kelly" };
+    }
+    const rawFactor = fLo > 0 ? fLo / fHat : 0;
+    const perScopeQualifies = row?.per_scope_qualifies === true;
+    const aggregateQualifies = row?.aggregate_qualifies === true;
+    // Per-scope wins precedence: cap 1.0. Aggregate-only: cap 0.33.
+    const path: "per_scope" | "aggregate_only" = perScopeQualifies
+      ? "per_scope"
+      : "aggregate_only";
+    const cap = perScopeQualifies ? 1.0 : (aggregateQualifies ? 0.33 : 1.0);
+    const factor = Math.max(0, Math.min(rawFactor, cap));
+    return { factor, fHat, fLo, rawFactor, pHat, pLo, path };
+  } catch (err) {
+    logger.warn(
+      { err, league, marketType },
+      "computeAdaptiveKellyFactor lookup failed — returning no_evidence",
+    );
+    return { factor: 0, reason: "no_evidence" };
+  }
+}
+
 // 2026-05-09 (no-bet-dropped): operator kill-switch for the production→
 // shadow fallthrough behavior added in this commit. Default true.
 // When false, every demote site reverts to its previous reject behavior.
@@ -1049,6 +1158,9 @@ export async function placePaperBet(
   // PASS_IF (a OR b). Failure demotes to shadow; the bet still records so
   // the per-scope sample keeps accumulating.
   let livePathTag: "per_scope" | "market_type_aggregate" | null = null;
+  // Resolved league name lifted to outer scope so the adaptive-Kelly step
+  // downstream can reuse it without a second matches lookup.
+  let scopeLeague: string | null = null;
   if (!isShadowBet) {
     try {
       const matchLeague = await db
@@ -1057,6 +1169,7 @@ export async function placePaperBet(
         .where(eq(matchesTable.id, matchId))
         .limit(1);
       const league = matchLeague[0]?.league;
+      scopeLeague = league ?? null;
       if (league) {
         const gateRow = await db.execute(sql`
           WITH per_scope AS (
@@ -1121,6 +1234,47 @@ export async function placePaperBet(
       logger.warn(
         { err, matchId, marketType, selectionName },
         "Live eligibility lookup failed — proceeding without scope gate (fail-open to preserve placement)",
+      );
+    }
+  }
+
+  // 2026-05-13: adaptive Kelly factor. Given the scope IS live-eligible above,
+  // compute f_lo/f̂ for this bet's odds against the scope's Wilson-95 lower
+  // bound. The factor multiplies the base Kelly fraction (n=30 → ~0.34, n=300
+  // → ~0.79, n=3000 → ~0.93; asymptote = 1.0). Per-scope qualifiers cap at
+  // 1.0; aggregate-only qualifiers cap at 0.33 (the *market* is proven, this
+  // specific scope's evidence is thinner). f̂ ≤ 0 means the bet's odds combined
+  // with the scope's win-rate yield non-positive log-growth at the point
+  // estimate — demote to shadow with a distinct reason so any spike here
+  // surfaces model-calibration drift independent of eligibility shifts.
+  let adaptiveKellyMultiplier = 1.0;
+  let adaptiveFactorAudit: AdaptiveKellyResult | null = null;
+  if (!isShadowBet && livePathTag != null && scopeLeague != null) {
+    const adaptive = await computeAdaptiveKellyFactor(scopeLeague, marketType, backOdds);
+    if ("reason" in adaptive) {
+      if (adaptive.reason === "negative_kelly") {
+        await logShadowGateExemption(
+          "scope_eligible_but_negative_kelly",
+          experimentTag ?? null,
+          `Scope ${scopeLeague}:${marketType} is live-eligible but f̂ ≤ 0 at this bet's odds (backOdds=${backOdds}) — Kelly point estimate is non-positive given scope win-rate; demoting to shadow. Track this rate as a calibration-drift signal.`,
+          null,
+          universeTier,
+        );
+        isShadowBet = true;
+      }
+      // reason === "no_evidence": leave adaptiveKellyMultiplier=1.0 (the
+      // eligibility gate already passed, so trust the existing fraction).
+    } else {
+      adaptiveKellyMultiplier = adaptive.factor;
+      adaptiveFactorAudit = adaptive;
+      logger.info(
+        {
+          matchId, marketType, league: scopeLeague,
+          backOdds, pHat: adaptive.pHat, pLo: adaptive.pLo,
+          fHat: adaptive.fHat, fLo: adaptive.fLo,
+          rawFactor: adaptive.rawFactor, cappedFactor: adaptive.factor, path: adaptive.path,
+        },
+        "Adaptive Kelly factor computed",
       );
     }
   }
@@ -1887,6 +2041,29 @@ export async function placePaperBet(
     );
   }
 
+  // 2026-05-13: adaptive Kelly factor (Wilson-LCB / Kelly-LCB ratio).
+  // Applied AFTER tierKellyFraction so it composes multiplicatively with the
+  // existing per-tag multiplier, and BEFORE portfolio correlation shrinkage
+  // and the max_stake_pct hard cap so all existing downstream guards still
+  // bind. factor=1.0 when no evidence (e.g. brand-new scope qualifying via
+  // aggregate-only with NULL p_hat in the row picked); haircuts down as
+  // sample uncertainty grows.
+  if (!isShadowBet && adaptiveKellyMultiplier < 1.0 && adaptiveKellyMultiplier > 0) {
+    const originalStake = stake;
+    stake = Math.round(stake * adaptiveKellyMultiplier * 100) / 100;
+    logger.info(
+      {
+        matchId, marketType, experimentTag,
+        originalStake, reducedStake: stake,
+        adaptiveFactor: adaptiveKellyMultiplier,
+        path: adaptiveFactorAudit?.path ?? null,
+        pHat: adaptiveFactorAudit?.pHat ?? null,
+        pLo: adaptiveFactorAudit?.pLo ?? null,
+      },
+      "Adaptive Kelly factor multiplier applied",
+    );
+  }
+
   // Phase 5d.2 (Task 13 wire-in, 2026-05-11): portfolio correlation
   // shrinkage. Treats this new candidate plus any already-pending bets
   // on the same fixture as a basket and shrinks each leg's fraction by
@@ -2354,6 +2531,19 @@ export async function placePaperBet(
         // Lever A+G observability: which eligibility path authorised live
         // placement (per_scope | market_type_aggregate | null for shadow).
         liveEligibilityPath: isShadowBet ? null : livePathTag,
+        // 2026-05-13: adaptive Kelly factor audit. Captures f̂, f_lo, raw and
+        // capped factor + path so the operator can verify post-hoc that
+        // sizing was Wilson-LCB-proportional and trace any calibration drift
+        // through the scope_eligible_but_negative_kelly demotion rate.
+        adaptiveKelly: isShadowBet || !adaptiveFactorAudit ? null : {
+          pHat: adaptiveFactorAudit.pHat,
+          pLo: adaptiveFactorAudit.pLo,
+          fHat: adaptiveFactorAudit.fHat,
+          fLo: adaptiveFactorAudit.fLo,
+          rawFactor: adaptiveFactorAudit.rawFactor,
+          cappedFactor: adaptiveFactorAudit.factor,
+          path: adaptiveFactorAudit.path,
+        },
         exposureAtPlacement: {
           currentExposure: Math.round(exposureAtPlacement.current * 100) / 100,
           maxExposure: Math.round(exposureAtPlacement.max * 100) / 100,
