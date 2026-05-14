@@ -67,6 +67,44 @@ function kellyFractionForScore(opportunityScore: number): number {
   return 0.125;
 }
 
+// 2026-05-14 Block C — classify placeResult.error into a structured
+// (reason, errorClass) pair so SQL audits over lazy_promote_placement_failed
+// can histogram failure modes without scraping pm2 logs. Buckets the error
+// strings emitted by placeLiveBetOnBetfair (betfairLive.ts) and the relayed
+// Betfair API errors. Unknown strings fall through to ("betfair_other",
+// "other") so the row is still queryable and we can iterate.
+function classifyPlacementFailure(
+  error: string | null | undefined,
+  unavailableOnExchange?: boolean,
+): { reason: string; errorClass: string } {
+  if (unavailableOnExchange) return { reason: "market_unavailable_on_exchange", errorClass: "exchange_availability" };
+  const e = String(error ?? "").trim();
+  if (!e) return { reason: "no_error_string", errorClass: "unknown" };
+  const upper = e.toUpperCase();
+
+  if (upper.includes("INSUFFICIENT_FUNDS") || upper.includes("INSUFFICIENT FUNDS"))
+    return { reason: "insufficient_funds", errorClass: "wallet" };
+  if (e.startsWith("SLIPPAGE_") || upper.startsWith("SLIPPAGE_"))
+    return { reason: "slippage_guard_blocked", errorClass: "slippage" };
+  if (e.includes("below Betfair minimum") || upper.includes("BELOW BETFAIR MINIMUM"))
+    return { reason: "stake_below_minimum", errorClass: "sizing" };
+  if (e.includes("Cannot map selection"))
+    return { reason: "selection_unmappable", errorClass: "mapping" };
+  if (e.includes("no runners") || upper.includes("NO RUNNERS"))
+    return { reason: "market_empty", errorClass: "exchange_availability" };
+  if (upper.includes("MARKET UNAVAILABLE") || upper.includes("UNAVAILABLE ON BETFAIR"))
+    return { reason: "market_unavailable_on_exchange", errorClass: "exchange_availability" };
+  if (upper.includes("INVALID_BET") || upper.includes("ERROR_IN_ORDER") || upper.includes("INVALID_ODDS") || upper.includes("INVALID_BACK_LAY_COMBINATION"))
+    return { reason: "betfair_invalid_order", errorClass: "betfair_api" };
+  if (upper.includes("BET_TAKEN_OR_LAPSED") || upper.includes("MARKET_NOT_OPEN_FOR_BETTING") || upper.includes("EVENT_INACTIVE"))
+    return { reason: "market_lifecycle_closed", errorClass: "exchange_availability" };
+  if (upper.includes("TIMEOUT") || upper.includes("ECONNREFUSED") || upper.includes("ETIMEDOUT"))
+    return { reason: "relay_network_error", errorClass: "infra" };
+  if (upper.includes("COLLAPSE") || upper.includes("DUP_GUARD") || upper.includes("DUPLICATE"))
+    return { reason: "collapse_guard_blocked", errorClass: "safety" };
+  return { reason: "betfair_other", errorClass: "other" };
+}
+
 // 2026-05-10: extended from 6h to 168h to match trading_far emission window.
 // Pre-fix, only bets within 6h of kickoff were lazy-promote eligible.
 // Today's analysis found 216 quality AH shadow bets (Tier A + score 70+ +
@@ -442,8 +480,17 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           // lazy_promote_placement_failed row so the operator can audit
           // Betfair-side rejection rates from SQL alone, without scraping
           // pm2 logs.
+          //
+          // 2026-05-14 Block C — classify the raw error into (reason, errorClass)
+          // so audits can histogram failure modes. Before this, all 72k+
+          // daily rows had details.reason = null, making SQL diagnosis
+          // impossible.
+          const { reason, errorClass } = classifyPlacementFailure(
+            placeResult.error,
+            (placeResult as { unavailableOnExchange?: boolean }).unavailableOnExchange,
+          );
           logger.info(
-            { betId: r.id, matchId: r.match_id, error: placeResult.error },
+            { betId: r.id, matchId: r.match_id, error: placeResult.error, reason, errorClass },
             "lazyPromote: live placement failed — bet stays shadow for retry",
           );
           await db.insert(complianceLogsTable).values({
@@ -456,6 +503,9 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
               odds, stake, score, edge, bankroll,
               betfairEventId: m.betfair_event_id,
               error: placeResult.error ?? null,
+              reason,
+              errorClass,
+              unavailableOnExchange: (placeResult as { unavailableOnExchange?: boolean }).unavailableOnExchange ?? false,
               adaptiveKelly: adaptiveAudit,
             } as Record<string, unknown>,
             timestamp: new Date(),

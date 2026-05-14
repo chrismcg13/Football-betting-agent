@@ -1,5 +1,5 @@
 import { logger } from "../lib/logger";
-import { db, paperBetsTable, agentConfigTable } from "@workspace/db";
+import { db, paperBetsTable, agentConfigTable, complianceLogsTable } from "@workspace/db";
 import { eq, and, isNotNull, sql } from "drizzle-orm";
 import {
   isRelayConfigured,
@@ -174,6 +174,189 @@ async function acceptPartialAndCancel(
   return true;
 }
 
+// 2026-05-14 Block ZERO — eligibility symmetry. A pending live bet must
+// continue to satisfy the current two-path eligibility gate
+// (v_live_eligibility_candidates OR v_live_eligibility_market_types with
+// three-signal-disproof carve-out); holding an ineligible position is
+// equivalent to placing a fresh ineligible bet by inaction.
+//
+// Cancellation semantics: relayCancelBet on an EXECUTABLE order cancels
+// only the unmatched portion. If betfair_size_matched > 0, the matched
+// stake is already committed exposure and stays live (PARTIAL_SCOPE_DEMOTED).
+// If unmatched, full cancel and demote bet_track→shadow.
+//
+// Symmetric to the placement gate in lazyPromoteShadowToPaper.ts:194-232:
+// scope eligibility statements apply at both entry and exit. Cancels return
+// stake from Betfair, so net exposure can only decrease.
+async function enforceScopeEligibilityOnPendingBets(): Promise<{
+  scanned: number;
+  demoted_full: number;
+  demoted_partial: number;
+  cancel_failed: number;
+}> {
+  if (!isRelayConfigured()) return { scanned: 0, demoted_full: 0, demoted_partial: 0, cancel_failed: 0 };
+
+  const rows = await db.execute(sql`
+    WITH latest_signal AS (
+      SELECT league, market_type, n, win_rate, wilson_lo95_winrate, roi, clv_t_stat
+      FROM analysis_signal_strength
+      WHERE computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+        AND league <> '__market_type_aggregate__'
+    ),
+    disproven AS (
+      SELECT league, market_type FROM latest_signal
+      WHERE n >= 30 AND roi < 0 AND clv_t_stat < 0
+    ),
+    per_scope_ok AS (
+      SELECT league, market_type FROM v_live_eligibility_candidates
+    ),
+    mkt_ok AS (
+      SELECT market_type FROM v_live_eligibility_market_types
+    )
+    SELECT pb.id AS bet_id, pb.match_id, pb.market_type, pb.selection_name,
+           pb.betfair_bet_id, pb.betfair_market_id, pb.betfair_status,
+           pb.qualification_path, pb.placed_at,
+           pb.stake::numeric AS stake,
+           COALESCE(pb.betfair_size_matched, 0)::numeric AS size_matched,
+           pb.betfair_avg_price_matched::numeric AS avg_price_matched,
+           m.league, m.kickoff_time,
+           ls.n, ls.win_rate, ls.wilson_lo95_winrate, ls.roi, ls.clv_t_stat,
+           ((m.league, pb.market_type) IN (SELECT league, market_type FROM per_scope_ok)) AS per_scope_qualified,
+           (pb.market_type IN (SELECT market_type FROM mkt_ok)) AS mkt_qualified,
+           ((m.league, pb.market_type) IN (SELECT league, market_type FROM disproven)) AS three_signal_disproven
+    FROM paper_bets pb
+    JOIN matches m ON m.id = pb.match_id
+    WHERE pb.bet_track = 'live'
+      AND pb.status = 'pending'
+      AND pb.betfair_bet_id IS NOT NULL
+      AND pb.deleted_at IS NULL
+      AND pb.betfair_status IN ('EXECUTABLE','PARTIALLY_MATCHED')
+      AND m.kickoff_time > NOW()
+      AND (m.league, pb.market_type) NOT IN (SELECT league, market_type FROM per_scope_ok)
+      AND (
+        pb.market_type NOT IN (SELECT market_type FROM mkt_ok)
+        OR (m.league, pb.market_type) IN (SELECT league, market_type FROM disproven)
+      )
+  `);
+
+  const ineligibleBets = (((rows as any).rows ?? []) as Array<{
+    bet_id: number; match_id: number; market_type: string; selection_name: string;
+    betfair_bet_id: string; betfair_market_id: string | null; betfair_status: string;
+    qualification_path: string | null; placed_at: string;
+    stake: string | number; size_matched: string | number;
+    avg_price_matched: string | number | null;
+    league: string; kickoff_time: string;
+    n: string | number | null; win_rate: string | number | null;
+    wilson_lo95_winrate: string | number | null; roi: string | number | null;
+    clv_t_stat: string | number | null;
+    per_scope_qualified: boolean; mkt_qualified: boolean; three_signal_disproven: boolean;
+  }>);
+
+  let demoted_full = 0;
+  let demoted_partial = 0;
+  let cancel_failed = 0;
+
+  for (const r of ineligibleBets) {
+    const sizeMatched = Number(r.size_matched) || 0;
+    const intendedStake = Number(r.stake) || 0;
+
+    const gateFailed = r.three_signal_disproven
+      ? "three_signal_disproven_in_aggregate_scope"
+      : (!r.per_scope_qualified && !r.mkt_qualified)
+        ? "both_paths_ineligible"
+        : "per_scope_ineligible";
+
+    const auditDetails = {
+      betId: r.bet_id,
+      matchId: r.match_id,
+      marketType: r.market_type,
+      league: r.league,
+      selectionName: r.selection_name,
+      originalQualificationPath: r.qualification_path,
+      placedAt: r.placed_at,
+      kickoffTime: r.kickoff_time,
+      betfairBetId: r.betfair_bet_id,
+      betfairStatus: r.betfair_status,
+      // Current empirical signal for this scope. Null fields mean
+      // analysis_signal_strength has no row for this (league, market_type)
+      // — i.e. scope has zero historical evidence in the latest snapshot.
+      currentSignal: {
+        n: r.n != null ? Number(r.n) : null,
+        winRate: r.win_rate != null ? Number(r.win_rate) : null,
+        wilsonLo95: r.wilson_lo95_winrate != null ? Number(r.wilson_lo95_winrate) : null,
+        roi: r.roi != null ? Number(r.roi) : null,
+        clvTStat: r.clv_t_stat != null ? Number(r.clv_t_stat) : null,
+      },
+      gateFailed,
+      perScopeQualified: r.per_scope_qualified,
+      mktTypeAggregateQualified: r.mkt_qualified,
+      threeSignalDisproven: r.three_signal_disproven,
+      sizeMatched,
+      intendedStake,
+    };
+
+    const cancelResult = await tryCancelAndVerify(r.betfair_bet_id);
+    if (!cancelResult.cancelled) {
+      cancel_failed++;
+      logger.warn(
+        { betfairBetId: r.betfair_bet_id, error: cancelResult.error, betId: r.bet_id },
+        "scopeDemote: cancel failed — will retry next cycle",
+      );
+      continue;
+    }
+
+    if (sizeMatched > 0) {
+      // Matched portion already committed; only the unmatched residue was
+      // cancelled by Betfair. Stake adjusts to matched size; bet stays live
+      // so it settles normally against the committed position.
+      await db.update(paperBetsTable).set({
+        betfairStatus: "PARTIAL_SCOPE_DEMOTED",
+        stake: String(sizeMatched),
+      }).where(eq(paperBetsTable.id, r.bet_id));
+      demoted_partial++;
+
+      await db.insert(complianceLogsTable).values({
+        actionType: "scope_demote_partial_cancel",
+        details: { ...auditDetails, action: "cancel_unmatched_residual_keep_matched" } as Record<string, unknown>,
+        timestamp: new Date(),
+      } as any);
+    } else {
+      // No match yet — full cancel returns stake; demote to shadow so the
+      // bet remains in the ledger for audit but never accrues exposure.
+      await db.update(paperBetsTable).set({
+        betfairStatus: "CANCELLED_SCOPE_DEMOTED",
+        status: "cancelled",
+        betTrack: "shadow",
+        qualificationPath: "cancelled_scope_lost_eligibility",
+        stake: "0",
+      }).where(eq(paperBetsTable.id, r.bet_id));
+      demoted_full++;
+
+      await db.insert(complianceLogsTable).values({
+        actionType: "scope_demote_full_cancel",
+        details: { ...auditDetails, action: "full_cancel_demote_to_shadow" } as Record<string, unknown>,
+        timestamp: new Date(),
+      } as any);
+    }
+
+    logger.info(
+      auditDetails,
+      sizeMatched > 0
+        ? "scopeDemote: cancelled unmatched residual on ineligible scope (matched portion committed)"
+        : "scopeDemote: cancelled and demoted to shadow (ineligible scope)",
+    );
+  }
+
+  if (ineligibleBets.length > 0) {
+    logger.info(
+      { scanned: ineligibleBets.length, demoted_full, demoted_partial, cancel_failed },
+      "scopeDemote: pending-bet eligibility re-check complete",
+    );
+  }
+
+  return { scanned: ineligibleBets.length, demoted_full, demoted_partial, cancel_failed };
+}
+
 export async function runOrderManagement(): Promise<{
   checked: number;
   accepted: number;
@@ -182,6 +365,16 @@ export async function runOrderManagement(): Promise<{
 }> {
   if (!isRelayConfigured()) {
     return { checked: 0, accepted: 0, cancelled: 0, resubmitted: 0 };
+  }
+
+  // 2026-05-14 Block ZERO — run BEFORE the fill-management loop so an
+  // ineligible-scope bet is cancelled this cycle rather than waiting for the
+  // CANCEL_TIMEOUT_MS expiry. Failures here are non-fatal: the next cycle
+  // retries any bet that didn't cancel cleanly.
+  try {
+    await enforceScopeEligibilityOnPendingBets();
+  } catch (err) {
+    logger.warn({ err }, "enforceScopeEligibilityOnPendingBets threw — continuing with fill management");
   }
 
   const liveBets = await db
