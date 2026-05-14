@@ -1214,26 +1214,22 @@ export async function fetchAndStoreOddsForFixture(
   const marketOddsMap = new Map<string, number[]>();
 
   // 2026-05-08 Neon cost-audit: only persist bookmakers we actually consume.
+  // 2026-05-14 Phase 5 cost-audit follow-up: dropped Marathonbet, Betano —
+  // each was writing ~70-90M rows/year (~250 MB raw) feeding only the
+  // soft-consensus side of pinnacleSharpMoveDetector's RLM check; Bet365 +
+  // Unibet retain that signal at half the cost (RLM detector IN-list
+  // tightened in lockstep). Kept:
   //
   //   Pinnacle    — fair-value reference, multi-source CLV resolver primary.
   //   Bet365      — soft-consensus input for sharp-move RLM detection.
   //   Unibet      — soft-consensus input for sharp-move RLM detection.
-  //   Marathonbet — soft-consensus input for sharp-move RLM detection.
-  //   Betano      — soft-consensus input for sharp-move RLM detection.
-  //   Betfair     — duplicate of betfair_exchange (kept temporarily; redundant).
   //
-  // 1xBet, 10Bet, BetVictor, William Hill, 888Sport, SBO, Dafabet, 188Bet,
-  // and any other bookmaker name returned by the API are dropped at write
-  // time. Pre-cleanup we had ~17.5M of 21.9M (80%) odds_snapshots rows in
-  // sources never read by any analysis path. Going forward we only persist
-  // ~6 sources per snapshot batch.
-  // 2026-05-08 cost-audit follow-up: dropped "Betfair" — it's redundant
-  // with the betfair_exchange source which we capture directly via the
-  // exchange book sweep cron. Pinnacle = fair-value reference / CLV
-  // resolver primary. The other 4 = soft-consensus inputs for sharp-move
-  // RLM detection (only the latest 15-min window is read).
+  // Everything else (1xBet, 10Bet, BetVictor, William Hill, 888Sport, SBO,
+  // Dafabet, 188Bet, Betfair, Marathonbet, Betano, plus any bookmaker the
+  // API returns that isn't in this set) is dropped at write time and
+  // back-cleaned by storageCleanup.NON_ESSENTIAL_AF_BOOKMAKERS.
   const ESSENTIAL_AF_BOOKMAKERS = new Set([
-    "Pinnacle", "Bet365", "Unibet", "Marathonbet", "Betano",
+    "Pinnacle", "Bet365", "Unibet",
   ]);
 
   for (const bm of fixture.bookmakers) {

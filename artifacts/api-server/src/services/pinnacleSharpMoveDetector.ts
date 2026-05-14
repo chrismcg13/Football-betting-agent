@@ -114,6 +114,9 @@ export async function runPinnacleSharpMoveDetector(): Promise<MoveResult> {
 
       // Reverse-line-movement check: if Pinnacle moved by >REVERSE_OPP_THRESHOLD_PCT
       // AND opposite direction to recent soft-book consensus, upgrade to 'reverse'.
+      // Soft consensus = Bet365 + Unibet (Marathonbet, Betano dropped 2026-05-14
+      // per Phase 5 cost audit; the two remaining sources retain a usable RLM
+      // signal at half the storage cost — see apiFootball.ESSENTIAL_AF_BOOKMAKERS).
       if (absMove >= REVERSE_OPP_THRESHOLD_PCT) {
         const softs = (await db.execute(sql`
           SELECT AVG(back_odds::float8) AS avg_odds
@@ -121,7 +124,7 @@ export async function runPinnacleSharpMoveDetector(): Promise<MoveResult> {
           WHERE match_id = ${c.match_id}
             AND market_type = ${marketType}
             AND selection_name = ${selectionName}
-            AND source IN ('api_football_real:Bet365','api_football_real:Unibet','api_football_real:Marathonbet','api_football_real:Betano')
+            AND source IN ('api_football_real:Bet365','api_football_real:Unibet')
             AND snapshot_time > NOW() - INTERVAL '15 minutes'
         `)) as unknown as { rows: Array<{ avg_odds: number | null }> };
         const softAvg = softs.rows[0]?.avg_odds;

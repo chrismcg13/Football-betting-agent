@@ -3,32 +3,34 @@ import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 /**
- * Storage cleanup service (2026-05-08 Neon cost audit).
+ * Storage cleanup service (2026-05-08 Neon cost audit, extended
+ * 2026-05-14 by Phase 5 of the Women's & Internationals expansion).
  *
- * Pre-cleanup state of the DB:
- *   odds_snapshots   3.6 GB  21.9M rows (80% of those rows are bookmakers
- *                                        no analysis path reads)
- *   odds_history     1.5 GB  7.8M rows  (used by line-movement detection
- *                                        — needs retention policy, not drop)
- *   compliance_logs  273 MB  321K rows  (line_movement legacy data + 24h+
- *                                        old bet_rejected rows are dead)
+ * State at 2026-05-14 entry (pre-Phase-5):
+ *   odds_snapshots   6.2 GB  23.7M rows (1 GB raw betfair_exchange + ~700 MB
+ *                                        Marathonbet/Betano never trimmed)
+ *   odds_history     1.3 GB  7.8M rows  (retention applied 2026-05-08)
+ *   compliance_logs  228 MB  441K rows
  *
- * Three cleanup tracks. All idempotent, safe to re-run, and bounded so
- * no single run can wipe live data:
+ * Cleanup tracks (all idempotent, batched, safe to re-run):
  *
- *   1. odds_snapshots non-essential bookmakers older than 14 days.
- *      Going forward apiFootball.ts:fetchOdds skips writing these. This
- *      backfill removes the historical bloat.
+ *   1. odds_snapshots:
+ *      (a) NON-ESSENTIAL bookmakers — full drop (>7d backfill). Going
+ *          forward apiFootball.ts skips writes. As of 2026-05-14
+ *          this includes Marathonbet + Betano (previously retention-only).
+ *      (b) ESSENTIAL bookmakers (Pinnacle 7d / Bet365 3d / Unibet 3d) —
+ *          retention. Read windows: Pinnacle 6h, others 15 min.
+ *      (c) betfair_exchange (7d retention, added 2026-05-14) — read
+ *          windows: 4h (valueDetection), 30 min (lazy promote),
+ *          24h (dataQualityMonitor). Was unbounded before.
  *
- *   2. compliance_logs:
- *      - Drop ALL `line_movement` rows (no current writer; legacy data).
- *      - Drop `bet_rejected` rows >24h old (only the last 24h is read by
- *        the rejection-reason dashboard; everything else is dead weight).
- *      - Drop `correlation_detection` rows >7d old (high-volume diagnostic).
+ *   2. compliance_logs: line_movement (full), bet_rejected (>24h),
+ *      correlation_detection (>7d).
  *
- *   3. odds_history retention: drop snapshot rows >30 days old.
- *      Line-movement detection only looks at the last few hours; older
- *      data has no analytical value.
+ *   3. odds_history retention: >7d.
+ *
+ *   4. analytics tables (runAnalyticsTablesCleanup): per-table retention
+ *      tuned to read windows; plus learning_narratives 50k row cap.
  *
  * Returns headline counts so the operator can confirm the impact.
  */
@@ -47,21 +49,36 @@ const NON_ESSENTIAL_AF_BOOKMAKERS = [
   // book sweep. No analysis path reads the AF Betfair version. Aggressive
   // cleanup (no retention buffer) — drop everything.
   "api_football_real:Betfair",
+  // 2026-05-14 Phase 5 cost-audit: Marathonbet, Betano dropped from
+  // ESSENTIAL — Bet365 + Unibet still feed pinnacleSharpMoveDetector's
+  // RLM soft-consensus IN-list; the additional two are storage cost
+  // without a unique signal. Each was contributing ~250 MB / 2M+ rows
+  // and growing. Full-drop, no retention buffer.
+  "api_football_real:Marathonbet",
+  "api_football_real:Betano",
 ];
 
 // Per-essential-bookmaker retention. Set tight because each is consumed
 // from a NARROW window:
 //   Pinnacle    — multi-source CLV resolver looks at last 6h (Strategy B);
 //                 cross-check looks at last 30 min. 7 days is generous.
-//   Bet365/Unibet/Marathonbet/Betano — sharp-move RLM detector queries
-//                 last 15 minutes. 3 days is generous.
+//   Bet365/Unibet — sharp-move RLM detector queries last 15 minutes.
+//                 3 days is generous.
 const ESSENTIAL_AF_BOOKMAKER_RETENTION: Record<string, string> = {
   "api_football_real:Pinnacle": "7 days",
   "api_football_real:Bet365": "3 days",
   "api_football_real:Unibet": "3 days",
-  "api_football_real:Marathonbet": "3 days",
-  "api_football_real:Betano": "3 days",
 };
+
+// 2026-05-14 Phase 5 cost-audit: betfair_exchange is the single largest
+// source (~12M rows, ~1 GB raw, ~3 GB total) — written every 60s by the
+// exchange book sweep, read by:
+//   valueDetection           — 4h window
+//   lazy_promote             — 30 min window
+//   dataQualityMonitor       — 24h window
+// 7-day retention is >7x the longest read window and reclaims the bulk
+// of the table. Batched DELETE same as essential-bookmaker pattern.
+const BETFAIR_EXCHANGE_RETENTION = "7 days";
 
 interface CleanupResult {
   evaluatedAt: string;
@@ -141,10 +158,10 @@ export async function runStorageCleanup(opts: {
   }
 
   // ─── (1b) odds_snapshots ESSENTIAL bookmakers — tight retention ──────────
-  // Pinnacle/Bet365/Unibet/Marathonbet/Betano are kept for live use but
-  // each has a NARROW read window (Pinnacle 6h via CLV resolver, others
-  // 15 min via sharp-move detector). Old data adds nothing analytically
-  // and is the bulk of the remaining bloat.
+  // Pinnacle/Bet365/Unibet are kept for live use but each has a NARROW
+  // read window (Pinnacle 6h via CLV resolver, others 15 min via
+  // sharp-move detector). Old data adds nothing analytically and is the
+  // bulk of the remaining bloat.
   for (const [source, retention] of Object.entries(ESSENTIAL_AF_BOOKMAKER_RETENTION)) {
     let perSource = 0;
     for (let i = 0; i < oddsSnapshotsMaxIterations; i++) {
@@ -163,6 +180,32 @@ export async function runStorageCleanup(opts: {
     }
     if (perSource > 0) {
       notes.push(`odds_snapshots[${source}] (>${retention}): ${perSource} rows deleted`);
+    }
+    oddsSnapshotsDeleted += perSource;
+  }
+
+  // ─── (1c) odds_snapshots betfair_exchange — 7-day retention ─────────────
+  // Largest single source. All reader paths (valueDetection 4h, lazy
+  // promote 30 min, dataQualityMonitor 24h) sit comfortably inside the
+  // 7-day window.
+  {
+    let perSource = 0;
+    for (let i = 0; i < oddsSnapshotsMaxIterations; i++) {
+      const result = (await db.execute(sql`
+        WITH deletable AS (
+          SELECT ctid FROM odds_snapshots
+          WHERE source = 'betfair_exchange'
+            AND snapshot_time < NOW() - ${sql.raw(`INTERVAL '${BETFAIR_EXCHANGE_RETENTION}'`)}
+          LIMIT ${oddsSnapshotsBatchSize}
+        )
+        DELETE FROM odds_snapshots WHERE ctid IN (SELECT ctid FROM deletable)
+      `)) as unknown as { rowCount?: number };
+      const deleted = result.rowCount ?? 0;
+      perSource += deleted;
+      if (deleted < oddsSnapshotsBatchSize) break;
+    }
+    if (perSource > 0) {
+      notes.push(`odds_snapshots[betfair_exchange] (>${BETFAIR_EXCHANGE_RETENTION}): ${perSource} rows deleted`);
     }
     oddsSnapshotsDeleted += perSource;
   }
@@ -367,6 +410,27 @@ export async function runAnalyticsTablesCleanup(): Promise<AnalyticsCleanupResul
     "calibration_buckets",
     "active = false AND fitted_at < NOW() - INTERVAL '90 days'",
   );
+
+  // 2026-05-14 Phase 5 cost-audit: learning_narratives is LLM-generated
+  // commentary, append-only, never read by the trading path. Cap at 50k
+  // rows on a rolling window via id-based DELETE (id is serial / monotonic
+  // with created_at). At ~12k rows/week of growth, 50k = ~4 weeks of
+  // history, far more than any human or downstream cron consumes.
+  try {
+    const res = (await db.execute(sql`
+      DELETE FROM learning_narratives
+      WHERE id < (
+        SELECT id FROM learning_narratives
+        ORDER BY id DESC
+        OFFSET 50000 LIMIT 1
+      )
+    `)) as unknown as { rowCount?: number };
+    const n = res.rowCount ?? 0;
+    if (n > 0) deleted["learning_narratives"] = n;
+  } catch (err) {
+    errors.push({ table: "learning_narratives", error: String(err) });
+    logger.warn({ err }, "learning_narratives cap DELETE failed");
+  }
 
   const totalRowsDeleted = Object.values(deleted).reduce((a, b) => a + b, 0);
   logger.info(
