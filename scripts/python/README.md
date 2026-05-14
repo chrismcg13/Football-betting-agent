@@ -37,6 +37,35 @@ this is fine inside `.venv`, but allow ~700 MB of free disk before the
 install. The fit script itself runs CPU-only and uses < 200 MB RAM at
 peak (a few hundred scopes × 1000 NUTS samples).
 
+## Phase 2a — FBref scraper needs Chrome
+
+The first Phase 2a run failed with `Exception: Chrome not found!
+Install it first!`. soccerdata's FBref reader uses Selenium via
+seleniumbase to bypass FBref's bot detection — both Chrome the
+browser AND chromedriver are required.
+
+Install on the VPS (Debian/Ubuntu):
+
+```bash
+wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/google-chrome.list
+sudo apt-get update && sudo apt-get install -y google-chrome-stable
+# chromedriver is auto-managed by seleniumbase on first run.
+```
+
+Adds ~200 MB. Alternatively, use chromium from the default repos:
+
+```bash
+sudo apt-get install -y chromium-browser
+```
+
+(Slightly smaller but seleniumbase's defaults expect google-chrome.)
+
+FotMob, ESPN, Understat, Football-Data.co.uk readers do NOT need
+Chrome — they're plain HTTPS scrapers. Only FBref / WhoScored /
+Sofascore need it.
+
 ## Manual trigger
 
 Each script has a matching admin endpoint on the api-server:

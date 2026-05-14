@@ -38,6 +38,13 @@ from typing import Optional
 import pandas as pd
 import psycopg2
 
+# Force unbuffered stderr so per-league diagnostic logs flush to the
+# parent (api-server) process line-by-line. First Phase 2b run came
+# back with only the first INFO line in stderrTail; the per-league
+# rejection summary never made it out. Most likely cause was Python's
+# default block-buffered stderr when stderr is a pipe (not a TTY).
+sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s scrape_fotmob_women: %(message)s",
@@ -103,11 +110,42 @@ def scrape_fotmob_schedules(season: str) -> pd.DataFrame:
         LOG.error("soccerdata not installed — pip install soccerdata>=1.9.0")
         raise
 
+    # Probe soccerdata's actual FotMob allow-list so we can intersect
+    # our candidate list against it and skip the per-league exception
+    # path entirely. The candidate list above is best-guess based on
+    # naming patterns — soccerdata's catalogue is the truth.
+    try:
+        all_fotmob_leagues = sd.FotMob().available_leagues()
+        LOG.info("FotMob exposes %d total leagues in soccerdata catalogue", len(all_fotmob_leagues))
+    except Exception as e:
+        LOG.warning("Could not enumerate FotMob.available_leagues(): %s", e)
+        all_fotmob_leagues = []
+
+    # Print the women's-relevant subset so the operator can see exactly
+    # what FotMob ships under in this soccerdata version.
+    women_keys = [k for k in all_fotmob_leagues if any(
+        w in k.lower() for w in ("women", "wsl", "nwsl", "frauen", "femin", "liga f",
+                                  "damallsvenskan", "toppserien", "kvinde")
+    )]
+    LOG.info("FotMob women's-relevant keys (%d): %s", len(women_keys), women_keys)
+
+    # Match our candidates against the catalogue (case-insensitive substring)
+    candidates_to_try: list[str] = []
+    for c in FOTMOB_WOMEN_LEAGUE_CANDIDATES:
+        if c in all_fotmob_leagues:
+            candidates_to_try.append(c)
+    # Plus any catalogue women's keys we didn't predict.
+    for k in women_keys:
+        if k not in candidates_to_try:
+            candidates_to_try.append(k)
+    LOG.info("Will attempt %d FotMob leagues this run", len(candidates_to_try))
+
     frames: list[pd.DataFrame] = []
     accepted: list[str] = []
     rejected: list[tuple[str, str]] = []
 
-    for league in FOTMOB_WOMEN_LEAGUE_CANDIDATES:
+    for league in candidates_to_try:
+        LOG.info("FotMob: attempting %s ...", league)
         try:
             fotmob = sd.FotMob(leagues=league, seasons=season)
             sched = fotmob.read_schedule()
@@ -120,14 +158,20 @@ def scrape_fotmob_schedules(season: str) -> pd.DataFrame:
             accepted.append(league)
             LOG.info("FotMob %s: %d matches", league, len(df))
         except ValueError as e:
-            # soccerdata raises ValueError for unknown league keys + lists valid ones.
-            rejected.append((league, str(e).split("\n")[0][:120]))
+            msg = str(e).split("\n")[0][:200]
+            LOG.warning("FotMob %s: ValueError %s", league, msg)
+            rejected.append((league, msg))
         except Exception as e:
-            rejected.append((league, f"{type(e).__name__}: {str(e)[:120]}"))
+            msg = f"{type(e).__name__}: {str(e)[:200]}"
+            LOG.warning("FotMob %s: %s", league, msg)
+            rejected.append((league, msg))
 
+    LOG.info("FotMob summary: accepted=%d rejected=%d", len(accepted), len(rejected))
+    if accepted:
+        LOG.info("Accepted leagues: %s", accepted)
     if rejected:
-        LOG.warning("FotMob: %d leagues rejected — accepted=%s rejected=%s",
-                    len(rejected), accepted, rejected[:3])
+        for lg, err in rejected[:10]:
+            LOG.info("  rejected[%s] = %s", lg, err)
     if not frames:
         LOG.warning("FotMob: 0 leagues returned data")
         return pd.DataFrame()
