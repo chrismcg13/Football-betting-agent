@@ -19,3 +19,9 @@ shap>=0.45
 penaltyblog>=1.3.0
 numpyro>=0.13.0
 jax>=0.4.20
+
+# Phase 2a (2026-05-14) — scraper sidecar for FBref / FotMob / Sofascore /
+# SoFIFA team-form data. soccerdata abstracts each source behind a common
+# pandas-DataFrame API and includes a built-in FS cache so we don't write
+# raw HTML / JSON to Postgres.
+soccerdata>=1.9.0

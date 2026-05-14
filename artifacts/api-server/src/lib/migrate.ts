@@ -3817,6 +3817,39 @@ export async function runMigrations() {
 
     logger.info("Phase 1a tables ready: scoreline_correlation, model_layer_enabled");
 
+    // ── Phase 2a (2026-05-14): soccerdata team-form scrape sidecar ────────
+    // Summary-only — one row per (source × league × season × team ×
+    // snapshot_date). Raw event data lives in the FS cache, never
+    // Postgres. extras jsonb absorbs per-source fields without schema
+    // churn (PPDA for FBref, shot-map summary for FotMob, etc.).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS team_form_scrape (
+        id SERIAL PRIMARY KEY,
+        source TEXT NOT NULL,
+        league_name TEXT NOT NULL,
+        league_country TEXT,
+        gender TEXT NOT NULL DEFAULT 'male' CHECK (gender IN ('male','female')),
+        season TEXT NOT NULL,
+        team_name TEXT NOT NULL,
+        snapshot_date DATE NOT NULL,
+        matches_played INTEGER,
+        xg_for NUMERIC(6,3),
+        xg_against NUMERIC(6,3),
+        shots_for INTEGER,
+        shots_on_target_for INTEGER,
+        goals_for INTEGER,
+        goals_against INTEGER,
+        extras JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS team_form_scrape_uq
+        ON team_form_scrape (source, league_name, season, team_name, snapshot_date)
+    `);
+
+    logger.info("Phase 2a table ready: team_form_scrape");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

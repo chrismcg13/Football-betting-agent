@@ -6119,6 +6119,21 @@ router.post("/admin/run-dixon-coles-fitter", async (_req, res) => {
   }
 });
 
+// Phase 2a (2026-05-14): manual trigger for the FBref team-form scraper.
+// Synchronous (typically 30-90s on first run; subsequent runs hit the
+// soccerdata FS cache and finish in ≤ 5s). Returns the sidecar's exit
+// code, duration, and stderr tail.
+router.post("/admin/run-team-form-scrape", async (_req, res) => {
+  try {
+    const { runTeamFormScrape } = await import("../services/teamFormScrapeCron");
+    const r = await runTeamFormScrape();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "Manual team-form scraper run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 0b (Women's & Internationals expansion, 2026-05-14). Seeds the
 // competition_aliases table with known Betfair-side names for the
 // marquee women's + international scopes, then triggers a synchronous

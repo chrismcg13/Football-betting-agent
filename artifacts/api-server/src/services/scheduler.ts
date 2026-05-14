@@ -2550,6 +2550,29 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Dixon-Coles fitter scheduler active — Mondays 05:00 UTC");
 
+  // Phase 2a (2026-05-14) — team-form scraper (FBref season stats).
+  // Tue 05:00 UTC weekly — one day after the Mon Python sidecar burst
+  // so the three Python crons (calibration / Dixon-Coles / team-form)
+  // don't compete for the .venv subprocess slot. soccerdata caches
+  // HTTP responses on disk so subsequent runs within the same week
+  // (manual triggers via /admin/run-team-form-scrape) are essentially
+  // free outside the cache TTL.
+  cron.schedule("0 5 * * 2", () => {
+    logger.info("Team-form scraper triggered (Tuesday 05:00 UTC)");
+    void (async () => {
+      try {
+        const r = await runPythonCron("team_form_scrape", async () => {
+          const { runTeamFormScrape } = await import("./teamFormScrapeCron");
+          return runTeamFormScrape();
+        });
+        logger.info(r, "Team-form scraper complete");
+      } catch (err) {
+        logger.error({ err }, "Team-form scraper failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Team-form scraper scheduler active — Tuesdays 05:00 UTC");
+
   // Task 11 (Phase 3d.1) — Smarkets ingestion every 15 min when the flag
   // is on. Maps Smarkets events to our match_id via team-name fuzzy match
   // (apiFootball.teamNameMatch) and persists per-selection snapshots
