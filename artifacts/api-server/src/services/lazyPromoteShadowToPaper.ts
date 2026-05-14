@@ -48,6 +48,7 @@ import { db, paperBetsTable, agentConfigTable, complianceLogsTable } from "@work
 import { eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { isLiveMode, getLiveBankroll, getAccountFunds } from "./betfairLive";
+import { computeAdaptiveKellyFactor } from "./paperTrading";
 
 async function getConfig(key: string): Promise<string | null> {
   const rows = await db
@@ -88,6 +89,10 @@ export interface LazyPromoteResult {
   skipped_kelly_below_min: number;
   skipped_paper_already_exists: number;
   skipped_kickoff_too_far: number;
+  // 2026-05-14: adaptive Kelly haircut applied at lazy-promote time. Distinct
+  // demotion counters surface Wilson-LCB shadow routes from this rail.
+  skipped_adaptive_negative_kelly: number;     // f̂ ≤ 0
+  skipped_adaptive_wilson_lcb_negative: number; // f̂ > 0 but f_lo ≤ 0
   errors: number;
 }
 
@@ -100,6 +105,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     skipped_kelly_below_min: 0,
     skipped_paper_already_exists: 0,
     skipped_kickoff_too_far: 0,
+    skipped_adaptive_negative_kelly: 0,
+    skipped_adaptive_wilson_lcb_negative: 0,
     errors: 0,
   };
 
@@ -187,7 +194,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
            pb.selection_canonical, pb.opportunity_score::numeric AS score,
            pb.calculated_edge::numeric AS edge,
            pb.odds_at_placement::numeric AS odds,
-           pb.universe_tier_at_placement AS universe_tier
+           pb.universe_tier_at_placement AS universe_tier,
+           m.league AS league
     FROM paper_bets pb JOIN matches m ON m.id = pb.match_id
     WHERE pb.bet_track = 'shadow'
       AND pb.status = 'pending'
@@ -215,6 +223,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     selection_canonical: string | null;
     score: string | number; edge: string | number; odds: string | number;
     universe_tier: string;
+    league: string | null;
   }>);
   result.pending_shadow_count = rows.length;
   if (rows.length === 0) return result;
@@ -281,9 +290,66 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
         continue;
       }
       const kellyFraction = kellyFractionForScore(score);
-      // Kelly stake = bankroll × kellyFraction × edge / (odds - 1).
-      // Approximation matches paperTrading.ts dynamic Kelly path.
-      let stake = bankroll * kellyFraction * edge / (odds - 1);
+
+      // 2026-05-14: apply adaptive Kelly factor (Wilson-LCB / Kelly-LCB ratio)
+      // BEFORE max_stake_pct cap, mirroring paperTrading.ts. The placement
+      // gate in paperTrading already routes new bets through this; the
+      // lazy-promote rail (which doesn't go through placePaperBet) was
+      // bypassing the factor entirely until this fix. ~79% of today's
+      // deployed capital flows through lazy-promote, so this is where the
+      // adaptive sizing matters most.
+      let adaptiveMultiplier = 1.0;
+      let adaptiveAudit: { pHat: number; pLo: number; fHat: number; fLo: number; rawFactor: number; cappedFactor: number; path: "per_scope" | "aggregate_only" } | null = null;
+      if (r.league) {
+        const adaptive = await computeAdaptiveKellyFactor(r.league, r.market_type, odds);
+        if ("reason" in adaptive) {
+          if (adaptive.reason === "negative_kelly") {
+            result.skipped_adaptive_negative_kelly++;
+            await db.insert(complianceLogsTable).values({
+              actionType: "shadow_gate_exemption",
+              details: {
+                reason: "scope_eligible_but_negative_kelly",
+                betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                league: r.league, backOdds: odds,
+                pHat: adaptive.pHat, pLo: adaptive.pLo,
+                fHat: adaptive.fHat, fLo: adaptive.fLo,
+                source: "lazy_promote",
+              },
+              timestamp: new Date(),
+            });
+            continue;
+          }
+          if (adaptive.reason === "wilson_lcb_negative") {
+            result.skipped_adaptive_wilson_lcb_negative++;
+            await db.insert(complianceLogsTable).values({
+              actionType: "shadow_gate_exemption",
+              details: {
+                reason: "scope_eligible_but_wilson_lcb_negative",
+                betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                league: r.league, backOdds: odds,
+                pHat: adaptive.pHat, pLo: adaptive.pLo,
+                fHat: adaptive.fHat, fLo: adaptive.fLo,
+                source: "lazy_promote",
+              },
+              timestamp: new Date(),
+            });
+            continue;
+          }
+          // reason === "no_evidence": keep multiplier=1.0 (eligibility gate
+          // already accepted; trust the existing score-keyed fraction).
+        } else {
+          adaptiveMultiplier = adaptive.factor;
+          adaptiveAudit = {
+            pHat: adaptive.pHat, pLo: adaptive.pLo,
+            fHat: adaptive.fHat, fLo: adaptive.fLo,
+            rawFactor: adaptive.rawFactor, cappedFactor: adaptive.factor,
+            path: adaptive.path,
+          };
+        }
+      }
+
+      // Kelly stake = bankroll × kellyFraction × edge / (odds - 1) × adaptiveMultiplier
+      let stake = bankroll * kellyFraction * edge / (odds - 1) * adaptiveMultiplier;
       stake = Math.min(stake, maxStake);
       stake = Math.round(stake * 100) / 100;
       // Task 2 (2026-05-11): no min-stake floor. If lazy-recomputed Kelly is
@@ -378,6 +444,9 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
             selectionName: r.selection_name,
             betfairBetId: placeResult.betfairBetId,
             score, edge, odds, newStake: stake, kellyFraction, bankroll,
+            // 2026-05-14: adaptive Kelly audit at lazy-promote time. null when
+            // no scope evidence row exists (factor=1.0 applied by default).
+            adaptiveKelly: adaptiveAudit,
           } as Record<string, unknown>,
           timestamp: new Date(),
         } as any);

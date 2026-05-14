@@ -680,7 +680,7 @@ async function getTierKellyFractionForTag(experimentTag: string | null | undefin
 // Distinct from the eligibility gate: that says "is this scope live-eligible
 // at all". This says "given it IS eligible, how big a fraction of full Kelly
 // does the evidence warrant".
-interface AdaptiveKellyResult {
+export interface AdaptiveKellyResult {
   factor: number;         // capped factor applied to base Kelly fraction
   fHat: number;           // f̂ at p̂
   fLo: number;            // f_lo at p_lo
@@ -689,11 +689,11 @@ interface AdaptiveKellyResult {
   pLo: number;            // Wilson lo95 win-rate
   path: "per_scope" | "aggregate_only";
 }
-async function computeAdaptiveKellyFactor(
+export async function computeAdaptiveKellyFactor(
   league: string,
   marketType: string,
   decimalOdds: number,
-): Promise<AdaptiveKellyResult | { factor: 0; reason: "negative_kelly" | "no_evidence" }> {
+): Promise<AdaptiveKellyResult | { factor: 0; reason: "negative_kelly" | "wilson_lcb_negative" | "no_evidence"; fHat?: number; fLo?: number; pHat?: number; pLo?: number }> {
   if (!Number.isFinite(decimalOdds) || decimalOdds <= 1) {
     return { factor: 0, reason: "no_evidence" };
   }
@@ -744,9 +744,17 @@ async function computeAdaptiveKellyFactor(
       // Bet's odds combined with scope win-rate yield non-positive expected
       // log-growth at the point estimate. Caller demotes; distinct reason
       // from "scope not eligible" so calibration drift can be tracked.
-      return { factor: 0, reason: "negative_kelly" };
+      return { factor: 0, reason: "negative_kelly", fHat, fLo, pHat, pLo };
     }
-    const rawFactor = fLo > 0 ? fLo / fHat : 0;
+    if (fLo <= 0) {
+      // Point estimate is +EV but Wilson 95% LCB on Kelly is non-positive —
+      // we cannot be 95% confident the bet is +EV at this bet's odds. The
+      // Wilson-LCB Kelly answer is "size = 0". Demote with a distinct reason
+      // separate from negative_kelly (which is a STRONGER bad signal): this
+      // one means evidence is too thin, not that the model is mis-calibrated.
+      return { factor: 0, reason: "wilson_lcb_negative", fHat, fLo, pHat, pLo };
+    }
+    const rawFactor = fLo / fHat;
     const perScopeQualifies = row?.per_scope_qualifies === true;
     const aggregateQualifies = row?.aggregate_qualifies === true;
     // Per-scope wins precedence: cap 1.0. Aggregate-only: cap 0.33.
@@ -1256,7 +1264,16 @@ export async function placePaperBet(
         await logShadowGateExemption(
           "scope_eligible_but_negative_kelly",
           experimentTag ?? null,
-          `Scope ${scopeLeague}:${marketType} is live-eligible but f̂ ≤ 0 at this bet's odds (backOdds=${backOdds}) — Kelly point estimate is non-positive given scope win-rate; demoting to shadow. Track this rate as a calibration-drift signal.`,
+          `Scope ${scopeLeague}:${marketType} is live-eligible but f̂ ≤ 0 at this bet's odds (backOdds=${backOdds}) — Kelly point estimate is non-positive given scope win-rate (p̂=${adaptive.pHat?.toFixed(4)}); demoting to shadow. Track this rate as a calibration-drift signal.`,
+          null,
+          universeTier,
+        );
+        isShadowBet = true;
+      } else if (adaptive.reason === "wilson_lcb_negative") {
+        await logShadowGateExemption(
+          "scope_eligible_but_wilson_lcb_negative",
+          experimentTag ?? null,
+          `Scope ${scopeLeague}:${marketType} is live-eligible and f̂=${adaptive.fHat?.toFixed(4)} > 0 (point-estimate Kelly positive) BUT f_lo=${adaptive.fLo?.toFixed(4)} ≤ 0 (Wilson 95% LCB on Kelly is non-positive). Cannot be 95% confident bet is +EV; Wilson-LCB Kelly answer is size=0. Demoting to shadow.`,
           null,
           universeTier,
         );
