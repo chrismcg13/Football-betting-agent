@@ -312,9 +312,16 @@ def main() -> int:
                 "n_matches": next(r["n_matches"] for r in group_rows if r["api_football_id"] == api_id),
             }
 
-    # 4. Write scoreline_correlation rows (UPSERT).
-    LOG.info("Writing %d rows to scoreline_correlation", len(posterior_by_scope))
+    # 4. Write scoreline_correlation rows. Delete-then-insert in a single
+    # transaction so stale scopes (e.g. ones that fit on a prior run but
+    # no longer qualify after a threshold change or join fix) are cleared
+    # rather than left behind to mislead the runtime. ON CONFLICT alone
+    # is insufficient — it only refreshes keys we're writing to this run.
+    LOG.info("Replacing scoreline_correlation rows for ASIAN_HANDICAP (%d new)", len(posterior_by_scope))
     with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM scoreline_correlation WHERE market_type = 'ASIAN_HANDICAP'"
+        )
         for api_id, p in posterior_by_scope.items():
             cur.execute(
                 """
@@ -322,13 +329,6 @@ def main() -> int:
                   (api_football_id, market_type, copula_kind, rho,
                    rho_posterior_sd, group_rho, n_matches, fitted_at)
                 VALUES (%s, 'ASIAN_HANDICAP', %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (api_football_id, market_type) DO UPDATE
-                SET copula_kind = EXCLUDED.copula_kind,
-                    rho = EXCLUDED.rho,
-                    rho_posterior_sd = EXCLUDED.rho_posterior_sd,
-                    group_rho = EXCLUDED.group_rho,
-                    n_matches = EXCLUDED.n_matches,
-                    fitted_at = NOW()
                 """,
                 (
                     api_id, p["copula_kind"], p["rho"], p["rho_sd"],
