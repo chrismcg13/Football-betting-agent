@@ -46,6 +46,150 @@ import {
 import { detectCurrentRegime } from "./marketRegime";
 import { checkLivePlacementGates } from "./livePlacementGate";
 
+// ===================== Block B (2026-05-14) — Bayesian shrinkage =========
+// Parameter-free shrinkage for the (market_type, odds_band) cells where
+// empirical evidence says the model is overstating AND CLV evidence says the
+// model is not significantly beating the close. Scope rule, refreshed every
+// 5 minutes from settled history:
+//   IN_SCOPE := wilson_lo95_winrate < model_p̂  AND  clv_t_stat < 1.96
+// Calibration:
+//   shrunk_p = (n × empirical_p + k × implied_p) / (n + k)
+// k = 30 by default (matches N_FLOOR / Wilson asymptotic regime); operator-
+// tunable via agent_config.calibration_prior_strength.
+// Self-governing: when CLV t-stat for a cell crosses 1.96 (model proven to
+// beat close), the cell exits scope automatically on the next snapshot.
+
+interface BayesianShrinkageStats {
+  inScope: boolean;
+  n: number;
+  empiricalP: number;
+  modelP: number;
+  wilsonLo95: number;
+  clvTStat: number | null;
+  oddsBand: string;
+}
+
+function bayesianBandKey(market: string, odds: number): string {
+  let band: string;
+  if (odds < 1.30) band = "1: <1.30";
+  else if (odds < 1.50) band = "2: 1.30-1.50";
+  else if (odds < 1.80) band = "3: 1.50-1.80";
+  else if (odds < 2.20) band = "4: 1.80-2.20";
+  else if (odds < 3.00) band = "5: 2.20-3.00";
+  else if (odds < 5.00) band = "6: 3.00-5.00";
+  else                  band = "7: 5.00+";
+  return `${market}|${band}`;
+}
+
+let bayesianBandsCache: { value: Map<string, BayesianShrinkageStats>; fetchedAt: number } | null = null;
+const BAYESIAN_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function refreshBayesianBandsCache(): Promise<void> {
+  // Single sweep over settled history. Wilson lo95 + CLV t-stat per band.
+  // Bands with n < 30 are excluded (no statistical referent for shrinkage at
+  // tiny samples; in that regime the prior dominates everything anyway).
+  const result = await db.execute(sql`
+    WITH banded AS (
+      SELECT
+        market_type,
+        CASE
+          WHEN odds_at_placement < 1.30 THEN '1: <1.30'
+          WHEN odds_at_placement < 1.50 THEN '2: 1.30-1.50'
+          WHEN odds_at_placement < 1.80 THEN '3: 1.50-1.80'
+          WHEN odds_at_placement < 2.20 THEN '4: 1.80-2.20'
+          WHEN odds_at_placement < 3.00 THEN '5: 2.20-3.00'
+          WHEN odds_at_placement < 5.00 THEN '6: 3.00-5.00'
+          ELSE                                   '7: 5.00+'
+        END                                                          AS odds_band,
+        (status = 'won')::int                                        AS won,
+        model_probability::numeric                                   AS p,
+        clv_pct::numeric                                             AS clv,
+        clv_source
+      FROM paper_bets
+      WHERE status IN ('won','lost')
+        AND deleted_at IS NULL
+    )
+    SELECT
+      market_type, odds_band,
+      COUNT(*)::int                                                  AS n,
+      AVG(p)::numeric                                                AS model_p,
+      AVG(won)::numeric                                              AS empirical_p,
+      ((SUM(won)::numeric/COUNT(*) + 1.96*1.96/(2*COUNT(*))
+        - 1.96 * sqrt(SUM(won)::numeric/COUNT(*) * (1 - SUM(won)::numeric/COUNT(*))/COUNT(*) + 1.96*1.96/(4*COUNT(*)*COUNT(*))))
+        / (1 + 1.96*1.96/COUNT(*)))::numeric                         AS wilson_lo95,
+      (AVG(clv) FILTER (WHERE clv_source='pinnacle')
+        / NULLIF(STDDEV_SAMP(clv) FILTER (WHERE clv_source='pinnacle')
+                 / sqrt(COUNT(*) FILTER (WHERE clv_source='pinnacle')), 0))::numeric
+                                                                     AS clv_t_stat
+    FROM banded
+    GROUP BY 1, 2
+    HAVING COUNT(*) >= 30
+  `);
+  const rows = (((result as unknown) as { rows?: Array<Record<string, unknown>> }).rows ?? []);
+  const map = new Map<string, BayesianShrinkageStats>();
+  for (const r of rows) {
+    const market = String(r.market_type);
+    const band = String(r.odds_band);
+    const modelP = Number(r.model_p);
+    const empiricalP = Number(r.empirical_p);
+    const wilsonLo95 = Number(r.wilson_lo95);
+    const clvTStat = r.clv_t_stat == null ? null : Number(r.clv_t_stat);
+    // Scope rule: model overstating AND CLV doesn't refute it. NULL CLV is
+    // treated as "no significant beat of the close" → in-scope when Wilson
+    // also flags overstatement. This keeps the rule applied even on bands
+    // where Pinnacle CLV coverage is sparse.
+    const inScope = modelP > wilsonLo95 && (clvTStat === null || clvTStat < 1.96);
+    map.set(`${market}|${band}`, {
+      inScope,
+      n: Number(r.n),
+      empiricalP,
+      modelP,
+      wilsonLo95,
+      clvTStat,
+      oddsBand: band,
+    });
+  }
+  bayesianBandsCache = { value: map, fetchedAt: Date.now() };
+  logger.info(
+    { bands: map.size, in_scope_count: Array.from(map.values()).filter(v => v.inScope).length },
+    "Block B: Bayesian shrinkage cache refreshed",
+  );
+}
+
+async function getBayesianShrinkage(
+  marketType: string,
+  odds: number,
+): Promise<BayesianShrinkageStats | null> {
+  const now = Date.now();
+  if (!bayesianBandsCache || now - bayesianBandsCache.fetchedAt > BAYESIAN_CACHE_TTL_MS) {
+    await refreshBayesianBandsCache();
+  }
+  return bayesianBandsCache!.value.get(bayesianBandKey(marketType, odds)) ?? null;
+}
+
+// k defaults to 30 (matches N_FLOOR; equivalent to "the implied probability
+// carries the prior weight of one Wilson asymptotic sample"). Operator-tunable
+// for empirical re-tuning after ~2-3 weeks of post-deploy history.
+const DEFAULT_CALIBRATION_PRIOR_STRENGTH = 30;
+let cachedPriorStrength: { value: number; fetchedAt: number } | null = null;
+const PRIOR_STRENGTH_TTL_MS = 60 * 1000;
+
+async function getCalibrationPriorStrength(): Promise<number> {
+  const now = Date.now();
+  if (cachedPriorStrength && now - cachedPriorStrength.fetchedAt < PRIOR_STRENGTH_TTL_MS) {
+    return cachedPriorStrength.value;
+  }
+  const rows = await db
+    .select({ value: agentConfigTable.value })
+    .from(agentConfigTable)
+    .where(eq(agentConfigTable.key, "calibration_prior_strength"));
+  const raw = rows[0]?.value;
+  const parsed = raw != null ? Number(raw) : NaN;
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_CALIBRATION_PRIOR_STRENGTH;
+  cachedPriorStrength = { value, fetchedAt: now };
+  return value;
+}
+
 // ===================== C1: Exchange-book capture (delayed app key) ========
 // Captured at placement time via listMarketCatalogue + listMarketBook on the
 // delayed app key (BETFAIR_APP_KEY, NOT LIVE_BETFAIR_KEY). Capture is purely
@@ -1123,6 +1267,76 @@ export async function placePaperBet(
     rawModelProbability = null,
     calibrationBucketId = null,
   } = options;
+
+  // ── Block B (2026-05-14) — parameter-free Bayesian shrinkage ───────────────
+  // Scope rule per (market_type, odds_band): shrink where
+  //   wilson_lo95_winrate < model_p̂ (model is overstating)
+  //   AND clv_t_stat < 1.96 (model is not significantly beating the close).
+  // Shrinkage formula: calibrated_p = (n × empirical_p + k × implied_p) / (n + k)
+  // with k = 30 (matches Wilson asymptotic regime threshold N_FLOOR).
+  // This runs BEFORE the eligibility check so the calibrated p̂ flows through
+  // the edge calc, eligibility view, adaptive Kelly, and stake sizing. The
+  // existing scope_eligible_but_negative_kelly path handles cases where
+  // shrunk f̂ goes negative — no new branching, no hardcoded floor.
+  //
+  // Self-governing: any (market_type, odds_band) cell whose CLV t-stat
+  // crosses 1.96 (model proven to beat close) automatically exits the scope
+  // rule on the next Bundle B cycle. The 5-minute cache TTL aligns the
+  // applied calibrator with the freshest snapshot.
+  try {
+    const shrinkage = await getBayesianShrinkage(marketType, backOdds);
+    if (shrinkage && shrinkage.inScope) {
+      const impliedP = 1 / backOdds;
+      const k = await getCalibrationPriorStrength();
+      const shrunkP =
+        (shrinkage.n * shrinkage.empiricalP + k * impliedP) / (shrinkage.n + k);
+      const shrunkEdge = shrunkP - impliedP;
+      logger.info(
+        {
+          matchId, marketType, backOdds,
+          rawP: modelProbability, shrunkP,
+          rawEdge: edge, shrunkEdge,
+          empiricalP: shrinkage.empiricalP,
+          n: shrinkage.n, k,
+          oddsBand: shrinkage.oddsBand,
+          wilsonLo95: shrinkage.wilsonLo95,
+          clvTStat: shrinkage.clvTStat,
+        },
+        "Block B: applied Bayesian shrinkage (model overstating + no CLV edge)",
+      );
+      // Fire-and-forget audit row; never block placement on logging.
+      void db.insert(complianceLogsTable).values({
+        actionType: "bayesian_shrinkage_applied",
+        details: {
+          matchId, marketType, backOdds, selectionName,
+          rawP: modelProbability, shrunkP,
+          rawEdge: edge, shrunkEdge,
+          empiricalP: shrinkage.empiricalP,
+          impliedP,
+          n: shrinkage.n,
+          k,
+          oddsBand: shrinkage.oddsBand,
+          wilsonLo95: shrinkage.wilsonLo95,
+          clvTStat: shrinkage.clvTStat,
+        } as Record<string, unknown>,
+        timestamp: new Date(),
+      } as any);
+      // Mutate the function-local bindings so the entire downstream pipeline
+      // (eligibility view check, Kelly sizing, adaptive Kelly, persistence)
+      // uses the calibrated values. The raw model_probability is preserved
+      // via rawModelProbability when present (Task 12 column).
+      modelProbability = shrunkP;
+      edge = shrunkEdge;
+    }
+  } catch (err) {
+    // Calibration lookup is never allowed to fail placement — fall through
+    // to the raw model_probability if the SQL throws or cache is unhealthy.
+    logger.warn(
+      { err, matchId, marketType },
+      "Block B shrinkage lookup failed — proceeding with raw model_probability",
+    );
+  }
+
   // 2026-05-12: Tier B/C are no longer structurally shadow. The eligibility
   // view (v_live_eligibility_candidates) is the empirical proof gate — when
   // a scope has demonstrated Wilson lower-95 winrate > 50% AND/OR CLV t-stat
