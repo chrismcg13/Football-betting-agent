@@ -38,10 +38,11 @@ Env: DATABASE_URL (inherited from the api-server child-process env).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
-from math import lgamma, log, sqrt
+from math import lgamma, sqrt
 from typing import Optional
 
 import numpy as np
@@ -49,12 +50,16 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# Logger named LOG (uppercase) so it does NOT shadow math.log — earlier
+# version used `log = logging.getLogger(...)`, which silently replaced
+# `from math import log` and made poisson_pmf throw
+# "TypeError: 'Logger' object is not callable" at runtime.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s fit_dixon_coles: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("fit_dixon_coles")
+LOG = logging.getLogger("fit_dixon_coles")
 
 MIN_SAMPLES_PER_SCOPE = 50          # below this, scope contributes nothing to the group posterior
 MIN_SAMPLES_PER_BACKTEST_CELL = 30  # below this, model_layer_enabled is not written for the cell
@@ -69,22 +74,38 @@ def fit_scope_rho(matches_df: pd.DataFrame) -> Optional[tuple[float, float]]:
     try:
         from penaltyblog.models import DixonColesGoalModel
     except ImportError:
-        log.error("penaltyblog not installed — pip install penaltyblog>=1.3.0")
+        LOG.error("penaltyblog not installed — pip install penaltyblog>=1.3.0")
         raise
 
     if len(matches_df) < MIN_SAMPLES_PER_SCOPE:
         return None
 
     try:
+        # Penaltyblog's cython kernel mutates the input arrays in place,
+        # which trips "buffer source array is read-only" when the
+        # pandas-derived numpy arrays land read-only. Force a writeable
+        # contiguous copy with explicit numeric / object dtypes.
+        goals_home = np.ascontiguousarray(
+            matches_df["home_goals"].to_numpy(dtype=np.float64, copy=True)
+        )
+        goals_away = np.ascontiguousarray(
+            matches_df["away_goals"].to_numpy(dtype=np.float64, copy=True)
+        )
+        teams_home = np.ascontiguousarray(
+            matches_df["home_team"].to_numpy(dtype=object, copy=True)
+        )
+        teams_away = np.ascontiguousarray(
+            matches_df["away_team"].to_numpy(dtype=object, copy=True)
+        )
         model = DixonColesGoalModel(
-            goals_home=matches_df["home_goals"].to_numpy(),
-            goals_away=matches_df["away_goals"].to_numpy(),
-            teams_home=matches_df["home_team"].to_numpy(),
-            teams_away=matches_df["away_team"].to_numpy(),
+            goals_home=goals_home,
+            goals_away=goals_away,
+            teams_home=teams_home,
+            teams_away=teams_away,
         )
         model.fit()
     except Exception as e:
-        log.warning("DC fit failed: %s", e)
+        LOG.warning("DC fit failed: %s", e)
         return None
 
     rho_mle = float(model.params.get("rho", 0.0))
@@ -150,8 +171,8 @@ def fit_hierarchical(group_rows: list[dict]) -> dict[int, tuple[float, float]]:
 
 def poisson_pmf(lam: float, k: int) -> float:
     if k == 0:
-        return np.exp(-lam)
-    log_p = -lam + k * log(lam) - lgamma(k + 1)
+        return float(np.exp(-lam))
+    log_p = -lam + k * math.log(lam) - lgamma(k + 1)
     return float(np.exp(log_p))
 
 
@@ -209,8 +230,8 @@ def backtest_cell(bets_df: pd.DataFrame, rho_by_scope: dict[int, float]) -> Opti
         p_baseline = ah_win_prob(lam_h, lam_a, 0.0, side, line)
         p_layer = ah_win_prob(lam_h, lam_a, rho_scope, side, line)
         eps = 1e-9
-        ll_baseline += -(outcome * log(max(p_baseline, eps)) + (1 - outcome) * log(max(1 - p_baseline, eps)))
-        ll_layer += -(outcome * log(max(p_layer, eps)) + (1 - outcome) * log(max(1 - p_layer, eps)))
+        ll_baseline += -(outcome * math.log(max(p_baseline, eps)) + (1 - outcome) * math.log(max(1 - p_baseline, eps)))
+        ll_layer += -(outcome * math.log(max(p_layer, eps)) + (1 - outcome) * math.log(max(1 - p_layer, eps)))
         n += 1
     if n == 0:
         return None
@@ -222,12 +243,12 @@ def backtest_cell(bets_df: pd.DataFrame, rho_by_scope: dict[int, float]) -> Opti
 def main() -> int:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
-        log.error("DATABASE_URL not set"); return 2
+        LOG.error("DATABASE_URL not set"); return 2
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
 
     # 1. Load matches per scope.
-    log.info("Loading settled matches (last %dd)", ANALYSIS_LOOKBACK_DAYS)
+    LOG.info("Loading settled matches (last %dd)", ANALYSIS_LOOKBACK_DAYS)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -245,8 +266,8 @@ def main() -> int:
         rows = cur.fetchall()
     df = pd.DataFrame(rows)
     if df.empty:
-        log.warning("No matches in window — exiting"); return 0
-    log.info("Loaded %d matches across %d scopes", len(df), df["api_football_id"].nunique())
+        LOG.warning("No matches in window — exiting"); return 0
+    LOG.info("Loaded %d matches across %d scopes", len(df), df["api_football_id"].nunique())
 
     # 2. Per-scope MLE.
     mle_rows: list[dict] = []
@@ -262,7 +283,7 @@ def main() -> int:
             "sd_mle": sd_mle,
             "n_matches": len(scope_df),
         })
-    log.info("Per-scope MLE: %d scopes fit", len(mle_rows))
+    LOG.info("Per-scope MLE: %d scopes fit", len(mle_rows))
 
     # 3. Hierarchical posterior, per gender group.
     posterior_by_scope: dict[int, dict] = {}
@@ -271,7 +292,7 @@ def main() -> int:
         group_rows = [r for r in mle_rows if r["gender"] == gender]
         if not group_rows:
             continue
-        log.info("Hierarchical posterior — gender=%s, %d scopes", gender, len(group_rows))
+        LOG.info("Hierarchical posterior — gender=%s, %d scopes", gender, len(group_rows))
         post = fit_hierarchical(group_rows)
         group_rho_by_gender[gender] = post.pop("_group_", (0.0, 0.0))[0]
         for api_id, (rho_post, sd_post) in post.items():
@@ -284,7 +305,7 @@ def main() -> int:
             }
 
     # 4. Write scoreline_correlation rows (UPSERT).
-    log.info("Writing %d rows to scoreline_correlation", len(posterior_by_scope))
+    LOG.info("Writing %d rows to scoreline_correlation", len(posterior_by_scope))
     with conn.cursor() as cur:
         for api_id, p in posterior_by_scope.items():
             cur.execute(
@@ -309,7 +330,7 @@ def main() -> int:
     conn.commit()
 
     # 5. Backtest per (market_type='ASIAN_HANDICAP', gender) cell.
-    log.info("Loading settled AH bets for backtest")
+    LOG.info("Loading settled AH bets for backtest")
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -335,7 +356,7 @@ def main() -> int:
         bets = cur.fetchall()
     bdf = pd.DataFrame(bets)
     if bdf.empty:
-        log.warning("No settled AH bets in 180d — skipping backtest"); return 0
+        LOG.warning("No settled AH bets in 180d — skipping backtest"); return 0
 
     # Parse selection_name like "Home -0.5" / "Away +1.25"
     bdf["side"] = bdf["selection_name"].str.split().str[0].str.lower()
@@ -350,11 +371,11 @@ def main() -> int:
         cell_df = bdf[bdf["gender"] == gender]
         result = backtest_cell(cell_df, rho_by_scope)
         if result is None:
-            log.info("Backtest cell (AH, %s): insufficient bets (%d)", gender, len(cell_df))
+            LOG.info("Backtest cell (AH, %s): insufficient bets (%d)", gender, len(cell_df))
             continue
         ll_baseline, ll_layer, n = result
         enabled = ll_layer < ll_baseline
-        log.info(
+        LOG.info(
             "Backtest cell (AH, %s, n=%d): baseline=%.5f layer=%.5f enabled=%s",
             gender, n, ll_baseline, ll_layer, enabled,
         )
@@ -370,7 +391,7 @@ def main() -> int:
         })
 
     # 6. Write model_layer_enabled rows (UPSERT).
-    log.info("Writing %d rows to model_layer_enabled", len(decisions))
+    LOG.info("Writing %d rows to model_layer_enabled", len(decisions))
     with conn.cursor() as cur:
         for d in decisions:
             cur.execute(
@@ -395,7 +416,7 @@ def main() -> int:
             )
     conn.commit()
     conn.close()
-    log.info("Phase 1b+1c run complete")
+    LOG.info("Phase 1b+1c run complete")
     return 0
 
 
