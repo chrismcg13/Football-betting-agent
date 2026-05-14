@@ -202,7 +202,13 @@ export interface MarketCatalogueItem {
   marketName: string;
   marketStartTime?: string;
   event: { id: string; name: string };
-  runners?: Array<{ selectionId: number; runnerName: string; sortPriority: number }>;
+  // 2026-05-14: added `handicap` — present on RUNNER_DESCRIPTION responses for
+  // ASIAN_HANDICAP_DOUBLE_LINE markets (one market per event, N×2 runners
+  // each at a distinct handicap line). pickAhMarketForLine and findSelectionId
+  // depend on this field to route placements to the correct line; without it
+  // they fall back to sortPriority and collapse all internal AH lines onto
+  // whatever Betfair listed first.
+  runners?: Array<{ selectionId: number; runnerName: string; sortPriority: number; handicap?: number | null }>;
   description?: { marketType: string };
 }
 

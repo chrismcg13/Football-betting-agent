@@ -1551,6 +1551,16 @@ export async function findEventIdByTeamNames(
 // Betfair selection at the SAME matched price. Mirrors the logic in
 // paperTrading.ts findAhMarketByLine (which was patched for capture in 4.A
 // but never wired into the LIVE placement path).
+// 2026-05-14 — Betfair returns ASIAN_HANDICAP as a single market per event with
+// N×2 runners (one per (team, handicap-line) pair). Pre-fix this function did
+// `runners.find(side-match)` and only checked the first matching runner's
+// handicap — collapsing all internal AH lines onto whichever runner Betfair
+// happened to return first. Confirmed via probe-betfair-ah.ts 2026-05-14: every
+// AH event has exactly 1 market with 32+ runners spanning multiple lines.
+//
+// Correct logic: among ALL runners in the market, find the ONE whose runner
+// name matches the requested side AND whose handicap matches the requested
+// line. Refuses to fall back to sortPriority — collapse would be silent.
 function pickAhMarketForLine(
   markets: MarketCatalogueItem[],
   selectionName: string | undefined,
@@ -1564,16 +1574,20 @@ function pickAhMarketForLine(
   const line = parseFloat(m[2]!);
   if (!Number.isFinite(line)) return null;
 
+  const homeLower = (homeTeam ?? "").toLowerCase();
+  const awayLower = (awayTeam ?? "").toLowerCase();
+
   for (const market of markets) {
     const runners = market.runners ?? [];
     if (runners.length < 2) continue;
-    const sideRunner = runners.find((r) => {
+    const matchingRunner = runners.find((r) => {
       const rn = r.runnerName.toLowerCase();
-      if (side === "home") return rn === (homeTeam ?? "").toLowerCase() || r.sortPriority === 1;
-      return rn === (awayTeam ?? "").toLowerCase() || r.sortPriority === 2;
+      const isSide = side === "home" ? rn === homeLower : rn === awayLower;
+      if (!isSide) return false;
+      if (r.handicap == null) return false;
+      return Math.abs(r.handicap - line) < 1e-6;
     });
-    if (!sideRunner || sideRunner.handicap == null) continue;
-    if (Math.abs(sideRunner.handicap - line) < 1e-6) return market;
+    if (matchingRunner) return market;
   }
   return null;
 }
@@ -1673,27 +1687,42 @@ export async function findMarketForBet(
 }
 
 export function findSelectionId(
-  runners: Array<{ selectionId: number; runnerName: string; sortPriority: number }>,
+  runners: Array<{ selectionId: number; runnerName: string; sortPriority: number; handicap?: number | null }>,
   selectionName: string,
   homeTeam: string,
   awayTeam: string,
 ): number | null {
   const sel = selectionName.toLowerCase().trim();
 
-  // Phase 3 Track D / AH selection-side strip (2026-05-08): for ASIAN_HANDICAP
-  // bets the selectionName encodes the line ("Home +0.5" / "Away -1.5"). After
-  // findAhMarketByLine has selected the line-specific market, both runners
-  // are at the right line — we just need to pick Home (sortPriority=1) or
-  // Away (sortPriority=2). Pre-fix the function fell through to the fuzzy
-  // matcher (runnerName="Manchester United" vs sel="home +0.5") and returned
-  // null → 0% AH capture. Strip the line first so the existing home/away
-  // resolution paths fire.
-  const ahMatch = sel.match(/^(home|away)\s*[+-]?\d/);
+  // 2026-05-14 — Betfair ASIAN_HANDICAP_DOUBLE_LINE markets carry N×2 runners
+  // (one per (team, handicap) pair). The original code at this branch did
+  // `runners.find(r => r.sortPriority === 1)` for any "home X" selectionName,
+  // returning the FIRST home-side selectionId regardless of line — silently
+  // collapsing all internal AH lines onto whichever Betfair runner sorted
+  // first. The collapse-bug-guard (betfairLive.ts:2060+) caught duplicate
+  // second-placements but the first placement still landed on the wrong line.
+  // Cumulative effect: 4 days of post-cutover AH PnL was attributed to lines
+  // the model emitted, not the lines actually backed.
+  //
+  // Correct: parse the line from the selectionName, find the runner whose
+  // team-name matches AND whose handicap equals the requested line. Refuse
+  // to fall through to sortPriority — without an exact handicap match the
+  // placement would route to the wrong Betfair selection.
+  const ahMatch = sel.match(/^(home|away)\s*([+-]?\d+(?:\.\d+)?)$/);
   if (ahMatch) {
-    const side = ahMatch[1] === "home"
-      ? runners.find((r) => r.sortPriority === 1)
-      : runners.find((r) => r.sortPriority === 2);
-    if (side) return side.selectionId;
+    const wantedSide = ahMatch[1]!;
+    const wantedLine = parseFloat(ahMatch[2]!);
+    if (!Number.isFinite(wantedLine)) return null;
+    const homeLower = homeTeam.toLowerCase();
+    const awayLower = awayTeam.toLowerCase();
+    const runner = runners.find((r) => {
+      const rn = r.runnerName.toLowerCase();
+      const sideMatches = wantedSide === "home" ? rn === homeLower : rn === awayLower;
+      if (!sideMatches) return false;
+      if (r.handicap == null) return false;
+      return Math.abs(r.handicap - wantedLine) < 1e-6;
+    });
+    return runner ? runner.selectionId : null;
   }
 
   if (sel === "home" || sel === homeTeam.toLowerCase()) {
