@@ -45,3 +45,5 @@ export * from "./marketCorrelationMatrix";
 export * from "./competitionAliases";
 export * from "./teams";
 export * from "./teamAliases";
+export * from "./scorelineCorrelation";
+export * from "./modelLayerEnabled";

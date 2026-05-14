@@ -808,11 +808,35 @@ function poissonPmf(lambda: number, k: number): number {
 // so distributions sum to 1.0 within numerical precision. This is the engine
 // powering Asian Handicap, Win-to-Nil, Team-Total, Odd/Even, and (in C4)
 // Half-Time/Full-Time + Winning-Margin predictions.
+//
+// Phase 1a (2026-05-14): optional Dixon-Coles low-score correction.
+// When opts.rho is non-zero and opts.copulaKind='dixon_coles', applies
+// the (1−λ_h·λ_a·ρ, 1+λ_a·ρ, 1+λ_h·ρ, 1−ρ) corner-cell multipliers
+// from Dixon & Coles (1997). Re-normalises afterwards. ρ=0 → identical
+// to independent-Poisson baseline (safe default). copulaKind='sarmanov'
+// reuses the same corner-cell shape for now (DC is a Sarmanov special
+// case per Michels et al. 2023); diverging Sarmanov density will be a
+// follow-up.
+export interface ScorelineMatrixOpts {
+  rho?: number;
+  copulaKind?: "dixon_coles" | "sarmanov";
+  maxGoals?: number;
+}
+
 export function scorelineMatrix(
   homeLambda: number,
   awayLambda: number,
-  maxGoals = 8,
+  optsOrLegacyMaxGoals: ScorelineMatrixOpts | number = {},
 ): number[][] {
+  // Backward-compat: callers that passed maxGoals as a positional number
+  // (pre-Phase-1a signature) still work.
+  const opts: ScorelineMatrixOpts =
+    typeof optsOrLegacyMaxGoals === "number"
+      ? { maxGoals: optsOrLegacyMaxGoals }
+      : optsOrLegacyMaxGoals;
+  const maxGoals = opts.maxGoals ?? 8;
+  const rho = opts.rho ?? 0;
+
   const ph: number[] = [];
   const pa: number[] = [];
   let homeAcc = 0;
@@ -834,6 +858,33 @@ export function scorelineMatrix(
     for (let a = 0; a <= maxGoals; a++) row[a] = ph[h] * pa[a];
     matrix.push(row);
   }
+
+  // Dixon-Coles low-score correction. Only the four cells {(0,0),(1,0),
+  // (0,1),(1,1)} are touched; everything else passes through unchanged.
+  if (rho !== 0 && Math.abs(rho) <= 0.2) {
+    const tau00 = 1 - homeLambda * awayLambda * rho;
+    const tau10 = 1 + awayLambda * rho;
+    const tau01 = 1 + homeLambda * rho;
+    const tau11 = 1 - rho;
+    // Defensive: skip if any multiplier goes negative (extreme λ + ρ);
+    // matrix stays as independent Poisson rather than emit P<0 cells.
+    if (tau00 > 0 && tau10 > 0 && tau01 > 0 && tau11 > 0) {
+      matrix[0][0] *= tau00;
+      matrix[1][0] *= tau10;
+      matrix[0][1] *= tau01;
+      matrix[1][1] *= tau11;
+      // Re-normalise so the matrix still sums to 1.
+      let sum = 0;
+      for (let h = 0; h <= maxGoals; h++) {
+        for (let a = 0; a <= maxGoals; a++) sum += matrix[h][a];
+      }
+      if (sum > 0 && Math.abs(sum - 1) > 1e-9) {
+        for (let h = 0; h <= maxGoals; h++) {
+          for (let a = 0; a <= maxGoals; a++) matrix[h][a] /= sum;
+        }
+      }
+    }
+  }
   return matrix;
 }
 
@@ -846,6 +897,7 @@ export function predictAsianHandicap(
   featureMap: Record<string, number>,
   side: "home" | "away",
   line: number,
+  opts?: { rho?: number; copulaKind?: "dixon_coles" | "sarmanov" },
 ): number | null {
   const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
   const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
@@ -856,13 +908,16 @@ export function predictAsianHandicap(
   // Detect by checking if 4*line is an odd integer.
   const quarterCheck = Math.round(line * 4);
   if (Math.abs(quarterCheck - line * 4) < 1e-6 && Math.abs(quarterCheck % 2) === 1) {
-    const lower = predictAsianHandicap(featureMap, side, line - 0.25);
-    const upper = predictAsianHandicap(featureMap, side, line + 0.25);
+    const lower = predictAsianHandicap(featureMap, side, line - 0.25, opts);
+    const upper = predictAsianHandicap(featureMap, side, line + 0.25, opts);
     if (lower == null || upper == null) return null;
     return (lower + upper) / 2;
   }
 
-  const matrix = scorelineMatrix(homeLambda, awayLambda);
+  const matrix = scorelineMatrix(homeLambda, awayLambda, {
+    rho: opts?.rho ?? 0,
+    copulaKind: opts?.copulaKind ?? "dixon_coles",
+  });
   let pWin = 0;
   let pPush = 0;
   for (let h = 0; h < matrix.length; h++) {

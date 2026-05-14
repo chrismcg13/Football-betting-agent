@@ -43,6 +43,7 @@ import {
 import { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } from "./tournamentMode";
 import { commissionAdjustedEV, getCommissionRate } from "./commissionService";
 import { calibrate } from "./calibration";
+import { loadDixonColesContext, dcOptsForMarket } from "./dixonColes";
 
 export interface ValueBet {
   matchId: number;
@@ -533,6 +534,11 @@ function getModelProbability(
   marketType: string,
   selectionName: string,
   featureMap: Record<string, number>,
+  // Phase 1a (2026-05-14): per-match Dixon-Coles correction context.
+  // Resolved once per match by loadDixonColesContext + dcOptsForMarket
+  // and threaded through; null/undefined means independent-Poisson
+  // baseline (the pre-Phase-1 behaviour).
+  dcOpts?: { rho: number; copulaKind: "dixon_coles" | "sarmanov" },
 ): number | null {
   // Substitute xg_proxy for zero goal averages before feeding models
   const enriched = enrichFeaturesWithXgProxy(featureMap);
@@ -737,7 +743,7 @@ function getModelProbability(
     const side = m[1].toLowerCase() as "home" | "away";
     const line = parseFloat(m[2]);
     if (!Number.isFinite(line)) return null;
-    return predictAsianHandicap(enriched, side, line);
+    return predictAsianHandicap(enriched, side, line, dcOpts);
   }
   // ─── C4 (2026-05-07): Half-Time / Full-Time joint outcome ──────────────────
   // Selection format: "Home/Home", "Home/Draw", ..., "Away/Away".
@@ -1445,6 +1451,13 @@ export async function detectValueBets(options?: {
       featureMap[f.featureName] = Number(f.featureValue);
     }
 
+    // Phase 1a (2026-05-14): load Dixon-Coles correction context once
+    // per match. Resolves (rho, copulaKind, gender) and consults
+    // model_layer_enabled to decide whether to apply on each market_type.
+    // Empty tables → ctx is a no-op (rho=0, all market_types disabled),
+    // so predictAsianHandicap below behaves identically to baseline.
+    const dcCtx = await loadDixonColesContext(match.id);
+
     // ── Pricing-pipeline picker (Prompt 5) ────────────────────────────────
     // Group oddsRows (already snapshotTime DESC) by (market, selection), then
     // run selectPricingSources per group: actionable = betfair_exchange only;
@@ -1496,7 +1509,8 @@ export async function detectValueBets(options?: {
       // Minimum odds floor on the actionable (placed) price
       if (actionablePrice < minOddsThreshold) continue;
 
-      const rawModelProb = getModelProbability(marketType, selectionName, featureMap);
+      const dcOpts = dcOptsForMarket(dcCtx, marketType);
+      const rawModelProb = getModelProbability(marketType, selectionName, featureMap, dcOpts);
       if (rawModelProb === null) continue;
 
       // Task 12 (2026-05-11): calibration layer. Raw sigmoid → calibrated

@@ -3773,6 +3773,50 @@ export async function runMigrations() {
 
     logger.info("Phase 0 tables ready: competition_aliases, teams, team_aliases");
 
+    // ── Phase 1a (2026-05-14): Dixon-Coles / Sarmanov scaffolding ────────
+    // scoreline_correlation holds per-scope rho values (posterior mean
+    // from hierarchical Bayes fit, Phase 1b). model_layer_enabled is the
+    // per-(market_type, gender) on/off decision the Phase 1c backtest
+    // writes. Both empty on landing → runtime falls back to rho=0 (status
+    // quo independent Poisson) and layer disabled-by-default-safe.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS scoreline_correlation (
+        id SERIAL PRIMARY KEY,
+        api_football_id INTEGER NOT NULL,
+        market_type TEXT NOT NULL,
+        copula_kind TEXT NOT NULL CHECK (copula_kind IN ('dixon_coles','sarmanov')),
+        rho NUMERIC(6,4) NOT NULL,
+        rho_posterior_sd NUMERIC(6,4) NOT NULL,
+        group_rho NUMERIC(6,4) NOT NULL,
+        n_matches INTEGER NOT NULL,
+        fitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS scoreline_correlation_scope_uq
+        ON scoreline_correlation (api_football_id, market_type)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS model_layer_enabled (
+        id SERIAL PRIMARY KEY,
+        market_type TEXT NOT NULL,
+        gender TEXT NOT NULL CHECK (gender IN ('male','female')),
+        layer TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL,
+        log_loss_baseline NUMERIC(8,6),
+        log_loss_with_layer NUMERIC(8,6),
+        n_backtest_bets INTEGER,
+        decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS model_layer_enabled_scope_uq
+        ON model_layer_enabled (market_type, gender, layer)
+    `);
+
+    logger.info("Phase 1a tables ready: scoreline_correlation, model_layer_enabled");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
