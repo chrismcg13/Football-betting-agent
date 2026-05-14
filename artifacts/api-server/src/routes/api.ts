@@ -2607,12 +2607,25 @@ router.post("/admin/run-vacuum-full", async (req, res) => {
 // oddsHistoryBatchSize?, oddsSnapshotsMaxIterations?, oddsHistoryMaxIterations? }.
 router.post("/admin/run-storage-cleanup", async (req, res) => {
   try {
-    const oddsSnapshotsBatchLimit = (req.body ?? {}).oddsSnapshotsBatchLimit;
-    const oddsHistoryBatchLimit = (req.body ?? {}).oddsHistoryBatchLimit;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    // 2026-05-14 Phase 5 fix: the previous body params (BatchLimit) were
+    // typo'd vs the function signature (BatchSize / MaxIterations) and so
+    // never plumbed through. Accept both names for compat; coerce to the
+    // function's expected fields.
+    const oddsSnapshotsBatchSize =
+      body.oddsSnapshotsBatchSize ?? body.oddsSnapshotsBatchLimit;
+    const oddsSnapshotsMaxIterations =
+      body.oddsSnapshotsMaxIterations ?? body.oddsSnapshotsBatchLimit;
+    const oddsHistoryBatchSize =
+      body.oddsHistoryBatchSize ?? body.oddsHistoryBatchLimit;
+    const oddsHistoryMaxIterations =
+      body.oddsHistoryMaxIterations ?? body.oddsHistoryBatchLimit;
     const { runStorageCleanup, vacuumCleanedTables } = await import("../services/storageCleanup");
     const cleanup = await runStorageCleanup({
-      oddsSnapshotsBatchLimit: oddsSnapshotsBatchLimit ? Number(oddsSnapshotsBatchLimit) : undefined,
-      oddsHistoryBatchLimit: oddsHistoryBatchLimit ? Number(oddsHistoryBatchLimit) : undefined,
+      oddsSnapshotsBatchSize: oddsSnapshotsBatchSize ? Number(oddsSnapshotsBatchSize) : undefined,
+      oddsSnapshotsMaxIterations: oddsSnapshotsMaxIterations ? Number(oddsSnapshotsMaxIterations) : undefined,
+      oddsHistoryBatchSize: oddsHistoryBatchSize ? Number(oddsHistoryBatchSize) : undefined,
+      oddsHistoryMaxIterations: oddsHistoryMaxIterations ? Number(oddsHistoryMaxIterations) : undefined,
     });
     const vacuum = await vacuumCleanedTables();
     res.json({ success: true, cleanup, vacuum });

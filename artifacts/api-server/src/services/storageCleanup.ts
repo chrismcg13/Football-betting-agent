@@ -97,7 +97,9 @@ export async function runStorageCleanup(opts: {
   // Per-source batch size (small enough to fit in 60s statement_timeout
   // even before the partial index is built / before autovacuum updates
   // statistics). Default 10K rows per DELETE, up to 50 iterations per
-  // source per call.
+  // source per call. For one-shot historical backfill where multiple
+  // million-row sources need draining in a single call, raise
+  // oddsSnapshotsMaxIterations (eg. 1000 = 10M rows / source / call).
   oddsSnapshotsBatchSize?: number;
   oddsSnapshotsMaxIterations?: number;
   oddsHistoryBatchSize?: number;
@@ -109,6 +111,9 @@ export async function runStorageCleanup(opts: {
   const oddsSnapshotsMaxIterations = opts.oddsSnapshotsMaxIterations ?? 50;
   const oddsHistoryBatchSize = opts.oddsHistoryBatchSize ?? 10_000;
   const oddsHistoryMaxIterations = opts.oddsHistoryMaxIterations ?? 50;
+  notes.push(
+    `runStorageCleanup options: oddsSnapshotsMaxIterations=${oddsSnapshotsMaxIterations} batchSize=${oddsSnapshotsBatchSize}`,
+  );
 
   // ─── (0) Idempotent index build for the cleanup hot path ─────────────────
   // Without this, the source-filtered DELETE is a sequential scan over
@@ -128,11 +133,15 @@ export async function runStorageCleanup(opts: {
     notes.push(`Index build skipped: ${String(err)}`);
   }
 
-  // ─── (1a) odds_snapshots non-essential bookmakers — aggressive cleanup ──
-  // Non-essentials we no longer write at all (apiFootball.ts filter) AND
-  // never read. Retention tightened from 14d → 7d on 2026-05-11
-  // (back-to-theory plan §H) to reclaim the ~2.6 GB of stale index/toast
-  // pressure on odds_snapshots. Per-source loop with small batches.
+  // ─── (1a) odds_snapshots non-essential bookmakers — full drop ───────────
+  // Non-essentials we no longer write (apiFootball.ts ESSENTIAL set) AND
+  // no analysis path reads. By definition there is no value in retaining
+  // them at all — the 7-day buffer on the prior version of this loop was
+  // an over-conservative artefact. Removed 2026-05-14 so Marathonbet +
+  // Betano (newly added on the same day) actually drain on the first
+  // cleanup run instead of waiting a week. Existing legacy sources
+  // (1xBet, 10Bet etc.) are already past any meaningful boundary, so
+  // dropping the time filter has no read-side consequences for them.
   let oddsSnapshotsDeleted = 0;
   for (const source of NON_ESSENTIAL_AF_BOOKMAKERS) {
     let perSource = 0;
@@ -142,7 +151,6 @@ export async function runStorageCleanup(opts: {
           SELECT ctid
           FROM odds_snapshots
           WHERE source = ${source}
-            AND snapshot_time < NOW() - INTERVAL '7 days'
           LIMIT ${oddsSnapshotsBatchSize}
         )
         DELETE FROM odds_snapshots WHERE ctid IN (SELECT ctid FROM deletable)
