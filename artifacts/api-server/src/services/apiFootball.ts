@@ -2208,6 +2208,7 @@ export async function capturePreKickoffLineups(): Promise<{
       SELECT m.id, m.home_team, m.away_team, m.league, m.api_fixture_id, m.kickoff_time
       FROM matches m
       JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+       AND (cc.country IS NULL OR m.country IS NULL OR LOWER(REPLACE(cc.country, '-', ' ')) = LOWER(REPLACE(m.country, '-', ' ')))
       WHERE m.status = 'scheduled'
         AND m.kickoff_time BETWEEN ${in30min} AND ${in90min}
         AND m.api_fixture_id IS NOT NULL
@@ -2682,6 +2683,7 @@ export async function captureRefereesForUpcoming(): Promise<{ checked: number; c
     SELECT m.id, m.api_fixture_id
     FROM matches m
     JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+       AND (cc.country IS NULL OR m.country IS NULL OR LOWER(REPLACE(cc.country, '-', ' ')) = LOWER(REPLACE(m.country, '-', ' ')))
     LEFT JOIN match_referees mr ON mr.match_id = m.id
     WHERE m.status = 'scheduled'
       AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '72 hours'
@@ -2735,6 +2737,7 @@ export async function captureH2hForUpcoming(): Promise<{ checked: number; captur
     SELECT m.id, m.api_fixture_id, m.home_team, m.away_team
     FROM matches m
     JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+       AND (cc.country IS NULL OR m.country IS NULL OR LOWER(REPLACE(cc.country, '-', ' ')) = LOWER(REPLACE(m.country, '-', ' ')))
     LEFT JOIN match_h2h h ON h.match_id = m.id
     WHERE m.status = 'scheduled'
       AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '72 hours'
@@ -3016,6 +3019,7 @@ export async function captureUpcomingPredictions(): Promise<{
     SELECT m.id AS match_id, m.api_fixture_id
     FROM matches m
     JOIN competition_config cc ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+       AND (cc.country IS NULL OR m.country IS NULL OR LOWER(REPLACE(cc.country, '-', ' ')) = LOWER(REPLACE(m.country, '-', ' ')))
     LEFT JOIN af_predictions p ON p.api_fixture_id = m.api_fixture_id
     WHERE m.status = 'scheduled'
       AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '72 hours'

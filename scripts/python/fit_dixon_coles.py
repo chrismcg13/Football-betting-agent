@@ -61,7 +61,13 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("fit_dixon_coles")
 
-MIN_SAMPLES_PER_SCOPE = 50          # below this, scope contributes nothing to the group posterior
+MIN_SAMPLES_PER_SCOPE = 30          # below this, scope contributes nothing to the group posterior.
+                                     # Lowered 50 → 30 on 2026-05-14: the whole point of hierarchical
+                                     # Bayes is that scopes with small n get heavily shrunk toward the
+                                     # group mean via posterior weighting (sd_mle ∝ 1/√n), so the
+                                     # 50-match cliff was a no-op cutoff that hid small-n scopes from
+                                     # the group fit instead of letting them contribute their (low-
+                                     # information) signal.
 MIN_SAMPLES_PER_BACKTEST_CELL = 30  # below this, model_layer_enabled is not written for the cell
 ANALYSIS_LOOKBACK_DAYS = 1095        # 3 seasons
 RHO_CAP = 0.2                         # mirror the runtime clamp in scorelineMatrix

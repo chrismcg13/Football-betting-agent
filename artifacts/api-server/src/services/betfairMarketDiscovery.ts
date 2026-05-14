@@ -53,7 +53,13 @@ export async function runBetfairMarketDiscovery(): Promise<MarketDiscoveryResult
       kickoffTime: matchesTable.kickoffTime,
     })
     .from(matchesTable)
-    .innerJoin(competitionConfigTable, sql`LOWER(REPLACE(${competitionConfigTable.name}, '-', ' ')) = LOWER(REPLACE(${matchesTable.league}, '-', ' '))`)
+    .innerJoin(
+      competitionConfigTable,
+      sql`LOWER(REPLACE(${competitionConfigTable.name}, '-', ' ')) = LOWER(REPLACE(${matchesTable.league}, '-', ' '))
+        AND (${competitionConfigTable.country} IS NULL OR ${matchesTable.country} IS NULL
+             OR LOWER(REPLACE(${competitionConfigTable.country}, '-', ' '))
+              = LOWER(REPLACE(${matchesTable.country}, '-', ' ')))`,
+    )
     .where(
       and(
         eq(matchesTable.status, "scheduled"),
