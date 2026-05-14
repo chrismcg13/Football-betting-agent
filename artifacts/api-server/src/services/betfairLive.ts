@@ -5,6 +5,7 @@ import { paperBetsTable, complianceLogsTable, oddsSnapshotsTable } from "@worksp
 import { eq, and, isNotNull, isNull, sql, desc, inArray } from "drizzle-orm";
 import { BETFAIR_TICKS } from "./orderManager";
 import { relayGetLiquidity } from "./vpsRelay";
+import { teamNameMatch } from "./apiFootball";
 
 /**
  * Task 24 Part D — persistence-type resolver. Reads two config keys
@@ -1574,16 +1575,19 @@ function pickAhMarketForLine(
   const line = parseFloat(m[2]!);
   if (!Number.isFinite(line)) return null;
 
-  const homeLower = (homeTeam ?? "").toLowerCase();
-  const awayLower = (awayTeam ?? "").toLowerCase();
+  const teamForSide = side === "home" ? (homeTeam ?? "") : (awayTeam ?? "");
 
   for (const market of markets) {
     const runners = market.runners ?? [];
     if (runners.length < 2) continue;
     const matchingRunner = runners.find((r) => {
-      const rn = r.runnerName.toLowerCase();
-      const isSide = side === "home" ? rn === homeLower : rn === awayLower;
-      if (!isSide) return false;
+      // 2026-05-14 second iteration: exact-string team match was too strict —
+      // failed on "Bodo/Glimt" vs "Bodø/Glimt", "IF Elfsborg" vs "Elfsborg",
+      // "OH Leuven" vs "Oud-Heverlee Leuven", and dozens of similar variants
+      // across Eliteserien / Allsvenskan / Jupiler Pro / etc. Use the
+      // accent-strip + prefix-aware fuzzy matcher from apiFootball; pair it
+      // with the strict handicap predicate so the collapse fix is preserved.
+      if (!teamNameMatch(r.runnerName, teamForSide)) return false;
       if (r.handicap == null) return false;
       return Math.abs(r.handicap - line) < 1e-6;
     });
@@ -1713,12 +1717,12 @@ export function findSelectionId(
     const wantedSide = ahMatch[1]!;
     const wantedLine = parseFloat(ahMatch[2]!);
     if (!Number.isFinite(wantedLine)) return null;
-    const homeLower = homeTeam.toLowerCase();
-    const awayLower = awayTeam.toLowerCase();
+    const teamForSide = wantedSide === "home" ? homeTeam : awayTeam;
     const runner = runners.find((r) => {
-      const rn = r.runnerName.toLowerCase();
-      const sideMatches = wantedSide === "home" ? rn === homeLower : rn === awayLower;
-      if (!sideMatches) return false;
+      // Fuzzy team-name match keeps tolerance for naming variants
+      // (accents, club prefixes, abbreviations) while strict handicap match
+      // preserves the collapse fix.
+      if (!teamNameMatch(r.runnerName, teamForSide)) return false;
       if (r.handicap == null) return false;
       return Math.abs(r.handicap - wantedLine) < 1e-6;
     });
