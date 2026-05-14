@@ -295,19 +295,31 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       // not — every lazy-promote candidate threw ReferenceError silently for
       // 24h before this fix. Lazy promotion was therefore 0/day from
       // 2026-05-11 onward despite Tier A shadow bets accruing.
-      const fresh = await db.execute(sql`
-        SELECT 1 FROM odds_snapshots
-        WHERE match_id = ${r.match_id}
-          AND market_type = ${r.market_type}
-          AND source = 'betfair_exchange'
-          AND snapshot_time > NOW() - INTERVAL '24 hours'
-        LIMIT 1
-      `);
-      const hasFreshExchange = (((fresh as any).rows ?? []) as unknown[]).length > 0;
-      if (!hasFreshExchange) {
-        result.skipped_no_exchange++;
-        continue;
-      }
+      //
+      // 2026-05-14: snapshot-freshness gate REMOVED. The 24h-snapshot test
+      // was a stale heuristic proxy for tradeability — not a probabilistic
+      // statement. The actual test of tradeability is the exchange API call
+      // at placement time inside placeLiveBetOnBetfair, which:
+      //   - calls relayGetLiquidity / listMarketCatalogue to discover markets,
+      //   - falls back to findEventIdByTeamNames for af_* placeholder IDs
+      //     (betfairLive.ts:1591 — so af_* bets CAN place natively),
+      //   - returns unavailableOnExchange=true cleanly when no market exists.
+      //
+      // Removing the proxy unblocks ~1,466 eligible-scope shadow bets per
+      // day (929 numeric-id matches kicking off in 24–168h that the sweep
+      // has not yet covered + 537 af_* matches that the placement-time
+      // resolver handles natively). The downstream lazy_promote_placement_failed
+      // path (Block C) classifies any actual rejection into reason +
+      // errorClass so unmappable / unavailable events stay shadow and the
+      // operator can audit the rejection rate from SQL.
+      //
+      // Theory: scope eligibility (Wilson lo95 > 0.50 OR CLV t > 1.96 at
+      // n>=30, OR market_type aggregate three-gate pass) is the probabilistic
+      // proof that a bet should deploy capital. Symmetric to Block ZERO —
+      // an eligible scope is a placement candidate unless the actual exchange
+      // says otherwise. The skipped_no_exchange counter is retained in the
+      // result interface for backward compatibility with operator dashboards
+      // but is no longer incremented.
 
       // Check no live (or legacy paper) bet already exists on the same
       // canonical selection for this match. Post-cutover this branch promotes
