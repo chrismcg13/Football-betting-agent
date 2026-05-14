@@ -3717,6 +3717,62 @@ export async function runMigrations() {
       ON CONFLICT (key) DO NOTHING
     `);
 
+    // ── Phase 0 (2026-05-14): Women's & internationals expansion ─────────
+    // Three new tables — competition_aliases (Betfair-name → AF-league-id
+    // hand-curated lookup), teams (normalised teams catalogue replacing
+    // free-text home_team/away_team on matches), team_aliases (per-source
+    // alias map).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS competition_aliases (
+        id SERIAL PRIMARY KEY,
+        source TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        api_football_id INTEGER NOT NULL REFERENCES competition_config(api_football_id),
+        note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS competition_aliases_source_alias_uq
+        ON competition_aliases (source, alias)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS teams (
+        id SERIAL PRIMARY KEY,
+        api_football_team_id INTEGER UNIQUE,
+        canonical_name TEXT NOT NULL,
+        country TEXT,
+        gender TEXT NOT NULL DEFAULT 'male' CHECK (gender IN ('male','female')),
+        is_national_team BOOLEAN NOT NULL DEFAULT false,
+        clubelo_name TEXT,
+        fbref_id TEXT,
+        fotmob_id TEXT,
+        fifa_code TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS teams_canonical_gender_uq
+        ON teams (canonical_name, gender)
+    `);
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS team_aliases (
+        id SERIAL PRIMARY KEY,
+        team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+        source TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS team_aliases_source_alias_uq
+        ON team_aliases (source, alias)
+    `);
+
+    logger.info("Phase 0 tables ready: competition_aliases, teams, team_aliases");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

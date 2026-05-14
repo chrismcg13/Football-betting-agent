@@ -42,3 +42,6 @@ export * from "./shapDriftRuns";
 export * from "./kellyFractionLookup";
 export * from "./featureAttribution";
 export * from "./marketCorrelationMatrix";
+export * from "./competitionAliases";
+export * from "./teams";
+export * from "./teamAliases";

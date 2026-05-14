@@ -6104,5 +6104,145 @@ router.post("/admin/reconcile-live-statement", async (req, res) => {
   }
 });
 
+// Phase 0 (Women's & Internationals expansion, 2026-05-14). One-shot
+// idempotent SQL bundle:
+//   1. Dedupe + fix mis-tagged rows in competition_config (fake FA WSL
+//      900005, NULL+male-tagged garbage rows, alt-id duplicates like
+//      Frauen Bundesliga 82 vs 770).
+//   2. Backfill has_betfair_exchange=true for the marquee women's
+//      leagues (WSL, NWSL, Liga F, Frauen-Bundesliga, D1 Féminine, Serie
+//      A Femminile, Brasileiro Women, Damallsvenskan, Toppserien,
+//      Kvindeligaen, women's international windows) and major
+//      international competitions (AFCON, Gold Cup, UEFA Nations
+//      League, WC Qualifiers for all six confederations).
+//
+// Safe to re-run — every change is guarded by a WHERE/ON CONFLICT.
+// Returns per-step row counts so the operator can verify the deltas.
+router.post("/admin/phase-0-dedupe-and-backfill", async (_req, res) => {
+  try {
+    const { db } = await import("@workspace/db");
+    const { complianceLogsTable } = await import("@workspace/db");
+    const counts: Record<string, number> = {};
+
+    // ─── (1) Dedupe garbage rows ────────────────────────────────────────
+    // 1a. The fake "FA WSL" row at api_football_id=900005 (not a real AF
+    // league id; api_football_id=771 is the real WSL).
+    const r1a = (await db.execute(sql`
+      DELETE FROM competition_config WHERE api_football_id = 900005
+    `)) as unknown as { rowCount?: number };
+    counts["dedupe_fake_fa_wsl_900005"] = r1a.rowCount ?? 0;
+
+    // 1b. NULL-id rows with women's names but gender='male' — orphaned
+    // bad data from earlier imports.
+    const r1b = (await db.execute(sql`
+      DELETE FROM competition_config
+      WHERE api_football_id IS NULL
+        AND name IN (
+          'NWSL Women',
+          'Spanish Liga F',
+          'US National Women Soccer League',
+          'Primera División Femenina'
+        )
+    `)) as unknown as { rowCount?: number };
+    counts["dedupe_null_id_women_gender_male"] = r1b.rowCount ?? 0;
+
+    // 1c. Alt-id duplicates. 82 = legacy Frauen Bundesliga; 770 is the
+    // current API-football authoritative id. 139 = men's Serie A id
+    // (someone tagged it gender=female by mistake — corrupt row). 190 is
+    // a Tier-C duplicate of A-League Women 196 (already Tier B).
+    // Mark inactive rather than DELETE so any cron still pulling by the
+    // alt id sees an explicit signal rather than a missing row.
+    const r1c = (await db.execute(sql`
+      UPDATE competition_config
+      SET is_active = false
+      WHERE api_football_id IN (82, 190)
+        OR (api_football_id = 139 AND gender = 'female')
+    `)) as unknown as { rowCount?: number };
+    counts["deactivate_alt_id_duplicates"] = r1c.rowCount ?? 0;
+
+    // ─── (2) Backfill has_betfair_exchange for marquee women's scopes ──
+    // Confirmed via Betfair Exchange UI as carrying AH and/or OU 1.5
+    // markets during their respective seasons. Pinnacle covers all of
+    // these, so CLV is measurable once bets fire.
+    const r2a = (await db.execute(sql`
+      UPDATE competition_config
+      SET has_betfair_exchange = true
+      WHERE gender = 'female'
+        AND api_football_id IN (
+          771,   -- WSL (England)
+          254,   -- NWSL (USA)
+          770,   -- Frauen-Bundesliga (Germany)
+          775,   -- Liga F (Spain)
+          773,   -- Division 1 Féminine (France)
+          524,   -- Serie A Femminile (Italy)
+          74,    -- Brasileiro Women (Brazil)
+          790,   -- Brasileiro Feminino (Brazil — alt id)
+          793,   -- Damallsvenskan (Sweden)
+          794,   -- Toppserien (Norway)
+          795,   -- Kvindeligaen (Denmark)
+          8,     -- FIFA Women's World Cup
+          22,    -- International Friendlies Women
+          666,   -- Women's International Friendlies
+          880,   -- Women's WC Qualifiers - Europe
+          1083,  -- UEFA Women's Championship Qualifiers
+          960    -- UEFA Women's Euro
+        )
+        AND COALESCE(has_betfair_exchange, false) = false
+    `)) as unknown as { rowCount?: number };
+    counts["backfill_betfair_exchange_women"] = r2a.rowCount ?? 0;
+
+    // ─── (3) Backfill has_betfair_exchange for major international comps ─
+    // All Pinnacle-priced during their respective tournament windows;
+    // Betfair carries them. WC qualifiers across all six confederations.
+    const r3a = (await db.execute(sql`
+      UPDATE competition_config
+      SET has_betfair_exchange = true
+      WHERE api_football_id IN (
+          6,    -- Africa Cup of Nations
+          11,   -- CONCACAF Gold Cup
+          5,    -- UEFA Nations League
+          848,  -- UEFA Nations League (alt id)
+          9,    -- Copa America
+          7,    -- AFC Asian Cup
+          15,   -- FIFA WC Qualifiers - UEFA
+          29,   -- FIFA WC Qualifiers - CONMEBOL
+          30,   -- FIFA WC Qualifiers - AFC
+          31,   -- FIFA WC Qualifiers - CONCACAF
+          33,   -- FIFA WC Qualifiers - CAF
+          34    -- FIFA WC Qualifiers - OFC
+        )
+        AND COALESCE(has_betfair_exchange, false) = false
+    `)) as unknown as { rowCount?: number };
+    counts["backfill_betfair_exchange_intl"] = r3a.rowCount ?? 0;
+
+    // ─── (4) De-vig method: women's + internationals → 'shin' ──────────
+    // Phase 1 §1.5 audit recommendation. Proportional de-vig under-
+    // corrects favourite-longshot bias in soft markets; Shin handles
+    // them better. Idempotent: only flip rows that are still on the
+    // default 'power'. Leaves leagues that have been hand-set to
+    // anything else alone.
+    const r4a = (await db.execute(sql`
+      UPDATE competition_config
+      SET devig_method = 'shin'
+      WHERE devig_method = 'power'
+        AND (gender = 'female' OR competition_type = 'international')
+    `)) as unknown as { rowCount?: number };
+    counts["devig_shin_for_soft_markets"] = r4a.rowCount ?? 0;
+
+    // Audit log
+    await db.insert(complianceLogsTable).values({
+      actionType: "phase_0_dedupe_and_backfill",
+      details: { counts },
+      timestamp: new Date(),
+    });
+
+    logger.info({ counts }, "Phase 0 dedupe + has_betfair_exchange backfill complete");
+    res.json({ ok: true, counts });
+  } catch (err) {
+    logger.error({ err }, "Phase 0 dedupe + backfill failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 export default router;
 

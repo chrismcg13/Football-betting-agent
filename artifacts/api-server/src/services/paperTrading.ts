@@ -2229,6 +2229,48 @@ export async function placePaperBet(
     }
   }
 
+  // Phase 0 (Women's & Internationals expansion, 2026-05-14):
+  // concurrent-bet correlation cap. Scale stake by 1/√k where k is the
+  // number of currently-pending live bets in the same market_type. Same-
+  // market_type bets share systematic model-bias risk (a model that
+  // overestimates AH lines one weekend hits every open AH bet
+  // correlatedly), which the existing per-fixture portfolio shrinkage
+  // doesn't see. √k is the variance-inflation factor under a constant-
+  // correlation portfolio assumption. Applied BEFORE every other Kelly
+  // factor (tier, adaptive, portfolio) so each subsequent shrinkage
+  // operates on the correlation-discounted base. Shadow bets skip — they
+  // have stake=0 anyway.
+  let concurrentCorrelationCap = 1.0;
+  if (!isShadowBet && stake > 0) {
+    const openCountRows = (await db.execute(sql`
+      SELECT count(*)::int AS k
+      FROM paper_bets
+      WHERE bet_track = 'live'
+        AND status IN ('pending', 'pending_placement')
+        AND deleted_at IS NULL
+        AND market_type = ${marketType}
+    `)) as unknown as { rows: Array<{ k: number }> };
+    const k = Number(openCountRows.rows[0]?.k ?? 0);
+    // k=0 → factor 1.0 (this is the first bet). k>=1 → 1/√(k+1) so the
+    // new bet ALSO counts in the cap denominator. Without +1, the first
+    // concurrent bet gets a free pass (factor=1) while every subsequent
+    // bet shrinks — same direction of bias the cap is meant to remove.
+    concurrentCorrelationCap = 1 / Math.sqrt(k + 1);
+    if (concurrentCorrelationCap < 1.0) {
+      const originalStake = stake;
+      stake = Math.round(stake * concurrentCorrelationCap * 100) / 100;
+      logger.info(
+        {
+          matchId, marketType, experimentTag,
+          openConcurrentInMarketType: k,
+          concurrentCorrelationCap,
+          originalStake, reducedStake: stake,
+        },
+        "Concurrent-bet correlation cap applied (1/√(k+1))",
+      );
+    }
+  }
+
   // Sub-phase 9: tier kelly_fraction multiplier. Per-tag value from
   // experiment_registry.kelly_fraction, applied after all conviction-based
   // sizing and before the hard cap. Catches BOTH candidate-tier (0.25) and
@@ -2775,6 +2817,10 @@ export async function placePaperBet(
           cappedFactor: adaptiveFactorAudit.factor,
           path: adaptiveFactorAudit.path,
         },
+        // Phase 0 (2026-05-14): 1/√(k+1) concurrent-bet correlation cap.
+        // k = open bets in this market_type at decision time; null for
+        // shadow (no stake applied).
+        concurrentCorrelationCap: isShadowBet ? null : concurrentCorrelationCap,
         exposureAtPlacement: {
           currentExposure: Math.round(exposureAtPlacement.current * 100) / 100,
           maxExposure: Math.round(exposureAtPlacement.max * 100) / 100,
