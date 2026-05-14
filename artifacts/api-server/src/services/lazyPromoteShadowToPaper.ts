@@ -49,6 +49,95 @@ import { eq, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { isLiveMode, getLiveBankroll, getAccountFunds } from "./betfairLive";
 import { computeAdaptiveKellyFactor } from "./paperTrading";
+import { sweepEventOnDemand } from "./exchangeBookSweep";
+
+// 2026-05-14 Fix 2 — 6-hour cache of unavailable (event_id, market_type) pairs.
+// On unavailableOnExchange from placeLiveBetOnBetfair we trigger a targeted
+// listMarketCatalogue + listMarketBook for the event. If Betfair has no
+// relevant markets for the event, we record that fact and short-circuit any
+// further lazy-promote attempts on the same (event, market_type) for 6h.
+//
+// Why 6h: Betfair lists markets closer to kickoff. A market that wasn't there
+// at T is unlikely to appear in the next 5-min cycle, but may appear within 6h
+// as the fixture approaches. 6h balances retry cost against catch-up latency.
+//
+// Self-clearing: the cache TTL ensures every event eventually retries; success
+// (markets found, snapshots written) clears the entry immediately so the next
+// cycle re-attempts placement against the fresh snapshot.
+
+interface UnavailabilityCacheEntry {
+  triedAt: number;
+  foundMarkets: boolean;
+}
+const onDemandUnavailabilityCache = new Map<string, UnavailabilityCacheEntry>();
+const ONDEMAND_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function unavailabilityCacheKey(betfairEventId: string, marketType: string): string {
+  return `${betfairEventId}|${marketType}`;
+}
+
+function isCachedAsUnavailable(betfairEventId: string, marketType: string): boolean {
+  const entry = onDemandUnavailabilityCache.get(unavailabilityCacheKey(betfairEventId, marketType));
+  if (!entry) return false;
+  if (Date.now() - entry.triedAt >= ONDEMAND_CACHE_TTL_MS) return false;
+  return !entry.foundMarkets;
+}
+
+async function triggerOnDemandFetch(
+  matchId: number,
+  betfairEventId: string,
+  marketType: string,
+  homeTeam: string,
+  awayTeam: string,
+): Promise<void> {
+  // Fire-and-forget from the caller; this helper updates the cache so the
+  // *next* lazy-promote cycle can either re-attempt against a fresh
+  // snapshot or skip via the cache. Never throws to the caller — errors are
+  // logged and the cache is set to a permissive default.
+  const cacheKey = unavailabilityCacheKey(betfairEventId, marketType);
+  try {
+    const result = await sweepEventOnDemand(matchId, betfairEventId, homeTeam, awayTeam);
+    onDemandUnavailabilityCache.set(cacheKey, {
+      triedAt: Date.now(),
+      foundMarkets: result.foundMarkets,
+    });
+    logger.info(
+      {
+        matchId, betfairEventId, marketType,
+        resolvedEventId: result.resolvedEventId,
+        marketsDiscovered: result.marketsDiscovered,
+        snapshotsWritten: result.snapshotsWritten,
+        reason: result.reason,
+      },
+      "onDemandFetch: targeted exchange refresh complete",
+    );
+    void db.insert(complianceLogsTable).values({
+      actionType: "ondemand_exchange_fetch",
+      details: {
+        matchId,
+        betfairEventId,
+        resolvedEventId: result.resolvedEventId,
+        marketType,
+        marketsDiscovered: result.marketsDiscovered,
+        snapshotsWritten: result.snapshotsWritten,
+        foundMarkets: result.foundMarkets,
+        reason: result.reason,
+      } as Record<string, unknown>,
+      timestamp: new Date(),
+    } as any);
+  } catch (err) {
+    // On error, write a short-TTL cache entry so the same event isn't
+    // re-fetched immediately while we log and recover.
+    onDemandUnavailabilityCache.set(cacheKey, {
+      triedAt: Date.now(),
+      foundMarkets: false,
+    });
+    logger.warn(
+      { err, matchId, betfairEventId, marketType },
+      "onDemandFetch: sweepEventOnDemand threw — cached as unavailable for 6h",
+    );
+  }
+}
 
 async function getConfig(key: string): Promise<string | null> {
   const rows = await db
@@ -125,6 +214,11 @@ export interface LazyPromoteResult {
   promoted: number;
   skipped_no_exchange: number;
   skipped_kelly_below_min: number;
+  // 2026-05-14 Fix 2: when a recent on-demand catalogue fetch confirmed the
+  // event has no relevant markets (cached for 6h), short-circuit subsequent
+  // placement attempts on the same (event, market_type) without burning relay
+  // API budget.
+  skipped_event_unavailable_cached: number;
   skipped_paper_already_exists: number;
   skipped_kickoff_too_far: number;
   // 2026-05-14: adaptive Kelly haircut applied at lazy-promote time. Distinct
@@ -151,6 +245,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     promoted: 0,
     skipped_no_exchange: 0,
     skipped_kelly_below_min: 0,
+    skipped_event_unavailable_cached: 0,
     skipped_paper_already_exists: 0,
     skipped_kickoff_too_far: 0,
     skipped_adaptive_negative_kelly: 0,
@@ -469,6 +564,17 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           continue;
         }
 
+        // 2026-05-14 Fix 2 — short-circuit if a recent on-demand catalogue
+        // fetch confirmed this (event, market_type) has no relevant markets
+        // on Betfair. The 6h cache prevents the same dead event from being
+        // retried every 5 minutes (~71 wasted relay calls per event before
+        // this gate). Cache entry is cleared on next sweep cycle when TTL
+        // expires.
+        if (isCachedAsUnavailable(m.betfair_event_id, r.market_type)) {
+          result.skipped_event_unavailable_cached++;
+          continue;
+        }
+
         const { placeLiveBetOnBetfair } = await import("./betfairLive");
         const promoteEdge = Number(r.edge);
         const placeResult = await placeLiveBetOnBetfair({
@@ -523,6 +629,26 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
             timestamp: new Date(),
           } as any);
           result.betfair_rejected++;
+
+          // 2026-05-14 Fix 2 — on unavailableOnExchange, trigger a targeted
+          // catalogue refresh for the event. Fire-and-forget: this populates
+          // odds_snapshots if Betfair has markets we missed, and sets the
+          // 6h cache so the next 71 cycles don't retry this dead event.
+          // Other failure modes (slippage, insufficient_funds, invalid_order)
+          // are NOT events we want to re-sweep — they're placement-time
+          // issues, not catalogue-coverage issues.
+          const unavailable = (placeResult as { unavailableOnExchange?: boolean }).unavailableOnExchange === true
+            || reason === "market_unavailable_on_exchange";
+          if (unavailable) {
+            void triggerOnDemandFetch(
+              r.match_id,
+              m.betfair_event_id,
+              r.market_type,
+              m.home_team,
+              m.away_team,
+            );
+          }
+
           continue;
         }
 

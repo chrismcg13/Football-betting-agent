@@ -3,10 +3,12 @@ import { eq, and, gte, lte, isNotNull, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import {
   listMarketBook,
+  listMarketCatalogue,
   type MarketCatalogueItem,
   type MarketBook,
 } from "./betfair";
 import { getCatalogueForEvent } from "./paperTrading";
+import { findEventIdByTeamNames } from "./betfairLive";
 
 // Allowlist matches C1 captureExchangeSnapshot: numeric Betfair event IDs only.
 const BETFAIR_EVENT_ID_RE = /^\d+$/;
@@ -345,4 +347,165 @@ export async function runExchangeBookSweep(
   };
   logger.info(summary, "Exchange book sweep complete");
   return summary;
+}
+
+// 2026-05-14 Fix 2 — on-demand single-event sweep.
+//
+// When placeLiveBetOnBetfair returns unavailableOnExchange for an event whose
+// (league, market_type) is eligibility-proven, this triggers a targeted
+// listMarketCatalogue + listMarketBook for that one event — bypassing the
+// 5-minute catalogueCache and writing whatever Betfair returns to
+// odds_snapshots. Mirrors per-event logic of runExchangeBookSweep.
+//
+// af_* placeholder event IDs resolve via findEventIdByTeamNames first
+// (same fallback path placeLiveBetOnBetfair already uses).
+//
+// Returns foundMarkets so the caller can populate its 6h "tried — empty"
+// cache and avoid re-fetching dead events every 5 min.
+export interface OnDemandSweepResult {
+  resolvedEventId: string | null;
+  marketsDiscovered: number;
+  snapshotsWritten: number;
+  foundMarkets: boolean;
+  reason: string;
+}
+
+export async function sweepEventOnDemand(
+  matchId: number,
+  betfairEventId: string,
+  homeTeam: string,
+  awayTeam: string,
+): Promise<OnDemandSweepResult> {
+  let resolvedEventId: string | null = betfairEventId.startsWith("af_")
+    ? null
+    : betfairEventId;
+
+  if (!resolvedEventId) {
+    try {
+      resolvedEventId = await findEventIdByTeamNames(homeTeam, awayTeam);
+    } catch (err) {
+      logger.warn({ err, matchId, betfairEventId }, "sweepEventOnDemand: team-name resolve threw");
+      return {
+        resolvedEventId: null,
+        marketsDiscovered: 0,
+        snapshotsWritten: 0,
+        foundMarkets: false,
+        reason: "team_name_resolve_error",
+      };
+    }
+  }
+
+  if (!resolvedEventId || !BETFAIR_EVENT_ID_RE.test(resolvedEventId)) {
+    return {
+      resolvedEventId,
+      marketsDiscovered: 0,
+      snapshotsWritten: 0,
+      foundMarkets: false,
+      reason: "event_id_unresolvable",
+    };
+  }
+
+  // Force-bypass the 5-min catalogueCache by calling listMarketCatalogue
+  // directly. The cache wouldn't catch fresh markets that Betfair listed
+  // since the last sweep; this is the "make the exchange the authority"
+  // intent.
+  let catalogue: MarketCatalogueItem[];
+  try {
+    catalogue = await listMarketCatalogue([resolvedEventId]);
+  } catch (err) {
+    logger.warn(
+      { err, matchId, resolvedEventId },
+      "sweepEventOnDemand: listMarketCatalogue threw",
+    );
+    return {
+      resolvedEventId,
+      marketsDiscovered: 0,
+      snapshotsWritten: 0,
+      foundMarkets: false,
+      reason: "catalogue_api_error",
+    };
+  }
+
+  const relevant = catalogue.filter((c) => {
+    const bf = c.description?.marketType;
+    return bf != null && TARGET_BETFAIR_MARKET_TYPES.has(bf);
+  });
+  if (relevant.length === 0) {
+    return {
+      resolvedEventId,
+      marketsDiscovered: 0,
+      snapshotsWritten: 0,
+      foundMarkets: false,
+      reason: "no_relevant_market_types",
+    };
+  }
+
+  const marketIdsByCtx = new Map<string, { bfMarketType: string; internalMarketType: string; catalogue: MarketCatalogueItem }>();
+  for (const cat of relevant) {
+    marketIdsByCtx.set(cat.marketId, {
+      bfMarketType: cat.description!.marketType!,
+      internalMarketType: toInternalMarketType(cat.description!.marketType!),
+      catalogue: cat,
+    });
+  }
+
+  let books: MarketBook[];
+  try {
+    books = await listMarketBook(Array.from(marketIdsByCtx.keys()));
+  } catch (err) {
+    logger.warn(
+      { err, matchId, resolvedEventId, marketCount: marketIdsByCtx.size },
+      "sweepEventOnDemand: listMarketBook threw",
+    );
+    return {
+      resolvedEventId,
+      marketsDiscovered: marketIdsByCtx.size,
+      snapshotsWritten: 0,
+      foundMarkets: true,
+      reason: "book_api_error",
+    };
+  }
+
+  const snapshotTime = new Date();
+  let snapshotsWritten = 0;
+  for (const book of books) {
+    const ctx = marketIdsByCtx.get(book.marketId);
+    if (!ctx) continue;
+    if (book.status !== "OPEN") continue;
+    for (const runner of book.runners) {
+      if (runner.status !== "ACTIVE") continue;
+      const back = runner.ex?.availableToBack?.[0]?.price;
+      const lay = runner.ex?.availableToLay?.[0]?.price;
+      if (back == null && lay == null) continue;
+      const catRunner = ctx.catalogue.runners?.find((r) => r.selectionId === runner.selectionId);
+      if (!catRunner) continue;
+      const selectionName = deriveSelectionName(ctx.bfMarketType, catRunner, homeTeam, awayTeam);
+      if (!selectionName) continue;
+      try {
+        await db.insert(oddsSnapshotsTable).values({
+          matchId,
+          marketType: ctx.internalMarketType,
+          selectionName,
+          backOdds: back != null ? String(back) : null,
+          layOdds: lay != null ? String(lay) : null,
+          source: "betfair_exchange",
+          snapshotTime,
+        });
+        snapshotsWritten += 1;
+      } catch (err) {
+        logger.warn(
+          { err, matchId, marketId: book.marketId, selectionName },
+          "sweepEventOnDemand: odds_snapshots insert failed",
+        );
+      }
+    }
+  }
+
+  return {
+    resolvedEventId,
+    marketsDiscovered: marketIdsByCtx.size,
+    snapshotsWritten,
+    foundMarkets: marketIdsByCtx.size > 0,
+    reason: snapshotsWritten > 0 ? "snapshots_written" : "markets_found_no_active_runners",
+  };
 }
