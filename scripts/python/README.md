@@ -10,7 +10,8 @@ return non-zero on error so the wrapper logs it.
 |---|---|---|
 | `fit_calibration.py` | Mon 04:00 | `calibration_buckets` |
 | `fit_dixon_coles.py` | Mon 05:00 | `scoreline_correlation`, `model_layer_enabled` |
-| `scrape_team_form.py` | Tue 05:00 | `team_form_scrape` (FBref season stats; Phase 2b/c add FotMob/Sofascore/SoFIFA) |
+| `scrape_team_form.py` | Tue 05:00 | `team_form_scrape` (FBref season stats; Phase 2c will add Sofascore/SoFIFA) |
+| `scrape_fotmob_women.py` | Wed 05:00 | `xg_match_data` source='fotmob' (women's match-level xG — WSL/NWSL/Frauen-Bundesliga/etc.) |
 | `shap_drift.py` | Daily 03:30 | `shap_drift_runs` |
 | `feature_attribution.py` | 1st of month 04:30 | `feature_attribution`, `feature_lifecycle` |
 | `compute_market_correlations.py` | 1st of month 04:45 | `market_correlation_matrix` |

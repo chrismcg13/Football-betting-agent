@@ -6134,6 +6134,21 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
+// Phase 2b (2026-05-14): manual trigger for FotMob women's match-xG
+// scraper. Synchronous; first run typically 60-180s as soccerdata
+// crawls a dozen+ women's-league candidate keys. Subsequent runs hit
+// the FS cache.
+router.post("/admin/run-fotmob-women-scrape", async (_req, res) => {
+  try {
+    const { runFotmobWomenScrape } = await import("../services/fotmobWomenScrapeCron");
+    const r = await runFotmobWomenScrape();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "Manual FotMob women's scraper run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 0b (Women's & Internationals expansion, 2026-05-14). Seeds the
 // competition_aliases table with known Betfair-side names for the
 // marquee women's + international scopes, then triggers a synchronous

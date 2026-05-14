@@ -2573,6 +2573,29 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Team-form scraper scheduler active — Tuesdays 05:00 UTC");
 
+  // Phase 2b (2026-05-14) — FotMob women's match-xG scraper.
+  // Wed 05:00 UTC weekly — last in the Python sidecar cascade
+  // (calibration Mon 04, DC Mon 05, team-form Tue 05, FotMob Wed 05).
+  // Writes to xg_match_data with source='fotmob'. Each row is one
+  // match × source; the existing team_xg_rolling aggregator (5-game
+  // rolling average) reads them downstream and feeds home_xg_proxy /
+  // away_xg_proxy features into scorelineMatrix via predictionEngine.
+  cron.schedule("0 5 * * 3", () => {
+    logger.info("FotMob women's scraper triggered (Wednesday 05:00 UTC)");
+    void (async () => {
+      try {
+        const r = await runPythonCron("fotmob_women_scrape", async () => {
+          const { runFotmobWomenScrape } = await import("./fotmobWomenScrapeCron");
+          return runFotmobWomenScrape();
+        });
+        logger.info(r, "FotMob women's scraper complete");
+      } catch (err) {
+        logger.error({ err }, "FotMob women's scraper failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("FotMob women's scraper scheduler active — Wednesdays 05:00 UTC");
+
   // Task 11 (Phase 3d.1) — Smarkets ingestion every 15 min when the flag
   // is on. Maps Smarkets events to our match_id via team-name fuzzy match
   // (apiFootball.teamNameMatch) and persists per-selection snapshots
