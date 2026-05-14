@@ -55,17 +55,26 @@ def current_season_code(today: Optional[datetime] = None) -> str:
     return f"{(year - 1) % 100:02d}{year % 100:02d}"
 
 
-# Phase 2a — FBref men's leagues. soccerdata's `available_leagues()`
-# lists the canonical keys; these are the high-Kelly-ROI scopes that
-# already trade live on Betfair.
-FBREF_MENS_LEAGUES = [
+# Phase 2a — FBref leagues. soccerdata's stock FBref reader only ships
+# with a limited canonical-key set (the Big 5 men's, INT cups). Wider
+# coverage (Championship, lower divisions, women's domestic leagues)
+# needs soccerdata's custom-leagues registration — a Phase 2b/c
+# follow-up. For now we take what's free out of the box.
+FBREF_LEAGUES = [
     "ENG-Premier League",
-    "ENG-Championship",
     "ESP-La Liga",
     "ITA-Serie A",
     "GER-Bundesliga",
     "FRA-Ligue 1",
+    # Women's coverage — only INT-Women's World Cup is in the stock
+    # FBref allow-list. WSL / NWSL / Frauen-Bundesliga land via FotMob
+    # in Phase 2b.
+    "INT-Women's World Cup",
 ]
+# Gender mapping for the gender column on team_form_scrape rows.
+FBREF_LEAGUE_GENDER = {
+    "INT-Women's World Cup": "female",
+}
 
 
 def _to_int(v) -> Optional[int]:
@@ -94,8 +103,8 @@ def scrape_fbref_team_stats(season: str) -> pd.DataFrame:
         LOG.error("soccerdata not installed — pip install soccerdata>=1.9.0")
         raise
 
-    LOG.info("Initialising FBref reader for season %s, %d leagues", season, len(FBREF_MENS_LEAGUES))
-    fbref = sd.FBref(leagues=FBREF_MENS_LEAGUES, seasons=season)
+    LOG.info("Initialising FBref reader for season %s, %d leagues", season, len(FBREF_LEAGUES))
+    fbref = sd.FBref(leagues=FBREF_LEAGUES, seasons=season)
     try:
         # standard season-to-date team stats — soccerdata returns a
         # MultiIndex df indexed by (league, season, team).
@@ -161,6 +170,7 @@ def main() -> int:
                     except Exception:
                         extras[k] = str(v)
 
+            gender = FBREF_LEAGUE_GENDER.get(league_name, "male")
             try:
                 cur.execute(
                     """
@@ -169,7 +179,7 @@ def main() -> int:
                        team_name, snapshot_date,
                        matches_played, xg_for, xg_against,
                        goals_for, goals_against, extras)
-                    VALUES ('fbref', %s, %s, 'male', %s,
+                    VALUES ('fbref', %s, %s, %s, %s,
                             %s, %s,
                             %s, %s, %s,
                             %s, %s, %s)
@@ -186,6 +196,7 @@ def main() -> int:
                     (
                         league_name,
                         league_name.split("-")[0] if "-" in league_name else None,
+                        gender,
                         season,
                         team_name,
                         snapshot_date,
