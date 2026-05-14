@@ -1,0 +1,21 @@
+# Python sidecar dependencies for api-server's calibration / drift /
+# Dixon-Coles fit / market-correlation crons. Installed into .venv on
+# the VPS (see scripts/python/README.md).
+
+# Existing crons (fit_calibration, shap_drift, feature_attribution,
+# compute_market_correlations).
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+psycopg2-binary>=2.9
+scikit-learn>=1.3
+shap>=0.45
+
+# Phase 1b (2026-05-14) — Dixon-Coles MLE + hierarchical-Bayes ρ fit.
+# penaltyblog handles the per-scope DC MLE (the standard Dixon-Coles
+# bivariate Poisson likelihood with the τ-correction). numpyro+jax run
+# the hierarchical posterior on top — every scope gets a
+# shrinkage-weighted ρ even when its own n is small.
+penaltyblog>=1.3.0
+numpyro>=0.13.0
+jax>=0.4.20

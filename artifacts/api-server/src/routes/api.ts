@@ -6104,6 +6104,21 @@ router.post("/admin/reconcile-live-statement", async (req, res) => {
   }
 });
 
+// Phase 1b + 1c (2026-05-14): manual trigger for the Dixon-Coles ρ fit
+// + backtest. Returns the Python sidecar's exit code, duration, and
+// last stderr lines. Useful for the initial seed before the first
+// Monday-05:00 cron tick fires.
+router.post("/admin/run-dixon-coles-fitter", async (_req, res) => {
+  try {
+    const { runDixonColesFitter } = await import("../services/dixonColesFitCron");
+    const r = await runDixonColesFitter();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "Manual Dixon-Coles fitter run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 0b (Women's & Internationals expansion, 2026-05-14). Seeds the
 // competition_aliases table with known Betfair-side names for the
 // marquee women's + international scopes, then triggers a synchronous

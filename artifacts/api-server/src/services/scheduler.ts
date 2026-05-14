@@ -2527,6 +2527,29 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Calibration fitter scheduler active — Mondays 04:00 UTC");
 
+  // Phase 1b + 1c (2026-05-14) — Dixon-Coles ρ fit + per-(market_type,
+  // gender) backtest decision. Mondays 05:00 UTC — runs AFTER the
+  // calibration fitter so the latest isotonic buckets are in place.
+  // Single Python sidecar run writes both scoreline_correlation
+  // (posterior ρ per scope) and model_layer_enabled (cell on/off +
+  // log-loss provenance). The runtime cache in services/dixonColes.ts
+  // refreshes within 60s.
+  cron.schedule("0 5 * * 1", () => {
+    logger.info("Dixon-Coles fitter triggered (Monday 05:00 UTC)");
+    void (async () => {
+      try {
+        const r = await runPythonCron("dixon_coles_fitter", async () => {
+          const { runDixonColesFitter } = await import("./dixonColesFitCron");
+          return runDixonColesFitter();
+        });
+        logger.info(r, "Dixon-Coles fitter complete");
+      } catch (err) {
+        logger.error({ err }, "Dixon-Coles fitter failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Dixon-Coles fitter scheduler active — Mondays 05:00 UTC");
+
   // Task 11 (Phase 3d.1) — Smarkets ingestion every 15 min when the flag
   // is on. Maps Smarkets events to our match_id via team-name fuzzy match
   // (apiFootball.teamNameMatch) and persists per-selection snapshots
