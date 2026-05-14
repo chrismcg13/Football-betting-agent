@@ -37,6 +37,14 @@ from typing import Optional
 import pandas as pd
 import psycopg2
 
+# Force unbuffered stderr so per-step diagnostic logs flush to the
+# parent (api-server) process line-by-line. Without this, Python uses
+# block buffering when stderr is a pipe (not a TTY) and intermediate
+# INFO logs get trapped in the buffer until process exit — which can
+# wipe everything off the wrapper's 2KB stderrTail window. Same fix as
+# in scrape_fotmob_women.py.
+sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s scrape_team_form: %(message)s",
@@ -103,8 +111,10 @@ def scrape_fbref_team_stats(season: str) -> pd.DataFrame:
         LOG.error("soccerdata not installed — pip install soccerdata>=1.9.0")
         raise
 
-    LOG.info("Initialising FBref reader for season %s, %d leagues", season, len(FBREF_LEAGUES))
+    LOG.info("Initialising FBref reader for season %s, %d leagues: %s",
+             season, len(FBREF_LEAGUES), FBREF_LEAGUES)
     fbref = sd.FBref(leagues=FBREF_LEAGUES, seasons=season)
+    LOG.info("FBref reader initialised; fetching standard team_season_stats")
     try:
         # standard season-to-date team stats — soccerdata returns a
         # MultiIndex df indexed by (league, season, team).
@@ -116,8 +126,10 @@ def scrape_fbref_team_stats(season: str) -> pd.DataFrame:
     if df is None or df.empty:
         LOG.warning("FBref returned empty DataFrame")
         return pd.DataFrame()
-    LOG.info("FBref returned %d team-rows", len(df))
-    return df.reset_index()
+    LOG.info("FBref returned %d rows; columns=%s", len(df), list(df.columns)[:20])
+    df = df.reset_index()
+    LOG.info("After reset_index: columns=%s", list(df.columns)[:20])
+    return df
 
 
 def main() -> int:
@@ -137,6 +149,8 @@ def main() -> int:
     conn.autocommit = False
     inserted = 0
     updated = 0
+    skipped_no_league = 0
+    skipped_no_team = 0
 
     # soccerdata column names sometimes vary; we coerce defensively.
     def col(row, *names):
@@ -145,11 +159,23 @@ def main() -> int:
                 return row[n]
         return None
 
+    # Log a sample row's full column dict so the operator can see what
+    # FBref actually returned — column names, types, sample values.
+    if len(df) > 0:
+        sample = df.iloc[0].to_dict()
+        LOG.info("Sample FBref row keys: %s", list(sample.keys())[:30])
+        LOG.info("Sample FBref row values (first 10 cols): %s",
+                 {k: str(v)[:40] for k, v in list(sample.items())[:10]})
+
     with conn.cursor() as cur:
         for _, row in df.iterrows():
             league_name = str(col(row, "league") or "")
             team_name = str(col(row, "team") or "")
-            if not league_name or not team_name:
+            if not league_name:
+                skipped_no_league += 1
+                continue
+            if not team_name:
+                skipped_no_team += 1
                 continue
             mp = _to_int(col(row, "MP", "Matches", "matches"))
             xg = _to_float(col(row, "xG", "xG_for", "xg_for"))
@@ -216,8 +242,11 @@ def main() -> int:
                 continue
     conn.commit()
     conn.close()
-    LOG.info("FBref scrape complete: inserted=%d updated=%d snapshot_date=%s",
-             inserted, updated, snapshot_date)
+    LOG.info(
+        "FBref scrape complete: inserted=%d updated=%d "
+        "skipped_no_league=%d skipped_no_team=%d snapshot_date=%s",
+        inserted, updated, skipped_no_league, skipped_no_team, snapshot_date,
+    )
     return 0
 
 
