@@ -3395,22 +3395,28 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("OddsPapi budget summary scheduler active — daily at 00:01 UTC");
 
-  // Pre-kickoff CLV cron: every 15 minutes (upgraded from 30 with 100k budget)
-  // For any pending bet kicking off in the next 90 min, fetch Pinnacle closing odds
-  // and store as closing_pinnacle_odds → snapshot C for three-snapshot CLV system
-  cron.schedule("*/15 * * * *", () => {
-    logger.info("Pre-kickoff CLV cron triggered — fetching Pinnacle closing odds");
+  // Pre-kickoff CLV cron: every 1 minute. Phase 4 (2026-05-14)
+  // upgraded the frequency from */15 and tightened the snap window
+  // inside fetchAndStoreClosingLineForPendingBets() to T-0 ± 90s.
+  // The old 4-hour window meant most bets were snapped at T-1h to
+  // T-3h on the first cron tick after entering — Pinnacle moves
+  // significantly in the final hour, especially on women's and
+  // lower-tier international markets, so the early snap was biasing
+  // CLV downward for exactly the scopes Phase 0 is trying to
+  // qualify. Per-bet snap_delta_seconds now logged in
+  // compliance_logs.pinnacle_close_capture.
+  cron.schedule("* * * * *", () => {
     void fetchAndStoreClosingLineForPendingBets()
       .then((r) => {
         if (r.checked > 0) {
-          logger.info(r, "Pre-kickoff CLV cron complete");
+          logger.info(r, "Pre-kickoff CLV cron complete (T-90s window)");
         }
       })
       .catch((err) => {
         logger.warn({ err }, "Pre-kickoff CLV cron failed — non-fatal");
       });
   }, { timezone: "UTC" });
-  logger.info("Pre-kickoff CLV cron active — every 15 minutes (Pinnacle closing line + snapshot C)");
+  logger.info("Pre-kickoff CLV cron active — every 1 minute, T-0 ± 90s snap window");
 
   // Pre-kickoff snapshot B: every 15 minutes
   // Captures Pinnacle odds 45-75 min before kickoff (1hr reference point)

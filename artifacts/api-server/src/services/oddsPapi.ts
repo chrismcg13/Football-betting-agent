@@ -3311,11 +3311,24 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
   const key = process.env.ODDSPAPI_KEY;
   if (!key) return { checked: 0, updated: 0, skipped: 0 };
 
+  // Phase 4 (2026-05-14): tighten the closing-line snap window to
+  // kickoff ± 90 seconds. The prior 4-hour window meant most bets got
+  // captured at T-1h to T-3:45 — Pinnacle moves significantly in the
+  // final hour (and the final 15 min especially), so an early snap
+  // systematically biases CLV downward, with the worst hit on
+  // women's / lower-tier international books that adjust latest.
+  //
+  // Paired with the cron-tick increase from */15 to */1 in
+  // scheduler.ts so every bet gets ~2 chances to capture in its
+  // [T-90s, T+0] window. Once captured (closingPinnacleOdds NOT NULL),
+  // subsequent ticks skip — the snap stays at whatever moment in the
+  // last 90s the cron actually fired.
   const now = new Date();
-  const in4h = new Date(now.getTime() + 4 * 60 * 60 * 1000);
+  const in90s = new Date(now.getTime() + 90 * 1000);
 
-  // Find pending bets for fixtures kicking off in the next 4 hours
-  // that don't already have a closing line stored
+  // Pre-join with matches to keep kickoffTime on the result rows — we
+  // log the per-bet snap_delta_seconds (kickoff - now) on every capture
+  // so the operator can audit timing in compliance_logs.
   const pendingBets = await db
     .select({
       id: paperBetsTable.id,
@@ -3324,6 +3337,7 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
       selectionName: paperBetsTable.selectionName,
       oddsAtPlacement: paperBetsTable.oddsAtPlacement,
       closingPinnacleOdds: paperBetsTable.closingPinnacleOdds,
+      kickoffTime: matchesTable.kickoffTime,
     })
     .from(paperBetsTable)
     .innerJoin(matchesTable, eq(paperBetsTable.matchId, matchesTable.id))
@@ -3331,7 +3345,7 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
       and(
         eq(paperBetsTable.status, "pending"),
         sql`${matchesTable.kickoffTime} >= ${now}`,
-        sql`${matchesTable.kickoffTime} <= ${in4h}`,
+        sql`${matchesTable.kickoffTime} <= ${in90s}`,
         sql`${paperBetsTable.closingPinnacleOdds} IS NULL`,
       ),
     );
@@ -3519,10 +3533,37 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
 
         const sourceForCount = clvSourceTag ?? "unknown";
         bySource[sourceForCount] = (bySource[sourceForCount] ?? 0) + 1;
+
+        // Phase 4 (2026-05-14): per-bet capture audit. Records the gap
+        // between snap time and kickoff time so the operator can verify
+        // we're consistently inside the T-0 ± 90s window (and isn't
+        // silently regressing for women's / international scopes where
+        // late line moves matter most). Fire-and-forget — never blocks
+        // the CLV write.
+        const snapDeltaSeconds = Math.round(
+          (new Date(bet.kickoffTime).getTime() - Date.now()) / 1000,
+        );
+        void db.insert(complianceLogsTable).values({
+          actionType: "pinnacle_close_capture",
+          details: {
+            betId: bet.id,
+            matchId,
+            marketType,
+            selectionName: bet.selectionName,
+            snapDeltaSeconds,
+            clvSource: clvSourceTag,
+            clvSourceTier,
+            placementOdds,
+            closingOdds,
+            clvPct,
+          },
+          timestamp: new Date(),
+        });
+
         logger.info(
           {
             betId: bet.id, matchId, marketType, selection: bet.selectionName,
-            placementOdds, closingOdds, clvPct,
+            placementOdds, closingOdds, clvPct, snapDeltaSeconds,
             source: clvSourceTag, tier: clvSourceTier, dataQuality,
           },
           "Pre-kickoff CLV stored (multi-anchor) + snapshot C",
