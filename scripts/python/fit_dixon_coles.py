@@ -258,6 +258,8 @@ def main() -> int:
             FROM matches m
             JOIN competition_config cc
               ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+             AND LOWER(REPLACE(COALESCE(cc.country,''), '-', ' '))
+               = LOWER(REPLACE(COALESCE(m.country,''), '-', ' '))
             WHERE m.home_score IS NOT NULL AND m.away_score IS NOT NULL
               AND m.kickoff_time >= NOW() - INTERVAL '%s days'
               AND cc.api_football_id IS NOT NULL
@@ -342,6 +344,8 @@ def main() -> int:
             JOIN matches m ON m.id = pb.match_id
             JOIN competition_config cc
               ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(m.league, '-', ' '))
+             AND LOWER(REPLACE(COALESCE(cc.country,''), '-', ' '))
+               = LOWER(REPLACE(COALESCE(m.country,''), '-', ' '))
             LEFT JOIN features f_home
               ON f_home.match_id = m.id AND f_home.feature_name = 'home_goals_scored_avg'
             LEFT JOIN features f_away
