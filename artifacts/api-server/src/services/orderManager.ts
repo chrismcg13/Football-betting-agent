@@ -226,6 +226,8 @@ async function enforceScopeEligibilityOnPendingBets(): Promise<{
            ((m.league, pb.market_type) IN (SELECT league, market_type FROM disproven)) AS three_signal_disproven
     FROM paper_bets pb
     JOIN matches m ON m.id = pb.match_id
+    LEFT JOIN latest_signal ls
+      ON ls.league = m.league AND ls.market_type = pb.market_type
     WHERE pb.bet_track = 'live'
       AND pb.status = 'pending'
       AND pb.betfair_bet_id IS NOT NULL
