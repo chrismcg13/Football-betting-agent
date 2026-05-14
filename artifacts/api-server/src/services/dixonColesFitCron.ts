@@ -26,6 +26,11 @@ export interface DixonColesFitResult {
   exitCode: number;
   durationMs: number;
   stderrTail: string;
+  spawnError?: string;
+  pythonBin: string;
+  scriptPath: string;
+  pythonBinExists: boolean;
+  scriptExists: boolean;
 }
 
 export async function runDixonColesFitter(): Promise<DixonColesFitResult> {
@@ -36,7 +41,37 @@ export async function runDixonColesFitter(): Promise<DixonColesFitResult> {
     : path.join(repoRoot, PYTHON_BIN);
   const scriptPath = path.join(repoRoot, FITTER_SCRIPT);
 
-  logger.info({ pythonBin, scriptPath, repoRoot }, "Spawning Dixon-Coles fitter");
+  // Up-front existence checks so a spawn ENOENT comes back diagnostic-rich
+  // rather than as an opaque exitCode=-1. Cheap I/O — sync stat calls.
+  const fs = await import("node:fs");
+  const pythonBinExists = (() => {
+    try { return fs.statSync(pythonBin).isFile(); } catch { return false; }
+  })();
+  const scriptExists = (() => {
+    try { return fs.statSync(scriptPath).isFile(); } catch { return false; }
+  })();
+
+  logger.info(
+    { pythonBin, scriptPath, repoRoot, pythonBinExists, scriptExists },
+    "Spawning Dixon-Coles fitter",
+  );
+
+  if (!pythonBinExists || !scriptExists) {
+    const reason = !pythonBinExists
+      ? `Python binary not found at ${pythonBin}`
+      : `Script not found at ${scriptPath}`;
+    logger.error({ pythonBin, scriptPath, repoRoot }, reason);
+    return {
+      exitCode: -1,
+      durationMs: Date.now() - startedAt,
+      stderrTail: "",
+      spawnError: reason,
+      pythonBin,
+      scriptPath,
+      pythonBinExists,
+      scriptExists,
+    };
+  }
 
   return new Promise<DixonColesFitResult>((resolve) => {
     const child = spawn(pythonBin, [scriptPath], {
@@ -46,6 +81,7 @@ export async function runDixonColesFitter(): Promise<DixonColesFitResult> {
     });
 
     let stderrBuf = "";
+    let spawnErrorMsg: string | undefined;
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString().trim();
       if (text) logger.info({ source: "fit_dixon_coles.py" }, text);
@@ -59,11 +95,17 @@ export async function runDixonColesFitter(): Promise<DixonColesFitResult> {
     });
 
     child.on("error", (err) => {
+      spawnErrorMsg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       logger.error({ err, pythonBin, scriptPath }, "Failed to spawn Dixon-Coles fitter");
       resolve({
         exitCode: -1,
         durationMs: Date.now() - startedAt,
         stderrTail: stderrBuf.slice(-2000),
+        spawnError: spawnErrorMsg,
+        pythonBin,
+        scriptPath,
+        pythonBinExists,
+        scriptExists,
       });
     });
 
@@ -81,6 +123,11 @@ export async function runDixonColesFitter(): Promise<DixonColesFitResult> {
         exitCode: code ?? -1,
         durationMs,
         stderrTail: stderrBuf.slice(-2000),
+        ...(spawnErrorMsg ? { spawnError: spawnErrorMsg } : {}),
+        pythonBin,
+        scriptPath,
+        pythonBinExists,
+        scriptExists,
       });
     });
   });
