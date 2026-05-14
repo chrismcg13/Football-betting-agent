@@ -16,11 +16,37 @@
  */
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { logger } from "../lib/logger";
 
 const PYTHON_BIN = process.env["CALIBRATION_PYTHON"] ?? ".venv/bin/python";
 const FITTER_SCRIPT = "scripts/python/fit_dixon_coles.py";
+
+/**
+ * Walk up from `process.cwd()` looking for the pnpm-workspace.yaml file
+ * (repo root marker). Falls back to process.cwd() if not found. PM2
+ * starts api-server with cwd = artifacts/api-server (the bundle dir),
+ * not the repo root — without this walk-up, the .venv + script paths
+ * resolve relative to the wrong directory.
+ *
+ * CALIBRATION_REPO_ROOT env still overrides if set, for explicit ops
+ * control on non-standard layouts.
+ */
+function discoverRepoRoot(): string {
+  const explicit = process.env["CALIBRATION_REPO_ROOT"];
+  if (explicit) return explicit;
+  let dir = process.cwd();
+  // Cap the walk at ~8 levels so we don't loop forever if the marker is
+  // missing for some reason.
+  for (let i = 0; i < 8; i++) {
+    if (fs.existsSync(path.join(dir, "pnpm-workspace.yaml"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return process.cwd();
+}
 
 export interface DixonColesFitResult {
   exitCode: number;
@@ -35,15 +61,16 @@ export interface DixonColesFitResult {
 
 export async function runDixonColesFitter(): Promise<DixonColesFitResult> {
   const startedAt = Date.now();
-  const repoRoot = process.env["CALIBRATION_REPO_ROOT"] ?? process.cwd();
+  const repoRoot = discoverRepoRoot();
   const pythonBin = path.isAbsolute(PYTHON_BIN)
     ? PYTHON_BIN
     : path.join(repoRoot, PYTHON_BIN);
   const scriptPath = path.join(repoRoot, FITTER_SCRIPT);
 
   // Up-front existence checks so a spawn ENOENT comes back diagnostic-rich
-  // rather than as an opaque exitCode=-1. Cheap I/O — sync stat calls.
-  const fs = await import("node:fs");
+  // rather than as an opaque exitCode=-1. Resolve the python symlink
+  // (.venv/bin/python -> python3 in this repo's setup) before stat-ing
+  // so the spawn never trips on a dangling target.
   const pythonBinExists = (() => {
     try { return fs.statSync(pythonBin).isFile(); } catch { return false; }
   })();
