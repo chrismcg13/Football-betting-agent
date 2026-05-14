@@ -6104,6 +6104,166 @@ router.post("/admin/reconcile-live-statement", async (req, res) => {
   }
 });
 
+// Phase 0b (Women's & Internationals expansion, 2026-05-14). Seeds the
+// competition_aliases table with known Betfair-side names for the
+// marquee women's + international scopes, then triggers a synchronous
+// reverse-map run so the betfair_competition_id gets populated in this
+// admin call. Also patches the Shin de-vig miss from Phase 0a — the
+// 12 internationals have competition_type='league' so the prior WHERE
+// clause didn't catch them; we now flip them explicitly by id.
+//
+// Idempotent: ON CONFLICT DO NOTHING on each alias; reverse-map skips
+// already-linked rows.
+router.post("/admin/phase-0b-seed-aliases-and-reverse-map", async (_req, res) => {
+  try {
+    const { db } = await import("@workspace/db");
+    const { competitionAliasesTable, complianceLogsTable } = await import("@workspace/db");
+
+    // Multiple alias variants per AF id — caught against any of them.
+    // The (source, alias) unique constraint prevents duplicates if the
+    // endpoint is re-fired.
+    const aliases: Array<{ alias: string; api_football_id: number; note?: string }> = [
+      // ── Women's domestic ─────────────────────────────────────────────
+      { alias: "FA Women's Super League",     api_football_id: 771, note: "WSL" },
+      { alias: "Women's Super League",        api_football_id: 771, note: "WSL" },
+      { alias: "English WSL",                 api_football_id: 771, note: "WSL" },
+      { alias: "NWSL",                        api_football_id: 254, note: "NWSL USA" },
+      { alias: "Women's National Soccer League", api_football_id: 254, note: "NWSL USA" },
+      { alias: "National Womens Soccer League",  api_football_id: 254, note: "NWSL USA" },
+      { alias: "Frauen Bundesliga",           api_football_id: 770, note: "Frauen-Bundesliga" },
+      { alias: "Frauen-Bundesliga",           api_football_id: 770, note: "Frauen-Bundesliga" },
+      { alias: "German Frauen-Bundesliga",    api_football_id: 770, note: "Frauen-Bundesliga" },
+      { alias: "Bundesliga Women",            api_football_id: 770, note: "Frauen-Bundesliga" },
+      { alias: "Liga F",                      api_football_id: 775, note: "Liga F Spain" },
+      { alias: "Primera Division Femenina",   api_football_id: 775, note: "Liga F Spain" },
+      { alias: "Primera División Femenina",   api_football_id: 775, note: "Liga F Spain" },
+      { alias: "Spanish Liga F",              api_football_id: 775, note: "Liga F Spain" },
+      { alias: "Division 1 Féminine",         api_football_id: 773, note: "D1F France" },
+      { alias: "Division 1 Feminine",         api_football_id: 773, note: "D1F France" },
+      { alias: "D1 Arkema",                   api_football_id: 773, note: "D1F France" },
+      { alias: "Premiere Ligue Feminine",     api_football_id: 773, note: "D1F France" },
+      { alias: "Première Ligue Féminine",     api_football_id: 773, note: "D1F France" },
+      { alias: "Serie A Femminile",           api_football_id: 524, note: "Italy Women" },
+      { alias: "Italian Serie A Women",       api_football_id: 524, note: "Italy Women" },
+      { alias: "Serie A Women",               api_football_id: 524, note: "Italy Women" },
+      { alias: "Brasileiro Feminino",         api_football_id: 74,  note: "Brasileiro Women" },
+      { alias: "Campeonato Brasileiro Feminino", api_football_id: 74, note: "Brasileiro Women" },
+      { alias: "Damallsvenskan",              api_football_id: 793, note: "Sweden Women" },
+      { alias: "Swedish Damallsvenskan",      api_football_id: 793, note: "Sweden Women" },
+      { alias: "Toppserien",                  api_football_id: 794, note: "Norway Women" },
+      { alias: "Norwegian Toppserien",        api_football_id: 794, note: "Norway Women" },
+      { alias: "Kvindeligaen",                api_football_id: 795, note: "Denmark Women" },
+      { alias: "Gjensidige Kvindeligaen",     api_football_id: 795, note: "Denmark Women" },
+      { alias: "Danish Kvindeligaen",         api_football_id: 795, note: "Denmark Women" },
+      // ── Women's international ────────────────────────────────────────
+      { alias: "FIFA Women's World Cup",      api_football_id: 8,   note: "Women's WC" },
+      { alias: "Women's World Cup",           api_football_id: 8,   note: "Women's WC" },
+      { alias: "Womens World Cup",            api_football_id: 8,   note: "Women's WC" },
+      { alias: "Women's International Friendlies", api_football_id: 22, note: "Women's int'l friendlies" },
+      { alias: "Womens International Friendlies",  api_football_id: 22, note: "Women's int'l friendlies" },
+      { alias: "International Friendlies (Women)", api_football_id: 22, note: "Women's int'l friendlies" },
+      { alias: "International Friendlies Women",   api_football_id: 22, note: "Women's int'l friendlies" },
+      { alias: "Women's WC Qualifying - UEFA",       api_football_id: 880, note: "W WCQ UEFA" },
+      { alias: "Women's World Cup Qualifying - UEFA", api_football_id: 880, note: "W WCQ UEFA" },
+      { alias: "Women's World Cup Qualifying UEFA",   api_football_id: 880, note: "W WCQ UEFA" },
+      { alias: "UEFA Women's Championship Qualifying",      api_football_id: 1083, note: "W Euro Q" },
+      { alias: "Women's European Championship Qualifying",  api_football_id: 1083, note: "W Euro Q" },
+      { alias: "UEFA Women's Euro Qualifying",              api_football_id: 1083, note: "W Euro Q" },
+      { alias: "UEFA Women's Euro",                         api_football_id: 960,  note: "W Euro" },
+      { alias: "Women's European Championship",             api_football_id: 960,  note: "W Euro" },
+      { alias: "UEFA Women's Championship",                 api_football_id: 960,  note: "W Euro" },
+      // ── Men's international ──────────────────────────────────────────
+      { alias: "UEFA Nations League",         api_football_id: 5,   note: "UNL" },
+      { alias: "Africa Cup of Nations",       api_football_id: 6,   note: "AFCON" },
+      { alias: "African Cup of Nations",      api_football_id: 6,   note: "AFCON" },
+      { alias: "AFCON",                       api_football_id: 6,   note: "AFCON" },
+      { alias: "CONCACAF Gold Cup",           api_football_id: 11,  note: "Gold Cup" },
+      { alias: "Gold Cup",                    api_football_id: 11,  note: "Gold Cup" },
+      { alias: "Copa America",                api_football_id: 9,   note: "Copa America" },
+      { alias: "Copa América",                api_football_id: 9,   note: "Copa America" },
+      { alias: "AFC Asian Cup",               api_football_id: 7,   note: "Asian Cup" },
+      { alias: "Asian Cup",                   api_football_id: 7,   note: "Asian Cup" },
+      { alias: "World Cup Qualifying - UEFA",    api_football_id: 15, note: "WCQ UEFA" },
+      { alias: "World Cup Qualifying UEFA",      api_football_id: 15, note: "WCQ UEFA" },
+      { alias: "FIFA World Cup Qualifying - UEFA", api_football_id: 15, note: "WCQ UEFA" },
+      { alias: "World Cup Qualifying - CONMEBOL",    api_football_id: 29, note: "WCQ CONMEBOL" },
+      { alias: "World Cup Qualifying CONMEBOL",      api_football_id: 29, note: "WCQ CONMEBOL" },
+      { alias: "FIFA World Cup Qualifying - CONMEBOL", api_football_id: 29, note: "WCQ CONMEBOL" },
+      { alias: "World Cup Qualifying - AFC",         api_football_id: 30, note: "WCQ AFC" },
+      { alias: "World Cup Qualifying AFC",           api_football_id: 30, note: "WCQ AFC" },
+      { alias: "World Cup Qualifying - CONCACAF",    api_football_id: 31, note: "WCQ CONCACAF" },
+      { alias: "World Cup Qualifying CONCACAF",      api_football_id: 31, note: "WCQ CONCACAF" },
+      { alias: "World Cup Qualifying - CAF",         api_football_id: 33, note: "WCQ CAF" },
+      { alias: "World Cup Qualifying CAF",           api_football_id: 33, note: "WCQ CAF" },
+      { alias: "World Cup Qualifying - OFC",         api_football_id: 34, note: "WCQ OFC" },
+      { alias: "World Cup Qualifying OFC",           api_football_id: 34, note: "WCQ OFC" },
+    ];
+
+    // Bulk-insert with ON CONFLICT DO NOTHING (idempotent on (source, alias)).
+    let aliasInserted = 0;
+    for (const a of aliases) {
+      const r = (await db.execute(sql`
+        INSERT INTO competition_aliases (source, alias, api_football_id, note)
+        VALUES ('betfair', ${a.alias}, ${a.api_football_id}, ${a.note ?? null})
+        ON CONFLICT (source, alias) DO NOTHING
+      `)) as unknown as { rowCount?: number };
+      aliasInserted += r.rowCount ?? 0;
+    }
+
+    // Fix Phase 0a Shin de-vig miss — internationals have
+    // competition_type='league' (not 'international') so the earlier
+    // WHERE clause didn't catch them. Flip the 12 marquee international
+    // ids explicitly.
+    const r2 = (await db.execute(sql`
+      UPDATE competition_config
+      SET devig_method = 'shin'
+      WHERE devig_method = 'power'
+        AND api_football_id IN (5, 848, 6, 11, 9, 7, 15, 29, 30, 31, 33, 34)
+    `)) as unknown as { rowCount?: number };
+    const devigShinIntl = r2.rowCount ?? 0;
+
+    // Trigger reverse-map (synchronous so the deltas come back in one call).
+    const { runBetfairReverseMapping } = await import("../services/betfairFirstUniverse");
+    const reverseMap = await runBetfairReverseMapping();
+
+    await db.insert(complianceLogsTable).values({
+      actionType: "phase_0b_seed_aliases_and_reverse_map",
+      details: {
+        aliasInserted,
+        devigShinIntl,
+        aliasHits: reverseMap.aliasHits,
+        writesApplied: reverseMap.writesApplied,
+        writesProposed: reverseMap.writesProposed,
+      },
+      timestamp: new Date(),
+    });
+
+    logger.info(
+      {
+        aliasInserted, devigShinIntl,
+        reverseMapAliasHits: reverseMap.aliasHits,
+        reverseMapWritesApplied: reverseMap.writesApplied,
+      },
+      "Phase 0b alias seeding + reverse-map complete",
+    );
+    res.json({
+      ok: true,
+      aliasInserted,
+      devigShinIntl,
+      reverseMap: {
+        aliasHits: reverseMap.aliasHits,
+        writesApplied: reverseMap.writesApplied,
+        writesProposed: reverseMap.writesProposed,
+        fuzzyFailures: reverseMap.fuzzyMatchFailures.belowThresholdCount,
+        durationMs: reverseMap.durationMs,
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, "Phase 0b alias seeding + reverse-map failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 0 (Women's & Internationals expansion, 2026-05-14). One-shot
 // idempotent SQL bundle:
 //   1. Dedupe + fix mis-tagged rows in competition_config (fake FA WSL

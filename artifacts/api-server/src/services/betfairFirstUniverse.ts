@@ -30,6 +30,7 @@
 import {
   db,
   competitionConfigTable,
+  competitionAliasesTable,
   oddspapiLeagueCoverageTable,
   paperBetsTable,
   matchesTable,
@@ -631,6 +632,9 @@ export interface BetfairReverseMappingResult {
     updateUniverseTier: number;        // strictly 0 by insert-only contract
   };
   writesApplied: number;
+  // Phase 0b (2026-05-14): count of mappings resolved via the
+  // hand-curated competition_aliases table (bypassing the fuzzy match).
+  aliasHits: number;
   skippedUnmappedRegion: number;
   fuzzyMatchFailures: {
     belowThresholdCount: number;
@@ -712,6 +716,24 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
     if (r.betfairCompetitionId != null) ccByBetfairId.set(r.betfairCompetitionId, r);
   }
 
+  // Phase 0b (2026-05-14): hand-curated Betfair-name → AF-league-id
+  // overrides. Consulted BEFORE the token-set / Levenshtein fuzzy match.
+  // Needed because Betfair often names women's competitions and lower-
+  // tier internationals differently from API-Football ("FA Women's
+  // Super League" vs "WSL", "Women's World Cup Qualifying - UEFA" vs
+  // "Women's WC Qualifiers - Europe"). Empty by default; populated via
+  // /api/admin/seed-competition-aliases. Keys lowercased for case-
+  // insensitive lookup.
+  const aliasRows = await db
+    .select()
+    .from(competitionAliasesTable)
+    .where(eq(competitionAliasesTable.source, "betfair"));
+  const aliasMap = new Map<string, number>();
+  for (const r of aliasRows) {
+    aliasMap.set(r.alias.trim().toLowerCase(), r.apiFootballId);
+  }
+  let aliasHits = 0;
+
   const opRows = await db.select().from(oddspapiLeagueCoverageTable);
   const opByLeague = new Map<string, typeof opRows[number]>();
   for (const r of opRows) opByLeague.set(r.league.toLowerCase(), r);
@@ -751,6 +773,35 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
     }
 
     const bfName = bfComp.competition.name;
+
+    // Phase 0b (2026-05-14): consult competition_aliases BEFORE fuzzy.
+    // If a Betfair-side name has a hand-curated AF-league-id mapping,
+    // use it directly — bypasses the fuzzy match for the cases where
+    // the names differ too much for token-set / Levenshtein to bridge
+    // (women's competitions, international tournaments with regional
+    // naming variation).
+    const aliasHit = aliasMap.get(bfName.trim().toLowerCase());
+    if (aliasHit != null) {
+      const existingCc = ccByApiFootballId.get(aliasHit);
+      if (existingCc != null && existingCc.betfairCompetitionId == null) {
+        if (!dryRun) {
+          await db
+            .update(competitionConfigTable)
+            .set({ betfairCompetitionId: bfComp.competition.id })
+            .where(eq(competitionConfigTable.apiFootballId, aliasHit));
+          writesApplied++;
+        }
+        writesProposed.updateBetfairCompetitionId++;
+        aliasHits++;
+        // also register so the next iteration knows it's linked
+        ccByBetfairId.set(bfComp.competition.id, existingCc);
+        proposedTierAssignments.unchanged = (proposedTierAssignments.unchanged ?? 0) + 1;
+        continue;
+      }
+      // alias resolved but target row missing or already linked — fall
+      // through to standard match so the fuzzy path can still do its job.
+    }
+
     const mappedCountries = mapBetfairRegion(bfComp.competitionRegion);
 
     let candidates: typeof afLeagues = [];
@@ -1019,6 +1070,7 @@ export async function runBetfairReverseMapping(): Promise<BetfairReverseMappingR
     proposedTierAssignments,
     writesProposed,
     writesApplied,
+    aliasHits,
     skippedUnmappedRegion,
     fuzzyMatchFailures: {
       belowThresholdCount: fuzzyFailures.length,
