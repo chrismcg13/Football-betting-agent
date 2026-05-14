@@ -93,6 +93,16 @@ export interface LazyPromoteResult {
   // demotion counters surface Wilson-LCB shadow routes from this rail.
   skipped_adaptive_negative_kelly: number;     // f̂ ≤ 0
   skipped_adaptive_wilson_lcb_negative: number; // f̂ > 0 but f_lo ≤ 0
+  // 2026-05-14: agent_status (paused_streak / paused_daily / paused_weekly)
+  // halts lazy-promote alongside the kill switch. Mirrors the trading-cycle
+  // forceShadowOnly behaviour so both rails respect circuit breakers
+  // consistently.
+  skipped_agent_paused: number;
+  // 2026-05-14: distinct counter for downstream Betfair placement failures
+  // (INSUFFICIENT_FUNDS, market unavailable, slippage, etc.). Previously
+  // these were bucketed into `errors`; splitting them out lets the operator
+  // distinguish "Betfair said no" from "code threw".
+  betfair_rejected: number;
   errors: number;
 }
 
@@ -107,6 +117,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     skipped_kickoff_too_far: 0,
     skipped_adaptive_negative_kelly: 0,
     skipped_adaptive_wilson_lcb_negative: 0,
+    skipped_agent_paused: 0,
+    betfair_rejected: 0,
     errors: 0,
   };
 
@@ -380,6 +392,20 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           continue;
         }
 
+        // 2026-05-14: also honour agent_status circuit breakers. paused_streak
+        // (consecutive-loss halt), paused_daily and paused_weekly all gate
+        // production-track placement in the trading cycle via forceShadowOnly.
+        // The lazy-promote rail must respect the same signal — the same loss
+        // distribution that fired the breaker covers candidates here too. Keep
+        // lazy-promote logically equivalent to a "fresh emission via
+        // placePaperBet"; not honouring agent_status lets thousands of pending
+        // shadow bets quietly route live while the trading cycle has stopped.
+        const agentStatus = await getConfig("agent_status");
+        if (agentStatus !== null && agentStatus !== "running") {
+          result.skipped_agent_paused++;
+          continue;
+        }
+
         // Look up match identity for placeLiveBetOnBetfair.
         const matchRow = await db.execute(sql`
           SELECT home_team, away_team, betfair_event_id
@@ -410,12 +436,31 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
         });
 
         if (!placeResult.success || !placeResult.betfairBetId) {
-          // Stays shadow. Compliance event already written by placeLiveBetOnBetfair.
+          // Stays shadow. placeLiveBetOnBetfair may have written its own
+          // compliance event for some failure modes, but not all paths log
+          // (e.g. INSUFFICIENT_FUNDS, market unavailable). Write a dedicated
+          // lazy_promote_placement_failed row so the operator can audit
+          // Betfair-side rejection rates from SQL alone, without scraping
+          // pm2 logs.
           logger.info(
             { betId: r.id, matchId: r.match_id, error: placeResult.error },
             "lazyPromote: live placement failed — bet stays shadow for retry",
           );
-          result.errors++;
+          await db.insert(complianceLogsTable).values({
+            actionType: "lazy_promote_placement_failed",
+            details: {
+              betId: r.id,
+              matchId: r.match_id,
+              marketType: r.market_type,
+              selectionName: r.selection_name,
+              odds, stake, score, edge, bankroll,
+              betfairEventId: m.betfair_event_id,
+              error: placeResult.error ?? null,
+              adaptiveKelly: adaptiveAudit,
+            } as Record<string, unknown>,
+            timestamp: new Date(),
+          } as any);
+          result.betfair_rejected++;
           continue;
         }
 
