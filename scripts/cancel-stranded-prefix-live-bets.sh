@@ -87,7 +87,14 @@ WHERE pb.bet_track = 'live'
   AND pb.betfair_market_id IS NOT NULL
   AND pb.betfair_selection_id IS NOT NULL
   AND pb.status = 'pending'
-  AND pb.betfair_status IN ('EXECUTABLE','PARTIALLY_MATCHED')
+  -- EXECUTABLE only: 0% matched, fully cancellable, slot fully releasable.
+  -- PARTIALLY_MATCHED excluded — its matched stake is committed on Betfair
+  -- regardless, and the post-cancel betfair_status (PARTIAL_ACCEPTED) is
+  -- still in the collapse-guard liveStatuses set, so the slot stays
+  -- blocked. Those settle naturally on kickoff; nothing to gain by
+  -- cancelling the unmatched residual.
+  AND pb.betfair_status = 'EXECUTABLE'
+  AND COALESCE(pb.betfair_size_matched, 0) = 0
   AND m.kickoff_time > NOW()
   AND pb.deleted_at IS NULL
 ORDER BY pb.id;
@@ -143,7 +150,7 @@ while IFS='|' read -r id bf_id sel bf_status matched match_id league kickoff; do
     "SELECT betfair_status FROM paper_bets WHERE id = $id" 2>/dev/null || echo "")
 
   case "$CURRENT_STATUS" in
-    EXECUTABLE|PARTIALLY_MATCHED)
+    EXECUTABLE)
       ;;
     *)
       SKIPPED=$((SKIPPED + 1))
