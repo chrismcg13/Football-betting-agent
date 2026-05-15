@@ -3187,6 +3187,63 @@ export async function runMigrations() {
     `);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_analysis_segment_stats_recent ON analysis_segment_stats(computed_at DESC)`);
 
+    // 2026-05-15 — analysis_exclusion_rules.
+    //
+    // Filters (market_type, bet_track) cohorts out of analysis_segment_stats +
+    // analysis_signal_strength computation when an uncleared rule exists and
+    // the paper_bets row's placed_at is before the rule's cutover timestamp.
+    //
+    // Hard cutover semantics: pre-cutover rows are excluded permanently;
+    // post-cutover rows flow through analysis cleanly. Operator advances the
+    // cutover by updating exclude_placed_before for the row (typically to the
+    // moment the parser fix that addressed the corrupted data was deployed).
+    //
+    // Reversible: DROP TABLE analysis_exclusion_rules removes the gate
+    // entirely with zero touch on paper_bets. No backward-compat shims
+    // needed elsewhere — the analysisJobs.ts NOT EXISTS clauses become
+    // vacuously true.
+    //
+    // Audit trail: cleared_at / cleared_by capture when an operator decides
+    // a rule is no longer needed (vs. updating exclude_placed_before which
+    // keeps the rule active but advances the cutover).
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS analysis_exclusion_rules (
+        id                    SERIAL PRIMARY KEY,
+        market_type           TEXT NOT NULL,
+        bet_track             TEXT NOT NULL CHECK (bet_track IN ('live','shadow','paper')),
+        exclude_placed_before TIMESTAMPTZ NOT NULL,
+        reason                TEXT NOT NULL,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_by            TEXT,
+        cleared_at            TIMESTAMPTZ,
+        cleared_by            TEXT,
+        UNIQUE (market_type, bet_track)
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_aer_market_track
+        ON analysis_exclusion_rules (market_type, bet_track)
+        WHERE cleared_at IS NULL
+    `);
+
+    // Initial six rules: AH / OU_15 / OU_05 × {live, shadow}. The
+    // exclude_placed_before timestamp = NOW() at migration time, which
+    // means ALL existing paper_bets rows for these markets are excluded
+    // until the operator advances the cutover post parser-fix-deploy.
+    // ON CONFLICT DO NOTHING so repeat migrations are idempotent.
+    await db.execute(sql`
+      INSERT INTO analysis_exclusion_rules
+        (market_type, bet_track, exclude_placed_before, reason, created_by)
+      VALUES
+        ('ASIAN_HANDICAP','live',   NOW(), 'AH catalogue parser bug — exchangeBookSweep.ts:155 collapses N×2 runners onto Home -4/Away +4 labels with prices from one line bound to label of another. Fabricated edge signal.', 'parser-bug-2026-05-15'),
+        ('ASIAN_HANDICAP','shadow', NOW(), 'AH catalogue parser bug — exchangeBookSweep.ts:155 collapses N×2 runners onto Home -4/Away +4 labels with prices from one line bound to label of another. Fabricated edge signal.', 'parser-bug-2026-05-15'),
+        ('OVER_UNDER_15', 'live',   NOW(), 'OU_15 fingerprint match (77-85 pct win rate at 43 pct implied) — audit pending', 'parser-bug-2026-05-15'),
+        ('OVER_UNDER_15', 'shadow', NOW(), 'OU_15 fingerprint match (77-85 pct win rate at 43 pct implied) — audit pending', 'parser-bug-2026-05-15'),
+        ('OVER_UNDER_05', 'live',   NOW(), 'OU_05 fingerprint match (75 pct win rate at 46 pct implied, n=20 small but same pattern)', 'parser-bug-2026-05-15'),
+        ('OVER_UNDER_05', 'shadow', NOW(), 'OU_05 fingerprint match (75 pct win rate at 46 pct implied, n=20 small but same pattern)', 'parser-bug-2026-05-15')
+      ON CONFLICT (market_type, bet_track) DO NOTHING
+    `);
+
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS analysis_signal_strength (
         computed_at          TIMESTAMPTZ NOT NULL,

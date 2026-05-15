@@ -149,6 +149,19 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
       -- wins) which dominates the per-market priors CTE below and
       -- inflates shrunk_roi for low-n shadow segments. Drop them.
       AND pb.bet_track IN ('live', 'shadow')
+      -- 2026-05-15: analysis_exclusion_rules. Filters out rows from
+      -- (market_type, bet_track) pairs that have an uncleared exclusion
+      -- rule AND were placed before the rule's cutover. Hard cutover:
+      -- pre-cutover rows excluded permanently, post-cutover rows flow.
+      -- Operator advances the cutover by updating
+      -- analysis_exclusion_rules.exclude_placed_before for the row.
+      AND NOT EXISTS (
+        SELECT 1 FROM analysis_exclusion_rules r
+        WHERE r.market_type = pb.market_type
+          AND r.bet_track   = pb.bet_track
+          AND r.cleared_at IS NULL
+          AND pb.placed_at < r.exclude_placed_before
+      )
     GROUP BY m.league, pb.market_type, pb.bet_track
   `);
   const segmentRows = (segmentInsert as { rowCount: number }).rowCount ?? 0;
@@ -324,6 +337,17 @@ async function runMarketTypeAggregatePass(
       AND pb.deleted_at IS NULL
       AND pb.status IN ('won', 'lost')
       AND pb.bet_track IN ('live', 'shadow')
+      -- 2026-05-15: respect analysis_exclusion_rules (same semantics as
+      -- the per-scope INSERT). Pre-cutover rows on excluded (market_type,
+      -- bet_track) are filtered out before the market-type aggregate is
+      -- computed.
+      AND NOT EXISTS (
+        SELECT 1 FROM analysis_exclusion_rules r
+        WHERE r.market_type = pb.market_type
+          AND r.bet_track   = pb.bet_track
+          AND r.cleared_at IS NULL
+          AND pb.placed_at < r.exclude_placed_before
+      )
   `);
   const rows = ((raw as unknown) as {
     rows?: Array<{
