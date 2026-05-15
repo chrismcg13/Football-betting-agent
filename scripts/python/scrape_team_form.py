@@ -37,13 +37,19 @@ from typing import Optional
 import pandas as pd
 import psycopg2
 
-# Force unbuffered stderr so per-step diagnostic logs flush to the
-# parent (api-server) process line-by-line. Without this, Python uses
-# block buffering when stderr is a pipe (not a TTY) and intermediate
-# INFO logs get trapped in the buffer until process exit — which can
-# wipe everything off the wrapper's 2KB stderrTail window. Same fix as
-# in scrape_fotmob_women.py.
 sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+
+# Earlier runs landed exitCode=0 / 4 min duration / 0 rows in the DB
+# AND a stderrTail showing only the first LOG.info line. The python
+# `logging` module is being hijacked downstream — likely by
+# seleniumbase / soccerdata reconfiguring handlers at FBref-reader
+# init. Sidestep entirely: write diagnostic checkpoints via plain
+# `print(..., file=sys.stderr, flush=True)`. Nothing in third-party
+# code can redirect sys.stderr writes.
+def _log(msg: str, level: str = "INFO") -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} {level} scrape_team_form: {msg}", file=sys.stderr, flush=True)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,24 +117,23 @@ def scrape_fbref_team_stats(season: str) -> pd.DataFrame:
         LOG.error("soccerdata not installed — pip install soccerdata>=1.9.0")
         raise
 
-    LOG.info("Initialising FBref reader for season %s, %d leagues: %s",
-             season, len(FBREF_LEAGUES), FBREF_LEAGUES)
+    _log(f"Initialising FBref reader for season {season}, {len(FBREF_LEAGUES)} leagues: {FBREF_LEAGUES}")
     fbref = sd.FBref(leagues=FBREF_LEAGUES, seasons=season)
-    LOG.info("FBref reader initialised; fetching standard team_season_stats")
+    _log("FBref reader initialised; fetching standard team_season_stats")
     try:
         # standard season-to-date team stats — soccerdata returns a
         # MultiIndex df indexed by (league, season, team).
         df = fbref.read_team_season_stats(stat_type="standard")
     except Exception as e:
-        LOG.warning("FBref standard team_season_stats failed: %s", e)
+        _log(f"FBref standard team_season_stats failed: {type(e).__name__}: {e}", "WARN")
         return pd.DataFrame()
 
     if df is None or df.empty:
-        LOG.warning("FBref returned empty DataFrame")
+        _log("FBref returned empty DataFrame", "WARN")
         return pd.DataFrame()
-    LOG.info("FBref returned %d rows; columns=%s", len(df), list(df.columns)[:20])
+    _log(f"FBref returned {len(df)} rows; columns={list(df.columns)[:20]}")
     df = df.reset_index()
-    LOG.info("After reset_index: columns=%s", list(df.columns)[:20])
+    _log(f"After reset_index: columns={list(df.columns)[:20]}")
     return df
 
 
@@ -138,12 +143,12 @@ def main() -> int:
         LOG.error("DATABASE_URL not set"); return 2
 
     season = os.environ.get("SCRAPE_SEASON") or current_season_code()
-    LOG.info("Using season=%s", season)
+    _log(f"Using season={season}")
 
     snapshot_date = datetime.now(timezone.utc).date()
     df = scrape_fbref_team_stats(season)
     if df.empty:
-        LOG.warning("Nothing to write — exiting cleanly"); return 0
+        _log("Nothing to write — exiting cleanly", "WARN"); return 0
 
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -163,9 +168,9 @@ def main() -> int:
     # FBref actually returned — column names, types, sample values.
     if len(df) > 0:
         sample = df.iloc[0].to_dict()
-        LOG.info("Sample FBref row keys: %s", list(sample.keys())[:30])
-        LOG.info("Sample FBref row values (first 10 cols): %s",
-                 {k: str(v)[:40] for k, v in list(sample.items())[:10]})
+        _log(f"Sample FBref row keys: {list(sample.keys())[:30]}")
+        _log(f"Sample FBref row values (first 10 cols): "
+             f"{ {k: str(v)[:40] for k, v in list(sample.items())[:10]} }")
 
     with conn.cursor() as cur:
         for _, row in df.iterrows():
@@ -242,11 +247,9 @@ def main() -> int:
                 continue
     conn.commit()
     conn.close()
-    LOG.info(
-        "FBref scrape complete: inserted=%d updated=%d "
-        "skipped_no_league=%d skipped_no_team=%d snapshot_date=%s",
-        inserted, updated, skipped_no_league, skipped_no_team, snapshot_date,
-    )
+    _log(f"FBref scrape complete: inserted={inserted} updated={updated} "
+         f"skipped_no_league={skipped_no_league} skipped_no_team={skipped_no_team} "
+         f"snapshot_date={snapshot_date}")
     return 0
 
 

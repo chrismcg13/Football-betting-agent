@@ -45,6 +45,17 @@ import psycopg2
 # default block-buffered stderr when stderr is a pipe (not a TTY).
 sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
 
+
+# Same hijack-resistance fix as in scrape_team_form.py — diagnostic
+# checkpoints write via plain print(..., file=sys.stderr, flush=True)
+# rather than through the logging module, which gets reconfigured
+# downstream by soccerdata / seleniumbase and silently drops INFO
+# messages off the wrapper's stderrTail.
+def _log(msg: str, level: str = "INFO") -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} {level} scrape_fotmob_women: {msg}", file=sys.stderr, flush=True)
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s scrape_fotmob_women: %(message)s",
@@ -116,9 +127,9 @@ def scrape_fotmob_schedules(season: str) -> pd.DataFrame:
     # naming patterns — soccerdata's catalogue is the truth.
     try:
         all_fotmob_leagues = sd.FotMob().available_leagues()
-        LOG.info("FotMob exposes %d total leagues in soccerdata catalogue", len(all_fotmob_leagues))
+        _log(f"FotMob exposes {len(all_fotmob_leagues)} total leagues in soccerdata catalogue")
     except Exception as e:
-        LOG.warning("Could not enumerate FotMob.available_leagues(): %s", e)
+        _log(f"Could not enumerate FotMob.available_leagues(): {type(e).__name__}: {e}", "WARN")
         all_fotmob_leagues = []
 
     # Print the women's-relevant subset so the operator can see exactly
@@ -127,7 +138,7 @@ def scrape_fotmob_schedules(season: str) -> pd.DataFrame:
         w in k.lower() for w in ("women", "wsl", "nwsl", "frauen", "femin", "liga f",
                                   "damallsvenskan", "toppserien", "kvinde")
     )]
-    LOG.info("FotMob women's-relevant keys (%d): %s", len(women_keys), women_keys)
+    _log(f"FotMob women's-relevant keys ({len(women_keys)}): {women_keys}")
 
     # Match our candidates against the catalogue (case-insensitive substring)
     candidates_to_try: list[str] = []
@@ -138,42 +149,42 @@ def scrape_fotmob_schedules(season: str) -> pd.DataFrame:
     for k in women_keys:
         if k not in candidates_to_try:
             candidates_to_try.append(k)
-    LOG.info("Will attempt %d FotMob leagues this run", len(candidates_to_try))
+    _log(f"Will attempt {len(candidates_to_try)} FotMob leagues this run: {candidates_to_try}")
 
     frames: list[pd.DataFrame] = []
     accepted: list[str] = []
     rejected: list[tuple[str, str]] = []
 
     for league in candidates_to_try:
-        LOG.info("FotMob: attempting %s ...", league)
+        _log(f"FotMob: attempting {league} ...")
         try:
             fotmob = sd.FotMob(leagues=league, seasons=season)
             sched = fotmob.read_schedule()
             if sched is None or sched.empty:
-                LOG.info("FotMob %s: empty schedule (off-season or no data)", league)
+                _log(f"FotMob {league}: empty schedule (off-season or no data)")
                 continue
             df = sched.reset_index()
             df["fotmob_league_key"] = league
             frames.append(df)
             accepted.append(league)
-            LOG.info("FotMob %s: %d matches", league, len(df))
+            _log(f"FotMob {league}: {len(df)} matches")
         except ValueError as e:
             msg = str(e).split("\n")[0][:200]
-            LOG.warning("FotMob %s: ValueError %s", league, msg)
+            _log(f"FotMob {league}: ValueError {msg}", "WARN")
             rejected.append((league, msg))
         except Exception as e:
             msg = f"{type(e).__name__}: {str(e)[:200]}"
-            LOG.warning("FotMob %s: %s", league, msg)
+            _log(f"FotMob {league}: {msg}", "WARN")
             rejected.append((league, msg))
 
-    LOG.info("FotMob summary: accepted=%d rejected=%d", len(accepted), len(rejected))
+    _log(f"FotMob summary: accepted={len(accepted)} rejected={len(rejected)}")
     if accepted:
-        LOG.info("Accepted leagues: %s", accepted)
+        _log(f"Accepted leagues: {accepted}")
     if rejected:
         for lg, err in rejected[:10]:
-            LOG.info("  rejected[%s] = %s", lg, err)
+            _log(f"  rejected[{lg}] = {err}")
     if not frames:
-        LOG.warning("FotMob: 0 leagues returned data")
+        _log("FotMob: 0 leagues returned data", "WARN")
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
@@ -184,13 +195,13 @@ def main() -> int:
         LOG.error("DATABASE_URL not set"); return 2
 
     season = os.environ.get("SCRAPE_SEASON") or current_season_code()
-    LOG.info("Using season=%s", season)
+    _log(f"Using season={season}")
 
     df = scrape_fotmob_schedules(season)
     if df.empty:
-        LOG.warning("Nothing to write — exiting cleanly"); return 0
+        _log("Nothing to write — exiting cleanly", "WARN"); return 0
 
-    LOG.info("FotMob total rows across leagues: %d", len(df))
+    _log(f"FotMob total rows across leagues: {len(df)}")
 
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -262,8 +273,8 @@ def main() -> int:
                 continue
     conn.commit()
     conn.close()
-    LOG.info("FotMob scrape complete: inserted=%d updated=%d skipped_no_xg=%d",
-             inserted, updated, skipped_no_xg)
+    _log(f"FotMob scrape complete: inserted={inserted} updated={updated} "
+         f"skipped_no_xg={skipped_no_xg}")
     return 0
 
 
