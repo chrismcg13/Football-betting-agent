@@ -288,23 +288,121 @@ export async function runExchangeBookSweep(
       if (!ctx) continue;
       if (book.status !== "OPEN") continue;
 
+      // 2026-05-15 — AH parser fix from probe data (#step 6).
+      //
+      // Betfair returns ASIAN_HANDICAP (and ALT_TOTAL_GOALS) as
+      // ASIAN_HANDICAP_DOUBLE_LINE: ONE market per event with N×2 runners,
+      // each at a distinct (team, handicap) pair. The two unique selectionIds
+      // correspond to the two teams; the per-runner handicap field carries
+      // the line.
+      //
+      // Pre-fix bug: the old runner loop used
+      //   catalogue.runners.find(r => r.selectionId === book.selectionId)
+      // which returned the FIRST runner per selectionId — always sortPriority
+      // 1 or 2, always handicap ±maxLine (±4 on Betfair football). Every
+      // distinct book runner collapsed onto the ±4 labels. Combined with a
+      // strict name-match fallback that only resolved sortPriority 1/2, this
+      // produced the chronic odds_snapshots state we observed (only Home -4
+      // and Away +4 written, all other lines dropped to null).
+      //
+      // Fix: for DOUBLE_LINE markets, establish home/away selectionId mapping
+      // ONCE per market (name match preferred, sortPriority order fallback),
+      // then label each book runner directly from its (selectionId → side,
+      // handicap → line) pair. Bypasses deriveSelectionName's catRunner
+      // lookup entirely for AH/ATG.
+      const isDoubleLineMarket =
+        ctx.bfMarketType === "ASIAN_HANDICAP" ||
+        ctx.bfMarketType === "ALT_TOTAL_GOALS";
+
+      let homeSelectionId: number | null = null;
+      let awaySelectionId: number | null = null;
+      if (isDoubleLineMarket) {
+        const homeTeamLower = ctx.match.homeTeam.toLowerCase();
+        const awayTeamLower = ctx.match.awayTeam.toLowerCase();
+        const catRunners = ctx.catalogue.runners ?? [];
+        // Pass 1: exact name match
+        for (const r of catRunners) {
+          const nameLower = r.runnerName.trim().toLowerCase();
+          if (homeSelectionId === null && nameLower === homeTeamLower) {
+            homeSelectionId = r.selectionId;
+          }
+          if (awaySelectionId === null && nameLower === awayTeamLower) {
+            awaySelectionId = r.selectionId;
+          }
+        }
+        // Pass 2: prefix / contains match (handles "Torque" vs "Atletico Torque")
+        if (homeSelectionId === null || awaySelectionId === null) {
+          for (const r of catRunners) {
+            const nameLower = r.runnerName.trim().toLowerCase();
+            if (homeSelectionId === null && (
+              homeTeamLower.includes(nameLower) || nameLower.includes(homeTeamLower)
+            )) homeSelectionId = r.selectionId;
+            if (awaySelectionId === null && (
+              awayTeamLower.includes(nameLower) || nameLower.includes(awayTeamLower)
+            )) awaySelectionId = r.selectionId;
+          }
+        }
+        // Pass 3: sortPriority order (Betfair convention: first unique
+        // selectionId by sortPriority is home, second is away)
+        if (homeSelectionId === null || awaySelectionId === null) {
+          const sorted = [...catRunners].sort((a, b) => a.sortPriority - b.sortPriority);
+          const uniqueIds: number[] = [];
+          for (const r of sorted) {
+            if (!uniqueIds.includes(r.selectionId)) {
+              uniqueIds.push(r.selectionId);
+              if (uniqueIds.length === 2) break;
+            }
+          }
+          if (homeSelectionId === null) homeSelectionId = uniqueIds[0] ?? null;
+          if (awaySelectionId === null) awaySelectionId = uniqueIds[1] ?? null;
+        }
+        // Defensive: if we somehow still can't resolve, the same selectionId
+        // got assigned to both. Reject — better to skip than mislabel.
+        if (homeSelectionId === awaySelectionId) {
+          homeSelectionId = null;
+          awaySelectionId = null;
+        }
+      }
+
       for (const runner of book.runners) {
         if (runner.status !== "ACTIVE") continue;
         const back = runner.ex?.availableToBack?.[0]?.price;
         const lay = runner.ex?.availableToLay?.[0]?.price;
         if (back == null && lay == null) continue;
 
-        const catRunner = ctx.catalogue.runners?.find(
-          (r) => r.selectionId === runner.selectionId,
-        );
-        if (!catRunner) continue;
+        let selectionName: string | null = null;
 
-        const selectionName = deriveSelectionName(
-          ctx.bfMarketType,
-          catRunner,
-          ctx.match.homeTeam,
-          ctx.match.awayTeam,
-        );
+        if (isDoubleLineMarket) {
+          if (homeSelectionId === null || awaySelectionId === null) continue;
+          const handicap = runner.handicap;
+          if (handicap == null) continue;
+          const sign = handicap > 0 ? "+" : "";
+          const lineStr = `${sign}${handicap}`;
+          if (runner.selectionId === homeSelectionId) {
+            selectionName = ctx.bfMarketType === "ASIAN_HANDICAP"
+              ? `Home ${lineStr}`
+              : `Over ${handicap}`;  // ALT_TOTAL_GOALS — over from home/total perspective
+          } else if (runner.selectionId === awaySelectionId) {
+            selectionName = ctx.bfMarketType === "ASIAN_HANDICAP"
+              ? `Away ${lineStr}`
+              : `Under ${handicap}`;
+          } else {
+            continue;
+          }
+        } else {
+          // Non-DOUBLE_LINE markets — original lookup path. selectionId
+          // alone identifies the runner.
+          const catRunner = ctx.catalogue.runners?.find(
+            (r) => r.selectionId === runner.selectionId,
+          );
+          if (!catRunner) continue;
+          selectionName = deriveSelectionName(
+            ctx.bfMarketType,
+            catRunner,
+            ctx.match.homeTeam,
+            ctx.match.awayTeam,
+          );
+        }
         if (!selectionName) continue;
 
         try {
