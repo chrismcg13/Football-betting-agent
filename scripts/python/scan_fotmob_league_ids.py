@@ -75,36 +75,40 @@ def fetch(session: requests.Session, url: str, timeout: int = 12) -> Optional[re
 
 
 def strategy_a_sitemap(session: requests.Session) -> list[tuple[int, str]]:
-    """Probe known sitemap locations + robots.txt for any league URLs."""
-    _log("Strategy A: sitemap.xml probes")
+    """Hit the leagues-specific sitemap directly. The first run's
+    robots.txt enumeration discovered FotMob ships per-language
+    sitemaps at /sitemap/<lang>/leagues.xml — but iterating all ~40
+    language variants serially was eating 8+ minutes before reaching
+    parse. Single English fetch is enough; leagues are language-
+    agnostic (same IDs across all locales)."""
+    _log("Strategy A: leagues-specific sitemap direct fetch")
     found: dict[int, str] = {}
     candidate_urls = [
+        # Direct leagues-sitemap URLs FotMob actually publishes
+        # (discovered via robots.txt enumeration on the previous run).
+        "https://www.fotmob.com/sitemap/en/leagues.xml",
+        "https://www.fotmob.com/sitemap/leagues.xml",
+        # Last-resort generic sitemap candidates
         "https://www.fotmob.com/sitemap.xml",
         "https://www.fotmob.com/sitemap_leagues.xml",
-        "https://www.fotmob.com/sitemap-leagues.xml",
-        "https://www.fotmob.com/robots.txt",
     ]
     for url in candidate_urls:
-        resp = fetch(session, url)
+        resp = fetch(session, url, timeout=15)
         if resp is None or resp.status_code != 200:
             _log(f"  {url} → {resp.status_code if resp else 'err'}")
             continue
         body = resp.text or ""
         _log(f"  {url} → 200 ({len(body)} chars)")
-        # If it's robots.txt, extract any Sitemap: declarations to follow
-        if "robots.txt" in url:
-            for m in re.finditer(r"Sitemap:\s*(\S+)", body, re.IGNORECASE):
-                ext_url = m.group(1).strip()
-                _log(f"    robots references sitemap: {ext_url}")
-                ext_resp = fetch(session, ext_url)
-                if ext_resp and ext_resp.status_code == 200:
-                    body += ext_resp.text
-        # Find /leagues/ID/ patterns anywhere in the body
-        for m in re.finditer(r"/leagues/(\d+)/([a-z0-9\-]+)?", body):
+        # Find /leagues/ID/<slug> patterns in any sitemap XML or page.
+        # The slug carries the league name, e.g. "/leagues/9229/frauen-bundesliga".
+        for m in re.finditer(r"/leagues/(\d+)/?([a-z0-9\-]+)?", body):
             lid = int(m.group(1))
             slug = m.group(2) or ""
             if lid not in found:
                 found[lid] = slug
+        if found:
+            _log(f"  parsed {len(found)} unique league IDs from this sitemap")
+            break  # one successful sitemap is enough
     return [(lid, slug) for lid, slug in found.items()]
 
 
