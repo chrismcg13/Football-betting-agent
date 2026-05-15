@@ -2565,6 +2565,26 @@ export function startSettlementCron(): void {
   // wired for manual re-attempts on quieter FBref windows.
   logger.info("Team-form scraper cron DISABLED — FBref blocking Selenium (see Phase 2c pivot)");
 
+  // Phase 2c (2026-05-15) — SQL-only team_form_scrape aggregator.
+  // Replaces the broken FBref/FotMob scraper paths with a source-
+  // agnostic aggregator over xg_match_data (Understat men's,
+  // StatsBomb women's tournaments, plus anything we add later).
+  // Tue 05:00 UTC — same slot the original FBref scraper would
+  // have used. Runs in seconds; no external HTTP.
+  cron.schedule("0 5 * * 2", () => {
+    logger.info("Team-form aggregator triggered (Tuesday 05:00 UTC)");
+    void (async () => {
+      try {
+        const { runTeamFormAggregation } = await import("./teamFormAggregator");
+        const r = await runTeamFormAggregation();
+        logger.info(r, "Team-form aggregator complete");
+      } catch (err) {
+        logger.error({ err }, "Team-form aggregator failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Team-form aggregator scheduler active — Tuesdays 05:00 UTC");
+
   // Phase 2b FotMob scraper cron DISABLED 2026-05-15:
   // soccerdata 1.9 dropped FotMob entirely (catalogue lists
   // [ClubElo, ESPN, FBref, MatchHistory, SoFIFA, Sofascore, Understat,

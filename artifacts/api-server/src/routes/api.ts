@@ -6134,6 +6134,23 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
+// Phase 2c (2026-05-15) — SQL-only team_form_scrape aggregator.
+// Replaces the broken FBref + FotMob scraper paths. Computes
+// season-aggregate xG / matches / goals per (source × league ×
+// season × team) from xg_match_data. Source-agnostic: any new
+// xg_match_data feed lands in team_form_scrape automatically on the
+// next aggregation. Idempotent UPSERT on the unique index.
+router.post("/admin/run-team-form-aggregate", async (_req, res) => {
+  try {
+    const { runTeamFormAggregation } = await import("../services/teamFormAggregator");
+    const r = await runTeamFormAggregation();
+    res.json({ ok: true, ...r });
+  } catch (err) {
+    logger.error({ err }, "Team-form aggregation failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 2f (2026-05-15) — direct FBref season-stats scraper via
 // cloudscraper. Bypasses the Cloudflare wall that blocked the
 // Selenium-based soccerdata path. Writes to team_form_scrape with
