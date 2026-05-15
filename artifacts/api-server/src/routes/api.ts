@@ -6291,6 +6291,23 @@ router.post("/admin/normalize-statsbomb-and-refresh-xg", async (_req, res) => {
   }
 });
 
+// Phase 3b (2026-05-15) — StatsBomb open-data men's ingest. Pulls
+// FIFA WC 2022 + UEFA Euro 2024 + UEFA Euro 2020 + CL finals + various
+// other men's tournaments from raw.githubusercontent.com. Directly
+// relevant for FIFA WC 2026 (~5 weeks away) — all 48 qualified
+// nationals have prior-tournament xG history in this corpus. No cron
+// — operator-fired only.
+router.post("/admin/run-statsbomb-mens-ingest", async (_req, res) => {
+  try {
+    const { runStatsbombMensIngest } = await import("../services/statsbombMensIngestionCron");
+    const r = await runStatsbombMensIngest();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "Manual StatsBomb men's ingest run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 3 (2026-05-15) — cleanup pre-cutoff StatsBomb rows. The
 // initial ingest pulled 540 women's-football match summaries
 // including FAWSL 2018/19-2020/21, NWSL 2018 and Women's WC 2019 —

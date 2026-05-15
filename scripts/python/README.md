@@ -15,6 +15,7 @@ return non-zero on error so the wrapper logs it.
 | `scrape_fotmob_women.py` | **deprecated 2026-05-15** — soccerdata 1.9 dropped FotMob; replaced by `scrape_fotmob_direct.py` | manual admin endpoint kept for legacy testing |
 | `scrape_fotmob_direct.py` | manual (initially); will become weekly Sun cron once verified | `xg_match_data` source='fotmob' — WSL/NWSL/Frauen-Bundesliga/Liga F/D1 Féminine/Serie A Femminile/Damallsvenskan/Toppserien/Kvindeligaen/A-League W via FotMob's public /api endpoints |
 | `ingest_statsbomb_women.py` | manual (per-season) | `xg_match_data` source='statsbomb' (Women's WC, Women's Euro — tournament-only) |
+| `ingest_statsbomb_mens.py` | manual (per-tournament) | `xg_match_data` source='statsbomb' (Men's WC 2022, Euro 2024, Euro 2020, CL finals — directly relevant for FIFA WC 2026) |
 | `shap_drift.py` | Daily 03:30 | `shap_drift_runs` |
 | `feature_attribution.py` | 1st of month 04:30 | `feature_attribution`, `feature_lifecycle` |
 | `compute_market_correlations.py` | 1st of month 04:45 | `market_correlation_matrix` |
