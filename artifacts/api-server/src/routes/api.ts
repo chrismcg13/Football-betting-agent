@@ -6167,6 +6167,64 @@ router.post("/admin/run-statsbomb-ingest", async (_req, res) => {
   }
 });
 
+// Phase 2d (2026-05-15) — normalize the 126 existing StatsBomb rows
+// retroactively and refresh team_xg_rolling. computeTeamXGRolling
+// aggregates xg_match_data by exact team_name match; StatsBomb's
+// "<Country> Women's" / "WNT <Country>" spellings never match the
+// matches table's "<Country> W" convention, so without this step the
+// 126 rows we just kept are inert — the home_xg_proxy / away_xg_proxy
+// features stay 0 for upcoming women's international fixtures and the
+// model can't see the new signal.
+//
+// Two SQL phases:
+//   1. UPDATE source='statsbomb' rows with normalised team_name +
+//      league_name (matching the script's new normalize_*() helpers).
+//   2. Trigger computeTeamXGRolling() so the rolled-up
+//      team_xg_rolling rows land under the API-Football spellings
+//      and the feature engine can join them to live fixtures.
+router.post("/admin/normalize-statsbomb-and-refresh-xg", async (_req, res) => {
+  try {
+    const { db } = await import("@workspace/db");
+    // Apply the same normalisation rules in SQL that the Python
+    // helpers apply at ingest time. Keep it idempotent — re-runs are
+    // safe; once normalised the predicates don't re-match.
+    const teamUpdate = (await db.execute(sql`
+      UPDATE xg_match_data
+      SET home_team = CASE
+            WHEN home_team LIKE '% Women''s' THEN regexp_replace(home_team, ' Women''s$', ' W')
+            WHEN home_team LIKE 'Women''s %' THEN substring(home_team from 9) || ' W'
+            WHEN home_team LIKE 'WNT %' THEN substring(home_team from 5) || ' W'
+            ELSE home_team
+          END,
+          away_team = CASE
+            WHEN away_team LIKE '% Women''s' THEN regexp_replace(away_team, ' Women''s$', ' W')
+            WHEN away_team LIKE 'Women''s %' THEN substring(away_team from 9) || ' W'
+            WHEN away_team LIKE 'WNT %' THEN substring(away_team from 5) || ' W'
+            ELSE away_team
+          END,
+          league = CASE
+            WHEN league = 'Women''s World Cup' THEN 'FIFA Women''s World Cup'
+            ELSE league
+          END
+      WHERE source = 'statsbomb'
+    `)) as unknown as { rowCount?: number };
+
+    const { computeTeamXGRolling } = await import("../services/xgIngestionService");
+    const t0 = Date.now();
+    await computeTeamXGRolling();
+    const rollupDurationMs = Date.now() - t0;
+
+    res.json({
+      ok: true,
+      rowsTouched: teamUpdate.rowCount ?? 0,
+      rollupDurationMs,
+    });
+  } catch (err) {
+    logger.error({ err }, "Normalize StatsBomb + refresh xg failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 3 (2026-05-15) — cleanup pre-cutoff StatsBomb rows. The
 // initial ingest pulled 540 women's-football match summaries
 // including FAWSL 2018/19-2020/21, NWSL 2018 and Women's WC 2019 —

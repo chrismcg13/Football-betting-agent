@@ -94,6 +94,32 @@ def _season_start_year(season_name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+# Phase 2d (2026-05-15): name reconciliation. StatsBomb uses
+# "<Country> Women's" / "WNT <Country>"; the matches table follows
+# API-Football's convention "<Country> W". Without this normalization
+# at ingest time, computeTeamXGRolling produces team_xg_rolling rows
+# keyed on StatsBomb spellings that never match a bet fixture's
+# home_team / away_team, so the data is structurally inert.
+def normalize_team_name(name: str) -> str:
+    if not name:
+        return name
+    if name.endswith(" Women's"):
+        return name[: -len(" Women's")] + " W"
+    if name.startswith("Women's "):
+        return name[len("Women's "):] + " W"
+    if name.startswith("WNT "):
+        return name[len("WNT "):] + " W"
+    return name
+
+
+# Phase 2d: align StatsBomb league names to API-Football's matches
+# convention so home_xg_proxy / away_xg_proxy joins by league work.
+def normalize_league_name(name: str) -> str:
+    if name == "Women's World Cup":
+        return "FIFA Women's World Cup"
+    return name
+
+
 def fetch_json(url: str) -> Optional[Any]:
     try:
         resp = _session.get(url, timeout=HTTP_TIMEOUT)
@@ -210,8 +236,8 @@ def main() -> int:
                         skipped_already += 1
                         continue
 
-                    home = (m.get("home_team") or {}).get("home_team_name") or ""
-                    away = (m.get("away_team") or {}).get("away_team_name") or ""
+                    home = normalize_team_name((m.get("home_team") or {}).get("home_team_name") or "")
+                    away = normalize_team_name((m.get("away_team") or {}).get("away_team_name") or "")
                     home_g = m.get("home_score")
                     away_g = m.get("away_score")
                     match_date = m.get("match_date") or ""
@@ -258,7 +284,9 @@ def main() -> int:
                         ON CONFLICT (id) DO NOTHING
                         """,
                         (
-                            sb_id, home, away, comp_name, season_name, match_date,
+                            sb_id, home, away,
+                            normalize_league_name(comp_name),
+                            season_name, match_date,
                             round(home_xg, 4), round(away_xg, 4),
                             home_g, away_g,
                             home_g is not None and away_g is not None,
