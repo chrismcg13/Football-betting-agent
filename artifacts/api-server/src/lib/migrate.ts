@@ -3810,9 +3810,25 @@ export async function runMigrations() {
         decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    // Phase 1e (2026-05-15): per-scope decision. Add api_football_id
+    // column + replace the single (market_type, gender, layer) unique
+    // index with two partial indexes — one for per-scope rows
+    // (api_football_id NOT NULL), one for aggregate fallback
+    // (api_football_id IS NULL).
     await db.execute(sql`
-      CREATE UNIQUE INDEX IF NOT EXISTS model_layer_enabled_scope_uq
+      ALTER TABLE model_layer_enabled
+        ADD COLUMN IF NOT EXISTS api_football_id INTEGER
+    `);
+    await db.execute(sql`DROP INDEX IF EXISTS model_layer_enabled_scope_uq`);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS model_layer_enabled_per_scope_uq
+        ON model_layer_enabled (market_type, gender, layer, api_football_id)
+        WHERE api_football_id IS NOT NULL
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS model_layer_enabled_aggregate_uq
         ON model_layer_enabled (market_type, gender, layer)
+        WHERE api_football_id IS NULL
     `);
 
     logger.info("Phase 1a tables ready: scoreline_correlation, model_layer_enabled");

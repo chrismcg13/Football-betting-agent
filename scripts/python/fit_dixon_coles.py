@@ -503,16 +503,50 @@ def main() -> int:
     rho_by_scope = {api_id: p["rho"] for api_id, p in posterior_by_scope.items()}
 
     decisions: list[dict] = []
-    for gender in ("male", "female"):
-        cell_df = bdf[bdf["gender"] == gender]
-        result = backtest_cell(cell_df, rho_by_scope)
+
+    # Phase 1e (2026-05-15): per-scope backtest. The aggregate
+    # (market_type, gender) cell was masking real per-scope signal —
+    # EPL ρ ≈ −0.105 vs Serie A ρ ≈ −0.036, but aggregating diluted
+    # both. Now we backtest each (gender × api_football_id) cell
+    # individually, write per-scope rows to model_layer_enabled, AND
+    # keep an aggregate-level row as the fallback for scopes that
+    # don't have enough bets to backtest on their own.
+    for (gender, api_id), scope_bdf in bdf.groupby(["gender", "api_football_id"]):
+        if len(scope_bdf) < MIN_SAMPLES_PER_BACKTEST_CELL:
+            continue
+        result = backtest_cell(scope_bdf, rho_by_scope)
         if result is None:
-            LOG.info("Backtest cell (AH, %s): insufficient bets (%d)", gender, len(cell_df))
             continue
         ll_baseline, ll_layer, n = result
         enabled = ll_layer < ll_baseline
         LOG.info(
-            "Backtest cell (AH, %s, n=%d): baseline=%.5f layer=%.5f enabled=%s",
+            "Per-scope backtest (AH, %s, scope=%d, n=%d): baseline=%.5f layer=%.5f enabled=%s",
+            gender, int(api_id), n, ll_baseline, ll_layer, enabled,
+        )
+        copula = "sarmanov" if gender == "female" else "dixon_coles"
+        decisions.append({
+            "market_type": "ASIAN_HANDICAP",
+            "gender": gender,
+            "layer": copula,
+            "api_football_id": int(api_id),
+            "enabled": enabled,
+            "log_loss_baseline": ll_baseline,
+            "log_loss_with_layer": ll_layer,
+            "n_backtest_bets": n,
+        })
+
+    # Aggregate-level decision as fallback for scopes that didn't
+    # backtest individually (n < MIN_SAMPLES_PER_BACKTEST_CELL).
+    for gender in ("male", "female"):
+        cell_df = bdf[bdf["gender"] == gender]
+        result = backtest_cell(cell_df, rho_by_scope)
+        if result is None:
+            LOG.info("Backtest aggregate (AH, %s): insufficient bets (%d)", gender, len(cell_df))
+            continue
+        ll_baseline, ll_layer, n = result
+        enabled = ll_layer < ll_baseline
+        LOG.info(
+            "Aggregate backtest (AH, %s, n=%d): baseline=%.5f layer=%.5f enabled=%s",
             gender, n, ll_baseline, ll_layer, enabled,
         )
         copula = "sarmanov" if gender == "female" else "dixon_coles"
@@ -520,32 +554,35 @@ def main() -> int:
             "market_type": "ASIAN_HANDICAP",
             "gender": gender,
             "layer": copula,
+            "api_football_id": None,  # aggregate row
             "enabled": enabled,
             "log_loss_baseline": ll_baseline,
             "log_loss_with_layer": ll_layer,
             "n_backtest_bets": n,
         })
 
-    # 6. Write model_layer_enabled rows (UPSERT).
-    LOG.info("Writing %d rows to model_layer_enabled", len(decisions))
+    # 6. Replace model_layer_enabled rows for ASIAN_HANDICAP atomically.
+    # Same delete-then-insert pattern as scoreline_correlation in
+    # Phase 1b — stale per-scope rows from prior fits get cleaned up
+    # rather than leaving orphans.
+    LOG.info("Replacing model_layer_enabled rows for ASIAN_HANDICAP (%d new)", len(decisions))
     with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM model_layer_enabled WHERE market_type = 'ASIAN_HANDICAP'"
+        )
         for d in decisions:
             cur.execute(
                 """
                 INSERT INTO model_layer_enabled
-                  (market_type, gender, layer, enabled,
+                  (market_type, gender, layer, api_football_id, enabled,
                    log_loss_baseline, log_loss_with_layer, n_backtest_bets,
                    decided_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (market_type, gender, layer) DO UPDATE
-                SET enabled = EXCLUDED.enabled,
-                    log_loss_baseline = EXCLUDED.log_loss_baseline,
-                    log_loss_with_layer = EXCLUDED.log_loss_with_layer,
-                    n_backtest_bets = EXCLUDED.n_backtest_bets,
-                    decided_at = NOW()
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 """,
                 (
-                    d["market_type"], d["gender"], d["layer"], d["enabled"],
+                    d["market_type"], d["gender"], d["layer"],
+                    d.get("api_football_id"),
+                    d["enabled"],
                     d["log_loss_baseline"], d["log_loss_with_layer"],
                     d["n_backtest_bets"],
                 ),

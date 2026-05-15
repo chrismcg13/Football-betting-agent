@@ -8,6 +8,7 @@ import {
   numeric,
   integer,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
@@ -28,16 +29,27 @@ export const modelLayerEnabledTable = pgTable(
     marketType: text("market_type").notNull(),
     gender: text("gender").notNull(), // 'male' | 'female'
     layer: text("layer").notNull(),    // 'dixon_coles' | 'sarmanov' | future
+    // Phase 1e (2026-05-15): per-scope decision. NULL = aggregate row,
+    // used as fallback when a scope doesn't have its own backtest
+    // verdict (n_backtest_bets < MIN_SAMPLES_PER_BACKTEST_CELL).
+    // INTEGER = competition_config.api_football_id keyed row.
+    apiFootballId: integer("api_football_id"),
     enabled: boolean("enabled").notNull(),
-    // Backtest provenance — log-loss before/after the layer was applied
-    // on the cell's historical bets. Null pre-Phase-1c.
     logLossBaseline: numeric("log_loss_baseline", { precision: 8, scale: 6 }),
     logLossWithLayer: numeric("log_loss_with_layer", { precision: 8, scale: 6 }),
     nBacktestBets: integer("n_backtest_bets"),
     decidedAt: timestamp("decided_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex("model_layer_enabled_scope_uq").on(t.marketType, t.gender, t.layer),
+    // Two partial unique indexes — one for per-scope rows, one for
+    // aggregate (api_football_id IS NULL) rows. Avoids the trip-up
+    // of treating NULL as a distinct value in a regular unique index.
+    uniqueIndex("model_layer_enabled_per_scope_uq")
+      .on(t.marketType, t.gender, t.layer, t.apiFootballId)
+      .where(sql`api_football_id IS NOT NULL`),
+    uniqueIndex("model_layer_enabled_aggregate_uq")
+      .on(t.marketType, t.gender, t.layer)
+      .where(sql`api_football_id IS NULL`),
   ],
 );
 

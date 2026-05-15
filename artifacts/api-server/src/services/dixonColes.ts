@@ -44,13 +44,21 @@ async function loadLayerEnabledMap(): Promise<Map<string, boolean>> {
   const map = new Map<string, boolean>();
   try {
     const rows = (await db.execute(sql`
-      SELECT market_type, gender, layer, enabled
+      SELECT market_type, gender, layer, api_football_id, enabled
       FROM model_layer_enabled
     `)) as unknown as {
-      rows: Array<{ market_type: string; gender: string; layer: string; enabled: boolean }>;
+      rows: Array<{
+        market_type: string; gender: string; layer: string;
+        api_football_id: number | null; enabled: boolean;
+      }>;
     };
     for (const r of rows.rows ?? []) {
-      map.set(`${r.market_type}|${r.gender}|${r.layer}`, r.enabled === true);
+      // Phase 1e (2026-05-15): per-scope rows keyed by api_football_id;
+      // aggregate fallback rows keyed under sentinel "*".
+      const scopeKey = r.api_football_id != null
+        ? `${r.market_type}|${r.gender}|${r.layer}|${r.api_football_id}`
+        : `${r.market_type}|${r.gender}|${r.layer}|*`;
+      map.set(scopeKey, r.enabled === true);
     }
   } catch (err) {
     logger.warn({ err }, "model_layer_enabled load failed — defaulting all layers off");
@@ -111,10 +119,17 @@ export async function loadDixonColesContext(matchId: number): Promise<DcMatchCon
   const layerMap = await loadLayerEnabledMap();
   const enabledByMarketType = new Map<string, boolean>();
   for (const mt of ["ASIAN_HANDICAP", "OVER_UNDER_15"]) {
-    enabledByMarketType.set(
-      mt,
-      layerMap.get(`${mt}|${gender}|${copulaKind}`) === true,
-    );
+    // Phase 1e: per-scope decision first, aggregate fallback. If a
+    // scope has its own backtest verdict (n_backtest_bets ≥ 30) the
+    // per-scope row wins; otherwise consult the aggregate row.
+    let enabled: boolean | undefined;
+    if (cc?.api_football_id != null) {
+      enabled = layerMap.get(`${mt}|${gender}|${copulaKind}|${cc.api_football_id}`);
+    }
+    if (enabled === undefined) {
+      enabled = layerMap.get(`${mt}|${gender}|${copulaKind}|*`);
+    }
+    enabledByMarketType.set(mt, enabled === true);
   }
 
   const ctx: DcMatchContext = { rho, copulaKind, gender, enabledByMarketType };
