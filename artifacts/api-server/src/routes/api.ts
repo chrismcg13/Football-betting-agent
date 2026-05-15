@@ -6291,6 +6291,141 @@ router.post("/admin/normalize-statsbomb-and-refresh-xg", async (_req, res) => {
   }
 });
 
+// Phase 0.6 (2026-05-15) — seed the 48 FIFA World Cup 2026 qualified
+// nationals into the teams + team_aliases tables. The teams table
+// was added in Phase 0a but never seeded; this endpoint fills it
+// with the canonical 48-team list (per olympics.com + Wikipedia
+// 2026 FIFA World Cup tracking) plus the common naming variants
+// each source uses (API-Football, StatsBomb, FotMob).
+//
+// Why now: WC 2026 ~5 weeks away. Phase 0 enabled has_betfair_exchange
+// on all 6 WC Qualifier confederations + the WC itself. When matches
+// for these teams start firing, the model needs reliable team-name
+// → canonical resolution. Without this seed, every fixture's
+// home_team/away_team string gets handled as an unknown.
+router.post("/admin/seed-wc-2026-teams", async (_req, res) => {
+  try {
+    const { db } = await import("@workspace/db");
+    // 48 qualified nationals: 3 hosts + 16 UEFA + 6 CONMEBOL + 9 AFC
+    // + 10 CAF + 3 other CONCACAF + 1 OFC = 48.
+    // Each entry: [canonicalName, country, fifaCode, [aliases]]
+    // First alias is API-Football convention (matches our matches
+    // table); subsequent aliases cover StatsBomb / FotMob / common
+    // spelling variants.
+    const teams: Array<[string, string, string, string[]]> = [
+      // Hosts
+      ["USA", "USA", "USA", ["United States", "USA", "United States of America"]],
+      ["Canada", "Canada", "CAN", ["Canada"]],
+      ["Mexico", "Mexico", "MEX", ["Mexico"]],
+      // UEFA (16)
+      ["England", "England", "ENG", ["England"]],
+      ["France", "France", "FRA", ["France"]],
+      ["Spain", "Spain", "ESP", ["Spain"]],
+      ["Germany", "Germany", "GER", ["Germany"]],
+      ["Netherlands", "Netherlands", "NED", ["Netherlands", "Holland"]],
+      ["Portugal", "Portugal", "POR", ["Portugal"]],
+      ["Norway", "Norway", "NOR", ["Norway"]],
+      ["Scotland", "Scotland", "SCO", ["Scotland"]],
+      ["Belgium", "Belgium", "BEL", ["Belgium"]],
+      ["Austria", "Austria", "AUT", ["Austria"]],
+      ["Croatia", "Croatia", "CRO", ["Croatia"]],
+      ["Switzerland", "Switzerland", "SUI", ["Switzerland"]],
+      ["Bosnia and Herzegovina", "Bosnia and Herzegovina", "BIH", ["Bosnia", "Bosnia & Herzegovina", "Bosnia-Herzegovina"]],
+      ["Sweden", "Sweden", "SWE", ["Sweden"]],
+      ["Türkiye", "Turkey", "TUR", ["Turkey", "Türkiye"]],
+      ["Czechia", "Czech Republic", "CZE", ["Czech Republic", "Czechia", "Czech-Republic"]],
+      // CONMEBOL (6)
+      ["Argentina", "Argentina", "ARG", ["Argentina"]],
+      ["Brazil", "Brazil", "BRA", ["Brazil"]],
+      ["Uruguay", "Uruguay", "URU", ["Uruguay"]],
+      ["Colombia", "Colombia", "COL", ["Colombia"]],
+      ["Paraguay", "Paraguay", "PAR", ["Paraguay"]],
+      ["Ecuador", "Ecuador", "ECU", ["Ecuador"]],
+      // AFC (9, incl. Jordan + Uzbekistan debutants)
+      ["Iran", "Iran", "IRN", ["Iran", "Iran Islamic Republic"]],
+      ["Japan", "Japan", "JPN", ["Japan"]],
+      ["Korea Republic", "South Korea", "KOR", ["South Korea", "South-Korea", "Korea Republic", "Republic of Korea"]],
+      ["Australia", "Australia", "AUS", ["Australia"]],
+      ["Qatar", "Qatar", "QAT", ["Qatar"]],
+      ["Saudi Arabia", "Saudi Arabia", "KSA", ["Saudi Arabia", "Saudi-Arabia"]],
+      ["Iraq", "Iraq", "IRQ", ["Iraq"]],
+      ["Jordan", "Jordan", "JOR", ["Jordan"]],
+      ["Uzbekistan", "Uzbekistan", "UZB", ["Uzbekistan"]],
+      // CAF (10, incl. Cape Verde debutant)
+      ["Morocco", "Morocco", "MAR", ["Morocco"]],
+      ["Tunisia", "Tunisia", "TUN", ["Tunisia"]],
+      ["Algeria", "Algeria", "ALG", ["Algeria"]],
+      ["Senegal", "Senegal", "SEN", ["Senegal"]],
+      ["Cameroon", "Cameroon", "CMR", ["Cameroon"]],
+      ["Côte d'Ivoire", "Côte d'Ivoire", "CIV", ["Ivory Coast", "Ivory-Coast", "Côte d'Ivoire", "Cote d'Ivoire"]],
+      ["Egypt", "Egypt", "EGY", ["Egypt"]],
+      ["Ghana", "Ghana", "GHA", ["Ghana"]],
+      ["Nigeria", "Nigeria", "NGA", ["Nigeria"]],
+      ["Cape Verde", "Cape Verde", "CPV", ["Cape Verde", "Cabo Verde"]],
+      // CONCACAF (3 in addition to hosts)
+      ["Jamaica", "Jamaica", "JAM", ["Jamaica"]],
+      ["Panama", "Panama", "PAN", ["Panama"]],
+      ["Curaçao", "Curaçao", "CUW", ["Curacao", "Curaçao"]],
+      // OFC (1)
+      ["New Zealand", "New Zealand", "NZL", ["New Zealand", "New-Zealand"]],
+    ];
+
+    let teamsInserted = 0;
+    let teamsUpdated = 0;
+    let aliasesInserted = 0;
+
+    for (const [canonical, country, fifaCode, aliases] of teams) {
+      const r1 = (await db.execute(sql`
+        INSERT INTO teams
+          (canonical_name, country, gender, is_national_team, fifa_code)
+        VALUES (${canonical}, ${country}, 'male', true, ${fifaCode})
+        ON CONFLICT (canonical_name, gender) DO UPDATE SET
+          country = EXCLUDED.country,
+          is_national_team = true,
+          fifa_code = EXCLUDED.fifa_code
+        RETURNING id, (xmax = 0) AS inserted
+      `)) as unknown as { rows: Array<{ id: number; inserted: boolean }> };
+      const teamRow = r1.rows?.[0];
+      if (!teamRow) continue;
+      if (teamRow.inserted) teamsInserted++;
+      else teamsUpdated++;
+
+      // Seed aliases per source. Best-guess source assignments:
+      //   API-Football fixtures use the first alias (matches table)
+      //   StatsBomb / FotMob use the canonical name itself
+      for (const alias of aliases) {
+        const r2 = (await db.execute(sql`
+          INSERT INTO team_aliases (team_id, source, alias)
+          VALUES (${teamRow.id}, 'api_football', ${alias})
+          ON CONFLICT (source, alias) DO NOTHING
+        `)) as unknown as { rowCount?: number };
+        aliasesInserted += r2.rowCount ?? 0;
+      }
+      // Also tag the canonical name under statsbomb + fotmob sources
+      // so direct StatsBomb / FotMob lookups resolve.
+      for (const source of ["statsbomb", "fotmob"]) {
+        const r3 = (await db.execute(sql`
+          INSERT INTO team_aliases (team_id, source, alias)
+          VALUES (${teamRow.id}, ${source}, ${canonical})
+          ON CONFLICT (source, alias) DO NOTHING
+        `)) as unknown as { rowCount?: number };
+        aliasesInserted += r3.rowCount ?? 0;
+      }
+    }
+
+    res.json({
+      ok: true,
+      totalTeamsSeed: teams.length,
+      teamsInserted,
+      teamsUpdated,
+      aliasesInserted,
+    });
+  } catch (err) {
+    logger.error({ err }, "WC 2026 team seed failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 3b (2026-05-15) — StatsBomb open-data men's ingest. Pulls
 // FIFA WC 2022 + UEFA Euro 2024 + UEFA Euro 2020 + CL finals + various
 // other men's tournaments from raw.githubusercontent.com. Directly
