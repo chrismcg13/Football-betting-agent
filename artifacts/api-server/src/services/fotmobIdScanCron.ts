@@ -39,7 +39,7 @@ export interface FotmobIdScanResult {
   scriptExists: boolean;
 }
 
-export async function runFotmobIdScan(): Promise<FotmobIdScanResult> {
+export async function runFotmobIdScan(strategy: string = "all"): Promise<FotmobIdScanResult> {
   const startedAt = Date.now();
   const repoRoot = discoverRepoRoot();
   const pythonBin = path.isAbsolute(PYTHON_BIN)
@@ -72,11 +72,19 @@ export async function runFotmobIdScan(): Promise<FotmobIdScanResult> {
   }
 
   return new Promise<FotmobIdScanResult>((resolve) => {
-    const child = spawn(pythonBin, [scriptPath], {
+    const args = strategy && strategy !== "all"
+      ? [scriptPath, `--strategy=${strategy}`]
+      : [scriptPath];
+    const child = spawn(pythonBin, args, {
       cwd: repoRoot,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // Hard 6-minute timeout — kill the child if it hangs so the
+    // admin endpoint never blocks beyond that.
+    const killTimer = setTimeout(() => {
+      try { child.kill("SIGTERM"); } catch {}
+    }, 6 * 60 * 1000);
 
     let stderrBuf = "";
     let spawnErrorMsg: string | undefined;
@@ -107,6 +115,7 @@ export async function runFotmobIdScan(): Promise<FotmobIdScanResult> {
     });
 
     child.on("exit", (code) => {
+      clearTimeout(killTimer);
       const durationMs = Date.now() - startedAt;
       resolve({
         exitCode: code ?? -1,

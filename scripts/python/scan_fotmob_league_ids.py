@@ -157,58 +157,52 @@ def strategy_b_daily_matches(session: requests.Session, days: int = 30) -> list[
 
 
 def strategy_c_brute_scan(session: requests.Session, lo: int = 9000, hi: int = 10500,
-                          throttle_secs: float = 0.35) -> list[tuple[int, str]]:
-    """Sweep /api/leagues/{id} across an ID range. Known IDs:
-       WSL=9227, NWSL=9134, Liga F=9682, Serie A Femminile=9213.
-       Their cluster suggests women's leagues live in 9000-10500."""
-    _log(f"Strategy C: brute-force scan {lo}-{hi} (~{int((hi - lo) * throttle_secs)} sec at {1.0/throttle_secs:.1f} req/s)")
+                          workers: int = 8) -> list[tuple[int, str]]:
+    """Sweep /api/leagues/{id} across an ID range using a thread pool.
+       Workers fetch in parallel; the per-request HTTP overhead is
+       the bottleneck (FotMob has been responsive). With 8 workers
+       and 1500 requests this finishes in ~30s instead of ~8 min."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    _log(f"Strategy C: parallel brute scan {lo}-{hi} ({hi - lo + 1} requests, {workers} workers)")
     found: dict[int, str] = {}
     found_women: dict[int, str] = {}
-    consecutive_errs = 0
-    for lid in range(lo, hi + 1):
+
+    def _probe_one(lid: int) -> tuple[int, Optional[str]]:
         url = f"https://www.fotmob.com/api/leagues/{lid}"
         try:
-            resp = session.get(url, timeout=8)
+            resp = session.get(url, timeout=6)
         except Exception:
-            consecutive_errs += 1
-            if consecutive_errs >= 10:
-                _log(f"  10 consecutive errors at id={lid} — backing off, breaking", "WARN")
-                break
-            time.sleep(2.0)
-            continue
-        consecutive_errs = 0
-        if resp.status_code == 429:
-            _log(f"  id={lid}: 429 rate-limited, backing off 30s", "WARN")
-            time.sleep(30)
-            continue
+            return (lid, None)
         if resp.status_code != 200:
-            time.sleep(throttle_secs)
-            continue
+            return (lid, None)
         try:
             data = resp.json()
         except Exception:
-            time.sleep(throttle_secs)
-            continue
-        # Name can live at various paths in the league response
+            return (lid, None)
         name = None
         if isinstance(data, dict):
             details = data.get("details") or data.get("leagueDetails") or {}
             if isinstance(details, dict):
                 name = details.get("name") or details.get("leagueName")
             name = name or data.get("name") or data.get("leagueName")
-        if not isinstance(name, str) or not name:
-            time.sleep(throttle_secs)
-            continue
-        found[lid] = name
-        name_lower = name.lower()
-        if any(k in name_lower for k in WOMEN_KEYWORDS):
-            found_women[lid] = name
-            _log(f"  id={lid}: women's-keyword hit: {name!r}")
-        # Don't log every non-women hit, just every 100th progress marker
-        if lid % 100 == 0:
-            _log(f"  ...id={lid}: found {len(found)} total, {len(found_women)} women's so far")
-        time.sleep(throttle_secs)
-    _log(f"  scan complete: {len(found)} total leagues, {len(found_women)} women's matches")
+        return (lid, name if isinstance(name, str) and name else None)
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_probe_one, lid) for lid in range(lo, hi + 1)]
+        for fut in as_completed(futures):
+            lid, name = fut.result()
+            completed += 1
+            if name:
+                found[lid] = name
+                name_lower = name.lower()
+                if any(k in name_lower for k in WOMEN_KEYWORDS):
+                    found_women[lid] = name
+                    _log(f"  id={lid}: women's hit: {name!r}")
+            if completed % 250 == 0:
+                _log(f"  progress: {completed}/{len(futures)} probed, "
+                     f"{len(found)} total found, {len(found_women)} women's")
+    _log(f"  scan complete: {len(found)} total leagues, {len(found_women)} women's")
     return [(lid, name) for lid, name in found_women.items()]
 
 
@@ -228,10 +222,22 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    # 2026-05-15: --strategy CLI arg allows running each strategy
+    # independently (admin endpoints split per strategy). Default
+    # "all" runs every strategy sequentially as before, but Strategy
+    # C is now parallelized so total runtime is ~60-90s instead of
+    # ~8 min.
+    strategy_filter = "all"
+    for arg in sys.argv[1:]:
+        if arg.startswith("--strategy="):
+            strategy_filter = arg.split("=", 1)[1].lower()
+            break
+    _log(f"Running strategies: {strategy_filter}")
+
     all_candidates: list[tuple[int, str]] = []
 
     # Strategy A — fast probe
-    a_results = strategy_a_sitemap(session)
+    a_results = strategy_a_sitemap(session) if strategy_filter in ("all", "a", "sitemap") else []
     if a_results:
         _log(f"Strategy A found {len(a_results)} league entries")
         # sitemap entries are (id, slug); the slug is usually a clue
@@ -241,7 +247,8 @@ def main() -> int:
             all_candidates.append((lid, slug_normalized))
 
     # Strategy B — medium probe (30 days × 3 endpoint variants, throttled)
-    b_results = strategy_b_daily_matches(session, days=30)
+    b_results = (strategy_b_daily_matches(session, days=30)
+                 if strategy_filter in ("all", "b", "daily-matches") else [])
     if b_results:
         _log(f"Strategy B found {len(b_results)} unique leagues via daily-matches")
         all_candidates.extend(b_results)
@@ -252,9 +259,10 @@ def main() -> int:
     interim_hit_count = sum(1 for v in interim.values() if v)
     _log(f"After Strategies A+B: {interim_hit_count}/{len(TARGET_NAMES)} targets matched")
 
-    if interim_hit_count < len(TARGET_NAMES):
-        # Strategy C — brute force (slowest, last resort)
-        c_results = strategy_c_brute_scan(session, lo=9000, hi=10500, throttle_secs=0.35)
+    if (strategy_filter in ("c", "brute")
+            or (strategy_filter == "all" and interim_hit_count < len(TARGET_NAMES))):
+        # Strategy C — parallel brute scan, ~30-60s
+        c_results = strategy_c_brute_scan(session, lo=9000, hi=10500, workers=8)
         if c_results:
             _log(f"Strategy C found {len(c_results)} women's-keyword leagues via ID scan")
             all_candidates.extend(c_results)

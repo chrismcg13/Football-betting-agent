@@ -6134,18 +6134,18 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
-// FotMob multi-strategy ID scan (Phase 2j, 2026-05-15). After search
-// API + master directory + HTML scrape all dead-ended, this script
-// tries 3 more angles: (a) sitemap.xml probes, (b) daily-matches
-// harvest across last 30 days (extracts leagueId from every fixture
-// regardless of which league), (c) brute-force ID range scan 9000-
-// 10500 (where the 4 known women's IDs cluster). Up to ~10 min
-// synchronous; read-only.
-router.post("/admin/run-fotmob-id-scan", async (_req, res) => {
+// FotMob multi-strategy ID scan (Phase 2j, 2026-05-15). Optional
+// `strategy` body param ('a'|'sitemap'|'b'|'daily-matches'|
+// 'c'|'brute'|'all', default 'all'). Strategy C is now parallelized
+// (~30-60s) and there's a hard 6-min kill timer on the child
+// process so the endpoint can't hang forever. Read-only; never
+// writes the DB.
+router.post("/admin/run-fotmob-id-scan", async (req, res) => {
   try {
+    const strategy = String((req.body ?? {}).strategy ?? "all");
     const { runFotmobIdScan } = await import("../services/fotmobIdScanCron");
-    const r = await runFotmobIdScan();
-    res.json({ ok: r.exitCode === 0, ...r });
+    const r = await runFotmobIdScan(strategy);
+    res.json({ ok: r.exitCode === 0, strategy, ...r });
   } catch (err) {
     logger.error({ err }, "FotMob id scan failed");
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
