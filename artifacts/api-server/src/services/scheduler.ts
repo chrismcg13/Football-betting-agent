@@ -2550,28 +2550,20 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Dixon-Coles fitter scheduler active — Mondays 05:00 UTC");
 
-  // Phase 2a (2026-05-14) — team-form scraper (FBref season stats).
-  // Tue 05:00 UTC weekly — one day after the Mon Python sidecar burst
-  // so the three Python crons (calibration / Dixon-Coles / team-form)
-  // don't compete for the .venv subprocess slot. soccerdata caches
-  // HTTP responses on disk so subsequent runs within the same week
-  // (manual triggers via /admin/run-team-form-scrape) are essentially
-  // free outside the cache TTL.
-  cron.schedule("0 5 * * 2", () => {
-    logger.info("Team-form scraper triggered (Tuesday 05:00 UTC)");
-    void (async () => {
-      try {
-        const r = await runPythonCron("team_form_scrape", async () => {
-          const { runTeamFormScrape } = await import("./teamFormScrapeCron");
-          return runTeamFormScrape();
-        });
-        logger.info(r, "Team-form scraper complete");
-      } catch (err) {
-        logger.error({ err }, "Team-form scraper failed");
-      }
-    })();
-  }, { timezone: "UTC" });
-  logger.info("Team-form scraper scheduler active — Tuesdays 05:00 UTC");
+  // Phase 2a (2026-05-14) — team-form scraper. CRON DISABLED 2026-05-15:
+  // FBref is actively blocking Selenium-driven requests with a
+  // Cloudflare ConnectionError ("Could not download
+  // https://fbref.com/en/comps/.") even with Chrome installed on the
+  // VPS. Workaround paths under consideration:
+  //   (a) seleniumbase --undetected mode + retry-with-backoff
+  //   (b) residential proxy
+  //   (c) pivot — drop FBref entirely and compute team_form_scrape
+  //       from aggregations of xg_match_data (Understat for men's,
+  //       FotMob for women's once Phase 2b lands).
+  // Path (c) is the cleaner architecture — no second-source scraper to
+  // maintain. The admin endpoint /admin/run-team-form-scrape stays
+  // wired for manual re-attempts on quieter FBref windows.
+  logger.info("Team-form scraper cron DISABLED — FBref blocking Selenium (see Phase 2c pivot)");
 
   // Phase 2b (2026-05-14) — FotMob women's match-xG scraper.
   // Wed 05:00 UTC weekly — last in the Python sidecar cascade

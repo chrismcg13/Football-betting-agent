@@ -113,20 +113,54 @@ def _to_float(v) -> Optional[float]:
         return None
 
 
+def _resolve_fotmob_class():
+    """soccerdata 1.9 doesn't expose FotMob at the top level
+    (`sd.FotMob` → AttributeError). Try every plausible import path and
+    log `dir(soccerdata)` if all fail so the operator can see what
+    this version of soccerdata actually exports."""
+    try:
+        from soccerdata import FotMob  # type: ignore
+        _log("FotMob resolved via `from soccerdata import FotMob`")
+        return FotMob
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from soccerdata.fotmob import FotMob  # type: ignore
+        _log("FotMob resolved via `from soccerdata.fotmob import FotMob`")
+        return FotMob
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from soccerdata._fotmob import FotMob  # type: ignore
+        _log("FotMob resolved via `from soccerdata._fotmob import FotMob`")
+        return FotMob
+    except (ImportError, AttributeError):
+        pass
+    import soccerdata
+    avail = sorted(a for a in dir(soccerdata) if not a.startswith("_") and a[0].isupper())
+    _log(f"Could not import FotMob. soccerdata exports: {avail}", "WARN")
+    return None
+
+
 def scrape_fotmob_schedules(season: str) -> pd.DataFrame:
     """Try each candidate league individually. Returns combined DataFrame."""
     try:
-        import soccerdata as sd
+        import soccerdata  # noqa: F401
     except ImportError:
-        LOG.error("soccerdata not installed — pip install soccerdata>=1.9.0")
+        _log("soccerdata not installed — pip install soccerdata>=1.9.0", "WARN")
         raise
+
+    FotMob = _resolve_fotmob_class()
+    if FotMob is None:
+        _log("FotMob class unavailable — exiting Phase 2b cleanly", "WARN")
+        return pd.DataFrame()
 
     # Probe soccerdata's actual FotMob allow-list so we can intersect
     # our candidate list against it and skip the per-league exception
     # path entirely. The candidate list above is best-guess based on
     # naming patterns — soccerdata's catalogue is the truth.
     try:
-        all_fotmob_leagues = sd.FotMob().available_leagues()
+        all_fotmob_leagues = FotMob().available_leagues()
         _log(f"FotMob exposes {len(all_fotmob_leagues)} total leagues in soccerdata catalogue")
     except Exception as e:
         _log(f"Could not enumerate FotMob.available_leagues(): {type(e).__name__}: {e}", "WARN")
@@ -158,7 +192,7 @@ def scrape_fotmob_schedules(season: str) -> pd.DataFrame:
     for league in candidates_to_try:
         _log(f"FotMob: attempting {league} ...")
         try:
-            fotmob = sd.FotMob(leagues=league, seasons=season)
+            fotmob = FotMob(leagues=league, seasons=season)
             sched = fotmob.read_schedule()
             if sched is None or sched.empty:
                 _log(f"FotMob {league}: empty schedule (off-season or no data)")
