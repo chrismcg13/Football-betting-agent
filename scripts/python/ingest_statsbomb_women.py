@@ -40,8 +40,23 @@ def _log(msg: str, level: str = "INFO") -> None:
 
 
 STATSBOMB_BASE = "https://raw.githubusercontent.com/statsbomb/open-data/master/data"
-HTTP_TIMEOUT = 30
+HTTP_TIMEOUT = 15
 HTTP_HEADERS = {"User-Agent": "football-betting-agent statsbomb-ingest/1.0"}
+
+# Per-run hard cap on matches processed. StatsBomb open-data spans
+# ~800 women's matches × ~2-5 MB event JSON each = potentially several
+# GB to download. The first attempt hung 20+ min on the VPS before the
+# operator killed it. With this cap the run is bounded; the operator
+# re-fires the admin endpoint repeatedly until the backlog clears (the
+# already_ingested short-circuit means each subsequent run only fetches
+# the next 100 unseen matches).
+MAX_MATCHES_PER_RUN = int(os.environ.get("STATSBOMB_MAX_MATCHES", "100"))
+
+# Single HTTP session for connection pooling + keep-alive. Without
+# this, every fetch_json() opens a fresh TLS handshake — adds ~200ms
+# per request on average.
+_session = requests.Session()
+_session.headers.update(HTTP_HEADERS)
 
 # Competitions we want — filtered by gender='female' or known women's
 # tournament names. StatsBomb's free open-data covers (as of writing):
@@ -62,7 +77,7 @@ WOMEN_COMPETITION_KEYWORDS = (
 
 def fetch_json(url: str) -> Optional[Any]:
     try:
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+        resp = _session.get(url, timeout=HTTP_TIMEOUT)
     except Exception as e:
         _log(f"HTTP error {url}: {type(e).__name__}: {e}", "WARN")
         return None
@@ -120,10 +135,15 @@ def main() -> int:
     skipped_no_events = 0
     skipped_no_xg = 0
     matches_total = 0
+    _log(f"Per-run cap: {MAX_MATCHES_PER_RUN} matches (set STATSBOMB_MAX_MATCHES env to override)")
+    started = datetime.now(timezone.utc)
 
     try:
         with conn.cursor() as cur:
             for comp in women_comps:
+                if inserted >= MAX_MATCHES_PER_RUN:
+                    _log(f"Reached MAX_MATCHES_PER_RUN={MAX_MATCHES_PER_RUN} — re-fire to continue")
+                    break
                 comp_id = comp.get("competition_id")
                 season_id = comp.get("season_id")
                 comp_name = comp.get("competition_name") or "?"
@@ -132,12 +152,16 @@ def main() -> int:
                     continue
 
                 matches_url = f"{STATSBOMB_BASE}/matches/{comp_id}/{season_id}.json"
-                _log(f"Loading matches: {comp_name} {season_name} ({comp_id}/{season_id})")
+                _log(f"Loading matches index: {comp_name} {season_name} ({comp_id}/{season_id})")
                 matches = fetch_json(matches_url)
                 if not matches:
+                    _log(f"  empty matches index — skipping")
                     continue
+                _log(f"  matches index has {len(matches)} entries; checking ingest state...")
 
                 for m in matches:
+                    if inserted >= MAX_MATCHES_PER_RUN:
+                        break
                     matches_total += 1
                     raw_id = m.get("match_id")
                     if raw_id is None:
@@ -153,6 +177,11 @@ def main() -> int:
                     home_g = m.get("home_score")
                     away_g = m.get("away_score")
                     match_date = m.get("match_date") or ""
+
+                    # Per-match progress log BEFORE the events fetch so a hang
+                    # surfaces the offending match_id immediately.
+                    _log(f"  match {raw_id} ({comp_name} {season_name}): "
+                         f"{home} vs {away} {home_g}-{away_g} {match_date} — fetching events")
 
                     # Fetch event-level data and compute per-team xG.
                     events_url = f"{STATSBOMB_BASE}/events/{raw_id}.json"
@@ -198,12 +227,13 @@ def main() -> int:
                         ),
                     )
                     inserted += 1
-                    # Commit every 50 matches so a network drop in the
-                    # middle of a long run doesn't lose all progress.
-                    if inserted % 50 == 0:
-                        conn.commit()
-                        _log(f"Committed batch — total inserted so far: {inserted}")
-        conn.commit()
+                    # Commit every match — at 100 matches per run the
+                    # overhead is negligible and a network drop mid-run
+                    # never loses more than one match's progress.
+                    conn.commit()
+                    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+                    _log(f"  match {raw_id} ingested ({inserted}/{MAX_MATCHES_PER_RUN}) — "
+                         f"home_xg={home_xg:.2f} away_xg={away_xg:.2f} — elapsed={elapsed:.1f}s")
     finally:
         conn.close()
 
