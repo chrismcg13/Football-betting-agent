@@ -41,7 +41,7 @@ import logging
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import lgamma, sqrt
 from typing import Optional
 
@@ -60,6 +60,46 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOG = logging.getLogger("fit_dixon_coles")
+
+# Phase 1d (2026-05-15): mapping from xg_match_data.league string to
+# competition_config.api_football_id. Only includes scopes where the
+# attribution is unambiguous — Understat's Big 5 men's leagues and
+# StatsBomb's tournament corpus. Ambiguous strings (e.g. plain
+# "Premier League" which xg_match_data uses for the English EPL via
+# Understat but competition_config has 31 distinct "Premier League"
+# rows across countries) are NOT mapped here — those rows are dropped
+# from the augmentation rather than risk attributing to the wrong scope.
+XG_LEAGUE_TO_AF_ID: dict[str, int] = {
+    # Understat men's Big 5 (Understat uses these specific tags)
+    "EPL": 39,
+    "La Liga": 140,
+    "Bundesliga": 78,
+    "Serie A": 135,
+    "Ligue 1": 61,
+    # StatsBomb women's tournaments (post-Phase 2d normalization)
+    "FIFA Women's World Cup": 8,
+    "UEFA Women's Euro": 960,
+    # StatsBomb men's tournaments
+    "FIFA World Cup": 1,
+    "Copa America": 9,
+    # Women's domestic (post-Phase 2d normalization to API-Football naming)
+    "FA Women's Super League": 771,
+    "NWSL": 254,
+    # MLS
+    "Major League Soccer": 253,
+}
+
+# Leagues whose gender is unambiguous regardless of team-name suffix
+# heuristics. Used because some women's national teams (Wales,
+# Northern Ireland) don't carry the " W" suffix in xg_match_data, so
+# a suffix-only heuristic would misattribute them to the men's group.
+WOMEN_XG_LEAGUES = frozenset({
+    "FIFA Women's World Cup",
+    "UEFA Women's Euro",
+    "FA Women's Super League",
+    "NWSL",
+})
+
 
 MIN_SAMPLES_PER_SCOPE = 30          # below this, scope contributes nothing to the group posterior.
                                      # Lowered 50 → 30 on 2026-05-14: the whole point of hierarchical
@@ -275,7 +315,93 @@ def main() -> int:
     df = pd.DataFrame(rows)
     if df.empty:
         LOG.warning("No matches in window — exiting"); return 0
-    LOG.info("Loaded %d matches across %d scopes", len(df), df["api_football_id"].nunique())
+    LOG.info("Loaded %d matches across %d scopes from matches table",
+             len(df), df["api_football_id"].nunique())
+
+    # ── Phase 1d (2026-05-15): xg_match_data augmentation ────────────────
+    # The matches table is API-Football-only and structurally thin on
+    # women's tournaments + lower-coverage scopes. xg_match_data has
+    # an extra ~4-5K settled rows from Understat (men's Big 5) and
+    # StatsBomb (women's WC/Euro + men's tournaments). Wire them in so
+    # the DC posterior can produce per-scope ρ for scopes whose
+    # matches-table corpus is too thin to fit alone.
+    cutoff_date = (datetime.now(timezone.utc)
+                   - timedelta(days=ANALYSIS_LOOKBACK_DAYS)).date().isoformat()
+    LOG.info("Loading xg_match_data augmentation (cutoff_date=%s)", cutoff_date)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT home_team, away_team, league, home_goals, away_goals, match_date
+            FROM xg_match_data
+            WHERE is_result = true
+              AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+              AND home_team IS NOT NULL  AND away_team IS NOT NULL
+              AND match_date >= %s
+            """,
+            (cutoff_date,),
+        )
+        xg_rows = cur.fetchall()
+    LOG.info("xg_match_data candidate rows in window: %d", len(xg_rows))
+
+    augment_rows: list[dict] = []
+    league_dropped: dict[str, int] = {}
+    league_kept: dict[str, int] = {}
+    for r in xg_rows:
+        league_str = r.get("league") or ""
+        af_id = XG_LEAGUE_TO_AF_ID.get(league_str)
+        if af_id is None:
+            league_dropped[league_str] = league_dropped.get(league_str, 0) + 1
+            continue
+        home = r["home_team"]; away = r["away_team"]
+        if league_str in WOMEN_XG_LEAGUES:
+            gender = "female"
+        elif home.endswith(" W") or away.endswith(" W"):
+            gender = "female"
+        else:
+            gender = "male"
+        augment_rows.append({
+            "api_football_id": af_id,
+            "gender": gender,
+            "home_team": home,
+            "away_team": away,
+            "home_goals": int(r["home_goals"]),
+            "away_goals": int(r["away_goals"]),
+            # matches table uses 'kickoff_time' (timestamp); we use the
+            # xg_match_data match_date string but pandas will coerce
+            # downstream consumers (read_team_season_stats etc. don't
+            # care about the exact type for the goal-count fit).
+            "kickoff_time": r["match_date"],
+        })
+        league_kept[league_str] = league_kept.get(league_str, 0) + 1
+
+    LOG.info("xg_match_data augmentation: kept %d rows, dropped %d (unmapped leagues)",
+             len(augment_rows), sum(league_dropped.values()))
+    for lg, n in sorted(league_kept.items(), key=lambda kv: -kv[1]):
+        af = XG_LEAGUE_TO_AF_ID[lg]
+        LOG.info("  → kept league=%r af_id=%d count=%d", lg, af, n)
+    if league_dropped:
+        top_dropped = sorted(league_dropped.items(), key=lambda kv: -kv[1])[:5]
+        LOG.info("  top-5 unmapped leagues dropped: %s", top_dropped)
+
+    if augment_rows:
+        aug_df = pd.DataFrame(augment_rows)
+        before = len(df) + len(aug_df)
+        df = pd.concat([df, aug_df], ignore_index=True)
+        # Dedupe by (scope, date, home_team_lower). Cross-source matches
+        # of the same fixture have slightly different team spellings
+        # but identical date+home-side+scope — close enough for dedup
+        # without per-source fuzzy logic.
+        df["_dedup_key"] = (
+            df["api_football_id"].astype(str) + "|"
+            + df["kickoff_time"].astype(str).str[:10] + "|"
+            + df["home_team"].astype(str).str.lower()
+        )
+        df = df.drop_duplicates(subset="_dedup_key", keep="first")
+        df = df.drop(columns="_dedup_key")
+        LOG.info("After xg_match_data augment + dedup: %d rows (was %d before dedup)",
+                 len(df), before)
+    LOG.info("Combined corpus: %d matches across %d scopes",
+             len(df), df["api_football_id"].nunique())
 
     # 2. Per-scope MLE.
     mle_rows: list[dict] = []
