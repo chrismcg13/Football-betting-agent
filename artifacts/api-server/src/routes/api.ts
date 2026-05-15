@@ -6134,6 +6134,24 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
+// FotMob multi-strategy ID scan (Phase 2j, 2026-05-15). After search
+// API + master directory + HTML scrape all dead-ended, this script
+// tries 3 more angles: (a) sitemap.xml probes, (b) daily-matches
+// harvest across last 30 days (extracts leagueId from every fixture
+// regardless of which league), (c) brute-force ID range scan 9000-
+// 10500 (where the 4 known women's IDs cluster). Up to ~10 min
+// synchronous; read-only.
+router.post("/admin/run-fotmob-id-scan", async (_req, res) => {
+  try {
+    const { runFotmobIdScan } = await import("../services/fotmobIdScanCron");
+    const r = await runFotmobIdScan();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "FotMob id scan failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // FotMob league-ID discovery (2026-05-15 follow-up to the endpoint
 // probe). Tries 4 strategies (search API, master directory, /leagues
 // HTML, country-filtered HTML + __NEXT_DATA__ extraction) to find
