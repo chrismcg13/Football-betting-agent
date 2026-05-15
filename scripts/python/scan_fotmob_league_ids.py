@@ -32,7 +32,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-import requests
+import requests  # noqa: F401  (used by all 3 strategies)
 
 
 def _log(msg: str, level: str = "INFO") -> None:
@@ -159,33 +159,69 @@ def strategy_b_daily_matches(session: requests.Session, days: int = 30) -> list[
 def strategy_c_brute_scan(session: requests.Session, lo: int = 9000, hi: int = 10500,
                           workers: int = 8) -> list[tuple[int, str]]:
     """Sweep /api/leagues/{id} across an ID range using a thread pool.
-       Workers fetch in parallel; the per-request HTTP overhead is
-       the bottleneck (FotMob has been responsive). With 8 workers
-       and 1500 requests this finishes in ~30s instead of ~8 min."""
+       2026-05-15 fix: FotMob now serves SPA HTML to direct GETs (the
+       JSON API requires x-mas signing). HTML responses embed the
+       league name in the __NEXT_DATA__ SSR payload — extract that.
+       (Confirmed by Phase 2k wrapper test: WSL=9227 resolves to 'WSL'
+       via this exact path.)"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    _log(f"Strategy C: parallel brute scan {lo}-{hi} ({hi - lo + 1} requests, {workers} workers)")
+    _log(f"Strategy C: parallel brute scan {lo}-{hi} ({hi - lo + 1} requests, {workers} workers) — HTML/__NEXT_DATA__ mode")
     found: dict[int, str] = {}
     found_women: dict[int, str] = {}
+
+    next_data_re = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>', re.DOTALL)
 
     def _probe_one(lid: int) -> tuple[int, Optional[str]]:
         url = f"https://www.fotmob.com/api/leagues/{lid}"
         try:
-            resp = session.get(url, timeout=6)
+            resp = session.get(url, timeout=10)
         except Exception:
             return (lid, None)
         if resp.status_code != 200:
             return (lid, None)
+        body = resp.text or ""
+        # Path 1: try JSON (in case the API is unblocked for this client)
+        if "application/json" in resp.headers.get("content-type", "").lower():
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    details = data.get("details") or data.get("leagueDetails") or {}
+                    name = (details.get("name") if isinstance(details, dict) else None
+                            ) or data.get("name") or data.get("leagueName")
+                    if isinstance(name, str) and name:
+                        return (lid, name)
+            except Exception:
+                pass
+        # Path 2: parse __NEXT_DATA__ from HTML SSR payload (the
+        # primary path post-2026-05-15)
+        m = next_data_re.search(body)
+        if not m:
+            return (lid, None)
         try:
-            data = resp.json()
+            nd = json.loads(m.group(1))
         except Exception:
             return (lid, None)
-        name = None
-        if isinstance(data, dict):
-            details = data.get("details") or data.get("leagueDetails") or {}
-            if isinstance(details, dict):
-                name = details.get("name") or details.get("leagueName")
-            name = name or data.get("name") or data.get("leagueName")
-        return (lid, name if isinstance(name, str) and name else None)
+        pp = (nd.get("props") or {}).get("pageProps") or {}
+        # Probe common shapes — verified WSL via
+        # initialState.leagueOverview.details.name
+        for path_keys in (
+            ("initialState", "leagueOverview", "details", "name"),
+            ("league", "details", "name"),
+            ("leagueOverview", "details", "name"),
+            ("initialState", "league", "name"),
+            ("details", "name"),
+            ("leagueData", "details", "name"),
+        ):
+            cur: Any = pp
+            for k in path_keys:
+                if isinstance(cur, dict):
+                    cur = cur.get(k)
+                else:
+                    cur = None
+                    break
+            if isinstance(cur, str) and cur:
+                return (lid, cur)
+        return (lid, None)
 
     completed = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
