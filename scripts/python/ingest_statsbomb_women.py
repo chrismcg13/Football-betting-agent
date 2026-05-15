@@ -85,13 +85,18 @@ SEASON_CUTOFF_YEAR = int(os.environ.get("STATSBOMB_SEASON_CUTOFF", "2022"))
 
 
 def _season_start_year(season_name: str) -> Optional[int]:
-    """Extract the START year from a StatsBomb season_name string.
-    Formats vary: '2023', '2023/2024', '2024/2025'. Returns the first
-    4-digit number found, or None if the string doesn't contain one.
-    """
+    """Match any plausible football-season year (1900-2099). Earlier
+    version used `\\b(20\\d{2})\\b` which would have let pre-2000
+    competitions through if any matched the women's filter. Fixed
+    2026-05-15 alongside the same bug in ingest_statsbomb_mens.py."""
     import re
-    m = re.search(r"\b(20\d{2})\b", season_name or "")
-    return int(m.group(1)) if m else None
+    if not season_name:
+        return None
+    for m in re.finditer(r"\b(\d{4})\b", season_name):
+        y = int(m.group(1))
+        if 1900 <= y <= 2099:
+            return y
+    return None
 
 
 # Phase 2d (2026-05-15): name reconciliation. StatsBomb uses
@@ -175,14 +180,12 @@ def main() -> int:
     for c in women_comps_all:
         season_name = c.get("season_name") or ""
         start_year = _season_start_year(season_name)
-        if start_year is None:
-            # Defensive — keep ambiguous entries and let the operator audit
-            women_comps.append(c)
-            continue
-        if start_year >= SEASON_CUTOFF_YEAR:
-            women_comps.append(c)
-        else:
+        # Drop on ambiguous AND on pre-cutoff. Matches the safer
+        # men's-script policy fixed in the same commit.
+        if start_year is None or start_year < SEASON_CUTOFF_YEAR:
             dropped_old.append(f"{c.get('competition_name')} {season_name}")
+        else:
+            women_comps.append(c)
     _log(f"Found {len(women_comps_all)} women's (comp, season) entries; "
          f"{len(women_comps)} pass season cutoff ≥{SEASON_CUTOFF_YEAR} (dropped {len(dropped_old)} pre-cutoff)")
     if dropped_old:

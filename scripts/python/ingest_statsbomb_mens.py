@@ -107,8 +107,19 @@ def is_mens_competition(comp: dict) -> bool:
 
 
 def _season_start_year(season_name: str) -> Optional[int]:
-    m = re.search(r"\b(20\d{2})\b", season_name or "")
-    return int(m.group(1)) if m else None
+    """Match any plausible football-season year (1900-2099). Earlier
+    version used `\\b(20\\d{2})\\b` which silently let StatsBomb's WC
+    1970/1974 corpus through — season_name='FIFA World Cup 1974' didn't
+    match the 20XX regex, returned None, hit the keep-on-ambiguous
+    branch, ingested. Fixed 2026-05-15: now any 4-digit year is matched
+    and ambiguous entries DROP rather than keep (safer)."""
+    if not season_name:
+        return None
+    for m in re.finditer(r"\b(\d{4})\b", season_name):
+        y = int(m.group(1))
+        if 1900 <= y <= 2099:
+            return y
+    return None
 
 
 def already_ingested(cur, match_id: str) -> bool:
@@ -133,12 +144,13 @@ def main() -> int:
     for c in mens_all:
         season_name = c.get("season_name") or ""
         sy = _season_start_year(season_name)
-        if sy is None:
-            mens_in_cutoff.append(c)
-        elif sy >= SEASON_CUTOFF_YEAR:
-            mens_in_cutoff.append(c)
-        else:
+        # Drop on ambiguous (None) AND on pre-cutoff. Safer than the
+        # earlier keep-on-ambiguous policy that let WC 1970/1974
+        # through.
+        if sy is None or sy < SEASON_CUTOFF_YEAR:
             dropped_old.append(f"{c.get('competition_name')} {season_name}")
+        else:
+            mens_in_cutoff.append(c)
     _log(f"Found {len(mens_all)} men's (comp, season) entries; "
          f"{len(mens_in_cutoff)} pass season cutoff ≥{SEASON_CUTOFF_YEAR}; "
          f"dropped {len(dropped_old)}")
