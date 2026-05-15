@@ -766,11 +766,10 @@ export async function autoTransitionStaleMatches(): Promise<AutoTransitionResult
     byLeague[key] = (byLeague[key] ?? 0) + 1;
   }
 
-  // 1) Flip match status
+  // 1) Flip match status. matches table has no updated_at column — just SET status.
   await db.execute(sql.raw(`
     UPDATE matches
-    SET status = 'no_result_available',
-        updated_at = NOW()
+    SET status = 'no_result_available'
     WHERE id = ANY(ARRAY[${idListSql}]::int[])
       AND status = 'scheduled'
       AND home_score IS NULL
