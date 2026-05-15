@@ -747,7 +747,19 @@ export async function autoTransitionStaleMatches(): Promise<AutoTransitionResult
     return { matchesTransitioned: 0, betsVoided: 0, byLeague: {} };
   }
 
-  const matchIds = rows.map((r) => r.id);
+  // Sanitize to valid positive integers — id is the primary key, so this
+  // is defence-in-depth against any unexpected payload shape. Then inline
+  // as a PG int[] literal via sql.raw to bypass Drizzle's positional-
+  // record expansion of ANY(${jsArray}). Same fix pattern as
+  // cancel-disabled-market-unmatched.ts (Drizzle bug — Postgres rejects
+  // ANY((a,b,c)) but accepts ANY(ARRAY[a,b,c]::int[])).
+  const matchIds = rows
+    .map((r) => r.id)
+    .filter((n) => Number.isInteger(n) && n > 0);
+  if (matchIds.length === 0) {
+    return { matchesTransitioned: 0, betsVoided: 0, byLeague: {} };
+  }
+  const idListSql = matchIds.join(",");
   const byLeague: Record<string, number> = {};
   for (const r of rows) {
     const key = r.league ?? "__unknown__";
@@ -755,19 +767,19 @@ export async function autoTransitionStaleMatches(): Promise<AutoTransitionResult
   }
 
   // 1) Flip match status
-  await db.execute(sql`
+  await db.execute(sql.raw(`
     UPDATE matches
     SET status = 'no_result_available',
         updated_at = NOW()
-    WHERE id = ANY(${matchIds})
+    WHERE id = ANY(ARRAY[${idListSql}]::int[])
       AND status = 'scheduled'
       AND home_score IS NULL
-  `);
+  `));
 
   // 2) Void-settle attached pending bets — stake refund semantics. No PnL
   // applied (settlement_pnl=0); the existing void-handling in downstream
   // analytics already treats settlement_pnl=0 as a neutral outcome.
-  const voidResult = await db.execute(sql`
+  const voidResult = await db.execute(sql.raw(`
     UPDATE paper_bets
     SET status = 'void',
         settlement_pnl = '0',
@@ -775,11 +787,11 @@ export async function autoTransitionStaleMatches(): Promise<AutoTransitionResult
         gross_pnl = '0',
         commission_amount = '0',
         settled_at = NOW()
-    WHERE match_id = ANY(${matchIds})
+    WHERE match_id = ANY(ARRAY[${idListSql}]::int[])
       AND status IN ('pending','pending_placement')
       AND legacy_regime = false
       AND deleted_at IS NULL
-  `);
+  `));
   const betsVoided = (voidResult as { rowCount?: number }).rowCount ?? 0;
 
   // Audit trail
