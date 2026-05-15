@@ -49,11 +49,11 @@ def _log(msg: str, level: str = "INFO") -> None:
 
 FOTMOB_BASE = "https://www.fotmob.com/api"
 HTTP_TIMEOUT = 15
-# FotMob added bot protection in 2023: the public /api/ endpoints
-# require an X-Mas header (a per-request signed token) OR the request
-# arrives via their own web app referer chain. We try the request 3
-# ways per URL and report which (if any) worked, so this iteration
-# tells us what FotMob accepts today.
+# 2026-05-15 probe (probe_fotmob_endpoints.py) confirmed FotMob moved
+# from query-string `/api/leagues?id=X` (now 404) to path-based REST
+# `/api/leagues/X` (200). Match-detail endpoints (/api/matchDetails,
+# /api/matches/X) were also broken; we auto-discover the working
+# match URL on first contact by trying a list of candidates.
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -61,11 +61,23 @@ HTTP_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.fotmob.com/",
     "Origin": "https://www.fotmob.com",
-    # Public reverse-engineered constant — works on most endpoints
-    # without per-URL signing; FotMob's check accepts ANY non-empty
-    # value for some routes (verified by the open-source pyfotmob).
-    "X-Mas": "eyJib2R5Ijp7InVybCI6Ii9hcGkvbGVhZ3VlcyIsImNvZGUiOjAsImZvbyI6IjAifSwic2lnbmF0dXJlIjoiQUFBIn0=",
 }
+
+# Match-detail URL candidates — tried in order on the FIRST encountered
+# match. Whichever returns 200 with parseable JSON becomes the path
+# for the rest of the run. If all fail, we fall through to HTML
+# scraping of /matches/<id> with __NEXT_DATA__ regex extraction.
+MATCH_DETAIL_URL_CANDIDATES = [
+    "https://www.fotmob.com/api/match/{id}",
+    "https://www.fotmob.com/api/matches/{id}",
+    "https://www.fotmob.com/api/data/match?id={id}",
+    "https://www.fotmob.com/api/data/matchDetails?matchId={id}",
+    "https://www.fotmob.com/api/matchDetails?matchId={id}",
+]
+
+# Module-level cache: which URL template worked. Set once on first
+# successful match-detail fetch; reused for every subsequent call.
+_match_detail_template: Optional[str] = None
 MAX_MATCHES_PER_RUN = int(os.environ.get("FOTMOB_MAX_MATCHES", "100"))
 
 _session = requests.Session()
@@ -99,27 +111,91 @@ WOMENS_LEAGUES: list[tuple[int, str, str]] = [
 ]
 
 
-def fetch_json(url: str) -> Optional[Any]:
+def fetch_json(url: str, log_status: bool = True) -> Optional[Any]:
     try:
         resp = _session.get(url, timeout=HTTP_TIMEOUT)
     except Exception as e:
         _http_status_log.append((url[:80], f"{type(e).__name__}"))
-        _log(f"HTTP error {url}: {type(e).__name__}: {e}", "WARN")
+        if log_status:
+            _log(f"HTTP error {url}: {type(e).__name__}: {e}", "WARN")
         return None
     _http_status_log.append((url[:80], resp.status_code))
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
-        # Log a snippet of the body so we can see if FotMob is sending
-        # a JSON error reason ("Invalid X-Mas" etc.) vs a Cloudflare HTML page.
         body_snip = (resp.text or "")[:200].replace("\n", " ")
-        _log(f"HTTP {resp.status_code} {url} body={body_snip!r}", "WARN")
+        if log_status:
+            _log(f"HTTP {resp.status_code} {url} body={body_snip!r}", "WARN")
+        return None
+    # Reject HTML responses (FotMob returns the SPA shell on missing routes
+    # with status 200 sometimes; need to detect that too).
+    ct = (resp.headers.get("content-type") or "").lower()
+    if "json" not in ct and (resp.text or "").lstrip().startswith("<"):
         return None
     try:
         return resp.json()
     except Exception as e:
-        _log(f"JSON parse error {url}: {e}", "WARN")
+        if log_status:
+            _log(f"JSON parse error {url}: {e}", "WARN")
         return None
+
+
+def _extract_next_data(html: str) -> Optional[dict]:
+    """Last-resort fallback: pull the embedded SSR JSON blob out of a
+    Next.js page. Every probe target's HTML response had this marker
+    so FotMob is reliably serving SSR data to anonymous clients."""
+    m = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(\{.*?\})</script>',
+        html, re.DOTALL,
+    )
+    if not m:
+        return None
+    try:
+        import json as _json
+        return _json.loads(m.group(1))
+    except Exception:
+        return None
+
+
+def fetch_match_details(match_id: int) -> Optional[dict]:
+    """Auto-discover the working match-detail URL pattern on first
+    call; cache it for the rest of the run. Falls back to
+    HTML __NEXT_DATA__ extraction if no API path works."""
+    global _match_detail_template
+
+    if _match_detail_template is not None:
+        if _match_detail_template == "html_fallback":
+            return _fetch_match_via_html(match_id)
+        url = _match_detail_template.format(id=match_id)
+        return fetch_json(url, log_status=False)
+
+    # First-pass discovery: try each API candidate, then HTML fallback.
+    for tmpl in MATCH_DETAIL_URL_CANDIDATES:
+        url = tmpl.format(id=match_id)
+        _log(f"Probing match-detail URL: {url}")
+        data = fetch_json(url, log_status=True)
+        if isinstance(data, dict) and data:
+            _match_detail_template = tmpl
+            _log(f"  → MATCH DETAIL TEMPLATE LOCKED IN: {tmpl}")
+            return data
+
+    _log("All API match-detail candidates failed — trying HTML __NEXT_DATA__ fallback")
+    data = _fetch_match_via_html(match_id)
+    if data is not None:
+        _match_detail_template = "html_fallback"
+        _log("  → MATCH DETAIL TEMPLATE LOCKED IN: html_fallback (__NEXT_DATA__)")
+    return data
+
+
+def _fetch_match_via_html(match_id: int) -> Optional[dict]:
+    url = f"https://www.fotmob.com/matches/{match_id}"
+    try:
+        resp = _session.get(url, timeout=HTTP_TIMEOUT)
+    except Exception:
+        return None
+    if resp.status_code != 200:
+        return None
+    return _extract_next_data(resp.text or "")
 
 
 def normalize_team_name(name: str) -> str:
@@ -214,8 +290,15 @@ def main() -> int:
                     _log(f"Reached MAX_MATCHES_PER_RUN={MAX_MATCHES_PER_RUN} — re-fire to continue")
                     break
 
+                # 2026-05-15: FotMob moved from query-string to path-based.
+                # /api/leagues/{id} returns the league overview with the
+                # fixtures list. /api/leagues/{id}/matches returns a fuller
+                # match list if /leagues/{id} doesn't include enough.
                 _log(f"Loading league {fotmob_id} ({canonical_name})")
-                league_data = fetch_json(f"{FOTMOB_BASE}/leagues?id={fotmob_id}")
+                league_data = fetch_json(f"{FOTMOB_BASE}/leagues/{fotmob_id}")
+                if not league_data:
+                    # Fallback to the dedicated matches endpoint.
+                    league_data = fetch_json(f"{FOTMOB_BASE}/leagues/{fotmob_id}/matches")
                 if not league_data:
                     league_results.append(f"{canonical_name}: HTTP fetch failed")
                     continue
@@ -289,12 +372,21 @@ def main() -> int:
                     _log(f"  match {raw_id} ({canonical_name}): {home_name} vs {away_name} "
                          f"{home_g}-{away_g} {match_date} — fetching details")
 
-                    md = fetch_json(f"{FOTMOB_BASE}/matchDetails?matchId={raw_id}")
+                    md = fetch_match_details(int(raw_id))
                     if not md:
                         skipped_no_xg += 1
                         continue
 
                     home_xg, away_xg = _extract_xg(md)
+                    # If we're in html_fallback mode, the __NEXT_DATA__ shape
+                    # nests the match payload under props.pageProps — unwrap
+                    # before passing to _extract_xg.
+                    if home_xg is None and isinstance(md, dict):
+                        inner = (((md.get("props") or {}).get("pageProps") or {})
+                                 .get("matchData")) or \
+                                (((md.get("props") or {}).get("pageProps") or {}))
+                        if inner:
+                            home_xg, away_xg = _extract_xg(inner)
                     if home_xg is None or away_xg is None:
                         skipped_no_xg += 1
                         continue
@@ -331,6 +423,7 @@ def main() -> int:
     _log(f"FotMob direct ingest complete: inserted={inserted} "
          f"skipped_already={skipped_already} skipped_unfinished={skipped_unfinished} "
          f"skipped_no_xg={skipped_no_xg}")
+    _log(f"Match-detail template used: {_match_detail_template}")
     _log(f"Per-league: {league_results}")
     # HTTP status summary — last thing in stderr so it survives
     # truncation to a 2KB tail in the wrapper.
