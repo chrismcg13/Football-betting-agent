@@ -743,7 +743,13 @@ const NEW_MARKET_TYPES = new Set(["TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_COR
 // poor settlement data. Block placement and exclude from value detection.
 export const BANNED_MARKETS: ReadonlySet<string> = new Set([
   "OVER_UNDER_05",     // ~92% win rate — no edge signal
-  "OVER_UNDER_15",     // ~75% win rate — no edge signal
+  // OVER_UNDER_15 unbanned 2026-05-15. The empirical eligibility-view
+  // gate proves the scope DOES have edge (n=65, Wilson lo95 0.687,
+  // bootstrap_lo95_roi 0.428, CLV t-stat 2.77 against Pinnacle, ROI
+  // 0.96). Hardcoded ban violated CLAUDE.md Principle #1 ("statistical
+  // theory, not magic constants") — eligibility-view is the sole
+  // structural gate now. Per-scope adaptive Kelly + Wilson LCB still
+  // size conservatively for the small n=65 sample.
   "TOTAL_CARDS_55",    // ~85% win rate — no edge signal
   "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
   // Task 8 (2026-05-11): TOTAL_CORNERS_* unbanned. Phantom-signal root-cause

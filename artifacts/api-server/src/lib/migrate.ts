@@ -3336,7 +3336,6 @@ export async function runMigrations() {
       WITH banned (market_type, reason) AS (
         VALUES
           ('OVER_UNDER_05',   '>92% win rate near-cert no edge'),
-          ('OVER_UNDER_15',   '~75% win rate near-cert no edge'),
           ('TOTAL_CARDS_55',  '~85% win rate ref variance dominates'),
           ('TOTAL_CARDS_45',  'near-certainty unreliable settlement'),
           ('FIRST_HALF_OU_05','too easy; OU_15 retained'),
