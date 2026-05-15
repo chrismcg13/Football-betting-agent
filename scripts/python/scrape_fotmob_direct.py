@@ -78,6 +78,10 @@ MATCH_DETAIL_URL_CANDIDATES = [
 # Module-level cache: which URL template worked. Set once on first
 # successful match-detail fetch; reused for every subsequent call.
 _match_detail_template: Optional[str] = None
+
+# Track which league IDs we've already shape-dumped (so we don't
+# spam the same diagnostic for every league call).
+_shape_dumped: dict[int, bool] = {}
 MAX_MATCHES_PER_RUN = int(os.environ.get("FOTMOB_MAX_MATCHES", "100"))
 
 _session = requests.Session()
@@ -264,6 +268,50 @@ def _parse_score(score_str: Optional[str]) -> tuple[Optional[int], Optional[int]
     return int(m.group(1)), int(m.group(2))
 
 
+def discover_current_league_ids() -> None:
+    """Probe FotMob's master /api/leagues directory to find the
+    current IDs for our target women's leagues — 4 of our 10
+    hardcoded IDs returned 404, meaning FotMob renumbered them."""
+    targets_to_find = [
+        ("Frauen-Bundesliga", ["frauen-bundesliga", "frauen bundesliga", "bundesliga frauen", "frauen"]),
+        ("Division 1 Féminine", ["division 1 féminine", "premiere ligue", "d1 féminine", "d1 arkema"]),
+        ("Damallsvenskan", ["damallsvenskan"]),
+        ("Toppserien", ["toppserien"]),
+        ("Kvindeligaen", ["kvindeligaen", "kvindeligaen", "gjensidige kvindeligaen"]),
+        ("A-League Women", ["a-league women", "a league women", "a-league w"]),
+    ]
+    _log("Probing FotMob master /api/leagues directory for renumbered IDs...")
+    directory = fetch_json(f"{FOTMOB_BASE}/leagues", log_status=True)
+    if not directory:
+        _log("  /api/leagues did not return JSON — falling back to /api/allLeagues", "WARN")
+        directory = fetch_json(f"{FOTMOB_BASE}/allLeagues", log_status=True)
+    if not directory:
+        _log("  no directory endpoint found — skipping ID discovery", "WARN")
+        return
+
+    # Directory shape varies; flatten anything that looks like a league.
+    candidates: list[dict] = []
+    def _walk(obj):
+        if isinstance(obj, dict):
+            if any(k in obj for k in ("id", "leagueId", "ccode")) and "name" in obj:
+                candidates.append(obj)
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _walk(v)
+    _walk(directory)
+    _log(f"  directory has {len(candidates)} league-like entries")
+
+    for canonical, needles in targets_to_find:
+        for c in candidates:
+            name = (c.get("name") or "").lower()
+            for needle in needles:
+                if needle in name:
+                    _log(f"  candidate for {canonical}: id={c.get('id') or c.get('leagueId')} name={c.get('name')!r}")
+                    break
+
+
 def main() -> int:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -273,6 +321,11 @@ def main() -> int:
     _log(f"Per-run cap: {MAX_MATCHES_PER_RUN} matches (set FOTMOB_MAX_MATCHES env to override)")
     _log(f"Will attempt {len(WOMENS_LEAGUES)} FotMob women's leagues: "
          f"{[name for _, name, _ in WOMENS_LEAGUES]}")
+
+    # Before the main scrape, run the directory probe so we get the
+    # renumbered IDs surfaced in the same stderr tail as the scrape
+    # output. Cheap (1 HTTP call, parsed in-memory).
+    discover_current_league_ids()
 
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -299,20 +352,62 @@ def main() -> int:
                 if not league_data:
                     # Fallback to the dedicated matches endpoint.
                     league_data = fetch_json(f"{FOTMOB_BASE}/leagues/{fotmob_id}/matches")
+
+                # First-pass shape diagnostic: dump top-level keys + a
+                # sample fixture's shape so we can map our extraction
+                # logic to FotMob's current payload shape.
+                if league_data and not _shape_dumped.get(fotmob_id):
+                    _shape_dumped[fotmob_id] = True
+                    top_keys = sorted(league_data.keys())[:30] if isinstance(league_data, dict) else type(league_data).__name__
+                    _log(f"  shape({fotmob_id}): top_keys={top_keys}")
+                    # Try several known fixture-list paths
+                    for path_hint in (("matches",), ("matches", "allMatches"),
+                                      ("matches", "previous"), ("fixtures",),
+                                      ("overview", "leagueOverviewMatches"),
+                                      ("data", "matches"), ("results",)):
+                        cur = league_data
+                        for k in path_hint:
+                            if isinstance(cur, dict):
+                                cur = cur.get(k)
+                            else:
+                                cur = None
+                                break
+                        if isinstance(cur, list) and cur:
+                            sample = cur[0] if cur else None
+                            sample_keys = sorted(sample.keys())[:20] if isinstance(sample, dict) else type(sample).__name__
+                            _log(f"  fixtures at {'.'.join(path_hint)}: {len(cur)} items, sample_keys={sample_keys}")
                 if not league_data:
                     league_results.append(f"{canonical_name}: HTTP fetch failed")
                     continue
 
-                # Schema can vary: matches sometimes under `matches.allMatches`
-                # or `fixtures` or `matches.previous`.
+                # Schema can vary across endpoints. Probe known paths in
+                # priority order; first non-empty list wins.
                 candidates: list[Any] = []
-                m = league_data.get("matches") or {}
-                if isinstance(m, dict):
-                    candidates.extend(m.get("allMatches") or [])
-                    candidates.extend(m.get("previous") or [])
-                fixtures = league_data.get("fixtures") or []
-                if isinstance(fixtures, list):
-                    candidates.extend(fixtures)
+
+                def _try_path(obj, *keys) -> list:
+                    cur = obj
+                    for k in keys:
+                        if isinstance(cur, dict):
+                            cur = cur.get(k)
+                        else:
+                            return []
+                    return cur if isinstance(cur, list) else []
+
+                for path in [
+                    ("matches", "allMatches"),
+                    ("matches", "previous"),
+                    ("matches",),
+                    ("fixtures",),
+                    ("overview", "leagueOverviewMatches"),
+                    ("data", "matches"),
+                    ("results",),
+                ]:
+                    found = _try_path(league_data, *path)
+                    if found:
+                        candidates.extend(found)
+                        if not _shape_dumped.get(fotmob_id, "logged_path"):
+                            _log(f"  using fixtures path: {'.'.join(path)} ({len(found)} items)")
+                        break
 
                 # Dedup on match id within this batch
                 seen_in_league: set[str] = set()
