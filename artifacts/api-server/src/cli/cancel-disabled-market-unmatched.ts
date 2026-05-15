@@ -69,10 +69,19 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Build a parameterized IN-list. db.execute with sql template handles arrays via
-  // ANY(${array}) — but the cleanest portable form here is uppercase-comparison.
-  const disabledSet = disabled;
-  const candidates = await db.execute(sql`
+  // Inline as a PG array literal via sql.raw. Drizzle's tagged template
+  // expands `ANY(${jsArray})` as positional records ($1, $2, …) which
+  // Postgres rejects with "op ANY/ALL (array) requires array on right
+  // side" — same trap that bit scheduler.ts:1500-1507. Fix: sanitize each
+  // market_type to [A-Z0-9_]+ (defensive; the upstream getDisabledMarkets
+  // already normalizes) then inline into ARRAY[...]::text[].
+  const safe = disabled.filter((s) => /^[A-Z0-9_]+$/.test(s));
+  if (safe.length === 0) {
+    console.log("No safe market_type values to query — refusing to issue an empty IN-list. Check agent_config value for non-alphanumeric entries.");
+    process.exit(0);
+  }
+  const literalList = safe.map((s) => `'${s}'`).join(",");
+  const candidates = await db.execute(sql.raw(`
     SELECT pb.id,
            pb.betfair_bet_id,
            pb.market_type,
@@ -85,7 +94,7 @@ async function main(): Promise<void> {
     FROM paper_bets pb
     JOIN matches m ON m.id = pb.match_id
     WHERE pb.bet_track = 'live'
-      AND UPPER(pb.market_type) = ANY(${disabledSet})
+      AND UPPER(pb.market_type) = ANY(ARRAY[${literalList}]::text[])
       AND pb.betfair_market_id IS NOT NULL
       AND pb.betfair_selection_id IS NOT NULL
       AND pb.status = 'pending'
@@ -94,7 +103,7 @@ async function main(): Promise<void> {
       AND m.kickoff_time > NOW()
       AND pb.deleted_at IS NULL
     ORDER BY pb.id
-  `);
+  `));
 
   const rows = (((candidates as unknown) as { rows?: Candidate[] }).rows ?? []);
   console.log(`EXECUTABLE unmatched candidates on disabled markets: ${rows.length}`);
