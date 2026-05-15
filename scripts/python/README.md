@@ -10,8 +10,9 @@ return non-zero on error so the wrapper logs it.
 |---|---|---|
 | `fit_calibration.py` | Mon 04:00 | `calibration_buckets` |
 | `fit_dixon_coles.py` | Mon 05:00 | `scoreline_correlation`, `model_layer_enabled` |
-| `scrape_team_form.py` | **disabled 2026-05-15** — FBref blocks Selenium; pivoting to xg_match_data aggregation | `team_form_scrape` (manual via admin endpoint only) |
-| `scrape_fotmob_women.py` | Wed 05:00 | `xg_match_data` source='fotmob' (women's match-level xG — WSL/NWSL/Frauen-Bundesliga/etc.) |
+| `scrape_team_form.py` | **disabled 2026-05-15** — FBref blocks Selenium | manual admin endpoint only; pivoting to xg_match_data aggregation |
+| `scrape_fotmob_women.py` | **disabled 2026-05-15** — soccerdata 1.9 dropped FotMob | manual admin endpoint only |
+| `ingest_statsbomb_women.py` | manual (per-season) | `xg_match_data` source='statsbomb' (NWSL, FAWSL, Women's WC, Women's Euro — direct HTTP, no Selenium) |
 | `shap_drift.py` | Daily 03:30 | `shap_drift_runs` |
 | `feature_attribution.py` | 1st of month 04:30 | `feature_attribution`, `feature_lifecycle` |
 | `compute_market_correlations.py` | 1st of month 04:45 | `market_correlation_matrix` |

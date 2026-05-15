@@ -6135,9 +6135,8 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
 });
 
 // Phase 2b (2026-05-14): manual trigger for FotMob women's match-xG
-// scraper. Synchronous; first run typically 60-180s as soccerdata
-// crawls a dozen+ women's-league candidate keys. Subsequent runs hit
-// the FS cache.
+// scraper. Currently a no-op — soccerdata 1.9 dropped FotMob entirely.
+// Endpoint stays wired for future soccerdata releases that re-add it.
 router.post("/admin/run-fotmob-women-scrape", async (_req, res) => {
   try {
     const { runFotmobWomenScrape } = await import("../services/fotmobWomenScrapeCron");
@@ -6145,6 +6144,25 @@ router.post("/admin/run-fotmob-women-scrape", async (_req, res) => {
     res.json({ ok: r.exitCode === 0, ...r });
   } catch (err) {
     logger.error({ err }, "Manual FotMob women's scraper run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Phase 3 (2026-05-15) — manual trigger for StatsBomb open-data
+// women's ingest. Pulls free event-level data for NWSL, FAWSL,
+// FIFA Women's WC, Women's Euro from raw.githubusercontent.com and
+// writes per-match xG summary rows to xg_match_data with
+// source='statsbomb'. No cron — fire once per season for the
+// initial backfill, then occasionally for refreshes. First run
+// ~5-15 min depending on how many new matches; subsequent runs
+// skip already-ingested matches and finish in seconds.
+router.post("/admin/run-statsbomb-ingest", async (_req, res) => {
+  try {
+    const { runStatsbombIngest } = await import("../services/statsbombIngestionCron");
+    const r = await runStatsbombIngest();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "Manual StatsBomb ingest run failed");
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
