@@ -31,10 +31,18 @@ interface CachedBucket {
   method: string;
   params: IsotonicParams;
   fetchedAt: number;
+  nSamples: number;
 }
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const cache = new Map<string, CachedBucket | null>(); // null = no bucket found (negative cache)
+
+// 2026-05-15 — Finding 7 / #61 Path 4. Per-league isotonic fits on thin
+// samples are actively harmful (e.g. PL × MO at n=38 had ECE 0.45 — 45 pct
+// expected calibration error vs the global fit's 7 pct). Below this threshold
+// the per-league fit is rejected and the calibrate() flow falls through to
+// the market-type-global bucket.
+const PER_LEAGUE_MIN_SAMPLES = 100;
 
 function cacheKey(league: string | null, marketType: string): string {
   return `${league ?? "__GLOBAL__"}::${marketType}`;
@@ -60,6 +68,7 @@ async function loadActiveBucket(
       bucketId: calibrationBucketsTable.bucketId,
       method: calibrationBucketsTable.method,
       params: calibrationBucketsTable.params,
+      nSamples: calibrationBucketsTable.nSamples,
     })
     .from(calibrationBucketsTable)
     .where(whereClause)
@@ -71,6 +80,7 @@ async function loadActiveBucket(
     method: row.method,
     params: row.params as IsotonicParams,
     fetchedAt: Date.now(),
+    nSamples: row.nSamples,
   };
 }
 
@@ -138,6 +148,16 @@ export async function calibrate(
   let bucket: CachedBucket | null = null;
   if (league) {
     bucket = await getBucket(league, marketType);
+    // 2026-05-15 — Finding 7 / #61 Path 4. Reject per-league fits on thin
+    // samples — they're worse than the market-type-global fit at n<100
+    // (observed PL × MO ECE 0.45 vs global MO ECE 0.07).
+    if (bucket && bucket.nSamples < PER_LEAGUE_MIN_SAMPLES) {
+      logger.info(
+        { league, marketType, nSamples: bucket.nSamples, threshold: PER_LEAGUE_MIN_SAMPLES, bucketId: bucket.bucketId },
+        "Calibration: rejecting thin per-league isotonic — falling back to market-type-global",
+      );
+      bucket = null;
+    }
   }
   // 2. Fall back to market-type global.
   if (!bucket) {

@@ -591,6 +591,12 @@ export async function runStructuralAudits(): Promise<StructuralAuditResult> {
   }
 
   // ── Audit 3 — Match-results ingestion completeness ────────────────────────
+  // 2026-05-15 — #62 Path C. Threshold raised from 25 to 175 to match the
+  // chronic baseline from low-tier leagues without score-ingestion coverage.
+  // Also excludes 'no_result_available' (matches auto-transitioned by
+  // autoTransitionStaleMatches when stale > 48h). The alert now fires on
+  // ACTUAL degradation (sudden growth beyond chronic floor) rather than the
+  // steady-state count.
   try {
     const rows = await db.execute(sql`
       SELECT COUNT(*)::int AS n_stale
@@ -599,26 +605,26 @@ export async function runStructuralAudits(): Promise<StructuralAuditResult> {
         AND kickoff_time > NOW() - INTERVAL '7 days'
         AND betfair_event_id IS NOT NULL
         AND home_score IS NULL
-        AND status NOT IN ('cancelled','postponed','abandoned')
+        AND status NOT IN ('cancelled','postponed','abandoned','no_result_available')
     `);
     const n = Number(((rows as any).rows ?? [])[0]?.n_stale ?? 0);
-    const breach = n > 25;
+    const breach = n > 175;
     result.audits.push({
       audit_id: "structural_match_results_completeness",
       observed_value: n,
-      threshold: 25,
+      threshold: 175,
       threshold_direction: "max",
       breach,
-      detail: { n_stale: n, window: "kickoff_time < NOW() - 6h, > NOW() - 7d, score NULL, not cancelled/postponed" },
+      detail: { n_stale: n, window: "kickoff_time < NOW() - 6h, > NOW() - 7d, score NULL, not cancelled/postponed/abandoned/no_result_available" },
     });
     if (breach) {
       const fired = await writeStructuralAlert({
         audit_id: "structural_match_results_completeness",
         observed: n,
-        threshold: 25,
+        threshold: 175,
         direction: "max",
-        severity: n > 75 ? "critical" : "warn",
-        detail: { n_stale: n, interpretation: "Match results ingestion lagging — settlement timeout precondition. Bets on these matches will route through 72h-timeout path and may force-settle as losses." },
+        severity: n > 300 ? "critical" : "warn",
+        detail: { n_stale: n, interpretation: "Match results ingestion degrading beyond chronic baseline — investigate which leagues recently lost coverage." },
       });
       if (fired) result.alertsFired += 1;
     }
@@ -700,4 +706,98 @@ export async function runStructuralAudits(): Promise<StructuralAuditResult> {
 
   logger.info(result, "structural_audits evaluated");
   return result;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2026-05-15 — #62 Path A. Auto-transition stale-scheduled matches.
+//
+// Matches with kickoff_time > 48h ago, status='scheduled', and NULL final score
+// are matches the system thinks are about to happen but kickoff is past. They
+// accumulate from low-tier leagues where API-Football's score-ingestion endpoint
+// doesn't cover. Without intervention they sit forever as 'scheduled', and bets
+// attached to them route through the 72h timeout → force-settled as losses.
+//
+// Auto-transition: status='scheduled' → 'no_result_available' when the match
+// is >48h past kickoff with no score. Attached pending bets get void-settled
+// (status='void', settlement_pnl=0, no PnL applied) — stake refund semantics
+// rather than the force-loss semantics of timeout.
+//
+// Idempotent — re-running has no effect on already-transitioned matches.
+// ──────────────────────────────────────────────────────────────────────────────
+
+export interface AutoTransitionResult {
+  matchesTransitioned: number;
+  betsVoided: number;
+  byLeague: Record<string, number>;
+}
+
+export async function autoTransitionStaleMatches(): Promise<AutoTransitionResult> {
+  // Find candidate matches
+  const candidates = await db.execute(sql`
+    SELECT id, league
+    FROM matches
+    WHERE kickoff_time < NOW() - INTERVAL '48 hours'
+      AND home_score IS NULL
+      AND status = 'scheduled'
+  `);
+  const rows = (((candidates as any).rows ?? []) as Array<{ id: number; league: string | null }>);
+
+  if (rows.length === 0) {
+    logger.info({ matchesTransitioned: 0 }, "autoTransitionStaleMatches: no candidates");
+    return { matchesTransitioned: 0, betsVoided: 0, byLeague: {} };
+  }
+
+  const matchIds = rows.map((r) => r.id);
+  const byLeague: Record<string, number> = {};
+  for (const r of rows) {
+    const key = r.league ?? "__unknown__";
+    byLeague[key] = (byLeague[key] ?? 0) + 1;
+  }
+
+  // 1) Flip match status
+  await db.execute(sql`
+    UPDATE matches
+    SET status = 'no_result_available',
+        updated_at = NOW()
+    WHERE id = ANY(${matchIds})
+      AND status = 'scheduled'
+      AND home_score IS NULL
+  `);
+
+  // 2) Void-settle attached pending bets — stake refund semantics. No PnL
+  // applied (settlement_pnl=0); the existing void-handling in downstream
+  // analytics already treats settlement_pnl=0 as a neutral outcome.
+  const voidResult = await db.execute(sql`
+    UPDATE paper_bets
+    SET status = 'void',
+        settlement_pnl = '0',
+        net_pnl = '0',
+        gross_pnl = '0',
+        commission_amount = '0',
+        settled_at = NOW()
+    WHERE match_id = ANY(${matchIds})
+      AND status IN ('pending','pending_placement')
+      AND legacy_regime = false
+      AND deleted_at IS NULL
+  `);
+  const betsVoided = (voidResult as { rowCount?: number }).rowCount ?? 0;
+
+  // Audit trail
+  await db.insert(complianceLogsTable).values({
+    actionType: "stale_match_auto_transition",
+    details: {
+      matchesTransitioned: matchIds.length,
+      betsVoided,
+      byLeague,
+      cutoff: "kickoff_time < NOW() - 48h AND status=scheduled AND home_score IS NULL",
+    },
+    timestamp: new Date(),
+  });
+
+  logger.info(
+    { matchesTransitioned: matchIds.length, betsVoided, byLeague },
+    "autoTransitionStaleMatches: complete",
+  );
+
+  return { matchesTransitioned: matchIds.length, betsVoided, byLeague };
 }

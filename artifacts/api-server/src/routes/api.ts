@@ -2481,6 +2481,21 @@ router.post("/admin/run-structural-audits", async (_req, res) => {
   }
 });
 
+// 2026-05-15 — #62 Path A. Flips stale-scheduled matches to
+// 'no_result_available' and void-settles attached pending bets.
+// Runs daily 02:00 UTC alongside the data quality monitor; this endpoint
+// triggers on demand to clear the chronic baseline immediately.
+router.post("/admin/auto-transition-stale-matches", async (_req, res) => {
+  try {
+    const { autoTransitionStaleMatches } = await import("../services/dataQualityMonitor");
+    const r = await autoTransitionStaleMatches();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual auto-transition stale matches failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/run-adaptive-recommender", async (_req, res) => {
   try {
     const { runAdaptiveThresholdRecommender } = await import("../services/adaptiveThresholdRecommender");

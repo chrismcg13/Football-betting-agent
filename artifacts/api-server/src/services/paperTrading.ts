@@ -48,16 +48,25 @@ import { checkLivePlacementGates } from "./livePlacementGate";
 
 // ===================== Block B (2026-05-14) — Bayesian shrinkage =========
 // Parameter-free shrinkage for the (market_type, odds_band) cells where
-// empirical evidence says the model is overstating AND CLV evidence says the
-// model is not significantly beating the close. Scope rule, refreshed every
+// empirical evidence says the model is overstating. Scope rule, refreshed every
 // 5 minutes from settled history:
-//   IN_SCOPE := wilson_lo95_winrate < model_p̂  AND  clv_t_stat < 1.96
-// Calibration:
+//   IN_SCOPE := wilson_lo95_winrate < model_p̂
+//
+// 2026-05-15 — Finding 7 (mo_calibration_anomaly_2026_05_15): the original
+// rule had an AND clv_t_stat < 1.96 condition. For MO, Wilson under-performs
+// model_p̂ massively (Wilson 0.237 vs model_p̂ 0.42 — model picks losing sides)
+// but CLV t-stat passes (+2.15 — Pinnacle agrees with our directional pick).
+// The AND condition prevented shrinkage from firing despite the 59pp
+// over-confidence at high model_p. CLV positive proves direction; it does not
+// prove magnitude. Wilson under-performance alone is sufficient evidence that
+// model probabilities need to shrink toward implied_p — regardless of whether
+// the market agrees with our picks.
+// Calibration (unchanged):
 //   shrunk_p = (n × empirical_p + k × implied_p) / (n + k)
-// k = 30 by default (matches N_FLOOR / Wilson asymptotic regime); operator-
-// tunable via agent_config.calibration_prior_strength.
-// Self-governing: when CLV t-stat for a cell crosses 1.96 (model proven to
-// beat close), the cell exits scope automatically on the next snapshot.
+// k = 30 by default; operator-tunable via agent_config.calibration_prior_strength.
+// Self-governing: when Wilson lo95 for a cell crosses model_p̂ (model now
+// well-calibrated at that band), the cell exits scope automatically on the
+// next snapshot.
 
 interface BayesianShrinkageStats {
   inScope: boolean;
@@ -134,11 +143,12 @@ async function refreshBayesianBandsCache(): Promise<void> {
     const empiricalP = Number(r.empirical_p);
     const wilsonLo95 = Number(r.wilson_lo95);
     const clvTStat = r.clv_t_stat == null ? null : Number(r.clv_t_stat);
-    // Scope rule: model overstating AND CLV doesn't refute it. NULL CLV is
-    // treated as "no significant beat of the close" → in-scope when Wilson
-    // also flags overstatement. This keeps the rule applied even on bands
-    // where Pinnacle CLV coverage is sparse.
-    const inScope = modelP > wilsonLo95 && (clvTStat === null || clvTStat < 1.96);
+    // 2026-05-15 (Finding 7): scope rule is Wilson under-performance alone.
+    // CLV positive doesn't prove magnitude correctness, only directional
+    // agreement with the market. Wilson lo95 < model_p̂ is sufficient
+    // evidence that model probabilities are inflated and need to shrink
+    // toward implied_p. clvTStat retained on the row for diagnostics.
+    const inScope = modelP > wilsonLo95;
     map.set(`${market}|${band}`, {
       inScope,
       n: Number(r.n),

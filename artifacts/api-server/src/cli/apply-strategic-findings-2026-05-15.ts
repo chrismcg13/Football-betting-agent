@@ -186,6 +186,52 @@ const FINDINGS: Finding[] = [
     },
   },
   {
+    experiment_tag: "mo_calibration_compounded_ah_signal_2026_05_15",
+    analysis_type: "strategic_finding",
+    findings: {
+      summary:
+        "MO LR is 59 pp over-confident at high model_p (>=0.70 model bucket: predicts 87.3 pct win, realised 28.7 pct). This miscalibration likely AMPLIFIED the pre-parser-fix AH 'edge' signal beyond what the parser bug alone produced. Two compounding bugs, not one: AH parser corrupted (selection, price) binding AND LR over-confidence inflated stake sizes on bets the model was wildly wrong about.",
+      mechanism:
+        "AH stake sizing used Kelly fraction at model_p. If model_p was 70-90 pct on bets that actually win 28 pct of the time, Kelly stakes were 3-10x larger than the true-probability Kelly would have sized. Parser bug provided the synthetic edge signal; LR over-confidence provided the stake inflation. Each looks defensible in isolation; together they compound.",
+      implication_for_option_b:
+        "Option B (bivariate-Poisson fit with attack/defense parameters) addresses LR over-confidence at root by replacing LR-derived joint probabilities with directly-fitted calibrated parameters. This strengthens the case for B as the strategic play, not merely the cleaner play. Option A (inverse-Poisson projection from LR outputs) inherits the LR over-confidence and is operational continuity, not a permanent fix.",
+      pattern_to_watch:
+        "Individually-defensible code surfaces combining into actively-harmful behaviour. Worth considering whether there's a systematic way to catch compounding bugs that no single audit would surface — possibly via cross-component property tests on the end-to-end probability → stake → outcome chain.",
+    },
+    recommendations: {
+      strategic:
+        "Option B ships regardless of Option A's evaluation outcome. The only condition under which B does not ship: Option A produces zero or negative lift on ALL evaluated markets AND post-parser-fix AH retains no edge. Anything short of that — directional positive on even one market, or AH edge surviving — confirms B is the play.",
+      immediate_mitigation:
+        "#61 remediation (Path 1: loosen Block B AND-condition to just-Wilson; Path 4: disable per-league isotonic when n<100) shipped 2026-05-15. These shrink over-confident model_p toward implied_p, reducing the magnitude of stake inflation while Option B is built.",
+    },
+    actions_taken: {
+      status: "permanent_strategic_finding",
+      tasks: ["#61 shipped", "#49 Option A shipped (operational continuity)", "Option B design doc pending"],
+    },
+  },
+  {
+    experiment_tag: "clv_anchor_timing_drift_2026_05_15",
+    analysis_type: "strategic_finding",
+    findings: {
+      summary:
+        "Structural audit (closing_odds_timing) shows median anchor capture time for AH is T-48 min pre-kickoff vs the T-30 min threshold. CLV t-stats system-wide are computed against late-but-not-closing snapshots. Effect size unknown but consistent across markets — meaning every CLV t-stat in the system is a biased estimate of true CLV-vs-close.",
+      magnitude_unknown:
+        "Unknown whether the T-48 vs T-30 gap materially shifts CLV values. Late-market movement in the final 30 min before kickoff captures sharp money; missing it understates CLV. Direction of bias: unclear without comparing T-48 vs T-0 snapshots head-to-head on the same matches.",
+      not_a_money_guardrail_issue:
+        "CLV is used as a confidence signal for the eligibility gate, not for stake sizing directly. Biased CLV t-stats affect which scopes qualify, not which stakes apply once qualified. Bounded analytical risk.",
+    },
+    recommendations: {
+      short_term:
+        "Tighten the snap window in fetchAndStoreClosingLineForPendingBets once results-ingestion (#62) and AH parser fix (#step 6) are clean. Target: median T-delta <10 min, p95 <30 min.",
+      medium_term:
+        "Re-evaluate every Bundle B CLV t-stat once snap timing is tight. Scopes currently borderline-qualifying on CLV may shift either way; rebaseline.",
+    },
+    actions_taken: {
+      status: "logged_for_future_remediation",
+      next_review_trigger: "After #62 + step 6 ship clean; before Option B design doc work.",
+    },
+  },
+  {
     experiment_tag: "mo_calibration_anomaly_2026_05_15",
     analysis_type: "strategic_finding",
     findings: {

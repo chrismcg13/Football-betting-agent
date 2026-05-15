@@ -3005,7 +3005,17 @@ export function startSettlementCron(): void {
         // gate condition for OU_25/OU_35/FIRST_HALF_RESULT unban). Writes a
         // compliance_logs row when the gate clears so operator knows to ship
         // the BANNED_MARKETS one-line edit. Idempotent (one row per 7d window).
-        const { runDataQualityMonitor, runUnbanGateMonitor, runStructuralAudits } = await import("./dataQualityMonitor");
+        const {
+          runDataQualityMonitor,
+          runUnbanGateMonitor,
+          runStructuralAudits,
+          autoTransitionStaleMatches,
+        } = await import("./dataQualityMonitor");
+        // 2026-05-15 — #62 Path A. Auto-transition stale-scheduled matches
+        // (kickoff >48h ago, no score, status='scheduled') BEFORE running the
+        // structural audit, so the audit sees the post-transition count.
+        const at = await autoTransitionStaleMatches();
+        logger.info(at, "Auto-transition stale matches complete");
         const dq = await runDataQualityMonitor();
         logger.info(dq, "Data quality monitor complete");
         const ug = await runUnbanGateMonitor();
