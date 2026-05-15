@@ -19,6 +19,7 @@ import { logger } from "../lib/logger";
  */
 
 let cachedFlag: { value: boolean; fetchedAt: number } | null = null;
+let cachedDisabledMarkets: { set: Set<string>; fetchedAt: number } | null = null;
 const FLAG_CACHE_TTL_MS = 30_000; // 30s — short enough to react to operator flip, long enough to amortise lookups
 
 export async function isLivePlacementEnabled(): Promise<boolean> {
@@ -36,8 +37,35 @@ export async function isLivePlacementEnabled(): Promise<boolean> {
   return value;
 }
 
+// 2026-05-15 — per-market-type live-placement kill switch. CSV in
+// agent_config.live_placement_disabled_market_types. Used to halt live
+// flow on specific markets (e.g. when a data-layer bug fabricates edge
+// signal for that market). Re-uses the same 30s cache + invalidation
+// pattern as isLivePlacementEnabled. Operator flips via
+// /api/admin/set-config; the next placement attempt within 30s respects
+// the new value.
+async function getDisabledMarkets(): Promise<Set<string>> {
+  const now = Date.now();
+  if (cachedDisabledMarkets && now - cachedDisabledMarkets.fetchedAt < FLAG_CACHE_TTL_MS) {
+    return cachedDisabledMarkets.set;
+  }
+  const rows = (await db.execute(sql`
+    SELECT value FROM agent_config WHERE key = 'live_placement_disabled_market_types' LIMIT 1
+  `)) as unknown as { rows: Array<{ value: string }> };
+  const raw = rows.rows[0]?.value ?? "";
+  const set = new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean),
+  );
+  cachedDisabledMarkets = { set, fetchedAt: now };
+  return set;
+}
+
 export function invalidateLivePlacementFlagCache(): void {
   cachedFlag = null;
+  cachedDisabledMarkets = null;
 }
 
 export interface ScopeWhitelistResult {
@@ -122,6 +150,23 @@ export async function checkLivePlacementGates(args: {
     return {
       allowed: false,
       reason: "live_placement_enabled=false (operator kill switch)",
+      path: null,
+      kellyFractionOverride: null,
+    };
+  }
+
+  // Per-market-type kill switch — see getDisabledMarkets() above.
+  const disabled = await getDisabledMarkets();
+  if (disabled.has(args.marketType.toUpperCase())) {
+    if (args.betId) {
+      logger.info(
+        { betId: args.betId, marketType: args.marketType, league: args.league },
+        "Live placement gate: market_type in live_placement_disabled_market_types — shadow rail",
+      );
+    }
+    return {
+      allowed: false,
+      reason: `market_type ${args.marketType} in live_placement_disabled_market_types`,
       path: null,
       kellyFractionOverride: null,
     };

@@ -1543,6 +1543,33 @@ export async function placePaperBet(
       isShadowBet = true;
     }
   }
+
+  // 2026-05-15 — per-market-type kill switch. Reads
+  // agent_config.live_placement_disabled_market_types (CSV). Demotes
+  // BEFORE insert so the row lands cleanly on bet_track='shadow' rather
+  // than stranded as a live row with no Betfair placement. Re-uses the
+  // same 30s cache + invalidation as the boolean kill switch above.
+  // Operator flips via /api/admin/set-config; next placement attempt
+  // within 30s respects the new value.
+  if (postCutover && !isShadowBet) {
+    const csv = (await getConfigValue("live_placement_disabled_market_types")) ?? "";
+    const disabledSet = new Set(
+      csv
+        .split(",")
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean),
+    );
+    if (disabledSet.has(marketType.toUpperCase())) {
+      await logShadowGateExemption(
+        "market_type_disabled_for_live",
+        experimentTag ?? null,
+        `market_type ${marketType} in live_placement_disabled_market_types — demoting production-track signal to shadow`,
+        null,
+        universeTier,
+      );
+      isShadowBet = true;
+    }
+  }
   // Mutable: boosted bets that pre-qualify for Tier 1B get tagged "1B_boosted"
   // and bypass the production quarantine.
   let boostedTier1BApproved = false;

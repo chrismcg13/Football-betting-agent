@@ -537,6 +537,21 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           continue;
         }
 
+        // 2026-05-15 — per-market-type kill switch. Mirrors the check in
+        // paperTrading.placePaperBet so lazy-promote doesn't bypass the
+        // gate on the ~79% of capital that flows through this path.
+        const disabledCsv = (await getConfig("live_placement_disabled_market_types")) ?? "";
+        const disabledSet = new Set(
+          disabledCsv
+            .split(",")
+            .map((s) => s.trim().toUpperCase())
+            .filter(Boolean),
+        );
+        if (disabledSet.has(r.market_type.toUpperCase())) {
+          result.skipped_kelly_below_min++;  // reuse counter
+          continue;
+        }
+
         // 2026-05-14: also honour agent_status circuit breakers. paused_streak
         // (consecutive-loss halt), paused_daily and paused_weekly all gate
         // production-track placement in the trading cycle via forceShadowOnly.
