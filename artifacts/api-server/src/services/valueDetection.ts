@@ -539,6 +539,10 @@ function getModelProbability(
   // and threaded through; null/undefined means independent-Poisson
   // baseline (the pre-Phase-1 behaviour).
   dcOpts?: { rho: number; copulaKind: "dixon_coles" | "sarmanov" },
+  // Option A (2026-05-15): when 'opponent_aware', predictAH and predictTT
+  // route lambdas through the inverse-Poisson solver instead of marginal
+  // historical scoring rates. Per #49 brief decision.
+  lambdaSource: "marginal" | "opponent_aware" = "marginal",
 ): number | null {
   // Substitute xg_proxy for zero goal averages before feeding models
   const enriched = enrichFeaturesWithXgProxy(featureMap);
@@ -730,7 +734,7 @@ function getModelProbability(
             : lineSuffix === "35" ? 3.5
             : null;
     if (t == null) return null;
-    const tt = predictTeamTotalGoals(enriched, side, t);
+    const tt = predictTeamTotalGoals(enriched, side, t, { lambdaSource });
     if (!tt) return null;
     if (selectionName.startsWith("Over")) return tt.over;
     if (selectionName.startsWith("Under")) return tt.under;
@@ -743,7 +747,7 @@ function getModelProbability(
     const side = m[1].toLowerCase() as "home" | "away";
     const line = parseFloat(m[2]);
     if (!Number.isFinite(line)) return null;
-    return predictAsianHandicap(enriched, side, line, dcOpts);
+    return predictAsianHandicap(enriched, side, line, { ...dcOpts, lambdaSource });
   }
   // ─── C4 (2026-05-07): Half-Time / Full-Time joint outcome ──────────────────
   // Selection format: "Home/Home", "Home/Draw", ..., "Away/Away".
@@ -976,6 +980,22 @@ export async function detectValueBets(options?: {
 
   const configRows = await db.select().from(agentConfigTable);
   const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
+
+  // Option A (2026-05-15): when enabled, predictAH and predictTT use
+  // opponent-aware lambdas via inverse-Poisson projection from the LR
+  // outcomeModel. Default OFF — operator enables via:
+  //   POST /api/admin/set-config
+  //     { key: "option_a_opponent_aware_lambdas", value: "true" }
+  const lambdaSource: "marginal" | "opponent_aware" =
+    (cfg["option_a_opponent_aware_lambdas"] ?? "").toLowerCase().trim() === "true"
+      ? "opponent_aware"
+      : "marginal";
+  if (lambdaSource === "opponent_aware") {
+    logger.info(
+      { lambdaSource },
+      "Value detection: Option A enabled — AH/TT predictions use opponent-aware lambdas",
+    );
+  }
 
   // 2026-05-08: minEdge / minOppScore now sourced via adaptive recommender
   // with fallback chain (tier_market → market_type → global → agent_config
@@ -1510,7 +1530,7 @@ export async function detectValueBets(options?: {
       if (actionablePrice < minOddsThreshold) continue;
 
       const dcOpts = dcOptsForMarket(dcCtx, marketType);
-      const rawModelProb = getModelProbability(marketType, selectionName, featureMap, dcOpts);
+      const rawModelProb = getModelProbability(marketType, selectionName, featureMap, dcOpts, lambdaSource);
       if (rawModelProb === null) continue;
 
       // Task 12 (2026-05-11): calibration layer. Raw sigmoid → calibrated

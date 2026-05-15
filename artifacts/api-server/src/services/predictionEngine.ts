@@ -888,19 +888,185 @@ export function scorelineMatrix(
   return matrix;
 }
 
+// ─── Option A — opponent-aware lambdas via inverse-Poisson projection ────────
+// Per Finding 3 (opponent_blind_lambdas_2026_05_15) + #49 brief decision:
+// solve for (λ_h, λ_a) that make the bivariate-Poisson scoreline matrix
+// reproduce the LR-derived outcome probabilities P(H,D,A). The LR
+// (outcomeModel) already conditions on opponent features (xG both sides,
+// Elo both sides, H2H). Inverting through the score matrix gives us
+// opponent-aware lambdas that AH and TT can use without bypassing the
+// LR's calibration.
+//
+// Over-determined system: 2 unknowns (λ_h, λ_a) vs 3 constraints (P_H, P_D,
+// P_A). Gauss-Newton least squares with numerical Jacobian. Converges in
+// ~10 iterations from the marginal-lambda starting point.
+
+function outcomeProbsFromLambdas(lh: number, la: number, maxGoals = 6) {
+  const matrix = scorelineMatrix(lh, la, { maxGoals });
+  let pH = 0, pD = 0, pA = 0;
+  for (let h = 0; h <= maxGoals; h++) {
+    for (let a = 0; a <= maxGoals; a++) {
+      if (h > a) pH += matrix[h][a];
+      else if (h === a) pD += matrix[h][a];
+      else pA += matrix[h][a];
+    }
+  }
+  return { home: pH, draw: pD, away: pA, matrix };
+}
+
+export interface SolveLambdasResult {
+  home: number;
+  away: number;
+  converged: boolean;
+  iterations: number;
+  residual: number;
+}
+
+export function solveLambdasFromOutcome(
+  targets: { home: number; draw: number; away: number },
+  initialHome: number,
+  initialAway: number,
+): SolveLambdasResult {
+  const maxGoals = 6;
+  const EPS = 1e-3;
+  const MAX_ITER = 30;
+  const CONVERGED_TOL = 1e-5;
+  let lh = Math.max(0.2, Math.min(3.5, initialHome));
+  let la = Math.max(0.2, Math.min(3.5, initialAway));
+  let lastResidual = Infinity;
+
+  for (let iter = 0; iter < MAX_ITER; iter++) {
+    const p = outcomeProbsFromLambdas(lh, la, maxGoals);
+    const rH = p.home - targets.home;
+    const rD = p.draw - targets.draw;
+    const rA = p.away - targets.away;
+    const residual = rH * rH + rD * rD + rA * rA;
+    if (residual < CONVERGED_TOL) {
+      return { home: lh, away: la, converged: true, iterations: iter, residual };
+    }
+    if (Math.abs(lastResidual - residual) < 1e-8) {
+      return { home: lh, away: la, converged: false, iterations: iter, residual };
+    }
+    lastResidual = residual;
+
+    // Numerical Jacobian
+    const pdh = outcomeProbsFromLambdas(lh + EPS, la, maxGoals);
+    const pda = outcomeProbsFromLambdas(lh, la + EPS, maxGoals);
+    const dHh = (pdh.home - p.home) / EPS;
+    const dDh = (pdh.draw - p.draw) / EPS;
+    const dAh = (pdh.away - p.away) / EPS;
+    const dHa = (pda.home - p.home) / EPS;
+    const dDa = (pda.draw - p.draw) / EPS;
+    const dAa = (pda.away - p.away) / EPS;
+
+    // Gauss-Newton normal equations (Jᵀ J) Δ = -Jᵀ r
+    const a11 = dHh * dHh + dDh * dDh + dAh * dAh;
+    const a12 = dHh * dHa + dDh * dDa + dAh * dAa;
+    const a22 = dHa * dHa + dDa * dDa + dAa * dAa;
+    const b1 = -(dHh * rH + dDh * rD + dAh * rA);
+    const b2 = -(dHa * rH + dDa * rD + dAa * rA);
+    const det = a11 * a22 - a12 * a12;
+    if (Math.abs(det) < 1e-12) {
+      return { home: lh, away: la, converged: false, iterations: iter, residual };
+    }
+    const deltaH = (a22 * b1 - a12 * b2) / det;
+    const deltaA = (-a12 * b1 + a11 * b2) / det;
+
+    // Damped step — backtrack if residual worsens
+    let damp = 1.0;
+    let accepted = false;
+    for (let d = 0; d < 6; d++) {
+      const nlh = Math.max(0.1, Math.min(5, lh + damp * deltaH));
+      const nla = Math.max(0.1, Math.min(5, la + damp * deltaA));
+      const np = outcomeProbsFromLambdas(nlh, nla, maxGoals);
+      const nr =
+        (np.home - targets.home) ** 2 +
+        (np.draw - targets.draw) ** 2 +
+        (np.away - targets.away) ** 2;
+      if (nr < residual) {
+        lh = nlh;
+        la = nla;
+        accepted = true;
+        break;
+      }
+      damp *= 0.5;
+    }
+    if (!accepted) {
+      return { home: lh, away: la, converged: false, iterations: iter + 1, residual };
+    }
+  }
+
+  const final = outcomeProbsFromLambdas(lh, la, maxGoals);
+  const fr =
+    (final.home - targets.home) ** 2 +
+    (final.draw - targets.draw) ** 2 +
+    (final.away - targets.away) ** 2;
+  return { home: lh, away: la, converged: false, iterations: MAX_ITER, residual: fr };
+}
+
+// Cache the solved lambdas per featureMap reference so multiple AH selections
+// for the same match don't re-solve. featureMap is built once per match in
+// valueDetection's outer loop, so this naturally amortises across selections.
+const lambdaCache = new WeakMap<Record<string, number>, SolveLambdasResult | null>();
+
+export function getOpponentAwareLambdas(
+  featureMap: Record<string, number>,
+): SolveLambdasResult | null {
+  const cached = lambdaCache.get(featureMap);
+  if (cached !== undefined) return cached;
+
+  const outcome = predictOutcome(featureMap);
+  if (!outcome) {
+    lambdaCache.set(featureMap, null);
+    return null;
+  }
+  const initH = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"] ?? 1.3;
+  const initA = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"] ?? 1.3;
+  if (initH <= 0 || initA <= 0) {
+    lambdaCache.set(featureMap, null);
+    return null;
+  }
+  const solved = solveLambdasFromOutcome(outcome, initH, initA);
+  lambdaCache.set(featureMap, solved);
+  return solved;
+}
+
 // C2 (2026-05-07): Asian Handicap probability for one side at a given line.
 // Settlement convention: "Home L" pays out on (home_goals - away_goals + L) > 0;
 // pushes (margin = 0) refund the stake (treated as 0.5 win for EV purposes).
 // Quarter handicaps (e.g. -0.25, -0.75) split between two adjacent half/whole
 // lines per Betfair rules — recurse and average.
+//
+// 2026-05-15 — opts.lambdaSource='opponent_aware' switches the lambda inputs
+// from marginal team-scoring rates to LR-derived opponent-aware lambdas via
+// inverse-Poisson projection. See solveLambdasFromOutcome + #49 brief.
 export function predictAsianHandicap(
   featureMap: Record<string, number>,
   side: "home" | "away",
   line: number,
-  opts?: { rho?: number; copulaKind?: "dixon_coles" | "sarmanov" },
+  opts?: {
+    rho?: number;
+    copulaKind?: "dixon_coles" | "sarmanov";
+    lambdaSource?: "marginal" | "opponent_aware";
+  },
 ): number | null {
-  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
-  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  let homeLambda: number;
+  let awayLambda: number;
+
+  if (opts?.lambdaSource === "opponent_aware") {
+    const solved = getOpponentAwareLambdas(featureMap);
+    if (solved) {
+      homeLambda = solved.home;
+      awayLambda = solved.away;
+    } else {
+      // Fall back to marginal if LR unavailable
+      homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+      awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+    }
+  } else {
+    homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+    awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  }
   if (homeLambda == null || awayLambda == null) return null;
   if (homeLambda <= 0 || awayLambda <= 0) return null;
 
@@ -950,13 +1116,35 @@ export function predictDrawNoBet(
   };
 }
 
-// C1 (2026-05-07): Per-side team-total goals — Poisson over the team's own
-// scoring lambda. Independent of opposition.
+// C1 (2026-05-07): Per-side team-total goals.
+//
+// 2026-05-15 — opts.lambdaSource='opponent_aware' switches from independent
+// marginal-Poisson to the matrix-marginal computed from LR-derived opponent-
+// aware lambdas. The matrix marginal Σ_a matrix[k][a] correctly captures
+// opposition defensive strength via the joint distribution.
 export function predictTeamTotalGoals(
   featureMap: Record<string, number>,
   side: "home" | "away",
   threshold: number,
+  opts?: { lambdaSource?: "marginal" | "opponent_aware" },
 ): { over: number; under: number } | null {
+  if (opts?.lambdaSource === "opponent_aware") {
+    const solved = getOpponentAwareLambdas(featureMap);
+    if (solved) {
+      // Matrix marginal: P(side_goals = k) = Σ_other matrix[k or *][* or k]
+      const { matrix } = outcomeProbsFromLambdas(solved.home, solved.away, 8);
+      let over = 0;
+      for (let h = 0; h < matrix.length; h++) {
+        for (let a = 0; a < matrix[h].length; a++) {
+          const sideGoals = side === "home" ? h : a;
+          if (sideGoals > threshold) over += matrix[h][a];
+        }
+      }
+      over = Math.max(0.01, Math.min(0.99, over));
+      return { over, under: 1 - over };
+    }
+    // Fall through to marginal if LR unavailable
+  }
   const lambda = side === "home"
     ? featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"]
     : featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
