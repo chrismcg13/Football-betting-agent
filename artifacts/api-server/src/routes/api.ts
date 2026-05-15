@@ -6134,6 +6134,22 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
+// Phase 2f (2026-05-15) — direct FBref season-stats scraper via
+// cloudscraper. Bypasses the Cloudflare wall that blocked the
+// Selenium-based soccerdata path. Writes to team_form_scrape with
+// source='fbref'. Operator-fired only; once verified we'll add a
+// Tuesday-05:00 weekly cron.
+router.post("/admin/run-fbref-direct", async (_req, res) => {
+  try {
+    const { runFbrefDirectScrape } = await import("../services/fbrefDirectScrapeCron");
+    const r = await runFbrefDirectScrape();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "Manual FBref direct run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 2e (2026-05-15) — direct-HTTP FotMob women's scraper.
 // Replaces the soccerdata path (which 1.9 broke). Scripts/python/
 // scrape_fotmob_direct.py hits FotMob's own public /api endpoints,

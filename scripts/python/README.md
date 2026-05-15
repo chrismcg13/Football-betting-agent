@@ -10,7 +10,8 @@ return non-zero on error so the wrapper logs it.
 |---|---|---|
 | `fit_calibration.py` | Mon 04:00 | `calibration_buckets` |
 | `fit_dixon_coles.py` | Mon 05:00 | `scoreline_correlation`, `model_layer_enabled` |
-| `scrape_team_form.py` | **disabled 2026-05-15** — FBref blocks Selenium | manual admin endpoint only; pivoting to xg_match_data aggregation |
+| `scrape_team_form.py` | **deprecated 2026-05-15** — FBref blocks Selenium; replaced by `scrape_fbref_direct.py` | manual admin endpoint kept for legacy testing |
+| `scrape_fbref_direct.py` | manual (initially); will become weekly Tue 05:00 cron once verified | `team_form_scrape` source='fbref' — Big 5 men's + Championship + FA WSL + NWSL via cloudscraper (HTTP, no browser) |
 | `scrape_fotmob_women.py` | **deprecated 2026-05-15** — soccerdata 1.9 dropped FotMob; replaced by `scrape_fotmob_direct.py` | manual admin endpoint kept for legacy testing |
 | `scrape_fotmob_direct.py` | manual (initially); will become weekly Sun cron once verified | `xg_match_data` source='fotmob' — WSL/NWSL/Frauen-Bundesliga/Liga F/D1 Féminine/Serie A Femminile/Damallsvenskan/Toppserien/Kvindeligaen/A-League W via FotMob's public /api endpoints |
 | `ingest_statsbomb_women.py` | manual (per-season) | `xg_match_data` source='statsbomb' (Women's WC, Women's Euro — tournament-only) |

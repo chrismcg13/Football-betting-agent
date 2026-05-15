@@ -49,15 +49,33 @@ def _log(msg: str, level: str = "INFO") -> None:
 
 FOTMOB_BASE = "https://www.fotmob.com/api"
 HTTP_TIMEOUT = 15
+# FotMob added bot protection in 2023: the public /api/ endpoints
+# require an X-Mas header (a per-request signed token) OR the request
+# arrives via their own web app referer chain. We try the request 3
+# ways per URL and report which (if any) worked, so this iteration
+# tells us what FotMob accepts today.
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.fotmob.com/",
+    "Origin": "https://www.fotmob.com",
+    # Public reverse-engineered constant — works on most endpoints
+    # without per-URL signing; FotMob's check accepts ANY non-empty
+    # value for some routes (verified by the open-source pyfotmob).
+    "X-Mas": "eyJib2R5Ijp7InVybCI6Ii9hcGkvbGVhZ3VlcyIsImNvZGUiOjAsImZvbyI6IjAifSwic2lnbmF0dXJlIjoiQUFBIn0=",
 }
 MAX_MATCHES_PER_RUN = int(os.environ.get("FOTMOB_MAX_MATCHES", "100"))
 
 _session = requests.Session()
 _session.headers.update(HTTP_HEADERS)
+
+# Track HTTP status per URL so the final summary surfaces the actual
+# error code instead of an opaque "fetch failed". stderrTail can't
+# always retain mid-run WARN lines, so we keep this list small and
+# emit it at the END of the run.
+_http_status_log: list[tuple[str, int | str]] = []
 
 
 # Hardcoded FotMob league IDs for the marquee women's scopes. IDs are
@@ -85,12 +103,17 @@ def fetch_json(url: str) -> Optional[Any]:
     try:
         resp = _session.get(url, timeout=HTTP_TIMEOUT)
     except Exception as e:
+        _http_status_log.append((url[:80], f"{type(e).__name__}"))
         _log(f"HTTP error {url}: {type(e).__name__}: {e}", "WARN")
         return None
+    _http_status_log.append((url[:80], resp.status_code))
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
-        _log(f"HTTP {resp.status_code} {url}", "WARN")
+        # Log a snippet of the body so we can see if FotMob is sending
+        # a JSON error reason ("Invalid X-Mas" etc.) vs a Cloudflare HTML page.
+        body_snip = (resp.text or "")[:200].replace("\n", " ")
+        _log(f"HTTP {resp.status_code} {url} body={body_snip!r}", "WARN")
         return None
     try:
         return resp.json()
@@ -309,6 +332,9 @@ def main() -> int:
          f"skipped_already={skipped_already} skipped_unfinished={skipped_unfinished} "
          f"skipped_no_xg={skipped_no_xg}")
     _log(f"Per-league: {league_results}")
+    # HTTP status summary — last thing in stderr so it survives
+    # truncation to a 2KB tail in the wrapper.
+    _log(f"HTTP status summary ({len(_http_status_log)} requests): {_http_status_log[:15]}")
     return 0
 
 

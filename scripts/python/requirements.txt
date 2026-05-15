@@ -25,3 +25,12 @@ jax>=0.4.20
 # pandas-DataFrame API and includes a built-in FS cache so we don't write
 # raw HTML / JSON to Postgres.
 soccerdata>=1.9.0
+
+# Phase 2f (2026-05-15) — direct FBref scraper bypassing Cloudflare.
+# cloudscraper handles JS challenges via HTTP (no browser); bs4 parses
+# the resulting HTML tables. Avoids the Selenium-Cloudflare wall that
+# blocked the soccerdata FBref path. Both are tiny pure-python deps
+# (~1-2 MB combined).
+cloudscraper>=1.2.71
+beautifulsoup4>=4.12.0
+lxml>=5.0
