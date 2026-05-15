@@ -94,24 +94,32 @@ _session.headers.update(HTTP_HEADERS)
 _http_status_log: list[tuple[str, int | str]] = []
 
 
-# Hardcoded FotMob league IDs for the marquee women's scopes. IDs are
-# from FotMob's own URLs (e.g. /leagues/9227/overview/wsl). Tried
-# per-run individually — if FotMob renames or removes any, the script
-# logs the failure and continues with the rest.
+# 2026-05-15 — IDs refreshed via Phase 2j brute scan that parses
+# __NEXT_DATA__ from FotMob's SPA HTML responses. Of the 10 originally
+# hardcoded only WSL=9227 and NWSL=9134 were correct — FotMob
+# renumbered the other 8 at some point and the silent HTML-shell
+# fallback meant we were collecting zero xG for those scopes without
+# observable error. Verified each new ID resolves to the expected
+# league name in __NEXT_DATA__.props.pageProps.initialState.
+# leagueOverview.details.name.
 #
 # tuple = (fotmob_league_id, canonical_league_name_for_db,
 #          api_football_league_name_for_matching_with_matches_table)
 WOMENS_LEAGUES: list[tuple[int, str, str]] = [
     (9227, "FA Women's Super League", "WSL"),
     (9134, "NWSL", "NWSL"),
-    (9229, "Frauen-Bundesliga", "Frauen-Bundesliga"),
-    (9682, "Liga F", "Liga F"),
-    (9223, "Division 1 Féminine", "Division 1 Féminine"),
-    (9213, "Serie A Femminile", "Serie A Femminile"),
-    (9220, "Damallsvenskan", "Damallsvenskan"),
-    (9156, "Toppserien", "Toppserien"),
-    (9367, "Kvindeligaen", "Kvindeligaen"),
-    (9304, "A-League Women", "A-League Women"),
+    (9676, "Frauen-Bundesliga", "Frauen-Bundesliga"),
+    (9907, "Liga F", "Liga F"),
+    # FotMob renamed D1 Féminine to "Première Ligue Féminine" (D1 Arkema rebrand).
+    # api-football still uses "Division 1 Féminine" so keep the match key.
+    (9677, "Première Ligue Féminine", "Division 1 Féminine"),
+    (10178, "Serie A Femminile", "Serie A Femminile"),
+    (9089, "Damallsvenskan", "Damallsvenskan"),
+    (9495, "A-League Women", "A-League Women"),
+    # Toppserien (Norway W) and Kvindeligaen (Denmark W) top divisions
+    # not found in 9000-10500 brute scan. Phase 2j follow-up will extend
+    # range to 10500-12000 + try strategy A on Nordic-language sitemaps.
+    # Leaving them out for now rather than ship dead IDs.
 ]
 
 

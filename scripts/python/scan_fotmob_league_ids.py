@@ -298,7 +298,17 @@ def main() -> int:
     if (strategy_filter in ("c", "brute")
             or (strategy_filter == "all" and interim_hit_count < len(TARGET_NAMES))):
         # Strategy C — parallel brute scan, ~30-60s
-        c_results = strategy_c_brute_scan(session, lo=9000, hi=10500, workers=8)
+        # Allow CLI override of range so we can extend hunt for missing
+        # Toppserien + Kvindeligaen IDs without rebuilding.
+        lo_arg, hi_arg = 9000, 10500
+        for arg in sys.argv[1:]:
+            if arg.startswith("--range="):
+                try:
+                    a, b = arg.split("=", 1)[1].split("-", 1)
+                    lo_arg, hi_arg = int(a), int(b)
+                except Exception:
+                    pass
+        c_results = strategy_c_brute_scan(session, lo=lo_arg, hi=hi_arg, workers=8)
         if c_results:
             _log(f"Strategy C found {len(c_results)} women's-keyword leagues via ID scan")
             all_candidates.extend(c_results)

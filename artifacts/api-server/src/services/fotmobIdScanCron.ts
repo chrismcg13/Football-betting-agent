@@ -39,7 +39,10 @@ export interface FotmobIdScanResult {
   scriptExists: boolean;
 }
 
-export async function runFotmobIdScan(strategy: string = "all"): Promise<FotmobIdScanResult> {
+export async function runFotmobIdScan(
+  strategy: string = "all",
+  range?: string,
+): Promise<FotmobIdScanResult> {
   const startedAt = Date.now();
   const repoRoot = discoverRepoRoot();
   const pythonBin = path.isAbsolute(PYTHON_BIN)
@@ -72,9 +75,9 @@ export async function runFotmobIdScan(strategy: string = "all"): Promise<FotmobI
   }
 
   return new Promise<FotmobIdScanResult>((resolve) => {
-    const args = strategy && strategy !== "all"
-      ? [scriptPath, `--strategy=${strategy}`]
-      : [scriptPath];
+    const args: string[] = [scriptPath];
+    if (strategy && strategy !== "all") args.push(`--strategy=${strategy}`);
+    if (range && /^\d+-\d+$/.test(range)) args.push(`--range=${range}`);
     const child = spawn(pythonBin, args, {
       cwd: repoRoot,
       env: process.env,

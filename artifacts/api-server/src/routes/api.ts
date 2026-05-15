@@ -6142,10 +6142,12 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
 // writes the DB.
 router.post("/admin/run-fotmob-id-scan", async (req, res) => {
   try {
-    const strategy = String((req.body ?? {}).strategy ?? "all");
+    const body = req.body ?? {};
+    const strategy = String(body.strategy ?? "all");
+    const range = typeof body.range === "string" ? body.range : undefined;
     const { runFotmobIdScan } = await import("../services/fotmobIdScanCron");
-    const r = await runFotmobIdScan(strategy);
-    res.json({ ok: r.exitCode === 0, strategy, ...r });
+    const r = await runFotmobIdScan(strategy, range);
+    res.json({ ok: r.exitCode === 0, strategy, range, ...r });
   } catch (err) {
     logger.error({ err }, "FotMob id scan failed");
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
