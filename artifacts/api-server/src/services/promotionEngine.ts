@@ -1010,9 +1010,9 @@ export async function computeArchetypeDistributionShift(): Promise<void> {
       COALESCE(SUM(pb.stake::numeric) FILTER (WHERE pb.status IN ('won','lost')), 0) as staked,
       COALESCE(SUM(
         LN(GREATEST(0.001,
-          (COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1) +
+          (COALESCE(NULLIF(pb.stake::numeric, 0), NULLIF(pb.shadow_stake::numeric, 0), 1) +
            COALESCE(NULLIF(pb.settlement_pnl::numeric, 0), pb.shadow_pnl::numeric, 0)) /
-          COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1)
+          COALESCE(NULLIF(pb.stake::numeric, 0), NULLIF(pb.shadow_stake::numeric, 0), 1)
         ))
       ) FILTER (WHERE pb.status IN ('won','lost')), 0) as sum_log_growth
     FROM paper_bets pb
@@ -1038,9 +1038,9 @@ export async function computeArchetypeDistributionShift(): Promise<void> {
         COALESCE(SUM(pb.stake::numeric) FILTER (WHERE pb.status IN ('won','lost')), 0) as staked,
         COALESCE(SUM(
           LN(GREATEST(0.001,
-            (COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1) +
+            (COALESCE(NULLIF(pb.stake::numeric, 0), NULLIF(pb.shadow_stake::numeric, 0), 1) +
              COALESCE(NULLIF(pb.settlement_pnl::numeric, 0), pb.shadow_pnl::numeric, 0)) /
-            COALESCE(NULLIF(pb.stake::numeric, 0), pb.shadow_stake::numeric, 1)
+            COALESCE(NULLIF(pb.stake::numeric, 0), NULLIF(pb.shadow_stake::numeric, 0), 1)
           ))
         ) FILTER (WHERE pb.status IN ('won','lost')), 0) as sum_log_growth
       FROM paper_bets pb
