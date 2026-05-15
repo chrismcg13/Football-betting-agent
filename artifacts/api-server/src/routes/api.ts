@@ -6134,6 +6134,23 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
+// Phase 2e (2026-05-15) — direct-HTTP FotMob women's scraper.
+// Replaces the soccerdata path (which 1.9 broke). Scripts/python/
+// scrape_fotmob_direct.py hits FotMob's own public /api endpoints,
+// no Selenium, no third-party scraper library, no auth. Writes to
+// xg_match_data with source='fotmob'. Operator-fired only for now;
+// once verified we'll add a weekly Sunday cron.
+router.post("/admin/run-fotmob-direct", async (_req, res) => {
+  try {
+    const { runFotmobDirectScrape } = await import("../services/fotmobDirectScrapeCron");
+    const r = await runFotmobDirectScrape();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "Manual FotMob direct scraper run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 2b (2026-05-14): manual trigger for FotMob women's match-xG
 // scraper. Currently a no-op — soccerdata 1.9 dropped FotMob entirely.
 // Endpoint stays wired for future soccerdata releases that re-add it.
