@@ -6167,6 +6167,37 @@ router.post("/admin/run-statsbomb-ingest", async (_req, res) => {
   }
 });
 
+// Phase 3 (2026-05-15) — cleanup pre-cutoff StatsBomb rows. The
+// initial ingest pulled 540 women's-football match summaries
+// including FAWSL 2018/19-2020/21, NWSL 2018 and Women's WC 2019 —
+// all >3 yrs old, with rosters/coaches/eras unrelated to anything
+// the model bets on in 2026. Per
+// feedback_ingest_only_predictive_data, those rows are dead weight
+// on Neon AND dilute any rolling-form / DC-fit aggregation. This
+// endpoint deletes everything that fails the same season-start-year
+// cutoff the ingest script now enforces at write time.
+router.post("/admin/cleanup-statsbomb-old", async (req, res) => {
+  try {
+    const cutoffYear = Number((req.body ?? {}).cutoffYear ?? 2022);
+    const cutoffDate = `${cutoffYear}-01-01`;
+    const { db } = await import("@workspace/db");
+    const result = (await db.execute(sql`
+      DELETE FROM xg_match_data
+      WHERE source = 'statsbomb'
+        AND (match_date IS NULL OR match_date < ${cutoffDate})
+    `)) as unknown as { rowCount?: number };
+    res.json({
+      ok: true,
+      cutoffYear,
+      cutoffDate,
+      deleted: result.rowCount ?? 0,
+    });
+  } catch (err) {
+    logger.error({ err }, "Cleanup pre-cutoff StatsBomb rows failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 0b (Women's & Internationals expansion, 2026-05-14). Seeds the
 // competition_aliases table with known Betfair-side names for the
 // marquee women's + international scopes, then triggers a synchronous

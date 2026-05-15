@@ -74,6 +74,25 @@ WOMEN_COMPETITION_KEYWORDS = (
     "fawsl",
 )
 
+# Recency cutoff. Per feedback_ingest_only_predictive_data: historical
+# depth >3 yrs for women's football is dead weight — rosters /
+# coaches / tactical eras have shifted, the old matches aren't
+# predictive of 2026 bets, and inserting them costs Neon storage and
+# dilutes any rolling-form / DC-fit aggregation that consumes the
+# table. StatsBomb open-data goes back to FAWSL 2018/19 + NWSL 2018 +
+# WWC 2019 — all of which fall under this cutoff.
+SEASON_CUTOFF_YEAR = int(os.environ.get("STATSBOMB_SEASON_CUTOFF", "2022"))
+
+
+def _season_start_year(season_name: str) -> Optional[int]:
+    """Extract the START year from a StatsBomb season_name string.
+    Formats vary: '2023', '2023/2024', '2024/2025'. Returns the first
+    4-digit number found, or None if the string doesn't contain one.
+    """
+    import re
+    m = re.search(r"\b(20\d{2})\b", season_name or "")
+    return int(m.group(1)) if m else None
+
 
 def fetch_json(url: str) -> Optional[Any]:
     try:
@@ -121,10 +140,29 @@ def main() -> int:
         _log("Could not fetch competitions index", "ERROR")
         return 1
 
-    women_comps = [c for c in competitions if is_women_competition(c)]
-    _log(f"Found {len(women_comps)} women's (comp, season) entries out of {len(competitions)} total")
+    women_comps_all = [c for c in competitions if is_women_competition(c)]
+    # Apply recency cutoff at source — per
+    # feedback_ingest_only_predictive_data, never let
+    # storage-irrelevant historical seasons through.
+    women_comps = []
+    dropped_old = []
+    for c in women_comps_all:
+        season_name = c.get("season_name") or ""
+        start_year = _season_start_year(season_name)
+        if start_year is None:
+            # Defensive — keep ambiguous entries and let the operator audit
+            women_comps.append(c)
+            continue
+        if start_year >= SEASON_CUTOFF_YEAR:
+            women_comps.append(c)
+        else:
+            dropped_old.append(f"{c.get('competition_name')} {season_name}")
+    _log(f"Found {len(women_comps_all)} women's (comp, season) entries; "
+         f"{len(women_comps)} pass season cutoff ≥{SEASON_CUTOFF_YEAR} (dropped {len(dropped_old)} pre-cutoff)")
+    if dropped_old:
+        _log(f"Dropped pre-cutoff: {dropped_old}")
     if not women_comps:
-        _log("No women's competitions in open-data — exiting", "WARN")
+        _log("No women's competitions pass cutoff — exiting", "WARN")
         return 0
 
     conn = psycopg2.connect(dsn)
