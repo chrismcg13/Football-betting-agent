@@ -6134,6 +6134,22 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
+// FotMob endpoint discovery probe (2026-05-15). Tries 25+ candidate
+// URL patterns and reports status codes + body hints (__NEXT_DATA__
+// presence, xG mentions). Read-only research — never writes to the
+// DB. Once a 200-OK candidate is identified, scrape_fotmob_direct
+// gets a one-line URL update and the women's xG pipeline is back.
+router.post("/admin/run-fotmob-probe", async (_req, res) => {
+  try {
+    const { runFotmobProbe } = await import("../services/fotmobProbeCron");
+    const r = await runFotmobProbe();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "FotMob probe failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Phase 2c (2026-05-15) — SQL-only team_form_scrape aggregator.
 // Replaces the broken FBref + FotMob scraper paths. Computes
 // season-aggregate xG / matches / goals per (source × league ×
