@@ -135,24 +135,82 @@ const FINDINGS: Finding[] = [
     analysis_type: "strategic_finding",
     findings: {
       summary:
-        "The £5k bankroll target, salary timeline, and subscription-service concept were built on edge signal that is now known to be partly fabricated (AH parser bug) or structurally absent on current modelling (BTTS, TEAM_TOTAL_*, OU_*). Until clean post-fix data demonstrates real edge on at least one market, the financial model is a hypothesis, not a plan.",
+        "The £5k bankroll target, salary timeline, and subscription-service concept were built on edge signal that is now known to be partly fabricated (AH parser bug) or empirically falsified at n large enough to be definitive (MO, BTTS, TEAM_TOTAL_*, OVER_UNDER_*). Until clean post-fix data demonstrates real edge on at least one market, the financial model is a hypothesis, not a plan.",
       what_changed_2026_05_15:
-        "AH parser bug discovery + Tier-1 coverage audit + power analysis on clean-data dataset. The 57 qualifying AH scopes, +55.6 pct ROI, +15.6 pct CLV that the strategic plan rested on are corrupt-input metrics. Cleaner markets (MO, BTTS, TEAM_TOTAL) have no qualifying scopes and average CLV is negative or unstable.",
-      what_is_still_true:
-        "The infrastructure (eligibility view, adaptive Kelly, two-path gate, exclusion rules) is sound. The bet-routing layer, settlement reconciliation, and risk guardrails are working as designed. The unknown is whether real edge exists in the underlying model once corrupted inputs are removed.",
+        "AH parser bug discovery + Tier-1 coverage audit + power analysis on full bet population (live + shadow + paper). The 57 qualifying AH scopes, +55.6 pct ROI, +15.6 pct CLV that the strategic plan rested on are corrupt-input metrics. Aggregate (Path 2) analysis on clean markets at large n shows: MATCH_ODDS Wilson lo95=0.237 (model loses more than it wins, gate unreachable on current architecture) + CLV t-stat +2.15 (model identifies value Pinnacle agrees with) — a calibration anomaly. BTTS n=581 CLV t=-1.24 (no edge). TEAM_TOTAL_AWAY_05 n=197 Wilson 0.489 + CLV t=-2.57 (Wilson close but CLV strongly negative). TEAM_TOTAL_HOME_15 n=245 Wilson 0.396 + CLV t=-1.19. TEAM_TOTAL_AWAY_15 n=190 Wilson 0.298 + CLV t=-0.58. OVER_UNDER_25 n=69 CLV t=-0.72.",
       what_is_falsified:
-        "Specific ROI projections, time-to-bankroll-doubling estimates, and any commercial commitment that assumed AH live PnL was a real-money signal of model edge.",
+        "On 4 of 5 measurable clean markets at definitive n, the eligibility gate correctly rejects. This isn't insufficient data — it's empirical evidence the current model has no measurable edge on these markets. Re-eligibility for these markets depends on task #49 (opponent-aware lambdas) for AH/TT-class, or task #61 (MO LR calibration) for MO. Pre-2026-05-15 ROI projections, time-to-bankroll-doubling estimates, salary timeline, subscription concept — all hypotheses contingent on those design passes delivering measurable lift.",
+      what_is_still_true:
+        "The infrastructure (eligibility view, adaptive Kelly, two-path gate, exclusion rules, kill switch, settlement reconciliation, risk guardrails) is sound. The unknown is whether real edge exists in the underlying model on any market once corrupted inputs are removed AND the modelling gaps (#49, #61) are addressed.",
     },
     recommendations: {
       capital_decision_rule:
-        "Do not size capital, salary, or subscription commitments based on pre-2026-05-15 edge numbers. Re-anchor only on clean post-fix data once aggregate paths re-qualify on at least one market.",
+        "Do not size capital, salary, or subscription commitments based on pre-2026-05-15 edge numbers. Re-anchor only on clean post-fix data once at least one market_type clears the eligibility gate.",
       messaging_principle:
-        "External communication about edge, ROI, or returns must footnote 'subject to clean-data verification post parser fix' until at least one market clears the eligibility gate on post-fix data.",
+        "External communication about edge, ROI, or returns must footnote 'subject to clean-data verification post parser fix AND model-architecture remediation' until at least one market clears the gate.",
+      ah_specific:
+        "AH is the only unfalsified market — its real edge (if any) is unknown until post-parser-fix shadow data accumulates. If AH clean-data fails the gate too, the financial model is falsified across every market the system currently bets.",
     },
     actions_taken: {
       status: "permanent_strategic_constraint",
       next_review_trigger:
         "At least one market_type clears the eligibility gate on data placed AFTER parser-fix-deploy timestamp.",
+      gate_conditions_for_capital_commitment: [
+        "AH aggregate path qualifies on post-parser-fix shadow data only",
+        "OR task #49 design pass demonstrates measurable Wilson + CLV lift on at least one TT/AH-class market",
+        "OR task #61 design pass identifies and fixes MO LR calibration anomaly with measurable Wilson lift",
+      ],
+    },
+  },
+  {
+    experiment_tag: "emission_concentration_structural_2026_05_15",
+    analysis_type: "strategic_finding",
+    findings: {
+      summary:
+        "AH emission concentration in the historical dataset is structural, not a bug. Per-match emission rate roughly equals the number of candidate selections passing edge threshold. AH has ~32 candidate selections per match (handicap lines -2 to +2 in 0.25 steps × 2 sides), giving 10.31 emissions/match. MO has 3 selections (1.05/match), BTTS has 2 (1.02/match), most TEAM_TOTAL/OVER_UNDER have 2 (~1.0/match). The 14k AH bets/week observed is inflation from selection cardinality, not from a throttle on other markets.",
+      retrospective_consequence:
+        "Any historical performance assessment that aggregated across markets without normalising per-market was implicitly weighted toward AH by emission cardinality. The 'composite ROI' figures used in strategic planning were ~80%+ AH-weighted. Now that AH edge is known to be partly fabricated, those composite figures are not reliable summaries of model performance.",
+      not_a_bug_to_fix:
+        "Selection cardinality is a property of how each market is structured on Betfair. AH is offered at many lines; BTTS is binary. Equalising emission would either suppress AH down to BTTS-volume (losing legitimate signal on real AH edge if it exists post-fix) or inflate BTTS to AH-volume (artificially — there are only 2 selections to bet). The correct stance is to evaluate each market on its own per-market data, never composite.",
+    },
+    recommendations: {
+      analytics_principle:
+        "All strategic performance assessments segment per-market_type. Cross-market composites are inadmissible.",
+      audit_trail:
+        "Bundle B's analysis_signal_strength already segments per-(market_type, bet_track). The view layer (v_live_eligibility_*) already segments. The risk is in ad-hoc reports and human summaries — flag any composite-ROI claim in strategic docs as a violation.",
+    },
+    actions_taken: {
+      status: "permanent_analytics_constraint",
+      enforcement:
+        "Per-market segmentation is now required in every retrospective. Add to CLAUDE.md as analytics principle when next revised.",
+    },
+  },
+  {
+    experiment_tag: "mo_calibration_anomaly_2026_05_15",
+    analysis_type: "strategic_finding",
+    findings: {
+      summary:
+        "MATCH_ODDS aggregate at n=1109 shows Wilson lo95=0.237 (model wins ~26 pct of bets — far below 50 pct break-even) BUT CLV t-stat=+2.15 with mean CLV=+1.93 pct (Pinnacle moves toward our side after we place). The model identifies value the sharpest market agrees with, but the outcomes systematically don't follow our probability assignments. This is a probability calibration error, not a feature gap.",
+      distinct_from_opponent_blindness:
+        "predictOutcome uses the trained outcomeModel LR (predictionEngine.ts:715-734) which has the full FEATURE_NAMES vector including opponent-derived xG proxies, Elo on both sides, head-to-head, etc. The LR is opponent-aware. The failure is at the LR's probability calibration, not at the feature engineering layer.",
+      hypothesised_mechanisms: [
+        "Edge-filter selection bias — probabilities well-calibrated overall, but the eligibility funnel selects bets where (model_prob - implied_prob) is largest, biasing the emitted subset toward over-confidence",
+        "Isotonic / Platt calibration drift on calibration_buckets for MO specifically",
+        "Training-test feature distribution shift — features at training time differ from features at predict time",
+        "Class imbalance in 3-way training data (home wins > away > draws historically) producing under-calibrated tails",
+      ],
+      relation_to_other_findings:
+        "Same observational symptom as the AH parser bug (positive CLV with bad realized outcomes) but DIFFERENT root cause. AH was a data-layer mislabel; MO is an LR-layer calibration issue. Separate diagnostic pass required.",
+    },
+    recommendations: {
+      diagnostic_pass:
+        "Open task #61 — read-only audit of MO predictions: training-time vs predict-time feature distribution; isotonic calibrator residuals on MO bins; edge-filter selection-bias quantification (compare LR probabilities on emitted vs all-fixture distributions); class balance in training.",
+      do_not_treat_as_part_of_49:
+        "Mixing MO calibration into #49 (opponent-aware lambdas) over-scopes the brief. Solutions are different — #49 changes the lambda inputs to the score-matrix; #61 likely retrains or re-calibrates the LR or fixes the emission filter. Keep them parallel.",
+    },
+    actions_taken: {
+      status: "new_diagnostic_pass_opened",
+      tasks: ["#61"],
     },
   },
   {

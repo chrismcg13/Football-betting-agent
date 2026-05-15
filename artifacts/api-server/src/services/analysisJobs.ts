@@ -30,6 +30,14 @@ const N_FLOOR = 30;
 const SHRINKAGE_N_PRIOR = 30;
 const CLV_T_THRESHOLD = 1.96;
 const WILSON_WINRATE_THRESHOLD = 0.50;
+// 2026-05-15 — conditional CLV gate. A scope is "Pinnacle-anchored" iff
+// tier1_n / n >= TIER1_COVERAGE_THRESHOLD. When Pinnacle-anchored, CLV t-stat
+// gate fires per the existing rule. When NOT Pinnacle-anchored (e.g. BTTS at
+// 0 pct Tier-1), the CLV gate is suspended and qualification rests on Wilson +
+// bootstrap alone. Threshold of 0.30 chosen as the lowest fraction at which
+// CLV t-stat on the Pinnacle subset is statistically meaningful — below this
+// the t-stat is computed on a sample too thin to overweight.
+const TIER1_COVERAGE_THRESHOLD = 0.30;
 // 2026-05-13: shrunk_roi qualification path removed. The 0.20 threshold had
 // no statistical referent (Wilson 0.50 is the 1:1-payout break-even; CLV
 // 1.96 is the 95% z-score; 0.20 was a magic number). With the market_type
@@ -113,7 +121,7 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
   // time so shadow uses shadow_*, live/paper uses net/settlement.
   const segmentInsert = await db.execute(sql`
     INSERT INTO analysis_segment_stats
-      (computed_at, league, market_type, bet_track, n, w, stake, pnl, avg_clv, sd_clv, clv_n)
+      (computed_at, league, market_type, bet_track, n, w, stake, pnl, avg_clv, sd_clv, clv_n, tier1_n)
     SELECT
       ${computedAt}::timestamptz                                   AS computed_at,
       COALESCE(m.league, '__unknown__')                            AS league,
@@ -136,7 +144,10 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
       -- "synthetic sharp consensus" closing-line anchor for non-Pinnacle scopes.
       AVG(COALESCE(pb.clv_pct, pb.synthetic_clv_pct))::numeric      AS avg_clv,
       STDDEV(COALESCE(pb.clv_pct, pb.synthetic_clv_pct))::numeric   AS sd_clv,
-      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL OR pb.synthetic_clv_pct IS NOT NULL)::int AS clv_n
+      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL OR pb.synthetic_clv_pct IS NOT NULL)::int AS clv_n,
+      -- 2026-05-15: Tier-1 (Pinnacle) anchor count for conditional CLV gate.
+      -- Scope is "Pinnacle-anchored" iff tier1_n / n >= TIER1_COVERAGE_THRESHOLD.
+      COUNT(*) FILTER (WHERE pb.clv_source_tier = 1)::int          AS tier1_n
     FROM paper_bets pb
     LEFT JOIN matches m ON pb.match_id = m.id
     WHERE pb.placed_at >= ${analysisStart}::date
@@ -214,13 +225,18 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
         WHEN s.sd_clv IS NULL OR s.sd_clv = 0 OR s.clv_n < 2 THEN NULL
         ELSE (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv
       END                                                                     AS clv_t_stat,
-      -- Qualifies live?
+      -- Qualifies live? (per-scope Path 1)
       -- Two independent theory-pinned paths (n>=30 AND pnl>0 are common floors):
       --   1. Wilson lo95 on raw win-rate > 0.50  (1:1-payout proof; Wilson 1927)
       --   2. CLV t-stat > 1.96 with avg_clv > 0  (closing-line proof; Student 1908)
-      -- The shrunk_roi > 0.20 path was removed 2026-05-13: 0.20 had no
-      -- statistical referent and every scope that qualified on it alone is
-      -- now reachable via the market_type aggregate path (Lever A+G).
+      -- 2026-05-15 — conditional CLV gate per Finding clv_anchor_mismatch_2026_05_15:
+      -- If scope is Pinnacle-anchored (tier1_n / n >= 0.30), CLV path remains
+      -- available. If Pinnacle is structurally unavailable for the scope
+      -- (tier1_n / n < 0.30, e.g. BTTS at 0 pct), the CLV path is suspended
+      -- and qualification rests on Wilson alone. The CLV t-stat is statistically
+      -- meaningless when computed on a sample where most rows have no Pinnacle
+      -- anchor; suspending the gate avoids fabricating qualification from a
+      -- thin Tier-1 subset.
       (
         s.n >= ${N_FLOOR}
         AND s.pnl > 0
@@ -229,7 +245,9 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
             - 1.96 * SQRT(s.w::numeric * (s.n - s.w)::numeric / NULLIF(s.n, 0) + 0.96)
                     / (s.n + 3.84)) > ${WILSON_WINRATE_THRESHOLD}
           OR (
-            s.sd_clv IS NOT NULL AND s.sd_clv > 0 AND s.clv_n >= 2
+            -- CLV path only available when Pinnacle-anchored.
+            (s.tier1_n::numeric / NULLIF(s.n, 0)) >= ${TIER1_COVERAGE_THRESHOLD}
+            AND s.sd_clv IS NOT NULL AND s.sd_clv > 0 AND s.clv_n >= 2
             AND (s.avg_clv * SQRT(s.clv_n::numeric)) / s.sd_clv > ${CLV_T_THRESHOLD}
             AND s.avg_clv > 0
           )
@@ -331,7 +349,8 @@ async function runMarketTypeAggregatePass(
       CASE WHEN pb.bet_track = 'shadow'
            THEN COALESCE(pb.shadow_pnl, 0)
            ELSE COALESCE(pb.net_pnl, pb.settlement_pnl, 0) END        AS pnl,
-      COALESCE(pb.clv_pct, pb.synthetic_clv_pct)                      AS clv
+      COALESCE(pb.clv_pct, pb.synthetic_clv_pct)                      AS clv,
+      (pb.clv_source_tier = 1)                                        AS is_tier1
     FROM paper_bets pb
     WHERE pb.placed_at >= ${analysisStart}::date
       AND pb.deleted_at IS NULL
@@ -356,6 +375,7 @@ async function runMarketTypeAggregatePass(
       stake: number | string | null;
       pnl: number | string | null;
       clv: number | string | null;
+      is_tier1: boolean | null;
     }>;
   }).rows ?? [];
 
@@ -365,6 +385,7 @@ async function runMarketTypeAggregatePass(
     wins: number;
     losses: number;
     clv: number[];
+    tier1_count: number;
   }
   const buckets = new Map<string, Bucket>();
   for (const r of rows) {
@@ -375,7 +396,7 @@ async function runMarketTypeAggregatePass(
     const market = r.market_type;
     let b = buckets.get(market);
     if (!b) {
-      b = { pairs: [], wins: 0, losses: 0, clv: [] };
+      b = { pairs: [], wins: 0, losses: 0, clv: [], tier1_count: 0 };
       buckets.set(market, b);
     }
     b.pairs.push({ stake, pnl });
@@ -383,6 +404,7 @@ async function runMarketTypeAggregatePass(
     else if (r.status === "lost") b.losses += 1;
     const clv = r.clv == null ? null : Number(r.clv);
     if (clv != null && Number.isFinite(clv)) b.clv.push(clv);
+    if (r.is_tier1) b.tier1_count += 1;
   }
 
   let rowsWritten = 0;
@@ -424,21 +446,28 @@ async function runMarketTypeAggregatePass(
 
     const pass1 = wilsonLo95 > WILSON_WINRATE_THRESHOLD;
     const pass2 = bootstrapLo95 != null && bootstrapLo95 > 0;
-    const pass3 = clvT != null && clvT > CLV_T_THRESHOLD;
-    const qualifiesLive = pass1 && pass2 && pass3;
+    const pass3 = clvT != null && clvT > CLV_T_THRESHOLD && meanClv != null && meanClv > 0;
+
+    // 2026-05-15 — conditional CLV gate. CLV t-stat is required only when
+    // scope is Pinnacle-anchored. When tier1 coverage < TIER1_COVERAGE_THRESHOLD
+    // (Pinnacle structurally unavailable — e.g. BTTS), CLV gate is suspended
+    // and qualification rests on Wilson + bootstrap alone.
+    const tier1Coverage = b.tier1_count / n;
+    const pinnacleAnchored = tier1Coverage >= TIER1_COVERAGE_THRESHOLD;
+    const qualifiesLive = pass1 && pass2 && (pinnacleAnchored ? pass3 : true);
     if (qualifiesLive) qualifying += 1;
 
     // Basis label exposes which gate(s) carried it across the line.
-    // 'three_gate_pass' when all pass; otherwise list the failed gates so an
-    // operator scanning the row can see why it's blocked.
+    // 'three_gate_pass' or 'two_gate_pass_clv_suspended' (Pinnacle unavailable);
+    // otherwise list the failed gates.
     let basis: string;
     if (qualifiesLive) {
-      basis = "three_gate_pass";
+      basis = pinnacleAnchored ? "three_gate_pass" : "two_gate_pass_clv_suspended";
     } else {
       const failed: string[] = [];
       if (!pass1) failed.push("wilson");
       if (!pass2) failed.push("bootstrap");
-      if (!pass3) failed.push("clv_t");
+      if (pinnacleAnchored && !pass3) failed.push("clv_t");
       basis = `failed:${failed.join(",")}`;
     }
 

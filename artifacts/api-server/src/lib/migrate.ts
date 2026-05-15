@@ -3187,6 +3187,26 @@ export async function runMigrations() {
     `);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_analysis_segment_stats_recent ON analysis_segment_stats(computed_at DESC)`);
 
+    // 2026-05-15 — Tier-1 CLV anchor count. Used by the conditional CLV gate
+    // in the eligibility computation: if scope has >= 30 pct Tier-1 (Pinnacle)
+    // anchoring then CLV t-stat is required for qualification; if Pinnacle is
+    // structurally unavailable for the scope, the CLV gate is suspended and
+    // qualification rests on Wilson + bootstrap alone. Backfilled to 0 on
+    // existing rows; new rows populated by analysisJobs.runBundleBAnalytics.
+    await db.execute(sql`
+      ALTER TABLE analysis_segment_stats
+      ADD COLUMN IF NOT EXISTS tier1_n INTEGER NOT NULL DEFAULT 0
+    `);
+
+    // Document the closing_pinnacle_odds semantic — it can hold Tier-2 anchors
+    // when Pinnacle is structurally unavailable. clv_source / clv_source_tier
+    // are the truth columns. Column rename deferred to a quiet maintenance
+    // window; a comment for now to keep downstream queries unbroken.
+    await db.execute(sql`
+      COMMENT ON COLUMN paper_bets.closing_pinnacle_odds IS
+      'Closing anchor odds. Sources to clv_source (clv_source_tier=1 means Pinnacle / pinnacle_derived; tier=2 means a sharp non-Pinnacle book). Despite the column name, this is NOT exclusively Pinnacle when Pinnacle coverage for the scope is unavailable (e.g. BTTS). Use clv_source / clv_source_tier for the actual anchor identity.'
+    `);
+
     // 2026-05-15 — analysis_exclusion_rules.
     //
     // Filters (market_type, bet_track) cohorts out of analysis_segment_stats +
