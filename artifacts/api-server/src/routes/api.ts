@@ -6152,6 +6152,23 @@ router.post("/admin/run-fotmob-id-scan", async (req, res) => {
   }
 });
 
+// FotMob community-wrapper test (Phase 2k, 2026-05-15). After raw
+// curl on /api/leagues/9227 returned 200+HTML (SPA shell — JSON API
+// now gated by x-mas signed-request header), tests whether
+// fotmob-api / PyFotMob wrappers (which reverse-engineer the
+// signing) can reach the real JSON. Pip-installs both packages and
+// reports which methods work. Read-only; 4-min hard kill timer.
+router.post("/admin/run-fotmob-wrapper-test", async (_req, res) => {
+  try {
+    const { runFotmobWrapperTest } = await import("../services/fotmobWrapperTestCron");
+    const r = await runFotmobWrapperTest();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "FotMob wrapper test failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // FotMob league-ID discovery (2026-05-15 follow-up to the endpoint
 // probe). Tries 4 strategies (search API, master directory, /leagues
 // HTML, country-filtered HTML + __NEXT_DATA__ extraction) to find
