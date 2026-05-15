@@ -6134,6 +6134,23 @@ router.post("/admin/run-team-form-scrape", async (_req, res) => {
   }
 });
 
+// FotMob league-ID discovery (2026-05-15 follow-up to the endpoint
+// probe). Tries 4 strategies (search API, master directory, /leagues
+// HTML, country-filtered HTML + __NEXT_DATA__ extraction) to find
+// current FotMob IDs for the 6 women's leagues whose hardcoded IDs
+// returned 404. Read-only. Operator pastes the discovered IDs back
+// into scrape_fotmob_direct.WOMENS_LEAGUES.
+router.post("/admin/run-fotmob-id-finder", async (_req, res) => {
+  try {
+    const { runFotmobIdFinder } = await import("../services/fotmobIdFinderCron");
+    const r = await runFotmobIdFinder();
+    res.json({ ok: r.exitCode === 0, ...r });
+  } catch (err) {
+    logger.error({ err }, "FotMob id finder failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // FotMob endpoint discovery probe (2026-05-15). Tries 25+ candidate
 // URL patterns and reports status codes + body hints (__NEXT_DATA__
 // presence, xG mentions). Read-only research — never writes to the
