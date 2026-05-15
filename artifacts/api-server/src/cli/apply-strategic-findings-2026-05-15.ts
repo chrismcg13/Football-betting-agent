@@ -117,12 +117,65 @@ const FINDINGS: Finding[] = [
         },
       ],
       decision_required:
-        "Operator approval after empirical impact brief built on clean post-fix shadow data. Wait ~30 days clean post-fix data before authoring brief so impact numbers are honest, not speculative.",
+        "Operator approval after empirical impact brief built on clean post-fix shadow data.",
     },
     actions_taken: {
       status: "design_pending",
       tasks: ["#49"],
-      gate: "30 days of clean post-fix shadow data accumulated before impact brief",
+      gate_conditions: [
+        "At least 3 mature scopes (n>=30 each) accumulated on a Pinnacle-unavailable market like BTTS",
+        "AH aggregate path re-qualified post parser-fix",
+      ],
+      gate_principle:
+        "The conditions trigger the brief, not the calendar. Brief is authored when these conditions are met — may be sooner or later than any calendar estimate.",
+    },
+  },
+  {
+    experiment_tag: "commercial_assumptions_on_unproven_edge_2026_05_15",
+    analysis_type: "strategic_finding",
+    findings: {
+      summary:
+        "The £5k bankroll target, salary timeline, and subscription-service concept were built on edge signal that is now known to be partly fabricated (AH parser bug) or structurally absent on current modelling (BTTS, TEAM_TOTAL_*, OU_*). Until clean post-fix data demonstrates real edge on at least one market, the financial model is a hypothesis, not a plan.",
+      what_changed_2026_05_15:
+        "AH parser bug discovery + Tier-1 coverage audit + power analysis on clean-data dataset. The 57 qualifying AH scopes, +55.6 pct ROI, +15.6 pct CLV that the strategic plan rested on are corrupt-input metrics. Cleaner markets (MO, BTTS, TEAM_TOTAL) have no qualifying scopes and average CLV is negative or unstable.",
+      what_is_still_true:
+        "The infrastructure (eligibility view, adaptive Kelly, two-path gate, exclusion rules) is sound. The bet-routing layer, settlement reconciliation, and risk guardrails are working as designed. The unknown is whether real edge exists in the underlying model once corrupted inputs are removed.",
+      what_is_falsified:
+        "Specific ROI projections, time-to-bankroll-doubling estimates, and any commercial commitment that assumed AH live PnL was a real-money signal of model edge.",
+    },
+    recommendations: {
+      capital_decision_rule:
+        "Do not size capital, salary, or subscription commitments based on pre-2026-05-15 edge numbers. Re-anchor only on clean post-fix data once aggregate paths re-qualify on at least one market.",
+      messaging_principle:
+        "External communication about edge, ROI, or returns must footnote 'subject to clean-data verification post parser fix' until at least one market clears the eligibility gate on post-fix data.",
+    },
+    actions_taken: {
+      status: "permanent_strategic_constraint",
+      next_review_trigger:
+        "At least one market_type clears the eligibility gate on data placed AFTER parser-fix-deploy timestamp.",
+    },
+  },
+  {
+    experiment_tag: "statistical_gate_not_temporal_2026_05_15",
+    analysis_type: "operating_principle",
+    findings: {
+      summary:
+        "Every project milestone is expressed as 'condition met when X' — not 'expected in N days.' Calendar projections are useful for fixture-rate planning but are never commitments. The data decides when a market becomes eligible; the system waits for statistical sufficiency, not calendar time.",
+      origin:
+        "This session repeatedly drifted into calendar-based language ('30 days clean data', '7-10 days to re-qualify', '5-6 weeks to MO clearance'). All such estimates are projections-on-current-fixture-rate, not commitments. The user (Chris) called out the drift three times before this principle was codified.",
+      principle_text:
+        "A scope re-qualifies when n is sufficient at the empirical p̂ to clear the gate, regardless of whether that takes 10 days or 60. Capital commitments built on pre-fix or pre-clean-data edge numbers are hypotheses, not plans. World Cup, season-end, fixture density — all change accumulation rates but none change the gate.",
+    },
+    recommendations: {
+      enforcement: [
+        "Added to CLAUDE.md §2 as Principle #7 alongside Principle #6 (every metric has a periodic verification check)",
+        "Future planning documents must phrase milestones as 'condition met when X' — agent should flag any 'expected in N days' phrasing in its own output as a violation of this principle",
+        "Calendar estimates allowed as parenthetical projections with explicit caveat (e.g. 'at current 50 bets/day this would reach n=30 in ~3 days, contingent on fixture availability')",
+      ],
+    },
+    actions_taken: {
+      status: "permanent_operating_principle",
+      codified_in: "CLAUDE.md §2 Principle #7",
     },
   },
 ];
