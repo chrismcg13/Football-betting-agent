@@ -2467,6 +2467,20 @@ router.post("/admin/run-data-quality-monitor", async (_req, res) => {
   }
 });
 
+// 2026-05-15 — four structural audits (CLAUDE.md Principle #6). Runs daily
+// at 02:00 UTC alongside the existing data-quality monitor; this endpoint
+// triggers on demand for verification without waiting for the cron tick.
+router.post("/admin/run-structural-audits", async (_req, res) => {
+  try {
+    const { runStructuralAudits } = await import("../services/dataQualityMonitor");
+    const r = await runStructuralAudits();
+    res.json({ success: true, result: r });
+  } catch (err) {
+    logger.error({ err }, "Manual structural audits failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/run-adaptive-recommender", async (_req, res) => {
   try {
     const { runAdaptiveThresholdRecommender } = await import("../services/adaptiveThresholdRecommender");

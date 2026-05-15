@@ -3005,11 +3005,16 @@ export function startSettlementCron(): void {
         // gate condition for OU_25/OU_35/FIRST_HALF_RESULT unban). Writes a
         // compliance_logs row when the gate clears so operator knows to ship
         // the BANNED_MARKETS one-line edit. Idempotent (one row per 7d window).
-        const { runDataQualityMonitor, runUnbanGateMonitor } = await import("./dataQualityMonitor");
+        const { runDataQualityMonitor, runUnbanGateMonitor, runStructuralAudits } = await import("./dataQualityMonitor");
         const dq = await runDataQualityMonitor();
         logger.info(dq, "Data quality monitor complete");
         const ug = await runUnbanGateMonitor();
         logger.info(ug, "Unban gate monitor complete");
+        // 2026-05-15 — four permanent structural audits (CLAUDE.md Principle #6):
+        //   clv_anchor_binding, betfair_partial_match, match_results_completeness,
+        //   closing_odds_timing. Writes data_quality_alerts on threshold breach.
+        const sa = await runStructuralAudits();
+        logger.info(sa, "Structural audits complete");
       } catch (err) {
         logger.error({ err }, "Data quality monitor failed");
       }

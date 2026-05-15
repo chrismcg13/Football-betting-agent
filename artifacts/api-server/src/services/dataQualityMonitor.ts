@@ -370,3 +370,334 @@ export async function runUnbanGateMonitor(): Promise<UnbanGateResult> {
   logger.info(result, "unban_gate_monitor evaluated");
   return result;
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2026-05-15 — structural audits.
+//
+// Four permanent periodic checks for "assumed-working" surfaces that nothing
+// else audits. Per CLAUDE.md Principle #6: every metric the system relies on
+// must have an automated audit; absence of audit = assumed-untrusted.
+//
+// Each audit writes data_quality_alerts rows on threshold breach. Idempotent
+// per (audit_id, day) — one alert per audit per day window.
+//
+// Audits:
+//   structural_clv_anchor_binding — for each (market_type), what fraction of
+//     settled live bets in the last 24h with closing_pinnacle_odds populated
+//     have a matching oddspapi_pinnacle / api_football_real:Pinnacle snapshot
+//     for (match_id, market_type, selection_name) within (-4h, +1h) of kickoff.
+//     Alert when fraction < 0.30 (Tier-1 anchor missing for the cohort).
+//
+//   structural_betfair_partial_match — for each settled live bet in last 24h,
+//     was betfair_size_matched within 95 pct of stake? Alert when partial-match
+//     rate > 15 pct cohort-wide — indicates liquidity or slippage issues
+//     producing under-stake fills that distort realised ROI.
+//
+//   structural_match_results_completeness — matches with kickoff > 6h ago that
+//     still have NULL final score AND betfair_event_id IS NOT NULL. Alert if
+//     count > 25. Settlement timeout precondition.
+//
+//   structural_closing_odds_timing — for settled bets in last 24h with
+//     closing_pinnacle_odds populated, the nearest matching oddspapi_pinnacle
+//     snapshot time vs kickoff_time. Alert if median |snap-kickoff| > 30 min
+//     for any market_type — strict pre-kickoff snap is the intended semantics.
+// ──────────────────────────────────────────────────────────────────────────────
+
+export interface StructuralAuditResult {
+  evaluatedAt: string;
+  audits: Array<{
+    audit_id: string;
+    market_type?: string;
+    observed_value: number;
+    threshold: number;
+    threshold_direction: "max" | "min";
+    breach: boolean;
+    detail: Record<string, unknown>;
+  }>;
+  alertsFired: number;
+}
+
+async function writeStructuralAlert(args: {
+  audit_id: string;
+  market_type?: string;
+  observed: number;
+  threshold: number;
+  direction: "max" | "min";
+  severity: "warn" | "critical";
+  detail: Record<string, unknown>;
+}): Promise<boolean> {
+  // Dedupe: one unack alert per (audit_id, market_type) per 24h.
+  const sourceTag = args.market_type ? `${args.audit_id}:${args.market_type}` : args.audit_id;
+  const existing = await db.execute(sql`
+    SELECT 1 FROM data_quality_alerts
+    WHERE source = ${sourceTag}
+      AND metric = ${args.audit_id}
+      AND detected_at > NOW() - INTERVAL '24 hours'
+      AND acknowledged_at IS NULL
+    LIMIT 1
+  `);
+  if ((((existing as any).rows ?? []) as unknown[]).length > 0) return false;
+
+  await db.execute(sql`
+    INSERT INTO data_quality_alerts (
+      source, metric, observed_value, baseline_value,
+      baseline_window_start, baseline_window_end,
+      ratio, threshold_ratio, severity, manifest
+    ) VALUES (
+      ${sourceTag}, ${args.audit_id},
+      ${args.observed}, ${args.threshold},
+      (NOW() - INTERVAL '24 hours')::date, NOW()::date,
+      ${args.observed}, ${args.threshold}, ${args.severity},
+      ${JSON.stringify({
+        audit_id: args.audit_id,
+        market_type: args.market_type ?? null,
+        direction: args.direction,
+        observed: args.observed,
+        threshold: args.threshold,
+        detail: args.detail,
+      })}::jsonb
+    )
+  `);
+  return true;
+}
+
+export async function runStructuralAudits(): Promise<StructuralAuditResult> {
+  const result: StructuralAuditResult = {
+    evaluatedAt: new Date().toISOString(),
+    audits: [],
+    alertsFired: 0,
+  };
+
+  // ── Audit 1 — CLV anchor binding ──────────────────────────────────────────
+  // For each market_type, fraction of settled live bets in last 24h with
+  // closing_pinnacle_odds populated that have a matching Pinnacle snapshot
+  // near kickoff. Below 0.30 = anchor binding suspect for that cohort.
+  try {
+    const rows = await db.execute(sql`
+      WITH bets AS (
+        SELECT pb.id, pb.match_id, pb.market_type, pb.selection_name,
+               pb.closing_pinnacle_odds::numeric AS recorded,
+               m.kickoff_time
+        FROM paper_bets pb
+        JOIN matches m ON pb.match_id = m.id
+        WHERE pb.bet_track = 'live'
+          AND pb.legacy_regime = false AND pb.deleted_at IS NULL
+          AND pb.status IN ('won','lost','void')
+          AND pb.settled_at >= NOW() - INTERVAL '24 hours'
+          AND pb.closing_pinnacle_odds IS NOT NULL
+      ),
+      matched AS (
+        SELECT
+          b.market_type,
+          b.id,
+          EXISTS (
+            SELECT 1 FROM odds_snapshots os
+            WHERE os.match_id = b.match_id
+              AND os.market_type = b.market_type
+              AND os.selection_name = b.selection_name
+              AND os.source IN ('oddspapi_pinnacle','api_football_real:Pinnacle')
+              AND os.snapshot_time BETWEEN b.kickoff_time - INTERVAL '4 hours' AND b.kickoff_time + INTERVAL '1 hour'
+          ) AS has_match
+        FROM bets b
+      )
+      SELECT market_type,
+             COUNT(*) AS n_bets,
+             COUNT(*) FILTER (WHERE has_match) AS n_matched,
+             ROUND(COUNT(*) FILTER (WHERE has_match)::numeric / NULLIF(COUNT(*), 0), 3) AS match_rate
+      FROM matched
+      GROUP BY market_type
+      HAVING COUNT(*) >= 10
+    `);
+    for (const r of ((rows as any).rows ?? []) as Array<{
+      market_type: string; n_bets: number | string;
+      n_matched: number | string; match_rate: number | string;
+    }>) {
+      const rate = Number(r.match_rate ?? 0);
+      const breach = rate < 0.30;
+      result.audits.push({
+        audit_id: "structural_clv_anchor_binding",
+        market_type: r.market_type,
+        observed_value: rate,
+        threshold: 0.30,
+        threshold_direction: "min",
+        breach,
+        detail: { n_bets: Number(r.n_bets), n_matched: Number(r.n_matched) },
+      });
+      if (breach) {
+        const fired = await writeStructuralAlert({
+          audit_id: "structural_clv_anchor_binding",
+          market_type: r.market_type,
+          observed: rate,
+          threshold: 0.30,
+          direction: "min",
+          severity: rate < 0.15 ? "critical" : "warn",
+          detail: { n_bets: Number(r.n_bets), n_matched: Number(r.n_matched), interpretation: "Pinnacle snapshot anchor missing for >70% of bets in cohort" },
+        });
+        if (fired) result.alertsFired += 1;
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, "structural_clv_anchor_binding audit failed");
+  }
+
+  // ── Audit 2 — Betfair partial-match rate ──────────────────────────────────
+  try {
+    const rows = await db.execute(sql`
+      SELECT
+        COUNT(*) AS n_bets,
+        COUNT(*) FILTER (
+          WHERE betfair_size_matched IS NULL
+             OR betfair_size_matched::numeric < (stake::numeric * 0.95)
+        ) AS n_partial,
+        ROUND(
+          COUNT(*) FILTER (
+            WHERE betfair_size_matched IS NULL
+               OR betfair_size_matched::numeric < (stake::numeric * 0.95)
+          )::numeric / NULLIF(COUNT(*), 0), 3
+        ) AS partial_rate
+      FROM paper_bets
+      WHERE bet_track = 'live'
+        AND legacy_regime = false AND deleted_at IS NULL
+        AND status IN ('won','lost','void')
+        AND settled_at >= NOW() - INTERVAL '24 hours'
+        AND stake::numeric > 0
+    `);
+    const r = ((rows as any).rows ?? [])[0] as { n_bets: number | string; n_partial: number | string; partial_rate: number | string } | undefined;
+    if (r && Number(r.n_bets) >= 10) {
+      const rate = Number(r.partial_rate ?? 0);
+      const breach = rate > 0.15;
+      result.audits.push({
+        audit_id: "structural_betfair_partial_match",
+        observed_value: rate,
+        threshold: 0.15,
+        threshold_direction: "max",
+        breach,
+        detail: { n_bets: Number(r.n_bets), n_partial: Number(r.n_partial) },
+      });
+      if (breach) {
+        const fired = await writeStructuralAlert({
+          audit_id: "structural_betfair_partial_match",
+          observed: rate,
+          threshold: 0.15,
+          direction: "max",
+          severity: rate > 0.30 ? "critical" : "warn",
+          detail: { n_bets: Number(r.n_bets), n_partial: Number(r.n_partial), interpretation: "Liquidity / slippage producing under-stake fills — realised ROI distorted by partial matches" },
+        });
+        if (fired) result.alertsFired += 1;
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, "structural_betfair_partial_match audit failed");
+  }
+
+  // ── Audit 3 — Match-results ingestion completeness ────────────────────────
+  try {
+    const rows = await db.execute(sql`
+      SELECT COUNT(*)::int AS n_stale
+      FROM matches
+      WHERE kickoff_time < NOW() - INTERVAL '6 hours'
+        AND kickoff_time > NOW() - INTERVAL '7 days'
+        AND betfair_event_id IS NOT NULL
+        AND home_score IS NULL
+        AND status NOT IN ('cancelled','postponed','abandoned')
+    `);
+    const n = Number(((rows as any).rows ?? [])[0]?.n_stale ?? 0);
+    const breach = n > 25;
+    result.audits.push({
+      audit_id: "structural_match_results_completeness",
+      observed_value: n,
+      threshold: 25,
+      threshold_direction: "max",
+      breach,
+      detail: { n_stale: n, window: "kickoff_time < NOW() - 6h, > NOW() - 7d, score NULL, not cancelled/postponed" },
+    });
+    if (breach) {
+      const fired = await writeStructuralAlert({
+        audit_id: "structural_match_results_completeness",
+        observed: n,
+        threshold: 25,
+        direction: "max",
+        severity: n > 75 ? "critical" : "warn",
+        detail: { n_stale: n, interpretation: "Match results ingestion lagging — settlement timeout precondition. Bets on these matches will route through 72h-timeout path and may force-settle as losses." },
+      });
+      if (fired) result.alertsFired += 1;
+    }
+  } catch (err) {
+    logger.error({ err }, "structural_match_results_completeness audit failed");
+  }
+
+  // ── Audit 4 — closing_pinnacle_odds write timing ──────────────────────────
+  // For settled bets with closing_pinnacle_odds, find the nearest matching
+  // oddspapi_pinnacle snapshot for (match, market, selection) and compare
+  // its time to kickoff_time. Strict pre-kickoff = small absolute delta.
+  try {
+    const rows = await db.execute(sql`
+      WITH bets AS (
+        SELECT pb.id, pb.match_id, pb.market_type, pb.selection_name,
+               pb.closing_pinnacle_odds::numeric AS recorded,
+               m.kickoff_time
+        FROM paper_bets pb
+        JOIN matches m ON pb.match_id = m.id
+        WHERE pb.bet_track = 'live'
+          AND pb.legacy_regime = false AND pb.deleted_at IS NULL
+          AND pb.status IN ('won','lost','void')
+          AND pb.settled_at >= NOW() - INTERVAL '24 hours'
+          AND pb.closing_pinnacle_odds IS NOT NULL
+      ),
+      nearest AS (
+        SELECT
+          b.market_type,
+          b.id,
+          MIN(ABS(EXTRACT(EPOCH FROM (os.snapshot_time - b.kickoff_time)))) AS delta_secs
+        FROM bets b
+        LEFT JOIN odds_snapshots os
+          ON os.match_id = b.match_id
+         AND os.market_type = b.market_type
+         AND os.selection_name = b.selection_name
+         AND os.source IN ('oddspapi_pinnacle','api_football_real:Pinnacle')
+         AND os.snapshot_time BETWEEN b.kickoff_time - INTERVAL '6 hours' AND b.kickoff_time + INTERVAL '2 hours'
+        GROUP BY b.market_type, b.id
+      )
+      SELECT
+        market_type,
+        COUNT(*) AS n,
+        ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY delta_secs)::numeric, 0) AS median_delta_secs
+      FROM nearest
+      WHERE delta_secs IS NOT NULL
+      GROUP BY market_type
+      HAVING COUNT(*) >= 10
+    `);
+    for (const r of ((rows as any).rows ?? []) as Array<{
+      market_type: string; n: number | string; median_delta_secs: number | string | null;
+    }>) {
+      const median = Number(r.median_delta_secs ?? 0);
+      const breach = median > 1800; // 30 min
+      result.audits.push({
+        audit_id: "structural_closing_odds_timing",
+        market_type: r.market_type,
+        observed_value: median,
+        threshold: 1800,
+        threshold_direction: "max",
+        breach,
+        detail: { n: Number(r.n), median_delta_secs: median, median_delta_minutes: Math.round(median / 60) },
+      });
+      if (breach) {
+        const fired = await writeStructuralAlert({
+          audit_id: "structural_closing_odds_timing",
+          market_type: r.market_type,
+          observed: median,
+          threshold: 1800,
+          direction: "max",
+          severity: median > 7200 ? "critical" : "warn",
+          detail: { n: Number(r.n), median_delta_minutes: Math.round(median / 60), interpretation: "Pinnacle close snapshot taken >30 min from kickoff — CLV anchor may include in-play movement or stale pre-match price" },
+        });
+        if (fired) result.alertsFired += 1;
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, "structural_closing_odds_timing audit failed");
+  }
+
+  logger.info(result, "structural_audits evaluated");
+  return result;
+}
