@@ -3335,10 +3335,6 @@ export async function runMigrations() {
       CREATE OR REPLACE VIEW v_banned_market_review AS
       WITH banned (market_type, reason) AS (
         VALUES
-          ('OVER_UNDER_05',   '>92% win rate near-cert no edge'),
-          ('TOTAL_CARDS_55',  '~85% win rate ref variance dominates'),
-          ('TOTAL_CARDS_45',  'near-certainty unreliable settlement'),
-          ('FIRST_HALF_OU_05','too easy; OU_15 retained'),
           ('OVER_UNDER_25',   'quarantined 2026-04-20 pricing-pipeline'),
           ('OVER_UNDER_35',   'quarantined 2026-04-20 pricing-pipeline'),
           ('FIRST_HALF_RESULT','quarantined 2026-04-20 pricing-pipeline'),

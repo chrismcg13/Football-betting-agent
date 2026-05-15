@@ -741,31 +741,32 @@ const NEW_MARKET_TYPES = new Set(["TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_COR
 // ── Banned-market hardstop (single source of truth) ───────────────────────────
 // These markets are permanently banned due to unreliable edge signals or
 // poor settlement data. Block placement and exclude from value detection.
+// 2026-05-15 — magic-number bans (OVER_UNDER_05, TOTAL_CARDS_55,
+// TOTAL_CARDS_45, FIRST_HALF_OU_05) removed alongside OVER_UNDER_15.
+// All four pre-empted scopes on asserted win rates without ever letting
+// the eligibility view measure them. Per Principle #1 ("statistical
+// theory, not magic constants"), shadow data should accumulate at £0
+// stake until n ≥ 30 settled bets land and the three-gate test (Wilson
+// lo95 > 0.50 + bootstrap_lo95_roi > 0 + CLV t-stat > 1.96) can fire.
+// Self-disqualifying outcomes are clean: a market that pre-empts on
+// "92% win rate at 1.05 odds" will fail bootstrap ROI and never
+// graduate, matching the asserted ban semantically while being
+// data-driven instead of asserted.
+//
+// Remaining entries below have stated operational reasons (pricing
+// pipeline / structural correlation) — they stay until those reasons
+// are resolved.
 export const BANNED_MARKETS: ReadonlySet<string> = new Set([
-  "OVER_UNDER_05",     // ~92% win rate — no edge signal
-  // OVER_UNDER_15 unbanned 2026-05-15. The empirical eligibility-view
-  // gate proves the scope DOES have edge (n=65, Wilson lo95 0.687,
-  // bootstrap_lo95_roi 0.428, CLV t-stat 2.77 against Pinnacle, ROI
-  // 0.96). Hardcoded ban violated CLAUDE.md Principle #1 ("statistical
-  // theory, not magic constants") — eligibility-view is the sole
-  // structural gate now. Per-scope adaptive Kelly + Wilson LCB still
-  // size conservatively for the small n=65 sample.
-  "TOTAL_CARDS_55",    // ~85% win rate — no edge signal
-  "TOTAL_CARDS_45",    // Near-certainty; unreliable settlement data
-  // Task 8 (2026-05-11): TOTAL_CORNERS_* unbanned. Phantom-signal root-cause
-  // patched in predictCorners (strict feature gate, no defaulting). Corners
-  // now flow through the normal eligibility ladder — shadow-only until they
-  // accrue n>=30 with Wilson lower-95 > breakeven; auto-promotes via
-  // v_live_eligibility_candidates. Wilson cold-market gate demotes any
-  // scope that fails to hold an edge.
-  "FIRST_HALF_OU_05",  // Too easy; FIRST_HALF_OU_15 retained instead
   // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
   "OVER_UNDER_25",
   // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
   "OVER_UNDER_35",
   // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
   "FIRST_HALF_RESULT",
-  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
+  // Structurally correlated with MATCH_ODDS (1X2 with two of three
+  // outcomes bundled — same information, dependent settlement).
+  // Correlation dedup at the portfolio layer would also need
+  // generalising before this can flow.
   "DOUBLE_CHANCE",
 ]);
 
