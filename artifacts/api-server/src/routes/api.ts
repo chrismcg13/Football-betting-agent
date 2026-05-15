@@ -2496,6 +2496,43 @@ router.post("/admin/auto-transition-stale-matches", async (_req, res) => {
   }
 });
 
+// 2026-05-15 — advance analysis_exclusion_rules cutover for a market_type.
+// Used after a parser fix deploys: pre-fix rows stay excluded (their
+// placed_at < new cutover), post-fix rows flow through Bundle B cleanly.
+// Body: { "marketType": "ASIAN_HANDICAP" }. Updates both 'live' and 'shadow'
+// bet_track rules for the market. Returns the count of rules updated and
+// the new exclude_placed_before timestamp.
+router.post("/admin/advance-exclusion-cutover", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as { marketType?: string };
+    const marketType = (body.marketType ?? "").trim().toUpperCase();
+    if (!/^[A-Z0-9_]+$/.test(marketType)) {
+      res.status(400).json({ success: false, message: "marketType must be alphanumeric+underscore" });
+      return;
+    }
+    const cutover = new Date();
+    const result = await db.execute(sql`
+      UPDATE analysis_exclusion_rules
+      SET exclude_placed_before = ${cutover.toISOString()}::timestamptz
+      WHERE market_type = ${marketType}
+        AND cleared_at IS NULL
+      RETURNING id, market_type, bet_track, exclude_placed_before, reason
+    `);
+    const rows = (((result as unknown) as { rows?: Array<Record<string, unknown>> }).rows ?? []);
+    res.json({
+      success: true,
+      marketType,
+      cutover: cutover.toISOString(),
+      rulesUpdated: rows.length,
+      rules: rows,
+      next: "Run /api/admin/run-bundle-b to recompute analysis_signal_strength with the new cutover.",
+    });
+  } catch (err) {
+    logger.error({ err }, "advance-exclusion-cutover failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/run-adaptive-recommender", async (_req, res) => {
   try {
     const { runAdaptiveThresholdRecommender } = await import("../services/adaptiveThresholdRecommender");
