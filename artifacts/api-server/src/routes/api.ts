@@ -4292,7 +4292,12 @@ router.get("/admin/scope-edge-rankings", async (req, res) => {
     const { db } = await import("@workspace/db");
     const { sql } = await import("drizzle-orm");
 
-    const rows = await db.execute(sql`
+    // Bundle 1P note: filter verdict + market in JS post-fetch rather than
+    // in SQL. Drizzle's `sql.execute()` with a JS-array parameter cast to
+    // text[] doesn't reliably round-trip through node-postgres in the
+    // current driver version (was returning empty `rows`). View is tiny
+    // (~200 rows) so application-layer filtering is trivial cost.
+    const raw = await db.execute(sql`
       SELECT
         league, market_type,
         n_total, n_sharp, pct_sharp_coverage,
@@ -4302,8 +4307,6 @@ router.get("/admin/scope-edge-rankings", async (req, res) => {
         qualifies_live_per_scope, edge_verdict
       FROM v_scope_edge_evidence
       WHERE n_sharp >= ${minSharp}
-        ${verdictList ? sql`AND edge_verdict = ANY(${verdictList}::text[])` : sql``}
-        ${market ? sql`AND market_type = ${market}` : sql``}
       ORDER BY
         CASE edge_verdict
           WHEN 'proven'         THEN 1
@@ -4315,14 +4318,28 @@ router.get("/admin/scope-edge-rankings", async (req, res) => {
         END,
         clv_tstat_sharp DESC NULLS LAST,
         n_sharp DESC
-      LIMIT ${limit}
     `);
 
-    const resultRows = (rows as { rows?: unknown[] }).rows ?? rows;
+    const allRows = ((raw as { rows?: unknown[] }).rows ?? []) as Array<{
+      league: string;
+      market_type: string;
+      edge_verdict: string;
+      [key: string]: unknown;
+    }>;
+
+    const filtered = allRows.filter((r) => {
+      if (verdictList && !verdictList.includes(r.edge_verdict)) return false;
+      if (market && r.market_type !== market) return false;
+      return true;
+    });
+
+    const limited = filtered.slice(0, limit);
+
     return res.json({
       ok: true,
-      count: Array.isArray(resultRows) ? resultRows.length : 0,
-      rows: resultRows,
+      count: limited.length,
+      totalMatching: filtered.length,
+      rows: limited,
     });
   } catch (err) {
     return res.status(500).json({ ok: false, message: String(err) });
