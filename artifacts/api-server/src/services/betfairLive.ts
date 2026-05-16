@@ -1276,17 +1276,11 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   OVER_UNDER_35: "OVER_UNDER_35",
   OVER_UNDER_45: "OVER_UNDER_45",
   ASIAN_HANDICAP: "ASIAN_HANDICAP",
-  DOUBLE_CHANCE: "DOUBLE_CHANCE",
   CORRECT_SCORE: "CORRECT_SCORE",
   FIRST_HALF_OU_05: "FIRST_HALF_GOALS_05",
   FIRST_HALF_OU_15: "FIRST_HALF_GOALS_15",
-  // Cards markets — Betfair Exchange uses OVER_UNDER_<line>_CARDS naming
-  TOTAL_CARDS_25: "OVER_UNDER_25_CARDS",
-  TOTAL_CARDS_35: "OVER_UNDER_35_CARDS",
-  TOTAL_CARDS_45: "OVER_UNDER_45_CARDS",
-  TOTAL_CARDS_55: "OVER_UNDER_55_CARDS",
-  // Half-time result — Betfair calls it HALF_TIME (1/X/2 outcomes for H1)
-  FIRST_HALF_RESULT: "HALF_TIME",
+  // 2026-05-16 subtract bundle: DOUBLE_CHANCE, TOTAL_CARDS_*,
+  // FIRST_HALF_RESULT removed. See feedback_subtract_before_restore.
   // Sub-phase 4.B (2026-05-08): VERIFIED by discovery cron observing
   // listMarketCatalogue across 50 upcoming Tier A/B/C events. All codes
   // below confirmed present in real Betfair Exchange responses.
@@ -1297,12 +1291,9 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   OVER_UNDER_85: "OVER_UNDER_85",
   FIRST_HALF_OU_25: "FIRST_HALF_GOALS_25",
   DRAW_NO_BET: "DRAW_NO_BET",
-  HALF_TIME_FULL_TIME: "HALF_TIME_FULL_TIME",
   HALF_TIME_SCORE: "HALF_TIME_SCORE",
-  GOALS_ODD_EVEN: "ODD_OR_EVEN",
-  // Win-to-nil — Betfair uses TEAM_A_WIN_TO_NIL / TEAM_B_WIN_TO_NIL
-  WIN_TO_NIL_HOME: "TEAM_A_WIN_TO_NIL",
-  WIN_TO_NIL_AWAY: "TEAM_B_WIN_TO_NIL",
+  // 2026-05-16 subtract bundle: HALF_TIME_FULL_TIME, GOALS_ODD_EVEN,
+  // WIN_TO_NIL_HOME, WIN_TO_NIL_AWAY removed.
   // Team total goals — Betfair encodes the line as suffix N (= goals N+).
   // TEAM_A_1 = "Home to score 1 or more" = OVER 0.5 line.
   // TEAM_A_2 = "Home to score 2 or more" = OVER 1.5 line.
@@ -1341,6 +1332,8 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
 // captures. The discovery cron extends this set as new market codes are
 // observed in real Betfair catalogue responses (writes to compliance_logs +
 // proposes additions via model_decision_audit_log).
+// 2026-05-16 subtract bundle: removed DOUBLE_CHANCE, FIRST_HALF_RESULT,
+// TOTAL_CARDS_25, TOTAL_CARDS_35 (no liquidity probes, zero non-paper bets).
 export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   "MATCH_ODDS",
   "BTTS",
@@ -1349,20 +1342,13 @@ export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   "OVER_UNDER_35",
   "OVER_UNDER_45",
   "ASIAN_HANDICAP",
-  "DOUBLE_CHANCE",
-  "FIRST_HALF_RESULT",
   "FIRST_HALF_OU_15",
-  "TOTAL_CARDS_25",
-  "TOTAL_CARDS_35",
 ]);
 
-const NON_EXCHANGE_MARKETS = new Set([
-  // Corners markets are still missing Exchange equivalents (sportsbook only)
-  "TOTAL_CORNERS_85",
-  "TOTAL_CORNERS_95",
-  "TOTAL_CORNERS_105",
-  "TOTAL_CORNERS_115",
-]);
+// 2026-05-16 subtract bundle: TOTAL_CORNERS_* entirely subtracted; this
+// set is now empty but retained for future re-use if another market_type
+// needs the same NON_EXCHANGE_MARKETS guard.
+const NON_EXCHANGE_MARKETS = new Set<string>([]);
 
 export interface MarketCatalogueItem {
   marketId: string;

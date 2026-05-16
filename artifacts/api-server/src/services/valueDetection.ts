@@ -32,18 +32,14 @@ import {
   predictOutcome,
   predictBtts,
   predictOverUnder,
-  predictCards,
-  predictCorners,
   predictDrawNoBet,
   predictTeamTotalGoals,
-  predictWinToNil,
-  predictOddEven,
   predictAsianHandicap,
-  predictHtFt,
-  predictBttsHalf,
-  predictSecondHalfResult,
   predictAsianTotalGoals,
   getModelVersion,
+  // 2026-05-16 subtract bundle: predictCards, predictCorners, predictWinToNil,
+  // predictOddEven, predictHtFt, predictBttsHalf, predictSecondHalfResult
+  // removed. See feedback_subtract_before_restore.
 } from "./predictionEngine";
 import { shouldBlockBet, getSoftLineBonus, detectSeasonalPhase } from "./tournamentMode";
 import { commissionAdjustedEV, getCommissionRate } from "./commissionService";
@@ -344,26 +340,12 @@ async function getHotStreakBonus(
 const DERIVED_MARKETS = new Set(["FIRST_HALF_RESULT"]);
 
 // Plan v3 Bundle 0 (2026-05-16): the 8 wired-but-zero-emission market
-// families. Each silent `continue` in the per-selection loop records a
-// reason against this set so we can root-cause why no bets emit. Aggregated
-// per cycle, flushed as ≤15 compliance_logs rows per cycle (cheap).
-const DIAGNOSTIC_TARGET_MARKETS: ReadonlySet<string> = new Set([
-  "TOTAL_CORNERS_75",
-  "TOTAL_CORNERS_85",
-  "TOTAL_CORNERS_95",
-  "TOTAL_CORNERS_105",
-  "TOTAL_CORNERS_115",
-  "HALF_TIME_FULL_TIME",
-  "GOALS_ODD_EVEN",
-  "WIN_TO_NIL_HOME",
-  "WIN_TO_NIL_AWAY",
-  "SECOND_HALF_RESULT",
-  "BTTS_SECOND_HALF",
-  "TOTAL_CARDS_25",
-  "TOTAL_CARDS_35",
-  "TOTAL_CARDS_45",
-  "TOTAL_CARDS_55",
-]);
+// families were instrumented to root-cause why they emitted no bets. Root
+// cause: zero liquidity probes + zero placed bets ever + not in edge
+// thesis. All 15 markets subtracted in the 2026-05-16 subtract bundle.
+// DIAGNOSTIC_TARGET_MARKETS retained as an empty set — the helpers below
+// become no-ops in steady state. Future diagnostic needs can re-populate.
+const DIAGNOSTIC_TARGET_MARKETS: ReadonlySet<string> = new Set<string>();
 
 function computeOpportunityScore(params: {
   edge: number;
@@ -579,8 +561,8 @@ function getModelProbability(
   const outcomePreds = predictOutcome(enriched);
   const bttsPreds = predictBtts(enriched);
   const ouPreds = predictOverUnder(enriched);
-  const cardsPreds = predictCards(enriched);
-  const cornersPreds = predictCorners(enriched);
+  // 2026-05-16 subtract bundle: cardsPreds + cornersPreds removed alongside
+  // predictCards/predictCorners function deletions.
 
   if (marketType === "MATCH_ODDS" && outcomePreds) {
     if (selectionName === "Home") return outcomePreds.home;
@@ -614,45 +596,9 @@ function getModelProbability(
     if (selectionName.startsWith("Over")) return 1 - under35;
     if (selectionName.startsWith("Under")) return under35;
   }
-  if (marketType === "TOTAL_CARDS_35" && cardsPreds) {
-    if (selectionName.startsWith("Over")) return cardsPreds.over35;
-    if (selectionName.startsWith("Under")) return cardsPreds.under35;
-  }
-  if (marketType === "TOTAL_CARDS_45" && cardsPreds) {
-    if (selectionName.startsWith("Over")) return cardsPreds.over45;
-    if (selectionName.startsWith("Under")) return cardsPreds.under45;
-  }
-  if (marketType === "TOTAL_CORNERS_95" && cornersPreds) {
-    if (selectionName.startsWith("Over")) return cornersPreds.over95;
-    if (selectionName.startsWith("Under")) return cornersPreds.under95;
-  }
-  if (marketType === "TOTAL_CORNERS_105" && cornersPreds) {
-    if (selectionName.startsWith("Over")) return cornersPreds.over105;
-    if (selectionName.startsWith("Under")) return cornersPreds.under105;
-  }
-  if (marketType === "TOTAL_CORNERS_85" && cornersPreds) {
-    // Task 8 fix: re-use the strict-gated cornersPreds. The prior inline
-    // fallback defaults (5.0 / 4.5) bypassed the strict guard in
-    // predictCorners and re-introduced the phantom-signal class.
-    const home = enriched["home_corners_avg"];
-    const away = enriched["away_corners_avg"];
-    if (home === undefined || away === undefined || home <= 0 || away <= 0) return null;
-    const lambda = home + away;
-    if (lambda < 4 || lambda > 16) return null;
-    const under85 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 8)));
-    if (selectionName.startsWith("Over")) return 1 - under85;
-    if (selectionName.startsWith("Under")) return under85;
-  }
-  if (marketType === "TOTAL_CORNERS_115" && cornersPreds) {
-    const home = enriched["home_corners_avg"];
-    const away = enriched["away_corners_avg"];
-    if (home === undefined || away === undefined || home <= 0 || away <= 0) return null;
-    const lambda = home + away;
-    if (lambda < 4 || lambda > 16) return null;
-    const under115 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 11)));
-    if (selectionName.startsWith("Over")) return 1 - under115;
-    if (selectionName.startsWith("Under")) return under115;
-  }
+  // 2026-05-16 subtract bundle: TOTAL_CARDS_25/35/45/55 + TOTAL_CORNERS_75/
+  // 85/95/105/115 emission branches removed. Zero placeable liquidity probes
+  // ever; zero non-paper bets ever placed. See feedback_subtract_before_restore.
   // Over/Under 0.5 goals
   if (marketType === "OVER_UNDER_05") {
     const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
@@ -671,17 +617,9 @@ function getModelProbability(
     if (selectionName.startsWith("Over")) return 1 - under45;
     if (selectionName.startsWith("Under")) return under45;
   }
-  // Double Chance emission deleted in Plan v3 Bundle 0 (2026-05-16). Low-odds
-  // (1.15-1.80) derived market, P3 violation, and structurally correlated with
-  // MATCH_ODDS. BANNED_MARKETS entry retained as defense in depth.
-  // First Half Result — scaled from full-match outcome (halves closer to 50/50)
-  if (marketType === "FIRST_HALF_RESULT" && outcomePreds) {
-    const scale = 0.7; // first half probabilities converge toward uniform
-    const mean = 1 / 3;
-    if (selectionName === "Home") return Math.max(0.05, Math.min(0.85, mean + (outcomePreds.home - mean) * scale));
-    if (selectionName === "Draw") return Math.max(0.15, Math.min(0.75, mean + (outcomePreds.draw - mean) * scale));
-    if (selectionName === "Away") return Math.max(0.05, Math.min(0.85, mean + (outcomePreds.away - mean) * scale));
-  }
+  // 2026-05-16 subtract bundle: DOUBLE_CHANCE + FIRST_HALF_RESULT emission
+  // branches removed alongside the 15-market subtract. Both already in
+  // BANNED_MARKETS at placement layer; emission was wasted cycle work.
   // First Half O/U 0.5 goals
   if (marketType === "FIRST_HALF_OU_05") {
     const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
@@ -700,19 +638,8 @@ function getModelProbability(
     if (selectionName.startsWith("Over")) return 1 - under15;
     if (selectionName.startsWith("Under")) return under15;
   }
-  // Cards 2.5 and 5.5
-  if (marketType === "TOTAL_CARDS_25" && cardsPreds) {
-    const lambda = (enriched["home_yellow_cards_avg"] ?? 2.0) + (enriched["away_yellow_cards_avg"] ?? 2.0);
-    const under25 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 2)));
-    if (selectionName.startsWith("Over")) return 1 - under25;
-    if (selectionName.startsWith("Under")) return under25;
-  }
-  if (marketType === "TOTAL_CARDS_55" && cardsPreds) {
-    const lambda = (enriched["home_yellow_cards_avg"] ?? 2.0) + (enriched["away_yellow_cards_avg"] ?? 2.0);
-    const under55 = Math.max(0.01, Math.min(0.99, poissonCdf(lambda, 5)));
-    if (selectionName.startsWith("Over")) return 1 - under55;
-    if (selectionName.startsWith("Under")) return under55;
-  }
+  // 2026-05-16 subtract bundle: TOTAL_CARDS_25/55 inline branches removed
+  // (alongside _35/_45 above) — all cards markets subtracted.
   // ─── C1 (2026-05-07): TIER S free markets — derived from existing models ───
   // Draw No Bet — pure renormalisation of MATCH_ODDS over (home, away).
   if (marketType === "DRAW_NO_BET") {
@@ -721,26 +648,8 @@ function getModelProbability(
     if (selectionName === "Home") return dnb.home;
     if (selectionName === "Away") return dnb.away;
   }
-  // Win-to-Nil (each side) — joint Poisson scoreline.
-  if (marketType === "WIN_TO_NIL_HOME") {
-    const p = predictWinToNil(enriched, "home");
-    if (p == null) return null;
-    if (selectionName === "Yes") return p;
-    if (selectionName === "No") return 1 - p;
-  }
-  if (marketType === "WIN_TO_NIL_AWAY") {
-    const p = predictWinToNil(enriched, "away");
-    if (p == null) return null;
-    if (selectionName === "Yes") return p;
-    if (selectionName === "No") return 1 - p;
-  }
-  // Goals odd/even — closed-form Poisson identity.
-  if (marketType === "GOALS_ODD_EVEN") {
-    const oe = predictOddEven(enriched);
-    if (!oe) return null;
-    if (selectionName === "Odd") return oe.odd;
-    if (selectionName === "Even") return oe.even;
-  }
+  // 2026-05-16 subtract bundle: WIN_TO_NIL_HOME/AWAY + GOALS_ODD_EVEN
+  // emission branches removed.
   // Over/Under high lines — Poisson over total scoring rate.
   if (marketType === "OVER_UNDER_55" || marketType === "OVER_UNDER_65") {
     const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;
@@ -776,34 +685,9 @@ function getModelProbability(
     if (!Number.isFinite(line)) return null;
     return predictAsianHandicap(enriched, side, line, { ...dcOpts, lambdaSource });
   }
-  // ─── C4 (2026-05-07): Half-Time / Full-Time joint outcome ──────────────────
-  // Selection format: "Home/Home", "Home/Draw", ..., "Away/Away".
-  if (marketType === "HALF_TIME_FULL_TIME") {
-    const htft = predictHtFt(enriched);
-    if (!htft) return null;
-    return htft[selectionName] ?? null;
-  }
-  // ─── C4: BTTS in first / second half ────────────────────────────────────────
-  if (marketType === "BTTS_FIRST_HALF") {
-    const r = predictBttsHalf(enriched, "first");
-    if (!r) return null;
-    if (selectionName === "Yes") return r.yes;
-    if (selectionName === "No") return r.no;
-  }
-  if (marketType === "BTTS_SECOND_HALF") {
-    const r = predictBttsHalf(enriched, "second");
-    if (!r) return null;
-    if (selectionName === "Yes") return r.yes;
-    if (selectionName === "No") return r.no;
-  }
-  // ─── C4: 2nd-half 1X2 — Poisson on second-half-only goal lambdas ──────────
-  if (marketType === "SECOND_HALF_RESULT") {
-    const r = predictSecondHalfResult(enriched);
-    if (!r) return null;
-    if (selectionName === "Home") return r.home;
-    if (selectionName === "Draw") return r.draw;
-    if (selectionName === "Away") return r.away;
-  }
+  // 2026-05-16 subtract bundle: HALF_TIME_FULL_TIME + BTTS_FIRST_HALF +
+  // BTTS_SECOND_HALF + SECOND_HALF_RESULT all subtracted. (BTTS_FIRST_HALF
+  // also subtracted by extension — same predictBttsHalf consumer.)
   // ─── Asian Total Goals (quarter lines) ─────────────────────────────────────
   // Selection format: "Over 2.75", "Under 2.25", etc. Parse line from name.
   // 2026-05-09 (Bundle 2): unified from prior `ASIAN_GOALS_${bucketSuffix}`

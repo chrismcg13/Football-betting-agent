@@ -1153,104 +1153,11 @@ export function predictTeamTotalGoals(
   return { over, under: 1 - over };
 }
 
-// C1 (2026-05-07): Win-to-nil — joint probability that side wins AND
-// opposition scores zero. Uses the scoreline matrix to capture the
-// home/away lambda interaction.
-export function predictWinToNil(
-  featureMap: Record<string, number>,
-  side: "home" | "away",
-): number | null {
-  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
-  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
-  if (homeLambda == null || awayLambda == null) return null;
-  if (homeLambda <= 0 || awayLambda <= 0) return null;
-  const matrix = scorelineMatrix(homeLambda, awayLambda);
-  let p = 0;
-  if (side === "home") {
-    for (let h = 1; h < matrix.length; h++) p += matrix[h][0];
-  } else {
-    for (let a = 1; a < matrix[0].length; a++) p += matrix[0][a];
-  }
-  return Math.max(0.01, Math.min(0.99, p));
-}
-
-// C4 (2026-05-07): Half-Time/Full-Time 3×3 joint outcome distribution.
-// FH probabilities scaled toward uniform (matches existing FIRST_HALF_RESULT
-// derivation). Joint approximated as P(FH=X) × P(FT=Y) — independence
-// approximation. Renormalised so the 9 cells sum to 1.0.
-// Selections: "Home/Home", "Home/Draw", ..., "Away/Away".
-export function predictHtFt(
-  featureMap: Record<string, number>,
-): Record<string, number> | null {
-  const o = predictOutcome(featureMap);
-  if (!o) return null;
-  const scale = 0.7;
-  const mean = 1 / 3;
-  const fh = {
-    Home: Math.max(0.05, Math.min(0.85, mean + (o.home - mean) * scale)),
-    Draw: Math.max(0.15, Math.min(0.75, mean + (o.draw - mean) * scale)),
-    Away: Math.max(0.05, Math.min(0.85, mean + (o.away - mean) * scale)),
-  };
-  const ft = { Home: o.home, Draw: o.draw, Away: o.away };
-  const result: Record<string, number> = {};
-  for (const fhKey of ["Home", "Draw", "Away"] as const) {
-    for (const ftKey of ["Home", "Draw", "Away"] as const) {
-      result[`${fhKey}/${ftKey}`] = fh[fhKey] * ft[ftKey];
-    }
-  }
-  const total = Object.values(result).reduce((a, b) => a + b, 0);
-  if (total > 0) {
-    for (const k of Object.keys(result)) result[k] = result[k] / total;
-  }
-  return result;
-}
-
-// C4 (2026-05-07): BTTS in a single half — both teams score in given half.
-// Half-lambda = ~45% (FH) or ~55% (2H) of full-match scoring rate.
-// P(BTTS in half) = (1 - exp(-λH_half)) * (1 - exp(-λA_half)) under
-// independence between teams.
-export function predictBttsHalf(
-  featureMap: Record<string, number>,
-  half: "first" | "second",
-): { yes: number; no: number } | null {
-  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
-  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
-  if (homeLambda == null || awayLambda == null) return null;
-  if (homeLambda < 0 || awayLambda < 0) return null;
-  const halfFactor = half === "first" ? 0.45 : 0.55;
-  const lH = homeLambda * halfFactor;
-  const lA = awayLambda * halfFactor;
-  const yes = (1 - Math.exp(-lH)) * (1 - Math.exp(-lA));
-  return {
-    yes: Math.max(0.01, Math.min(0.99, yes)),
-    no: Math.max(0.01, Math.min(0.99, 1 - yes)),
-  };
-}
-
-// C4 (2026-05-07): 2nd-half 1X2 outcome from second-half-only Poisson.
-// Same scoreline-matrix engine as MATCH_ODDS but with 0.55× lambdas.
-export function predictSecondHalfResult(
-  featureMap: Record<string, number>,
-): { home: number; draw: number; away: number } | null {
-  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
-  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
-  if (homeLambda == null || awayLambda == null) return null;
-  if (homeLambda <= 0 || awayLambda <= 0) return null;
-  const matrix = scorelineMatrix(homeLambda * 0.55, awayLambda * 0.55);
-  let pHome = 0;
-  let pDraw = 0;
-  let pAway = 0;
-  for (let h = 0; h < matrix.length; h++) {
-    for (let a = 0; a < matrix[h].length; a++) {
-      if (h > a) pHome += matrix[h][a];
-      else if (h === a) pDraw += matrix[h][a];
-      else pAway += matrix[h][a];
-    }
-  }
-  const total = pHome + pDraw + pAway;
-  if (total <= 0) return null;
-  return { home: pHome / total, draw: pDraw / total, away: pAway / total };
-}
+// 2026-05-16 SUBTRACT BUNDLE: predictWinToNil, predictHtFt, predictBttsHalf,
+// predictSecondHalfResult deleted. WIN_TO_NIL_HOME/AWAY, HALF_TIME_FULL_TIME,
+// BTTS_SECOND_HALF, SECOND_HALF_RESULT all failed three-check (no placeable
+// liquidity probes, zero bets ever placed, no edge thesis attached).
+// See [[feedback_subtract_before_restore]].
 
 // C4 (2026-05-07): Asian Total Goals at quarter lines (2.25, 2.75 etc).
 // Half-stake split between adjacent integer/half lines, mirroring AH push
@@ -1291,100 +1198,12 @@ export function predictAsianTotalGoals(
   return Math.max(0.01, Math.min(0.99, winSide + pPush * 0.5));
 }
 
-// C1 (2026-05-07): Odd/Even total goals — closed-form Poisson identity.
-// P(even total) = (1 + e^{-2λ}) / 2 where λ = home + away scoring rate.
-export function predictOddEven(
-  featureMap: Record<string, number>,
-): { odd: number; even: number } | null {
-  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
-  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
-  if (homeLambda == null || awayLambda == null) return null;
-  if (homeLambda < 0 || awayLambda < 0) return null;
-  const lambda = homeLambda + awayLambda;
-  const even = Math.max(0.05, Math.min(0.95, (1 + Math.exp(-2 * lambda)) / 2));
-  return { even, odd: 1 - even };
-}
-
-export function predictCards(featureMap: Record<string, number>): {
-  over25: number; under25: number;
-  over35: number; under35: number;
-  over45: number; under45: number;
-} | null {
-  const homeCards = featureMap["home_yellow_cards_avg"];
-  const awayCards = featureMap["away_yellow_cards_avg"];
-  // Need at least one cards feature
-  if (homeCards === undefined && awayCards === undefined) return null;
-
-  const hCards = homeCards ?? 1.8;
-  const aCards = awayCards ?? 1.6;
-  const teamLambda = hCards + aCards;
-
-  // 2026-05-08: referee blend. featureEngine populates referee_card_avg
-  // (Bayesian-shrunk to league avg 4.2) and referee_match_count. Blend
-  // weight scales with sample size — full ref signal at n=20+ caps. The
-  // referee component captures discipline tendency that pure team-stats
-  // miss (some refs avg 6+ cards/match, others 3-).
-  const refCards = featureMap["referee_card_avg"];
-  const refN = featureMap["referee_match_count"];
-  let lambda = teamLambda;
-  if (refCards !== undefined && refN !== undefined) {
-    const refWeight = Math.min(0.4, refN / 50);
-    lambda = teamLambda * (1 - refWeight) + refCards * refWeight;
-  }
-
-  const over25 = poissonOver(lambda, 2.5);
-  const over35 = poissonOver(lambda, 3.5);
-  const over45 = poissonOver(lambda, 4.5);
-  return {
-    over25,
-    under25: 1 - over25,
-    over35,
-    under35: 1 - over35,
-    over45,
-    under45: 1 - over45,
-  };
-}
-
-// Task 8 (2026-05-11 — back-to-theory plan): phantom corners root-cause.
-// Prior implementation defaulted missing home/away corner averages to 5.2/4.8.
-// Result: ANY match without computed corner features got λ ≈ 9.5 — the
-// Poisson over-9.5 probability landed ~0.50, and downstream value detection
-// found "edge" against any priced line, flooding the queue. 90 settled
-// TOTAL_CORNERS_75 bets accumulated −42.5% ROI before the blanket ban.
-// New rule: refuse to emit a corners probability unless BOTH team-corner
-// averages exist as observed features (no defaulting). Caller (valueDetection)
-// receives null → market is skipped for that fixture. Once corner features
-// are reliably backfilled, this returns real probabilities and the market
-// re-emits, gated by the standard live-eligibility view.
-export function predictCorners(featureMap: Record<string, number>): {
-  over95: number; under95: number;
-  over105: number; under105: number;
-} | null {
-  const homeCorners = featureMap["home_corners_avg"];
-  const awayCorners = featureMap["away_corners_avg"];
-  // Strict: both teams must have real, non-zero corner averages. A zero
-  // value here is the imputeMissingFeature default — treat as missing.
-  if (
-    homeCorners === undefined || awayCorners === undefined ||
-    homeCorners <= 0 || awayCorners <= 0
-  ) {
-    return null;
-  }
-  const lambda = homeCorners + awayCorners;
-  // Bound λ within plausible football corners range. Pathological inputs
-  // (e.g. youth-tournament fixtures with 2 corners/game or extreme attacks
-  // with 15+) should not produce extremes — clip to keep Poisson regular.
-  if (lambda < 4 || lambda > 16) return null;
-
-  const over95 = poissonOver(lambda, 9.5);
-  const over105 = poissonOver(lambda, 10.5);
-  return {
-    over95,
-    under95: 1 - over95,
-    over105,
-    under105: 1 - over105,
-  };
-}
+// 2026-05-16 SUBTRACT BUNDLE: predictOddEven, predictCards, predictCorners
+// deleted. GOALS_ODD_EVEN + TOTAL_CARDS_25/35/45/55 + TOTAL_CORNERS_75/85/95/
+// 105/115 failed three-check (no placeable liquidity probes ever, zero
+// non-paper bets ever placed, no edge thesis attached). Cards had a brief
+// 60-bet paper-only flurry in April 2026 that did not graduate.
+// See [[feedback_subtract_before_restore]].
 
 // ===================== Training sample builder from DB records =====================
 export interface DbTrainingSample {

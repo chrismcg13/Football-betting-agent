@@ -38,16 +38,15 @@ const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   "OVER_UNDER_85",
   "DRAW_NO_BET",
   "HALF_TIME",
-  "HALF_TIME_FULL_TIME",
-  "ODD_OR_EVEN",
-  "DOUBLE_CHANCE",
+  // 2026-05-16 subtract bundle: HALF_TIME_FULL_TIME, ODD_OR_EVEN,
+  // DOUBLE_CHANCE, TEAM_A_WIN_TO_NIL, TEAM_B_WIN_TO_NIL removed.
+  // Zero placeable liquidity probes ever, zero non-paper bets ever placed.
+  // See [[feedback_subtract_before_restore]].
   "ASIAN_HANDICAP",         // Sub-phase 4.A — was previously skipped
   "ALT_TOTAL_GOALS",        // 2026-05-09 (Bundle 2): Asian Total Goals
   "FIRST_HALF_GOALS_05",
   "FIRST_HALF_GOALS_15",
   "FIRST_HALF_GOALS_25",
-  "TEAM_A_WIN_TO_NIL",
-  "TEAM_B_WIN_TO_NIL",
   "TEAM_A_1",
   "TEAM_A_2",
   "TEAM_A_3",
@@ -61,9 +60,7 @@ function toInternalMarketType(bfMarketType: string): string {
   // Mappings here are the inverse of MARKET_TYPE_MAP in betfairLive.ts.
   switch (bfMarketType) {
     case "BOTH_TEAMS_TO_SCORE": return "BTTS";
-    case "ODD_OR_EVEN": return "GOALS_ODD_EVEN";
-    case "TEAM_A_WIN_TO_NIL": return "WIN_TO_NIL_HOME";
-    case "TEAM_B_WIN_TO_NIL": return "WIN_TO_NIL_AWAY";
+    // 2026-05-16 subtract bundle: ODD_OR_EVEN, TEAM_A/B_WIN_TO_NIL removed.
     case "TEAM_A_1": return "TEAM_TOTAL_HOME_05";
     case "TEAM_A_2": return "TEAM_TOTAL_HOME_15";
     case "TEAM_A_3": return "TEAM_TOTAL_HOME_25";
@@ -75,8 +72,7 @@ function toInternalMarketType(bfMarketType: string): string {
     case "FIRST_HALF_GOALS_15": return "FIRST_HALF_OU_15";
     case "FIRST_HALF_GOALS_25": return "FIRST_HALF_OU_25";
     case "ALT_TOTAL_GOALS": return "ASIAN_TOTAL_GOALS";
-    default: return bfMarketType; // OVER_UNDER_*, DRAW_NO_BET, HALF_TIME_FULL_TIME,
-                                  // DOUBLE_CHANCE, ASIAN_HANDICAP map 1:1
+    default: return bfMarketType; // OVER_UNDER_*, DRAW_NO_BET, ASIAN_HANDICAP map 1:1
   }
 }
 
@@ -101,8 +97,6 @@ function deriveSelectionName(
 
   if (
     bfMarketType === "BOTH_TEAMS_TO_SCORE" ||
-    bfMarketType === "TEAM_A_WIN_TO_NIL" ||
-    bfMarketType === "TEAM_B_WIN_TO_NIL" ||
     bfMarketType === "TEAM_A_1" || bfMarketType === "TEAM_A_2" || bfMarketType === "TEAM_A_3" ||
     bfMarketType === "TEAM_B_1" || bfMarketType === "TEAM_B_2" || bfMarketType === "TEAM_B_3"
   ) {
@@ -111,34 +105,15 @@ function deriveSelectionName(
     return null;
   }
 
-  if (bfMarketType === "ODD_OR_EVEN") {
-    if (lower === "odd") return "Odd";
-    if (lower === "even") return "Even";
-    return null;
-  }
-
-  if (bfMarketType === "DOUBLE_CHANCE") {
-    // Betfair runners: "<Home>/Draw", "Draw/<Away>", "<Home>/<Away>"
-    if (lower.includes("draw") && lower.startsWith(homeTeam.toLowerCase())) return "1X";
-    if (lower.includes("draw") && lower.endsWith(awayTeam.toLowerCase())) return "X2";
-    if (lower.startsWith(homeTeam.toLowerCase()) && lower.endsWith(awayTeam.toLowerCase())) return "12";
-    return null;
-  }
+  // 2026-05-16 subtract bundle: ODD_OR_EVEN, DOUBLE_CHANCE, HALF_TIME_FULL_TIME
+  // selection-name parser branches removed alongside TARGET_BETFAIR_MARKET_TYPES
+  // deletions. These market types are no longer captured by the sweep.
 
   if (bfMarketType === "DRAW_NO_BET") {
     if (lower === homeTeam.toLowerCase()) return "Home";
     if (lower === awayTeam.toLowerCase()) return "Away";
     if (runner.sortPriority === 1) return "Home";
     if (runner.sortPriority === 2) return "Away";
-    return null;
-  }
-
-  if (bfMarketType === "HALF_TIME_FULL_TIME") {
-    // Betfair runner: "Home/Home", "Home/Draw", ..., "Away/Away" — pass through
-    // matches our internal HALF_TIME_FULL_TIME selection names.
-    if (/^(Home|Draw|Away)\/(Home|Draw|Away)$/i.test(name)) {
-      return name.replace(/\b\w/g, (c) => c.toUpperCase()); // Title-case
-    }
     return null;
   }
 

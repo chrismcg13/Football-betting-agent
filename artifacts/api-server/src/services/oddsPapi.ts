@@ -152,21 +152,16 @@ const MARKET_IDS: Record<string, number> = {
   OVER_UNDER_45: 102,
   BTTS: 103,
   ASIAN_HANDICAP: 104,
-  DOUBLE_CHANCE: 105,
+  // 2026-05-16 subtract bundle: DOUBLE_CHANCE, FIRST_HALF_RESULT,
+  // TOTAL_CARDS_*, TOTAL_CORNERS_* ingestion IDs removed.
   TEAM_TOTAL_HOME_05: 106,
   TEAM_TOTAL_HOME_15: 106,
   TEAM_TOTAL_HOME_25: 106,
   TEAM_TOTAL_AWAY_05: 106,
   TEAM_TOTAL_AWAY_15: 106,
   TEAM_TOTAL_AWAY_25: 106,
-  FIRST_HALF_RESULT: 107,
   FIRST_HALF_OU_05: 108,
   FIRST_HALF_OU_15: 108,
-  TOTAL_CARDS_35: 112,
-  TOTAL_CARDS_45: 112,
-  TOTAL_CARDS_55: 112,
-  TOTAL_CORNERS_95: 113,
-  TOTAL_CORNERS_105: 113,
 };
 
 // OU line to target for each market type. 2026-05-08: added OVER_UNDER_05,
@@ -180,11 +175,7 @@ const OU_LINES: Record<string, string> = {
   OVER_UNDER_25: "2.5",
   OVER_UNDER_35: "3.5",
   OVER_UNDER_45: "4.5",
-  TOTAL_CARDS_35: "3.5",
-  TOTAL_CARDS_45: "4.5",
-  TOTAL_CARDS_55: "5.5",
-  TOTAL_CORNERS_95: "9.5",
-  TOTAL_CORNERS_105: "10.5",
+  // 2026-05-16 subtract bundle: TOTAL_CARDS_* + TOTAL_CORNERS_* removed.
 };
 
 // 2026-05-08 Phase B: team-total OU lines. Selection names are
