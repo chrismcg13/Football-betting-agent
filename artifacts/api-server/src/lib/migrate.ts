@@ -3534,29 +3534,14 @@ export async function runMigrations() {
         a.market_type,
         a.n_total,
         a.n_sharp,
-        COALESCE(am.n_matches, 0)                                       AS n_matches,
         ROUND((a.n_sharp::numeric / NULLIF(a.n_total, 0)) * 100, 1)    AS pct_sharp_coverage,
         ROUND((a.w_total::numeric / NULLIF(a.n_total, 0)) * 100, 2)    AS win_rate_pct,
-        -- Per-BET Wilson (kept for legacy/comparison; overstates confidence
-        -- when multiple bets per match).
         ROUND((
           ((a.w_total + 1.92) / (a.n_total + 3.84)
             - 1.96 * SQRT(a.w_total::numeric * (a.n_total - a.w_total)::numeric
                           / NULLIF(a.n_total, 0) + 0.96) / (a.n_total + 3.84))
           * 100
         )::numeric, 2)                                                 AS wilson_lo95_winrate_pct,
-        -- Bundle 1Q: per-MATCH Wilson — independence-honest measure.
-        -- A match "wins" iff sum of its sharp-anchored bets' pnl > 0.
-        -- Use THIS for capital-allocation decisions, not per-bet Wilson.
-        ROUND((am.w_matches::numeric / NULLIF(am.n_matches, 0)) * 100, 2) AS match_win_rate_pct,
-        ROUND((
-          CASE WHEN am.n_matches > 0 THEN
-            ((am.w_matches + 1.92) / (am.n_matches + 3.84)
-              - 1.96 * SQRT(am.w_matches::numeric * (am.n_matches - am.w_matches)::numeric
-                            / NULLIF(am.n_matches, 0) + 0.96) / (am.n_matches + 3.84))
-            * 100
-          END
-        )::numeric, 2)                                                 AS wilson_lo95_per_match_pct,
         ROUND(a.avg_clv_sharp::numeric, 2)                             AS avg_clv_sharp_pct,
         -- One-sample t-stat on sharp-anchored CLV vs zero.
         ROUND((
@@ -3602,7 +3587,22 @@ export async function runMigrations() {
                AND a.avg_clv_sharp > 0
             THEN 'weak'
           ELSE 'inconclusive'
-        END                                                            AS edge_verdict
+        END                                                            AS edge_verdict,
+        -- Bundle 1Q (2026-05-16): new columns APPENDED at end of SELECT.
+        -- Postgres CREATE OR REPLACE VIEW rejects column-order changes —
+        -- new columns must be added after existing ones (same constraint
+        -- that broke is_womens_league on 2026-05-11; see line 3324).
+        -- These three are the per-match independence-honest measures.
+        COALESCE(am.n_matches, 0)                                       AS n_matches,
+        ROUND((am.w_matches::numeric / NULLIF(am.n_matches, 0)) * 100, 2) AS match_win_rate_pct,
+        ROUND((
+          CASE WHEN am.n_matches > 0 THEN
+            ((am.w_matches + 1.92) / (am.n_matches + 3.84)
+              - 1.96 * SQRT(am.w_matches::numeric * (am.n_matches - am.w_matches)::numeric
+                            / NULLIF(am.n_matches, 0) + 0.96) / (am.n_matches + 3.84))
+            * 100
+          END
+        )::numeric, 2)                                                 AS wilson_lo95_per_match_pct
       FROM agg a
       LEFT JOIN agg_per_match am ON am.league = a.league AND am.market_type = a.market_type
       WHERE a.n_total >= 5
