@@ -40,7 +40,9 @@ import {
   backfillFilteredBetOutcomes,
   analyseSharpMovements,
   selectionNameVariants,
-  derivePinnacleDCFromMatchOdds,
+  // 2026-05-16 subtract bundle: derivePinnacleDCFromMatchOdds removed from
+  // import — DOUBLE_CHANCE subtracted. Function still exported by oddsPapi
+  // for now (dead code; next-pass cleanup).
   backfillPinnacleUnified,
   captureAllPendingSnapshots,
 } from "./oddsPapi";
@@ -3478,8 +3480,9 @@ export function startScheduler(): void {
     void runKickoffProximityPrefetch()
       .then(async (r) => {
         logger.info(r, "OddsPapi kickoff-proximity prefetch complete");
-        const dc = await derivePinnacleDCFromMatchOdds();
-        logger.info(dc, "Post-prefetch DC derivation complete");
+        // 2026-05-16 subtract bundle: derivePinnacleDCFromMatchOdds() call
+        // removed. DOUBLE_CHANCE is subtracted; was writing ~1500
+        // derived_from_match_odds rows / 15-min cron tick.
         const unified = await backfillPinnacleUnified();
         logger.info({ unified }, "Post-prefetch unified Pinnacle backfill complete");
       })
@@ -4339,8 +4342,7 @@ export function startScheduler(): void {
         }),
         runKickoffProximityPrefetch().then(async (r) => {
           logger.info(r, "Startup OddsPapi kickoff-proximity prefetch complete");
-          const dc = await derivePinnacleDCFromMatchOdds();
-          logger.info(dc, "Startup post-prefetch DC derivation complete");
+          // 2026-05-16 subtract bundle: DC derivation call removed.
           const unified = await backfillPinnacleUnified();
           logger.info({ unified }, "Startup post-prefetch unified Pinnacle backfill complete");
           return r;
