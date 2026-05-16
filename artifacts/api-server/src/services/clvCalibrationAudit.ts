@@ -56,11 +56,14 @@ export interface CalibrationResult {
   rSquared: number | null;
   bins: BinStats[];
   // Truth-test verdict:
-  //   'honest'      — slope ∈ [0.6, 1.5] AND R² ≥ 0.3
-  //   'noisy'       — slope abs < 0.6 OR R² < 0.3
+  //   'inverted'   — slope < 0 AND R² ≥ 0.3 (CLV ANTI-predicts realised ROI;
+  //                  worst pathology — pre-Bundle-1N MO sat here at slope=-0.69,
+  //                  R²=0.32 but was labelled 'honest' under the prior abs()-based logic)
+  //   'honest'     — slope ∈ [0.6, 1.5] AND R² ≥ 0.3
+  //   'noisy'      — slope ∈ [0, 0.6) OR R² < 0.3
   //   'underpredicts' — slope > 1.5 (CLV signal stronger than thought)
   //   'insufficient_data' — n < 50 bets total OR < 4 non-empty bins
-  verdict: "honest" | "noisy" | "underpredicts" | "insufficient_data";
+  verdict: "inverted" | "honest" | "noisy" | "underpredicts" | "insufficient_data";
 }
 
 function decileMidpoint(idx: number): number {
@@ -117,8 +120,16 @@ function verdict(
   if (nTotal < 50 || nNonEmptyBins < 4 || slope == null || rSquared == null) {
     return "insufficient_data";
   }
+  // Bundle 1N (2026-05-16) fix: a negative slope with meaningful R² is the
+  // WORST pathology — CLV anti-predicts realised ROI, so a "positive CLV"
+  // bet realises NEGATIVE ROI on average. The prior abs()-based logic
+  // labelled this 'honest' because |slope| > 0.6 AND R² > 0.3 both passed.
+  // Pre-Bundle-1N MO baseline (slope=-0.6906, R²=0.3175) was being
+  // reported 'honest' under the broken logic — masking the most dangerous
+  // calibration failure as healthy.
+  if (slope < 0 && rSquared >= 0.3) return "inverted";
   if (slope > 1.5) return "underpredicts";
-  if (Math.abs(slope) < 0.6 || rSquared < 0.3) return "noisy";
+  if (slope < 0.6 || rSquared < 0.3) return "noisy";
   return "honest";
 }
 
