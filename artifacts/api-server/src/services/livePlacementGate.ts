@@ -23,6 +23,13 @@ let cachedDisabledMarkets: { set: Set<string>; fetchedAt: number } | null = null
 // Bundle 1L FIX 1 + FIX 2 (2026-05-16): per-league demote + 24h window cap.
 let cachedDisabledLeagues: { set: Set<string>; fetchedAt: number } | null = null;
 let cachedMaxHoursToKickoff: { value: number; fetchedAt: number } | null = null;
+// Bundle 1L FIX 1b (2026-05-16, Pinnacle-aware timing): MINIMUM hours to
+// kickoff. Pinnacle's closing-line surge concentrates in the final 30-60
+// minutes; Betfair Exchange liquidity dries up over the same window.
+// Bets placed inside this window face (a) tighter Pinnacle = our edge
+// shrinks, (b) thin Betfair book = price moves against us between
+// placement decision and matched fill. Default floor 1.0h.
+let cachedMinHoursToKickoff: { value: number; fetchedAt: number } | null = null;
 const FLAG_CACHE_TTL_MS = 30_000; // 30s — short enough to react to operator flip, long enough to amortise lookups
 
 export async function isLivePlacementEnabled(): Promise<boolean> {
@@ -109,11 +116,33 @@ async function getMaxHoursToKickoff(): Promise<number> {
   return value;
 }
 
+// Bundle 1L FIX 1b (2026-05-16): minimum hours to kickoff. Default 1.0h
+// avoids Pinnacle's closing-line surge + Betfair Exchange liquidity dry-up
+// in the final hour. Theory-grounded (placing inside the surge faces
+// Pinnacle at its most informationally efficient, which compresses our
+// edge AND increases the risk of price moving between our placement
+// decision and the matched fill). Operator-overridable via
+// agent_config.live_placement_min_hours_to_kickoff.
+async function getMinHoursToKickoff(): Promise<number> {
+  const now = Date.now();
+  if (cachedMinHoursToKickoff && now - cachedMinHoursToKickoff.fetchedAt < FLAG_CACHE_TTL_MS) {
+    return cachedMinHoursToKickoff.value;
+  }
+  const rows = (await db.execute(sql`
+    SELECT value FROM agent_config WHERE key = 'live_placement_min_hours_to_kickoff' LIMIT 1
+  `)) as unknown as { rows: Array<{ value: string }> };
+  const parsed = Number(rows.rows[0]?.value ?? "1");
+  const value = Number.isFinite(parsed) && parsed >= 0 ? parsed : 1;
+  cachedMinHoursToKickoff = { value, fetchedAt: now };
+  return value;
+}
+
 export function invalidateLivePlacementFlagCache(): void {
   cachedFlag = null;
   cachedDisabledMarkets = null;
   cachedDisabledLeagues = null;
   cachedMaxHoursToKickoff = null;
+  cachedMinHoursToKickoff = null;
 }
 
 export interface ScopeWhitelistResult {
@@ -261,7 +290,44 @@ export async function checkLivePlacementGates(args: {
   // learning, just don't get real money.
   if (args.kickoffTime) {
     const maxHours = await getMaxHoursToKickoff();
+    const minHours = await getMinHoursToKickoff();
     const hoursToKickoff = (args.kickoffTime.getTime() - Date.now()) / (1000 * 60 * 60);
+
+    // Bundle 1L FIX 1b (2026-05-16): Pinnacle-aware lower bound. Default
+    // 1.0h — placement inside the closing-line surge faces Pinnacle at its
+    // most informationally efficient AND thin Betfair Exchange book.
+    if (hoursToKickoff < minHours) {
+      if (args.betId) {
+        logger.info(
+          {
+            betId: args.betId,
+            marketType: args.marketType,
+            league: args.league,
+            hoursToKickoff: Math.round(hoursToKickoff * 100) / 100,
+            minHours,
+          },
+          "Live placement gate: inside_min_window — shadow rail (Pinnacle surge avoidance)",
+        );
+        void db.insert(complianceLogsTable).values({
+          actionType: "live_placement_skip",
+          details: {
+            reason: "inside_min_window",
+            betId: args.betId,
+            marketType: args.marketType,
+            league: args.league,
+            hoursToKickoff: Math.round(hoursToKickoff * 100) / 100,
+            minHours,
+          },
+        });
+      }
+      return {
+        allowed: false,
+        reason: `inside live placement min window (${Math.round(hoursToKickoff * 100) / 100}h to kickoff < ${minHours}h min)`,
+        path: null,
+        kellyFractionOverride: null,
+      };
+    }
+
     if (hoursToKickoff > maxHours) {
       if (args.betId) {
         logger.info(

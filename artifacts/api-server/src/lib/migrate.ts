@@ -4020,7 +4020,15 @@ export async function runMigrations() {
               'K League 1,K League 2,Super League 1,Pro League,Czech Liga,3. Liga')
       ON CONFLICT (key) DO NOTHING
     `);
-    logger.info("Bundle 1L FIX 1+2 config seeded: live_placement_max_hours_to_kickoff=24, live_placement_disabled_leagues seeded with 6-league list");
+    // FIX 1b — Pinnacle-aware minimum-hours floor. Default 1.0h avoids
+    // the closing-line surge window where Pinnacle is sharpest and
+    // Betfair Exchange liquidity dries up. Operator-tunable.
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value)
+      VALUES ('live_placement_min_hours_to_kickoff', '1')
+      ON CONFLICT (key) DO NOTHING
+    `);
+    logger.info("Bundle 1L FIX 1+1b+2 config seeded: live_placement_min/max_hours_to_kickoff=1/24, live_placement_disabled_leagues seeded with 6-league list");
 
     // ── Bundle N.10 (2026-05-16): REINDEX af_predictions ────────────────────
     // 1331 rows but 9.4 MB total index = 40× table bloat. Reclaim ~9 MB.
