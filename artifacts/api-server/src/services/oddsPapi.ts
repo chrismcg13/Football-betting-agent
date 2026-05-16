@@ -3830,29 +3830,75 @@ export async function backfillClosingPinnacleFromMultiSource(opts: {
         oddspapiPinnacleBookmaker: null,
       });
 
-      if (!resolved.odds || !resolved.source) {
+      // Bundle 1T.5 (2026-05-16): apply same Tier-1 → Tier-2 → Tier-3 chain
+      // that fetchAndStoreClosingLineForPendingBets uses. Before this fix the
+      // backfill stopped at Tier-1 (Pinnacle only) — a 10000-bet backfill
+      // returned 2200 scanned / 116 updated / 2084 skipped because the
+      // resolver returned null for 95% of historical bets even though
+      // odds_snapshots had Tier-2 sharp anchors AND/OR Betfair Exchange close
+      // available. This fix lets the backfill drain the same fallback chain
+      // the pending-line cron walks.
+      let closingOdds: number | null = null;
+      let clvSourceTag: string | null = null;
+      let clvSourceTier: number | null = null;
+      let dataQuality: string | null = null;
+
+      if (resolved.odds && resolved.source) {
+        closingOdds = resolved.odds;
+        clvSourceTag = resolved.source === "derived_from_match_odds" ? "pinnacle_derived" : "pinnacle";
+        clvSourceTier = 1;
+        dataQuality = resolved.dataQuality;
+      } else {
+        // Tier-2 sharp non-Pinnacle.
+        const tier2 = await resolveTier2Anchor({
+          matchId: bet.matchId,
+          marketType: bet.marketType,
+          selectionName: bet.selectionName,
+        });
+        if (tier2) {
+          closingOdds = tier2.odds;
+          clvSourceTag = tier2.source;
+          clvSourceTier = 2;
+          dataQuality = "tier_2_sharp_anchor";
+        } else {
+          // Tier-3 last-resort Betfair Exchange.
+          const tier3 = await resolveTier3BetfairAnchor({
+            matchId: bet.matchId,
+            marketType: bet.marketType,
+            selectionName: bet.selectionName,
+          });
+          if (tier3) {
+            closingOdds = tier3.odds;
+            clvSourceTag = tier3.source;
+            clvSourceTier = 3;
+            dataQuality = "tier_3_betfair_fallback";
+          }
+        }
+      }
+
+      if (closingOdds == null) {
         skipped++;
         continue;
       }
 
       const placementOdds = Number(bet.oddsAtPlacement);
-      const clvPct = resolved.odds > 1
-        ? Math.round(((placementOdds - resolved.odds) / resolved.odds) * 100 * 1000) / 1000
+      const clvPct = closingOdds > 1
+        ? Math.round(((placementOdds - closingOdds) / closingOdds) * 100 * 1000) / 1000
         : null;
-      const clvSourceTag =
-        resolved.source === "derived_from_match_odds" ? "pinnacle_derived" : "pinnacle";
 
       await db
         .update(paperBetsTable)
         .set({
-          closingPinnacleOdds: String(resolved.odds),
+          closingPinnacleOdds: String(closingOdds),
           ...(clvPct != null ? { clvPct: String(clvPct) } : {}),
           clvSource: clvSourceTag,
-          clvDataQuality: resolved.dataQuality,
-        })
+          clvDataQuality: dataQuality,
+          clvSourceTier: clvSourceTier as unknown as number,
+        } as Record<string, unknown>)
         .where(eq(paperBetsTable.id, bet.id));
 
-      bySource[resolved.source] = (bySource[resolved.source] ?? 0) + 1;
+      const sourceKey = clvSourceTag ?? "unknown";
+      bySource[sourceKey] = (bySource[sourceKey] ?? 0) + 1;
       updated++;
     } catch (err) {
       logger.error({ err, betId: bet.id }, "Backfill: error resolving — skipping");
