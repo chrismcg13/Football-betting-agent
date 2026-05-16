@@ -2563,9 +2563,11 @@ router.post("/admin/run-tier-ladder-v2", async (_req, res) => {
 // odds for DC fallback). Idempotent. Body: { limit?: number }.
 router.post("/admin/backfill-closing-pinnacle", async (req, res) => {
   try {
-    const limit = Number((req.body ?? {}).limit ?? 5000);
+    const body = (req.body ?? {}) as { limit?: number; reAnchorBetfair?: boolean };
+    const limit = Number(body.limit ?? 5000);
+    const reAnchorBetfair = Boolean(body.reAnchorBetfair ?? false);
     const { backfillClosingPinnacleFromMultiSource } = await import("../services/oddsPapi");
-    const r = await backfillClosingPinnacleFromMultiSource({ limit });
+    const r = await backfillClosingPinnacleFromMultiSource({ limit, reAnchorBetfair });
     return res.json({ success: true, result: r });
   } catch (err) {
     logger.error({ err }, "backfill-closing-pinnacle failed");

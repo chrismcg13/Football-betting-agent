@@ -3871,11 +3871,21 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
  */
 export async function backfillClosingPinnacleFromMultiSource(opts: {
   limit?: number;
+  reAnchorBetfair?: boolean;
 } = {}): Promise<{
   scanned: number; updated: number; skipped: number; bySource: Record<string, number>;
 }> {
   const limit = opts.limit ?? 5000;
+  const reAnchorBetfair = opts.reAnchorBetfair ?? false;
 
+  // Bundle 1U.2 (2026-05-16) — reAnchorBetfair flag: includes bets currently
+  // anchored on betfair_exchange (single-source) so they get re-processed
+  // with the new Tier-3 priority order (Bet365/Unibet preferred, Betfair
+  // last). Without this, existing Tier-3 Betfair-anchored bets stay on
+  // Betfair forever even after deploy because the default WHERE clause
+  // only picks up closing_pinnacle_odds IS NULL bets. Operator directive
+  // 2026-05-16: "use bet365/matchbook/unibet ... where we have betfair
+  // currently" — re-anchor is the historical fix.
   const settledBets = await db
     .select({
       id: paperBetsTable.id,
@@ -3888,7 +3898,9 @@ export async function backfillClosingPinnacleFromMultiSource(opts: {
     .where(
       and(
         inArray(paperBetsTable.status, ["won", "lost", "void", "push"]),
-        sql`${paperBetsTable.closingPinnacleOdds} IS NULL`,
+        reAnchorBetfair
+          ? sql`(${paperBetsTable.closingPinnacleOdds} IS NULL OR ${paperBetsTable.clvSource} = 'betfair_exchange')`
+          : sql`${paperBetsTable.closingPinnacleOdds} IS NULL`,
         sql`${paperBetsTable.deletedAt} IS NULL`,
       ),
     )
