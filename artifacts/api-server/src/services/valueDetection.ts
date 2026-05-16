@@ -333,7 +333,32 @@ async function getHotStreakBonus(
 
 // ─── Opportunity scoring (revised formula) ────────────────────────────────────
 
-const DERIVED_MARKETS = new Set(["DOUBLE_CHANCE", "FIRST_HALF_RESULT"]);
+// Plan v3 Bundle 0 cleanup (2026-05-16): DOUBLE_CHANCE removed — low-odds
+// derived market (1.15-1.80), P3 violation, structurally correlated with
+// MATCH_ODDS. Emission branch in getModelProbability deleted alongside.
+const DERIVED_MARKETS = new Set(["FIRST_HALF_RESULT"]);
+
+// Plan v3 Bundle 0 (2026-05-16): the 8 wired-but-zero-emission market
+// families. Each silent `continue` in the per-selection loop records a
+// reason against this set so we can root-cause why no bets emit. Aggregated
+// per cycle, flushed as ≤15 compliance_logs rows per cycle (cheap).
+const DIAGNOSTIC_TARGET_MARKETS: ReadonlySet<string> = new Set([
+  "TOTAL_CORNERS_75",
+  "TOTAL_CORNERS_85",
+  "TOTAL_CORNERS_95",
+  "TOTAL_CORNERS_105",
+  "TOTAL_CORNERS_115",
+  "HALF_TIME_FULL_TIME",
+  "GOALS_ODD_EVEN",
+  "WIN_TO_NIL_HOME",
+  "WIN_TO_NIL_AWAY",
+  "SECOND_HALF_RESULT",
+  "BTTS_SECOND_HALF",
+  "TOTAL_CARDS_25",
+  "TOTAL_CARDS_35",
+  "TOTAL_CARDS_45",
+  "TOTAL_CARDS_55",
+]);
 
 function computeOpportunityScore(params: {
   edge: number;
@@ -641,12 +666,9 @@ function getModelProbability(
     if (selectionName.startsWith("Over")) return 1 - under45;
     if (selectionName.startsWith("Under")) return under45;
   }
-  // Double Chance — derived from match winner probabilities
-  if (marketType === "DOUBLE_CHANCE" && outcomePreds) {
-    if (selectionName === "1X") return Math.min(0.98, outcomePreds.home + outcomePreds.draw);
-    if (selectionName === "X2") return Math.min(0.98, outcomePreds.draw + outcomePreds.away);
-    if (selectionName === "12") return Math.min(0.98, outcomePreds.home + outcomePreds.away);
-  }
+  // Double Chance emission deleted in Plan v3 Bundle 0 (2026-05-16). Low-odds
+  // (1.15-1.80) derived market, P3 violation, and structurally correlated with
+  // MATCH_ODDS. BANNED_MARKETS entry retained as defense in depth.
   // First Half Result — scaled from full-match outcome (halves closer to 50/50)
   if (marketType === "FIRST_HALF_RESULT" && outcomePreds) {
     const scale = 0.7; // first half probabilities converge toward uniform
@@ -1176,6 +1198,23 @@ export async function detectValueBets(options?: {
   // (1466 inserts / cycle previously kept the cycle running 15+ minutes).
   const complianceBuffer: Array<typeof complianceLogsTable.$inferInsert> = [];
 
+  // Plan v3 Bundle 0 (2026-05-16): per-cycle diagnostic counters for the 8
+  // wired-but-zero-emission market families. recordDiagnostic{Reject,Accepted}
+  // are no-ops for markets outside DIAGNOSTIC_TARGET_MARKETS so the patch
+  // adds zero overhead on the dominant AH/MO/BTTS/OU paths.
+  const diagnosticRejections = new Map<string, Map<string, number>>();
+  const diagnosticAccepted = new Map<string, number>();
+  function recordDiagnosticReject(marketType: string, reason: string): void {
+    if (!DIAGNOSTIC_TARGET_MARKETS.has(marketType)) return;
+    const mapForMarket = diagnosticRejections.get(marketType) ?? new Map<string, number>();
+    mapForMarket.set(reason, (mapForMarket.get(reason) ?? 0) + 1);
+    diagnosticRejections.set(marketType, mapForMarket);
+  }
+  function recordDiagnosticAccepted(marketType: string): void {
+    if (!DIAGNOSTIC_TARGET_MARKETS.has(marketType)) return;
+    diagnosticAccepted.set(marketType, (diagnosticAccepted.get(marketType) ?? 0) + 1);
+  }
+
   // ─── Bulk pre-load all per-(league, marketType) and per-league data ─────
   // Previously the inner loop did 7+ sequential DB round-trips per selection
   // (~1500 iterations × 7 queries × 50ms = 8-10 minutes of pure DB latency).
@@ -1513,25 +1552,36 @@ export async function detectValueBets(options?: {
       // candidates flow through to placement where the data_tier-gated
       // hardstop at paperTrading.ts:683 confirms £0 stake. Production
       // track (Tier A) keeps the bans untouched.
-      if (BANNED_MARKETS.has(marketType) && !isExperimentTrack) continue;
+      if (BANNED_MARKETS.has(marketType) && !isExperimentTrack) {
+        recordDiagnosticReject(marketType, "banned_market_production_track");
+        continue;
+      }
 
       const pricing = selectPricingSources(groupRows, marketType, MARKET_TYPE_MAP_KEYS);
       if (!pricing.ok) {
         if (pricing.reason === "no_actionable_source") {
           pricingRejectNoBetfairExchange++; // legacy counter — repurposed
+          recordDiagnosticReject(marketType, "no_actionable_source");
         } else {
           pricingRejectNoFairValueSource++;
+          recordDiagnosticReject(marketType, "no_fair_value_source");
         }
         continue;
       }
       const { actionablePrice, actionableSource, fairValueOdds, fairValueSource, shadowOnly } = pricing;
 
       // Minimum odds floor on the actionable (placed) price
-      if (actionablePrice < minOddsThreshold) continue;
+      if (actionablePrice < minOddsThreshold) {
+        recordDiagnosticReject(marketType, "min_odds_floor");
+        continue;
+      }
 
       const dcOpts = dcOptsForMarket(dcCtx, marketType);
       const rawModelProb = getModelProbability(marketType, selectionName, featureMap, dcOpts, lambdaSource);
-      if (rawModelProb === null) continue;
+      if (rawModelProb === null) {
+        recordDiagnosticReject(marketType, "model_probability_null");
+        continue;
+      }
 
       // Task 12 (2026-05-11): calibration layer. Raw sigmoid → calibrated
       // probability via the active calibration_buckets row for
@@ -1583,7 +1633,10 @@ export async function detectValueBets(options?: {
       const effectiveShadowMinEdge = DERIVED_MARKETS.has(oddsRow.marketType)
         ? Math.max(shadowMinEdge, 0.02)
         : shadowMinEdge;
-      if (edge < effectiveShadowMinEdge) continue;
+      if (edge < effectiveShadowMinEdge) {
+        recordDiagnosticReject(oddsRow.marketType, "edge_below_shadow_floor");
+        continue;
+      }
 
       // Coverage filter (2026-05-08): for known-coverage-gated market types
       // (TEAM_TOTAL_*, FIRST_HALF_*, OVER_UNDER_05/45+), require a recent
@@ -1594,11 +1647,13 @@ export async function detectValueBets(options?: {
         COVERAGE_GATED_MARKETS.has(oddsRow.marketType) &&
         !coveredPairs.has(`${match.id}:${oddsRow.marketType}`)
       ) {
+        recordDiagnosticReject(oddsRow.marketType, "coverage_gate_no_betfair_snapshot");
         continue;
       }
 
       const evCheck = commissionAdjustedEV(modelProb, backOdds, commRate);
       if (evCheck.netEV <= 0) {
+        recordDiagnosticReject(oddsRow.marketType, "negative_net_ev_after_commission");
         logger.debug(
           { matchId: match.id, market: oddsRow.marketType, selection: oddsRow.selectionName, grossEV: evCheck.grossEV, netEV: evCheck.netEV, commRate },
           "Skipping bet: positive gross EV but negative net EV after commission",
@@ -1754,6 +1809,7 @@ export async function detectValueBets(options?: {
 
       if (placementTrack !== null) {
         byMarketType[oddsRow.marketType] = (byMarketType[oddsRow.marketType] ?? 0) + 1;
+        recordDiagnosticAccepted(oddsRow.marketType);
         valueBets.push({
           matchId: match.id,
           homeTeam: match.homeTeam,
@@ -1807,6 +1863,34 @@ export async function detectValueBets(options?: {
       }
     }
     logger.info({ registered, attempted: newExperiments.length, durationMs: Date.now() - regStart }, "New experiments registered");
+  }
+
+  // Plan v3 Bundle 0 (2026-05-16): flush per-cycle emission diagnostic rows
+  // for the 8 wired-but-zero-emission market families. One row per market
+  // tracked with its rejection-reason histogram + accepted count. Riding the
+  // same bulk-flush channel as other compliance writes (below).
+  const diagnosticMarkets = new Set<string>([
+    ...diagnosticRejections.keys(),
+    ...diagnosticAccepted.keys(),
+  ]);
+  for (const marketType of diagnosticMarkets) {
+    const reasonMap = diagnosticRejections.get(marketType) ?? new Map<string, number>();
+    const rejections: Record<string, number> = {};
+    let rejectedTotal = 0;
+    for (const [reason, count] of reasonMap) {
+      rejections[reason] = count;
+      rejectedTotal += count;
+    }
+    const emitted = diagnosticAccepted.get(marketType) ?? 0;
+    complianceBuffer.push({
+      actionType: "emission_diagnostic",
+      details: {
+        marketType,
+        emitted,
+        rejections,
+        rejectedTotal,
+      },
+    });
   }
 
   // Bulk-flush buffered compliance logs in chunks. Failures here must not
