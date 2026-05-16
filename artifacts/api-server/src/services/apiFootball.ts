@@ -395,20 +395,9 @@ const TEAM_TOTAL_LINES: Record<string, string> = {
   "3.5": "_35",
 };
 
-const CORNERS_LINES: Record<string, string> = {
-  "7.5": "TOTAL_CORNERS_75",
-  "8.5": "TOTAL_CORNERS_85",
-  "9.5": "TOTAL_CORNERS_95",
-  "10.5": "TOTAL_CORNERS_105",
-  "11.5": "TOTAL_CORNERS_115",
-};
-
-const CARDS_LINES: Record<string, string> = {
-  "2.5": "TOTAL_CARDS_25",
-  "3.5": "TOTAL_CARDS_35",
-  "4.5": "TOTAL_CARDS_45",
-  "5.5": "TOTAL_CARDS_55",
-};
+// 2026-05-16 subtract bundle: CORNERS_LINES + CARDS_LINES maps deleted
+// alongside their downstream consumers in mapOddsToMarket. See
+// feedback_subtract_before_restore.
 
 function mapOddsToMarket(
   betName: string,
@@ -441,17 +430,9 @@ function mapOddsToMarket(
     }
   }
 
-  if (norm.includes("double chance")) {
-    if (v === "Home/Draw" || v === "1X") return { marketType: "DOUBLE_CHANCE", selectionName: "1X", backOdds: o };
-    if (v === "Draw/Away" || v === "X2") return { marketType: "DOUBLE_CHANCE", selectionName: "X2", backOdds: o };
-    if (v === "Home/Away" || v === "12") return { marketType: "DOUBLE_CHANCE", selectionName: "12", backOdds: o };
-  }
-
-  if (norm.includes("first half winner") || norm === "half time result" || norm.includes("halftime result")) {
-    if (v === "Home") return { marketType: "FIRST_HALF_RESULT", selectionName: "Home", backOdds: o };
-    if (v === "Draw") return { marketType: "FIRST_HALF_RESULT", selectionName: "Draw", backOdds: o };
-    if (v === "Away") return { marketType: "FIRST_HALF_RESULT", selectionName: "Away", backOdds: o };
-  }
+  // 2026-05-16 subtract bundle: DOUBLE_CHANCE + FIRST_HALF_RESULT case
+  // branches removed. Both in BANNED_MARKETS at placement layer, both failed
+  // the placeable / experiment / intentional-removal three-check.
 
   if (norm.includes("first half") && norm.includes("goal")) {
     const line = v.replace("Over", "").replace("Under", "").trim();
@@ -465,23 +446,10 @@ function mapOddsToMarket(
     }
   }
 
-  if ((norm.includes("card") || norm.includes("yellow")) && (norm.includes("over") || norm.includes("under") || norm.includes("total"))) {
-    const line = v.replace("Over", "").replace("Under", "").trim();
-    const marketSuffix = CARDS_LINES[line];
-    if (marketSuffix) {
-      const sel = v.startsWith("Over") ? `Over ${line} Cards` : `Under ${line} Cards`;
-      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
-    }
-  }
-
-  if (norm.includes("corner") && (norm.includes("over") || norm.includes("under") || norm.includes("total"))) {
-    const line = v.replace("Over", "").replace("Under", "").trim();
-    const marketSuffix = CORNERS_LINES[line];
-    if (marketSuffix) {
-      const sel = v.startsWith("Over") ? `Over ${line} Corners` : `Under ${line} Corners`;
-      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
-    }
-  }
+  // 2026-05-16 subtract bundle: TOTAL_CARDS_* + TOTAL_CORNERS_* case branches
+  // removed. ~218k rows/day of API-Football writes to odds_snapshots
+  // eliminated. None of these markets had Betfair Exchange liquidity probes,
+  // none had non-paper bets ever placed.
 
   if (norm.includes("asian handicap")) {
     const line = v.replace("Home", "").replace("Away", "").trim();
@@ -496,27 +464,8 @@ function mapOddsToMarket(
     if (v === "Away") return { marketType: "DRAW_NO_BET", selectionName: "Away", backOdds: o };
   }
 
-  // C1 (2026-05-07): Win to Nil — team wins AND opposition fails to score.
-  // AF returns names like "Win to Nil - Home" / "Win to Nil - Away".
-  if (norm.includes("win to nil")) {
-    if (v === "Yes" || v === "yes") {
-      if (norm.includes("home")) return { marketType: "WIN_TO_NIL_HOME", selectionName: "Yes", backOdds: o };
-      if (norm.includes("away")) return { marketType: "WIN_TO_NIL_AWAY", selectionName: "Yes", backOdds: o };
-    }
-    if (v === "No" || v === "no") {
-      if (norm.includes("home")) return { marketType: "WIN_TO_NIL_HOME", selectionName: "No", backOdds: o };
-      if (norm.includes("away")) return { marketType: "WIN_TO_NIL_AWAY", selectionName: "No", backOdds: o };
-    }
-    // Some AF responses encode side in the value rather than the bet name.
-    if (v === "Home") return { marketType: "WIN_TO_NIL_HOME", selectionName: "Yes", backOdds: o };
-    if (v === "Away") return { marketType: "WIN_TO_NIL_AWAY", selectionName: "Yes", backOdds: o };
-  }
-
-  // C1 (2026-05-07): Odd/Even total goals.
-  if ((norm.includes("odd") && norm.includes("even")) || norm.includes("goals odd/even") || norm === "odd/even") {
-    if (v === "Odd" || v === "odd") return { marketType: "GOALS_ODD_EVEN", selectionName: "Odd", backOdds: o };
-    if (v === "Even" || v === "even") return { marketType: "GOALS_ODD_EVEN", selectionName: "Even", backOdds: o };
-  }
+  // 2026-05-16 subtract bundle: WIN_TO_NIL_HOME/AWAY + GOALS_ODD_EVEN case
+  // branches removed.
 
   // C1 (2026-05-07): Team-total goals — per-side over/under. AF bet names
   // include "Total - Home" / "Goals Over/Under (Home)" / "Home Team Total" etc.
@@ -539,28 +488,12 @@ function mapOddsToMarket(
     }
   }
 
-  // C4 (2026-05-07): Half-Time / Full-Time double — "HT/FT" / "Halftime/Fulltime"
-  // Values like "Home/Home", "Home/Draw", "Draw/Home", etc.
-  if (norm.includes("ht/ft") || norm.includes("half time/full time") || norm.includes("halftime/fulltime") || norm.includes("ht / ft")) {
-    if (/^(Home|Draw|Away)\/(Home|Draw|Away)$/.test(v)) {
-      return { marketType: "HALF_TIME_FULL_TIME", selectionName: v, backOdds: o };
-    }
-  }
-
-  // C4 (2026-05-07): BTTS in first / second half.
-  if (norm.includes("both teams") && norm.includes("score") && (norm.includes("first half") || norm.includes("1st half"))) {
-    if (v === "Yes" || v === "No") return { marketType: "BTTS_FIRST_HALF", selectionName: v, backOdds: o };
-  }
-  if (norm.includes("both teams") && norm.includes("score") && (norm.includes("second half") || norm.includes("2nd half"))) {
-    if (v === "Yes" || v === "No") return { marketType: "BTTS_SECOND_HALF", selectionName: v, backOdds: o };
-  }
-
-  // C4 (2026-05-07): 2nd-half 1X2 result.
-  if ((norm.includes("second half") || norm.includes("2nd half")) && (norm.includes("winner") || norm.includes("result"))) {
-    if (v === "Home" || v === "Draw" || v === "Away") {
-      return { marketType: "SECOND_HALF_RESULT", selectionName: v, backOdds: o };
-    }
-  }
+  // 2026-05-16 subtract bundle: HALF_TIME_FULL_TIME + BTTS_FIRST_HALF +
+  // BTTS_SECOND_HALF + SECOND_HALF_RESULT case branches removed.
+  // BTTS_FIRST_HALF subtracted as consistent extension — its predictBttsHalf
+  // function was deleted in the same bundle (same predictor as BTTS_SECOND_HALF
+  // which was explicitly approved). Leaving the mapper would orphan-write
+  // odds_snapshots rows for which no emission consumer exists.
 
   // C4 (2026-05-07): Asian Total Goals (quarter lines). AF tags as
   // "Asian Goals" / "Asian Total" with numeric lines like "2.25".

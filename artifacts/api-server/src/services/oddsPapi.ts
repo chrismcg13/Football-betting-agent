@@ -2369,11 +2369,8 @@ const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   { marketType: "OVER_UNDER_35",    selectionName: "Under 3.5" },
   { marketType: "OVER_UNDER_45",    selectionName: "Over 4.5" },
   { marketType: "OVER_UNDER_45",    selectionName: "Under 4.5" },
-  // Corners O/U
-  { marketType: "TOTAL_CORNERS_95",  selectionName: "Over 9.5 Corners" },
-  { marketType: "TOTAL_CORNERS_95",  selectionName: "Under 9.5 Corners" },
-  { marketType: "TOTAL_CORNERS_105", selectionName: "Over 10.5 Corners" },
-  { marketType: "TOTAL_CORNERS_105", selectionName: "Under 10.5 Corners" },
+  // 2026-05-16 subtract bundle: TOTAL_CORNERS_* removed from PREFETCH_TARGETS.
+  // Stops writes to odds_snapshots for these markets on every OddsPapi pull.
   // BTTS
   { marketType: "BTTS",              selectionName: "Yes" },
   { marketType: "BTTS",              selectionName: "No" },
@@ -2432,17 +2429,12 @@ const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   { marketType: "TEAM_TOTAL_AWAY_15", selectionName: "Under 1.5" },
   { marketType: "TEAM_TOTAL_AWAY_25", selectionName: "Over 2.5" },
   { marketType: "TEAM_TOTAL_AWAY_25", selectionName: "Under 2.5" },
-  // ── 2026-05-08 Phase B: First-half markets ──
-  { marketType: "FIRST_HALF_RESULT",  selectionName: "Home" },
-  { marketType: "FIRST_HALF_RESULT",  selectionName: "Draw" },
-  { marketType: "FIRST_HALF_RESULT",  selectionName: "Away" },
+  // 2026-05-16 subtract bundle: FIRST_HALF_RESULT + TOTAL_CARDS_55 removed.
+  // FIRST_HALF_OU_05/15 KEPT (in plan — bettable first-half goals markets).
   { marketType: "FIRST_HALF_OU_05",   selectionName: "Over 0.5" },
   { marketType: "FIRST_HALF_OU_05",   selectionName: "Under 0.5" },
   { marketType: "FIRST_HALF_OU_15",   selectionName: "Over 1.5" },
   { marketType: "FIRST_HALF_OU_15",   selectionName: "Under 1.5" },
-  // ── 2026-05-08 Phase B: TOTAL_CARDS_55 (35 + 45 already supported) ──
-  { marketType: "TOTAL_CARDS_55",     selectionName: "Over 5.5 Cards" },
-  { marketType: "TOTAL_CARDS_55",     selectionName: "Under 5.5 Cards" },
 ];
 
 export async function prefetchAndStoreOddsPapiOdds(
