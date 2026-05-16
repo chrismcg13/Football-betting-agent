@@ -3296,6 +3296,49 @@ const TIER_2_SOURCE_PRIORITY = [
   "betfair_exchange",
 ];
 
+/**
+ * Bundle 1T.3 (2026-05-16): Tier-3 last-resort Betfair Exchange anchor.
+ *
+ * Only invoked when both Pinnacle (tier 1) and Tier-2 sharp brokers
+ * (Smarkets / Matchbook / SBO / Bet365 / betfair_exchange-within-24h) return
+ * null. Looks for ANY Betfair Exchange snapshot in the last 14 days. Used to
+ * ensure every shadow bet has SOME closing-line value populated for the
+ * coverage column — even if it's not edge-meaningful (we trade on Betfair
+ * Exchange, so price drift between two of our own observations is not edge).
+ *
+ * clv_source_tier=3 tags these distinctly so the validation pipeline
+ * (clvCalibrationAudit.ts, Bundle 2B per-scope Kelly) continues to exclude
+ * them from edge gates per Bundle 1O. The SHARP_CLV_SOURCES allow-list
+ * already excludes 'betfair_exchange' regardless of tier.
+ *
+ * Coverage motivation: Bundle 1R audit found 100% no-anchor on Campeonato
+ * Brasileiro Série A (n=116), CONMEBOL Sudamericana (n=65), UEFA Europa
+ * League (n=31) — leagues where the tier-2 chain returns null because no
+ * sharp source has the fixture mapped. Operator directive 2026-05-16: every
+ * shadow bet, every league, every market_type needs SOME CLV.
+ */
+async function resolveTier3BetfairAnchor(args: {
+  matchId: number;
+  marketType: string;
+  selectionName: string;
+}): Promise<{ odds: number; source: string } | null> {
+  const rows = await db.execute(sql`
+    SELECT back_odds::float8 AS odds, snapshot_time
+    FROM odds_snapshots
+    WHERE match_id = ${args.matchId}
+      AND market_type = ${args.marketType}
+      AND selection_name = ${args.selectionName}
+      AND source = 'betfair_exchange'
+      AND back_odds::numeric > 1.01
+      AND snapshot_time > NOW() - INTERVAL '14 days'
+    ORDER BY snapshot_time DESC
+    LIMIT 1
+  `);
+  const list = (((rows as { rows?: Array<{ odds: number; snapshot_time: string }> }).rows ?? []));
+  if (list.length === 0 || !list[0]) return null;
+  return { odds: list[0].odds, source: "betfair_exchange" };
+}
+
 async function resolveTier2Anchor(args: {
   matchId: number;
   marketType: string;
@@ -3593,6 +3636,32 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
             clvSourceTag = tier2.source;
             clvSourceTier = 2;
             dataQuality = "tier_2_sharp_anchor";
+          } else {
+            // Bundle 1T.3 (2026-05-16): Tier-3 last-resort Betfair Exchange
+            // fallback. Ensures every shadow bet has SOME CLV anchor (per
+            // operator directive "every shadow bet needs SOME CLV"). Wider
+            // 14-day snapshot window vs Tier-2's 24h — catches anchor-orphan
+            // leagues like Campeonato Brasileiro Série A, CONMEBOL
+            // Sudamericana, UEFA Europa League (Bundle 1R audit: 100%
+            // no-anchor, n=212 total).
+            //
+            // NOT edge-meaningful (we trade ON Betfair Exchange so
+            // close-vs-place is price drift between two of our own
+            // observations, not edge vs a sharp third party). Tagged
+            // clv_source_tier=3 so the validation pipeline (Bundle 1O
+            // clvCalibrationAudit, Bundle 2B per-scope Kelly) continues to
+            // exclude these from edge gates.
+            const tier3 = await resolveTier3BetfairAnchor({
+              matchId,
+              marketType,
+              selectionName: bet.selectionName,
+            });
+            if (tier3) {
+              closingOdds = tier3.odds;
+              clvSourceTag = tier3.source; // 'betfair_exchange'
+              clvSourceTier = 3;
+              dataQuality = "tier_3_betfair_fallback";
+            }
           }
         }
 
