@@ -55,8 +55,19 @@ ANALYSIS_START_DATE = "2026-05-09"
 
 
 def fetch_settled(conn) -> list[dict]:
-    """Pull all settled bets with a non-null model_probability."""
-    sql = """
+    """Pull all settled bets with a non-null model_probability.
+
+    Bundle 1M (2026-05-16) fix: switched from psycopg2 %s parameter binding
+    to f-string interpolation for ANALYSIS_START_DATE. The prior version
+    raised psycopg2 IndexError on Python 3.12 because the em-dash and
+    en-dash characters in the SQL comment block (lines below) were being
+    miscounted by psycopg2's placeholder tokenizer, leading to a mismatch
+    between detected %s count and provided params tuple size.
+    ANALYSIS_START_DATE is a hardcoded module constant — zero injection
+    risk from inline interpolation. Comment characters preserved (the
+    rationale matters more than the original parameter-binding style).
+    """
+    sql = f"""
         SELECT
           pb.model_probability::float8 AS model_prob,
           pb.raw_model_probability::float8 AS raw_prob,
@@ -65,7 +76,7 @@ def fetch_settled(conn) -> list[dict]:
           m.league
         FROM paper_bets pb
         LEFT JOIN matches m ON pb.match_id = m.id
-        WHERE pb.placed_at >= %s::date
+        WHERE pb.placed_at >= '{ANALYSIS_START_DATE}'::date
           AND pb.deleted_at IS NULL
           AND pb.status IN ('won', 'lost')
           AND pb.model_probability IS NOT NULL
@@ -75,11 +86,11 @@ def fetch_settled(conn) -> list[dict]:
           -- probability, 64/64 wins) which would make isotonic
           -- regression report "perfectly calibrated at 0.99" — a
           -- false signal that under-corrects predictions in the
-          -- 0.5–0.9 band where shadow + live actually bet.
+          -- 0.5-0.9 band where shadow + live actually bet.
           AND pb.bet_track IN ('live', 'shadow')
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, (ANALYSIS_START_DATE,))
+        cur.execute(sql)
         return list(cur.fetchall())
 
 
