@@ -2529,6 +2529,28 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Bundle N.7 compliance_logs retention scheduler active — daily 03:15 UTC");
 
+  // Bundle 1C.1 (2026-05-16): CLV-vs-ROI calibration regression. Weekly
+  // Mondays 04:30 UTC (after Bundle B at 02:30 + calibration fitter at 04:00).
+  // Answers "is our CLV signal an honest predictor of realised ROI?" before
+  // Bundle 2B per-scope Kelly amplifies any bias. One compliance_logs row
+  // per (portfolio + per-marketType) — ~6 rows/week.
+  cron.schedule("30 4 * * 1", () => {
+    logger.info("Bundle 1C.1 CLV calibration audit triggered (Mondays 04:30 UTC)");
+    void (async () => {
+      try {
+        const { runClvCalibrationAuditWeekly } = await import("./clvCalibrationAudit");
+        const r = await runClvCalibrationAuditWeekly();
+        logger.info(
+          { portfolioVerdict: r.portfolio.verdict, durationMs: r.durationMs },
+          "Bundle 1C.1 CLV calibration audit complete",
+        );
+      } catch (err) {
+        logger.error({ err }, "Bundle 1C.1 CLV calibration audit failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle 1C.1 CLV calibration audit scheduler active — Mondays 04:30 UTC");
+
   // Bundle 1B.2 (2026-05-16): Club Elo fair-line CLV backfill. Every 15 min,
   // populates closing_elo_fair_odds + clv_elo_pct + elo_data_quality on
   // pending and recently-settled paper_bets for European fixtures where both

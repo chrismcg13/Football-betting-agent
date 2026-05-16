@@ -4222,6 +4222,29 @@ router.post("/admin/cancel-bet", async (req, res) => {
   }
 });
 
+// Bundle 1C.1 (2026-05-16): on-demand CLV calibration audit. Lets the
+// operator fire the regression immediately after deploy / on-demand without
+// waiting for the Mondays 04:30 UTC cron. Optional body: {marketType?, leagueId?}.
+router.post("/admin/run-clv-calibration-audit", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as { marketType?: string; leagueId?: string };
+    const { runClvCalibrationAudit, runClvCalibrationAuditWeekly } = await import("../services/clvCalibrationAudit");
+    if (body.marketType || body.leagueId) {
+      const result = await runClvCalibrationAudit(body);
+      return res.json({ ok: true, result });
+    }
+    const result = await runClvCalibrationAuditWeekly();
+    return res.json({
+      ok: true,
+      portfolio: result.portfolio,
+      perMarketType: result.perMarketType,
+      durationMs: result.durationMs,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: String(err) });
+  }
+});
+
 router.post("/admin/set-config", async (req, res) => {
   try {
     const { key, value } = req.body;
