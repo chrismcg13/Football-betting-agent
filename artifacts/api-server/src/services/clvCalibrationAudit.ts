@@ -19,6 +19,12 @@ const SHARP_CLV_SOURCES = [
   "oddspapi_sbobet",
   "oddspapi_sbo",
   "oddspapi_bet365",
+  // Bundle 1U.2 (2026-05-16): direct Matchbook ingestion writes
+  // source='matchbook' (per SharpSource type in sharpConsensus.ts), distinct
+  // from oddspapi_matchbook. Both are sharp exchange data and belong in the
+  // edge-validation pool. Without this entry, matchbook-anchored bets were
+  // being excluded from clvCalibrationAudit regressions.
+  "matchbook",
 ];
 
 // Bundle 1C.1 (2026-05-16): CLV-vs-ROI calibration regression.

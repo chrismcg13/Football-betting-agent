@@ -3285,7 +3285,18 @@ interface ResolvedClosing {
  * ≥2 distinct Tier-2 books per scope to admit). This function returns a
  * single snapshot per bet — no diversity checking here.
  */
+// Bundle 1U.2 (2026-05-16): added 'matchbook' (direct Matchbook ingestion writes
+// source='matchbook' per SharpSource type, distinct from oddspapi_matchbook which
+// is the OddsPapi-fetched variant). Both are sharp exchanges and edge-meaningful.
+// Bundle 1U.1 (2026-05-16): 'betfair_exchange' MOVED from Tier-2 to Tier-3
+// because we trade on the venue — the closing price is the venue's consensus,
+// not an independent sharp benchmark. Operator directive 2026-05-16: "use
+// bet365/matchbook/unibet as CLV sources where we have betfair currently or
+// nothing — better to have something independent to compare to and identify
+// edge." Independent bookmaker quotes (Bet365 / Unibet / Matchbook) anchor
+// edge-comparison cleanly; Betfair-as-anchor is circular.
 const TIER_2_SOURCE_PRIORITY = [
+  "matchbook",            // direct Matchbook API (sharp exchange)
   "oddspapi_smarkets",
   "oddspapi_matchbook",
   "oddspapi_betfair",
@@ -3293,7 +3304,6 @@ const TIER_2_SOURCE_PRIORITY = [
   "oddspapi_sbobet",
   "oddspapi_sbo",
   "oddspapi_bet365",
-  "betfair_exchange",
 ];
 
 /**
@@ -3325,10 +3335,16 @@ const TIER_2_SOURCE_PRIORITY = [
  * (likely beyond 14-day Betfair snapshot retention). Adding api_football_*
  * sources widens the net for the stragglers and future bets.
  */
+// Bundle 1U.2 (2026-05-16): reordered per operator directive — prefer
+// independent bookmaker quotes over Betfair Exchange. Bet365 + Unibet are
+// soft books (high margin, slow to move) but provide an INDEPENDENT
+// comparison point vs the venue-we-trade-on. Betfair Exchange close is the
+// market consensus on our own trading venue, so it's circular for CLV
+// measurement — kept as absolute last resort.
 const TIER_3_FALLBACK_PRIORITY: ReadonlyArray<string> = [
-  "betfair_exchange",
   "api_football_real:Bet365",
   "api_football_real:Unibet",
+  "betfair_exchange",
 ];
 
 async function resolveTier3BetfairAnchor(args: {
@@ -3354,12 +3370,50 @@ async function resolveTier3BetfairAnchor(args: {
   `);
   const list = ((rows as { rows?: Array<{ source: string; odds: number; snapshot_time: string }> }).rows ?? []);
   if (list.length === 0) return null;
-  // Pick best per priority — earliest in TIER_3_FALLBACK_PRIORITY wins.
-  for (const preferredSource of TIER_3_FALLBACK_PRIORITY) {
-    const match = list.find((r) => r.source === preferredSource);
-    if (match) return { odds: match.odds, source: match.source };
+
+  // Bundle 1U.2 (2026-05-16): operator directive "where they have multiple
+  // take a median or average to get the rounded accurate line possible". For
+  // each source, pick the most recent snapshot (LIMIT 50 above already orders
+  // by snapshot_time DESC, so first occurrence per source wins).
+  const latestPerSource = new Map<string, number>();
+  for (const r of list) {
+    if (!latestPerSource.has(r.source)) latestPerSource.set(r.source, r.odds);
   }
-  return null;
+
+  const sources = [...latestPerSource.keys()];
+  const odds = [...latestPerSource.values()];
+
+  // Single source: return its odds with its actual source tag. Preserves
+  // backwards-compat for the existing 754 Tier-3 bets anchored on a single
+  // source — their clv_source tag stays interpretable.
+  if (odds.length === 1) {
+    return { odds: odds[0]!, source: sources[0]! };
+  }
+
+  // Multi-source consensus: MEDIAN of implied probabilities, then convert
+  // back to fair odds. Median chosen over mean because:
+  //   - Robust to outlier quotes (one stale bookmaker drifting won't skew)
+  //   - For n=2 sources, median == mean (no behaviour difference)
+  //   - For n=3+ sources, median naturally rejects the outlier and returns
+  //     the middle quote — most reliable approximation of "true line"
+  //
+  // Tagged 'tier3_consensus:N' where N = source count, so the operator can
+  // distinguish aggregate-anchored bets from single-source. Stays excluded
+  // from SHARP_CLV_SOURCES allow-list per Bundle 1O (none of the Tier-3
+  // contributing sources are sharp, so the aggregate isn't either — soft
+  // bookmaker consensus is closer to true line than any individual quote
+  // but still not edge-meaningful).
+  const implieds = odds.map((o) => 1 / o).sort((a, b) => a - b);
+  const mid = implieds.length / 2;
+  const medianImplied = implieds.length % 2 === 1
+    ? implieds[Math.floor(mid)]!
+    : (implieds[mid - 1]! + implieds[mid]!) / 2;
+  const consensusOdds = 1 / medianImplied;
+
+  return {
+    odds: consensusOdds,
+    source: `tier3_consensus:${sources.length}`,
+  };
 }
 
 async function resolveTier2Anchor(args: {
