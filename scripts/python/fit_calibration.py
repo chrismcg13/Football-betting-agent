@@ -364,14 +364,27 @@ def fit_hierarchical_bayes(
         values_j = grid_samples_j.mean(axis=0)
 
         # Monotonicity check. If posterior-mean grid is not monotonic (which
-        # happens iff beta_j has substantial mass on both signs), fall back
-        # to writing the global grid for this league. Equivalent to full
-        # shrinkage — the conservative choice.
-        fell_back = False
+        # happens iff beta_j has substantial mass on both signs), SKIP writing
+        # a per-league bucket — the Node read path falls through to the
+        # (isotonic, Bundle 1N.1 hybrid) global bucket automatically. This is
+        # full shrinkage AND consistent with what gets actually used at runtime.
+        # Bundle 1N v1 wrote the hierarchical-global grid as a per-league row,
+        # but in 1N.1 the global bucket is isotonic, so writing the hierarchical
+        # global as a per-league row would create an inconsistency between
+        # what's stored as the league's calibration vs what the global actually
+        # is. Skipping is cleaner and matches what runtime would do anyway.
         is_monotonic = bool(np.all(np.diff(values_j) >= -1e-6))
         if not is_monotonic:
-            values_j = global_values
-            fell_back = True
+            log.info("Market %s, league %s, n=%d: non-monotonic posterior grid — skipping per-league bucket (Node read path falls back to global)",
+                     market_type, league_name, n_total)
+            # Log to compliance_logs for operator visibility.
+            # (Returned to main for actual logging since we don't have conn here.)
+            league_buckets.append({
+                "scope_league": league_name,
+                "skip": True,
+                "reason": "non_monotonic_posterior_grid",
+            })
+            continue
 
         # Per-league diagnostics. Brier_in on training fold, brier_out on
         # test fold. ECE on test if n_test >= 10 (else NaN — too noisy).
@@ -401,7 +414,7 @@ def fit_hierarchical_bayes(
             "brier_in": brier_in_j,
             "brier_out": brier_out_j,
             "ece_out": ece_out_j,
-            "fell_back_to_global": fell_back,
+            "skip": False,
         })
 
     n_total_global = int(train_mask.sum() + test_mask.sum())
@@ -422,6 +435,45 @@ def fit_hierarchical_bayes(
     }
 
 
+def _fit_isotonic_one_bucket(rows: list[dict], min_samples: int = 30) -> Optional[dict]:
+    """Single-bucket isotonic fit (sklearn). Returns bucket params or None.
+
+    Extracted to module scope as the global-bucket fitter in the Bundle 1N.1
+    hybrid setup AND the per-league fallback when hierarchical fails. Same
+    80/20 random split as the original isotonic fitter — at n>=1000 (global
+    bucket scale) the random split converges to the same distribution
+    regardless of leaguewise stratification.
+    """
+    from sklearn.isotonic import IsotonicRegression
+
+    probs = np.array(
+        [(r["raw_prob"] if r["raw_prob"] is not None else r["model_prob"]) for r in rows],
+        dtype=np.float64,
+    )
+    outcomes = np.array([r["won"] for r in rows], dtype=np.float64)
+    if len(probs) < min_samples:
+        return None
+    rng = np.random.default_rng(42)
+    idx = rng.permutation(len(probs))
+    cut = int(len(probs) * 0.8)
+    tr, te = idx[:cut], idx[cut:]
+    model = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    model.fit(probs[tr], outcomes[tr])
+    p_te = model.predict(probs[te])
+    brier_in = float(np.mean((probs[tr] - outcomes[tr]) ** 2))
+    brier_out = float(np.mean((p_te - outcomes[te]) ** 2))
+    ece_out = _expected_calibration_error(p_te, outcomes[te], n_bins=10)
+    breakpoints = model.X_thresholds_.astype(float).tolist()
+    values = model.y_thresholds_.astype(float).tolist()
+    return {
+        "n_samples": len(probs),
+        "params": {"breakpoints": breakpoints, "values": values},
+        "brier_in": brier_in,
+        "brier_out": brier_out,
+        "ece_out": ece_out,
+    }
+
+
 def fit_isotonic_per_league(
     market_rows: list[dict], market_type: str
 ) -> Optional[dict]:
@@ -431,52 +483,22 @@ def fit_isotonic_per_league(
     JAX exception, etc.). Preserves the pre-Bundle-1N behavior for that
     market_type so the whole fitter run doesn't get blocked by one bad fit.
     """
-    from sklearn.isotonic import IsotonicRegression
-
     by_league: dict[Optional[str], list[dict]] = {}
     for r in market_rows:
         lg = r["league"]
         by_league.setdefault(lg, []).append(r)
 
-    def _fit_one(rows: list[dict]) -> Optional[dict]:
-        probs = np.array(
-            [(r["raw_prob"] if r["raw_prob"] is not None else r["model_prob"]) for r in rows],
-            dtype=np.float64,
-        )
-        outcomes = np.array([r["won"] for r in rows], dtype=np.float64)
-        if len(probs) < 30:  # original isotonic threshold (stability)
-            return None
-        rng = np.random.default_rng(42)
-        idx = rng.permutation(len(probs))
-        cut = int(len(probs) * 0.8)
-        tr, te = idx[:cut], idx[cut:]
-        model = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-        model.fit(probs[tr], outcomes[tr])
-        p_te = model.predict(probs[te])
-        brier_in = float(np.mean((probs[tr] - outcomes[tr]) ** 2))
-        brier_out = float(np.mean((p_te - outcomes[te]) ** 2))
-        ece_out = _expected_calibration_error(p_te, outcomes[te], n_bins=10)
-        breakpoints = model.X_thresholds_.astype(float).tolist()
-        values = model.y_thresholds_.astype(float).tolist()
-        return {
-            "n_samples": len(probs),
-            "params": {"breakpoints": breakpoints, "values": values},
-            "brier_in": brier_in,
-            "brier_out": brier_out,
-            "ece_out": ece_out,
-        }
-
     league_buckets: list[dict] = []
     for lg, rows in sorted((k, v) for k, v in by_league.items() if k is not None):
-        b = _fit_one(rows)
+        b = _fit_isotonic_one_bucket(rows, min_samples=30)
         if b is None:
             continue
-        league_buckets.append({**b, "scope_league": lg, "fell_back_to_global": False})
+        league_buckets.append({**b, "scope_league": lg, "skip": False})
 
-    global_b = _fit_one(market_rows) if len(market_rows) >= MIN_SAMPLES_PER_GLOBAL else None
+    global_b = _fit_isotonic_one_bucket(market_rows, min_samples=MIN_SAMPLES_PER_GLOBAL)
     if global_b is None:
         return None
-    global_bucket = {**global_b, "scope_league": None, "fell_back_to_global": False}
+    global_bucket = {**global_b, "scope_league": None, "skip": False}
 
     return {
         "method": "isotonic",
@@ -572,6 +594,7 @@ def main() -> int:
         "market_types_orphaned": 0,
         "market_types_hierarchical": 0,
         "market_types_isotonic_fallback": 0,
+        "global_isotonic_override": 0,
         "buckets_written": 0,
         "monotonicity_fallbacks": 0,
     }
@@ -588,7 +611,7 @@ def main() -> int:
             summary["market_types_orphaned"] += 1
             continue
 
-        log.info("Market %s: %d post-cutover rows across %d leagues — fitting hierarchical Bayes",
+        log.info("Market %s: %d post-cutover rows across %d leagues — fitting hierarchical Bayes (per-league) + isotonic (global)",
                  market_type, len(market_rows),
                  len(set(r["league"] for r in market_rows if r["league"])))
 
@@ -605,11 +628,33 @@ def main() -> int:
             summary["market_types_isotonic_fallback"] += 1
         else:
             summary["market_types_hierarchical"] += 1
+
+            # Bundle 1N.1 (2026-05-16 hybrid): override the hierarchical global
+            # with an isotonic fit on the full corpus. The hierarchical posterior's
+            # global is constrained by hyperprior (β_global anchored near 1) and
+            # the per-league plate's σ_α/σ_β — too biased for n=600-6000 globals
+            # where isotonic's free shape fits cleanly. The Bundle 1N verification
+            # showed AH global ECE 0.028→0.061, MO 0.082→0.124 with hierarchical
+            # global. Isotonic global keeps those numbers honest. Per-league still
+            # uses the hierarchical posterior (the real shrinkage benefit).
+            iso_global = _fit_isotonic_one_bucket(market_rows, min_samples=MIN_SAMPLES_PER_GLOBAL)
+            if iso_global is not None:
+                iso_global["scope_league"] = None
+                iso_global["skip"] = False
+                result["global_bucket"] = iso_global
+                result["global_method"] = "isotonic"
+                summary["global_isotonic_override"] += 1
+            else:
+                # Should not happen — len(market_rows) >= MIN_SAMPLES_PER_GLOBAL
+                # is already gated above. Keep hierarchical global as defensive
+                # fallback.
+                result["global_method"] = "hierarchical_bayes_logistic"
         summary["market_types_processed"] += 1
 
-        method = result["method"]
+        method = result["method"]                                  # per-league method
+        global_method = result.get("global_method", method)        # global method
         global_b = result["global_bucket"]
-        write_bucket(conn, None, market_type, method,
+        write_bucket(conn, None, market_type, global_method,
                      global_b["n_samples"], global_b["params"],
                      global_b["brier_in"], global_b["brier_out"], global_b["ece_out"])
         summary["buckets_written"] += 1
@@ -618,12 +663,16 @@ def main() -> int:
                  global_b["brier_in"] or float("nan"),
                  global_b["brier_out"] or float("nan"),
                  global_b["ece_out"] or float("nan"),
-                 method)
+                 global_method)
 
         for lb in result["league_buckets"]:
-            if lb["fell_back_to_global"]:
+            if lb.get("skip"):
+                # Non-monotonic posterior grid — skipping per-league bucket so
+                # the Node read path falls back to the (isotonic) global. See
+                # Bundle 1N.1 hybrid note in fit_hierarchical_bayes.
                 summary["monotonicity_fallbacks"] += 1
                 log_monotonicity_fallback(conn, lb["scope_league"], market_type)
+                continue
             write_bucket(conn, lb["scope_league"], market_type, method,
                          lb["n_samples"], lb["params"],
                          lb["brier_in"], lb["brier_out"], lb["ece_out"])
