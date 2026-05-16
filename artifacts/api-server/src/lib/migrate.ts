@@ -3970,6 +3970,32 @@ export async function runMigrations() {
     `);
     logger.info("Bundle N.1 indexes ready: paper_bets_market_placed_idx, matches_kickoff_status_idx, api_usage_endpoint_date_idx");
 
+    // ── Bundle 1B.2 (2026-05-16): Club Elo fair-line CLV columns ────────────
+    // Independent third CLV anchor for European fixtures where both teams
+    // have an entry in club_elo_snapshots. Closes the 40-50% Pinnacle-only
+    // coverage gap on mid-tier European leagues. Computed from
+    // ratingDiff = elo_home + 60 - elo_away by services/clubEloFairLines.ts.
+    // Drizzle silently drops unknown fields on insert/update — the schema
+    // entries in lib/db/src/schema/paperBets.ts MUST match these columns
+    // exactly, and lib/db/dist MUST be rebuilt after this migration runs
+    // (feedback_lib_db_dist_rebuild).
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS closing_elo_fair_odds NUMERIC(10, 4),
+        ADD COLUMN IF NOT EXISTS clv_elo_pct           NUMERIC(8, 4),
+        ADD COLUMN IF NOT EXISTS elo_data_quality      TEXT
+    `);
+    // Re-create paper_bets_current view so the new columns surface through it
+    // (Postgres freezes view column lists at CREATE time even with SELECT *).
+    await db.execute(sql`DROP VIEW IF EXISTS paper_bets_current`);
+    await db.execute(sql`
+      CREATE VIEW paper_bets_current AS
+        SELECT * FROM paper_bets
+        WHERE legacy_regime = false
+          AND deleted_at IS NULL
+    `);
+    logger.info("Bundle 1B.2 columns ready: paper_bets.{closing_elo_fair_odds, clv_elo_pct, elo_data_quality} + view rebuilt");
+
     // ── Bundle N.10 (2026-05-16): REINDEX af_predictions ────────────────────
     // 1331 rows but 9.4 MB total index = 40× table bloat. Reclaim ~9 MB.
     // pg_repack would be preferred for online; REINDEX is fine for a

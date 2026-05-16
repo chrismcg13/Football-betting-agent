@@ -76,6 +76,17 @@ export const paperBetsTable = pgTable("paper_bets", {
   closingOddsProxy: numeric("closing_odds_proxy", { precision: 10, scale: 4 }),
   closingPinnacleOdds: numeric("closing_pinnacle_odds", { precision: 10, scale: 4 }),
   clvPct: numeric("clv_pct", { precision: 8, scale: 4 }),
+  // Bundle 1B.2 (2026-05-16): Club Elo fair-line CLV benchmark for European
+  // fixtures where both teams in club_elo_snapshots. Independent third source
+  // alongside Pinnacle (tier 1) and Smarkets (tier 2 — Bundle 1B.1 next).
+  // Derivation: ratingDiff = elo_home + 60 - elo_away;
+  // P(home_win) = 1 / (1 + 10^(-ratingDiff/400)); P(draw) parametric;
+  // fair odds = 1 / probability. See services/clubEloFairLines.ts.
+  closingEloFairOdds: numeric("closing_elo_fair_odds", { precision: 10, scale: 4 }),
+  clvEloPct: numeric("clv_elo_pct", { precision: 8, scale: 4 }),
+  // 'both_teams_covered' | 'home_missing' | 'away_missing' | 'stale_elo' (>14d)
+  // | 'unsupported_market' | NULL (not yet computed)
+  eloDataQuality: text("elo_data_quality"),
   status: text("status").notNull().default("pending"),
   settlementPnl: numeric("settlement_pnl", { precision: 12, scale: 2 }),
   placedAt: timestamp("placed_at", { withTimezone: true })
@@ -214,6 +225,9 @@ export const paperBetsCurrentView = pgView("paper_bets_current", {
   closingOddsProxy: numeric("closing_odds_proxy", { precision: 10, scale: 4 }),
   closingPinnacleOdds: numeric("closing_pinnacle_odds", { precision: 10, scale: 4 }),
   clvPct: numeric("clv_pct", { precision: 8, scale: 4 }),
+  closingEloFairOdds: numeric("closing_elo_fair_odds", { precision: 10, scale: 4 }),
+  clvEloPct: numeric("clv_elo_pct", { precision: 8, scale: 4 }),
+  eloDataQuality: text("elo_data_quality"),
   status: text("status").notNull(),
   settlementPnl: numeric("settlement_pnl", { precision: 12, scale: 2 }),
   placedAt: timestamp("placed_at", { withTimezone: true }).notNull(),

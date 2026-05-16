@@ -2529,6 +2529,26 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Bundle N.7 compliance_logs retention scheduler active — daily 03:15 UTC");
 
+  // Bundle 1B.2 (2026-05-16): Club Elo fair-line CLV backfill. Every 15 min,
+  // populates closing_elo_fair_odds + clv_elo_pct + elo_data_quality on
+  // pending and recently-settled paper_bets for European fixtures where both
+  // teams have Elo coverage. Independent third CLV anchor alongside Pinnacle
+  // (tier 1) and Smarkets (tier 2, Bundle 1B.1 next). Idempotent — only fills
+  // rows where elo_data_quality IS NULL.
+  cron.schedule("*/15 * * * *", () => {
+    logger.info("Bundle 1B.2 Club Elo fair-line backfill triggered (every 15 min)");
+    void (async () => {
+      try {
+        const { backfillEloFairLines } = await import("./clubEloFairLines");
+        const r = await backfillEloFairLines();
+        logger.info(r, "Bundle 1B.2 Club Elo fair-line backfill complete");
+      } catch (err) {
+        logger.error({ err }, "Bundle 1B.2 Club Elo fair-line backfill failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle 1B.2 Club Elo fair-line backfill scheduler active — every 15 min UTC");
+
   // Bundle N.5 (2026-05-16): daily Neon cost monitor. Single
   // compliance_logs row capturing top-15 table sizes, sequential-scan
   // ratios, and 7-day cron CPU totals. Replaces ad-hoc audits with a
