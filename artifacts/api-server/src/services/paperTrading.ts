@@ -2940,6 +2940,10 @@ export async function placePaperBet(
         betfairEventId: matchesTable.betfairEventId,
         league: matchesTable.league,
         country: matchesTable.country,
+        // Bundle 1L FIX 1 (2026-05-16): kickoffTime now load-bearing for
+        // the 24h live-placement window cap. Without this, the cap silently
+        // bypasses (logs a warning).
+        kickoffTime: matchesTable.kickoffTime,
       })
       .from(matchesTable)
       .where(eq(matchesTable.id, matchId))
@@ -2951,10 +2955,13 @@ export async function placePaperBet(
     // scope whitelist and qualifiesForTier1 post-filter are removed; only
     // the live_placement_enabled kill switch remains. If a bet is good
     // enough to be a paper bet, it's good enough to be a live bet.
+    // Bundle 1L (2026-05-16): kickoffTime now passed so the gate can apply
+    // the 24h cap (FIX 1) + per-league demote (FIX 2).
     const liveGates = await checkLivePlacementGates({
       marketType,
       league: match?.league ?? "",
       betId: bet.id,
+      kickoffTime: match?.kickoffTime ?? null,
     });
 
     // Fail-loud guard (Amendment 1). live_whitelist is deprecated; the

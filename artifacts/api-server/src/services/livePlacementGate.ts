@@ -1,4 +1,4 @@
-import { db } from "@workspace/db";
+import { db, complianceLogsTable } from "@workspace/db";
 import { sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
@@ -20,6 +20,9 @@ import { logger } from "../lib/logger";
 
 let cachedFlag: { value: boolean; fetchedAt: number } | null = null;
 let cachedDisabledMarkets: { set: Set<string>; fetchedAt: number } | null = null;
+// Bundle 1L FIX 1 + FIX 2 (2026-05-16): per-league demote + 24h window cap.
+let cachedDisabledLeagues: { set: Set<string>; fetchedAt: number } | null = null;
+let cachedMaxHoursToKickoff: { value: number; fetchedAt: number } | null = null;
 const FLAG_CACHE_TTL_MS = 30_000; // 30s — short enough to react to operator flip, long enough to amortise lookups
 
 export async function isLivePlacementEnabled(): Promise<boolean> {
@@ -63,9 +66,54 @@ async function getDisabledMarkets(): Promise<Set<string>> {
   return set;
 }
 
+// Bundle 1L FIX 2 (2026-05-16): per-league live-placement demote list.
+// CSV in agent_config.live_placement_disabled_leagues. League names are
+// lowercase-trimmed on read; operator stores in CSV at any case. Used to
+// shadow-only specific scopes whose live ROI Wilson lo95 came back
+// confirmed-negative in the shadow→live divergence audit.
+async function getDisabledLeagues(): Promise<Set<string>> {
+  const now = Date.now();
+  if (cachedDisabledLeagues && now - cachedDisabledLeagues.fetchedAt < FLAG_CACHE_TTL_MS) {
+    return cachedDisabledLeagues.set;
+  }
+  const rows = (await db.execute(sql`
+    SELECT value FROM agent_config WHERE key = 'live_placement_disabled_leagues' LIMIT 1
+  `)) as unknown as { rows: Array<{ value: string }> };
+  const raw = rows.rows[0]?.value ?? "";
+  const set = new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  cachedDisabledLeagues = { set, fetchedAt: now };
+  return set;
+}
+
+// Bundle 1L FIX 1 (2026-05-16): live-placement window cap. The Bundle 1L
+// timing-bucket audit showed bets placed within 24h of kickoff realise
+// +41% ROI; bets placed 24-48h out realise -8%; 48h+ progressively worse
+// (-19% to -24%). Default 24h cap; operator-overridable via
+// agent_config.live_placement_max_hours_to_kickoff.
+async function getMaxHoursToKickoff(): Promise<number> {
+  const now = Date.now();
+  if (cachedMaxHoursToKickoff && now - cachedMaxHoursToKickoff.fetchedAt < FLAG_CACHE_TTL_MS) {
+    return cachedMaxHoursToKickoff.value;
+  }
+  const rows = (await db.execute(sql`
+    SELECT value FROM agent_config WHERE key = 'live_placement_max_hours_to_kickoff' LIMIT 1
+  `)) as unknown as { rows: Array<{ value: string }> };
+  const parsed = Number(rows.rows[0]?.value ?? "24");
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
+  cachedMaxHoursToKickoff = { value, fetchedAt: now };
+  return value;
+}
+
 export function invalidateLivePlacementFlagCache(): void {
   cachedFlag = null;
   cachedDisabledMarkets = null;
+  cachedDisabledLeagues = null;
+  cachedMaxHoursToKickoff = null;
 }
 
 export interface ScopeWhitelistResult {
@@ -138,6 +186,11 @@ export async function checkLivePlacementGates(args: {
   marketType: string;
   league: string;
   betId?: number;
+  // Bundle 1L FIX 1 (2026-05-16): caller passes match kickoffTime so the
+  // 24h cap can fire. If null/undefined the cap is bypassed (fail-safe to
+  // proceed with other gates) and a warning is logged — caller should
+  // always pass it now that the SELECT includes kickoffTime.
+  kickoffTime?: Date | null;
 }): Promise<LivePlacementCheck> {
   const enabled = await isLivePlacementEnabled();
   if (!enabled) {
@@ -170,6 +223,81 @@ export async function checkLivePlacementGates(args: {
       path: null,
       kellyFractionOverride: null,
     };
+  }
+
+  // Bundle 1L FIX 2 (2026-05-16): per-league demote list. CSV in
+  // agent_config.live_placement_disabled_leagues. Belt-and-braces alongside
+  // FIX 1 (most demoted-league bets are 24h+ out and would be filtered by
+  // FIX 1 anyway, but the explicit list catches a <24h bet on these scopes).
+  const disabledLeagues = await getDisabledLeagues();
+  if (args.league && disabledLeagues.has(args.league.toLowerCase())) {
+    if (args.betId) {
+      logger.info(
+        { betId: args.betId, marketType: args.marketType, league: args.league },
+        "Live placement gate: league in live_placement_disabled_leagues — shadow rail",
+      );
+      void db.insert(complianceLogsTable).values({
+        actionType: "live_placement_skip",
+        details: {
+          reason: "league_disabled",
+          betId: args.betId,
+          marketType: args.marketType,
+          league: args.league,
+        },
+      });
+    }
+    return {
+      allowed: false,
+      reason: `league ${args.league} in live_placement_disabled_leagues`,
+      path: null,
+      kellyFractionOverride: null,
+    };
+  }
+
+  // Bundle 1L FIX 1 (2026-05-16): 24h pre-kickoff cap. Timing-bucket audit
+  // showed the cliff: <24h ROI +41% (n=54); 24-48h ROI -8% (n=116); 48-72h
+  // -23% (n=61); >120h -24% (n=40). Cap at 24h shadow-routes the bets
+  // beyond the cliff — they continue to flow into shadow track for
+  // learning, just don't get real money.
+  if (args.kickoffTime) {
+    const maxHours = await getMaxHoursToKickoff();
+    const hoursToKickoff = (args.kickoffTime.getTime() - Date.now()) / (1000 * 60 * 60);
+    if (hoursToKickoff > maxHours) {
+      if (args.betId) {
+        logger.info(
+          {
+            betId: args.betId,
+            marketType: args.marketType,
+            league: args.league,
+            hoursToKickoff: Math.round(hoursToKickoff * 10) / 10,
+            maxHours,
+          },
+          "Live placement gate: outside_24h_window — shadow rail",
+        );
+        void db.insert(complianceLogsTable).values({
+          actionType: "live_placement_skip",
+          details: {
+            reason: "outside_24h_window",
+            betId: args.betId,
+            marketType: args.marketType,
+            league: args.league,
+            hoursToKickoff: Math.round(hoursToKickoff * 10) / 10,
+            maxHours,
+          },
+        });
+      }
+      return {
+        allowed: false,
+        reason: `outside live placement window (${Math.round(hoursToKickoff * 10) / 10}h to kickoff > ${maxHours}h max)`,
+        path: null,
+        kellyFractionOverride: null,
+      };
+    }
+  } else if (args.betId) {
+    logger.warn(
+      { betId: args.betId, marketType: args.marketType, league: args.league },
+      "Live placement gate: kickoffTime missing — 24h window cap bypassed (caller should pass kickoffTime)",
+    );
   }
 
   return {

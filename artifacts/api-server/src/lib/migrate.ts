@@ -3996,6 +3996,32 @@ export async function runMigrations() {
     `);
     logger.info("Bundle 1B.2 columns ready: paper_bets.{closing_elo_fair_odds, clv_elo_pct, elo_data_quality} + view rebuilt");
 
+    // ── Bundle 1L FIX 1 + FIX 2 (2026-05-16) ────────────────────────────────
+    // Seed defaults for the live-placement window cap + per-league demote.
+    // ON CONFLICT DO NOTHING — operator overrides via /admin/set-config are
+    // preserved across re-deploys; only first-time installs take the defaults.
+    //
+    // FIX 1 — 24h pre-kickoff cap. Bundle 1L timing-bucket audit:
+    //   <24h:  +41% ROI on n=54  ← profitable
+    //   24-48h: -8% ROI on n=116 ← cliff
+    //   >120h: -24% ROI on n=40  ← bleeds
+    //
+    // FIX 2 — 6 confirmed Wilson-lo95-negative leagues. League names match
+    // matches.league column exact strings (case-insensitive comparison in
+    // livePlacementGate.getDisabledLeagues).
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value)
+      VALUES ('live_placement_max_hours_to_kickoff', '24')
+      ON CONFLICT (key) DO NOTHING
+    `);
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value)
+      VALUES ('live_placement_disabled_leagues',
+              'K League 1,K League 2,Super League 1,Pro League,Czech Liga,3. Liga')
+      ON CONFLICT (key) DO NOTHING
+    `);
+    logger.info("Bundle 1L FIX 1+2 config seeded: live_placement_max_hours_to_kickoff=24, live_placement_disabled_leagues seeded with 6-league list");
+
     // ── Bundle N.10 (2026-05-16): REINDEX af_predictions ────────────────────
     // 1331 rows but 9.4 MB total index = 40× table bloat. Reclaim ~9 MB.
     // pg_repack would be preferred for online; REINDEX is fine for a
