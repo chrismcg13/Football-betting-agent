@@ -2,6 +2,25 @@ import { db, paperBetsTable, matchesTable, complianceLogsTable } from "@workspac
 import { sql, and, eq, isNotNull, inArray, gte } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
+// Bundle 1O (2026-05-16): sharp-anchor sources only. A CLV measured against
+// the Betfair Exchange close (which is the venue we're TRADING ON) is not
+// an edge signal — it's just price drift between two of our own observations.
+// Per Neon audit 2026-05-16, 32.2% of BTTS settled bets (n=115) and 3.1% of
+// AH settled bets (n=298) had clv_source='betfair_exchange'. Including them
+// in the CLV calibration regression pollutes the slope/t-stat for those
+// scopes. The sharp-anchor allow-list mirrors TIER_2_PRIORITY_ORDER in
+// oddsPapi.ts but EXCLUDES betfair_exchange specifically.
+const SHARP_CLV_SOURCES = [
+  "pinnacle",
+  "pinnacle_derived",
+  "oddspapi_pinnacle",
+  "oddspapi_smarkets",
+  "oddspapi_matchbook",
+  "oddspapi_sbobet",
+  "oddspapi_sbo",
+  "oddspapi_bet365",
+];
+
 // Bundle 1C.1 (2026-05-16): CLV-vs-ROI calibration regression.
 //
 // The strategic question this answers: is our CLV signal an HONEST predictor
@@ -172,6 +191,10 @@ async function pullSettledBets(opts?: { marketType?: string; leagueId?: string }
   const conditions = [
     inArray(paperBetsTable.status, ["won", "lost"]),
     isNotNull(paperBetsTable.clvPct),
+    // Bundle 1O: sharp anchors only — drop betfair_exchange-anchored CLV
+    // and NULL clv_source (which is "no anchor available"). See SHARP_CLV_SOURCES
+    // comment above for the full reasoning.
+    inArray(paperBetsTable.clvSource, SHARP_CLV_SOURCES),
     gte(paperBetsTable.placedAt, sql`NOW() - INTERVAL '180 days'`),
   ];
   if (opts?.marketType) conditions.push(eq(paperBetsTable.marketType, opts.marketType));

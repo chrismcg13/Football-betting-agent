@@ -74,6 +74,18 @@ export const paperBetsTable = pgTable("paper_bets", {
   betThesis: text("bet_thesis"),
   isContrarian: text("is_contrarian").default("false"),
   closingOddsProxy: numeric("closing_odds_proxy", { precision: 10, scale: 4 }),
+  // SEMANTIC NOTE (Bundle 1O, 2026-05-16): column name is historic — this is
+  // the BEST-AVAILABLE-SHARP-ANCHOR closing odds at strict pre-kickoff snap,
+  // NOT strictly Pinnacle. The resolver tries Pinnacle first (clv_source_tier=1
+  // → clv_source='pinnacle'); on miss it falls through to Tier-2 sources
+  // (Smarkets, Matchbook, SBO/SBOBET, Bet365, finally betfair_exchange).
+  // ALWAYS read clv_source / clv_source_tier alongside this column to know
+  // the actual provenance. For markets where Pinnacle doesn't quote (notably
+  // BTTS: 32% of bets fall back to betfair_exchange), this column holds the
+  // exchange close — which is NOT an edge benchmark because it's the same
+  // venue we're trading on. Edge-validation paths (clvCalibrationAudit.ts,
+  // Bundle 2B Kelly allocator) MUST filter to sharp sources only (the
+  // SHARP_CLV_SOURCES allow-list, which excludes betfair_exchange).
   closingPinnacleOdds: numeric("closing_pinnacle_odds", { precision: 10, scale: 4 }),
   clvPct: numeric("clv_pct", { precision: 8, scale: 4 }),
   // Bundle 1B.2 (2026-05-16): Club Elo fair-line CLV benchmark for European
