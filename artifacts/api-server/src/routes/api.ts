@@ -4229,6 +4229,11 @@ router.post("/admin/set-config", async (req, res) => {
       return res.status(400).json({ error: "key and value required" });
     }
     await setConfigValue(key, String(value));
+    // Bundle N.1 (2026-05-16): invalidate the 60s read-through cache
+    // immediately so subsequent reads see the new value without waiting
+    // for the TTL to roll over.
+    const { invalidateAgentConfigCache } = await import("../services/configCache");
+    invalidateAgentConfigCache();
     const verify = await getConfigValue(key);
     return res.json({ success: true, key, value: verify });
   } catch (err) {

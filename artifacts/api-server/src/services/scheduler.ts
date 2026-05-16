@@ -2507,6 +2507,48 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Bundle B analytics scheduler active — daily 02:30 UTC");
 
+  // Bundle N.7 (2026-05-16): compliance_logs targeted retention sweep.
+  // 414 MB table has ~228 MB of operational-debug rows that nobody reads
+  // past their first 7-30 days. Daily prune keeps storage + sequential-
+  // scan cost bounded. Audit-critical actionTypes (bet_placed, settlement
+  // events, agent_control, etc.) are preserved indefinitely. Runs 03:15 UTC
+  // — after Bundle B (02:30) so we don't delete rows it's mid-aggregating.
+  cron.schedule("15 3 * * *", () => {
+    logger.info("Bundle N.7 compliance_logs retention triggered (daily 03:15 UTC)");
+    void (async () => {
+      try {
+        const { runComplianceLogRetention } = await import("./complianceLogRetention");
+        const r = await runComplianceLogRetention();
+        logger.info(r, "Bundle N.7 compliance_logs retention complete");
+      } catch (err) {
+        logger.error({ err }, "Bundle N.7 compliance_logs retention failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle N.7 compliance_logs retention scheduler active — daily 03:15 UTC");
+
+  // Bundle N.5 (2026-05-16): daily Neon cost monitor. Single
+  // compliance_logs row capturing top-15 table sizes, sequential-scan
+  // ratios, and 7-day cron CPU totals. Replaces ad-hoc audits with a
+  // passive daily checkpoint. Runs 03:30 UTC — after retention prune so
+  // the table-size snapshot reflects post-prune state.
+  cron.schedule("30 3 * * *", () => {
+    logger.info("Bundle N.5 Neon cost snapshot triggered (daily 03:30 UTC)");
+    void (async () => {
+      try {
+        const { captureNeonCostSnapshot } = await import("./neonCostMonitor");
+        const snapshot = await captureNeonCostSnapshot();
+        logger.info(
+          { dbSize: snapshot.dbSize, totalCpuHours7d: snapshot.totalCpuHours7d },
+          "Bundle N.5 Neon cost snapshot complete",
+        );
+      } catch (err) {
+        logger.error({ err }, "Bundle N.5 Neon cost snapshot failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle N.5 Neon cost monitor scheduler active — daily 03:30 UTC");
+
   // Task 12 — weekly calibration fit. Mondays at 04:00 UTC, after the
   // Sunday batch jobs finish. Spawns the Python fitter (one-shot,
   // ~5-30s), which writes new active rows to calibration_buckets. The

@@ -4,13 +4,18 @@ import {
   oddsSnapshotsTable,
   featuresTable,
   complianceLogsTable,
-  agentConfigTable,
   paperBetsTable,
   learningNarrativesTable,
   leagueEdgeScoresTable,
   competitionConfigTable,
   experimentRegistryTable,
 } from "@workspace/db";
+// Bundle N.1 (2026-05-16): route through the 60s read-through cache
+// instead of full-scanning agent_config every cycle. CLAUDE.md §11's
+// "60s cache" claim was previously aspirational — 3.3M sequential
+// scans across 137 rows confirmed near-100% cache miss. This is the
+// actual cache.
+import { getAgentConfigCached, maybeLogCacheStats } from "./configCache";
 import { eq, desc, and, gte, lte, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { sqlIntList } from "../lib/dbHelpers";
@@ -1000,8 +1005,8 @@ export async function detectValueBets(options?: {
   const modelVersion = getModelVersion();
   logger.info({ modelVersion }, "Running value detection");
 
-  const configRows = await db.select().from(agentConfigTable);
-  const cfg = Object.fromEntries(configRows.map((r) => [r.key, r.value]));
+  const cfg = await getAgentConfigCached();
+  maybeLogCacheStats();
 
   // Option A (2026-05-15): when enabled, predictAH and predictTT use
   // opponent-aware lambdas via inverse-Poisson projection from the LR
@@ -1053,12 +1058,12 @@ export async function detectValueBets(options?: {
   // map access.
   const scopedScoreMap = new Map<string, number>();
   const scopedEdgeMap = new Map<string, number>();
-  for (const r of configRows) {
-    if (!r.key.startsWith("min_opportunity_score:") && !r.key.startsWith("min_edge_threshold:")) continue;
-    const n = parseFloat(r.value);
+  for (const [key, value] of Object.entries(cfg)) {
+    if (!key.startsWith("min_opportunity_score:") && !key.startsWith("min_edge_threshold:")) continue;
+    const n = parseFloat(value);
     if (!Number.isFinite(n)) continue;
-    if (r.key.startsWith("min_opportunity_score:")) scopedScoreMap.set(r.key, n);
-    else scopedEdgeMap.set(r.key, n);
+    if (key.startsWith("min_opportunity_score:")) scopedScoreMap.set(key, n);
+    else scopedEdgeMap.set(key, n);
   }
   const resolveScoped = (base: string, league: string, market: string, fallback: number): number => {
     const map = base === "min_opportunity_score" ? scopedScoreMap : scopedEdgeMap;

@@ -3938,6 +3938,52 @@ export async function runMigrations() {
 
     logger.info("Phase 2a table ready: team_form_scrape");
 
+    // ── Bundle N.1 (2026-05-16): Neon cost discipline indexes ───────────────
+    // Sequential-scan amplification was 58% of the Neon bill. paper_bets had
+    // ZERO index covering (market_type, placed_at) → every Bundle B aggregate,
+    // CLV coverage query, dashboard pull was a full table scan. matches had
+    // no (kickoff_time, status) index → every trading cycle full-scanned 6k
+    // rows × 100s of times/day. api_usage had a backwards (date, endpoint)
+    // index that the typical "count by endpoint over time" query couldn't
+    // use. Expected aggregate egress reduction: 60-80% on these tables.
+    //
+    // CONCURRENTLY would be preferred but tsx/pg in migration runs inside
+    // a transaction → CONCURRENTLY is not allowed. These tables are small
+    // enough (paper_bets 22 MB, matches 2 MB, api_usage 34 MB) that the
+    // blocking-CREATE-INDEX overhead at startup is acceptable.
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS paper_bets_market_placed_idx
+        ON paper_bets (market_type, placed_at DESC)
+        WHERE deleted_at IS NULL
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS matches_kickoff_status_idx
+        ON matches (kickoff_time, status)
+    `);
+    // api_usage: swap the backwards (date, endpoint) index for (endpoint, date)
+    // matching the typical "WHERE endpoint=X ORDER BY date DESC" query shape.
+    // Keep both for one deploy to avoid query-plan regressions; drop old
+    // after verification (TODO N.1 follow-up).
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS api_usage_endpoint_date_idx
+        ON api_usage (endpoint, date DESC)
+    `);
+    logger.info("Bundle N.1 indexes ready: paper_bets_market_placed_idx, matches_kickoff_status_idx, api_usage_endpoint_date_idx");
+
+    // ── Bundle N.10 (2026-05-16): REINDEX af_predictions ────────────────────
+    // 1331 rows but 9.4 MB total index = 40× table bloat. Reclaim ~9 MB.
+    // pg_repack would be preferred for online; REINDEX is fine for a
+    // table this small. Runs only when forced via env var so we don't
+    // do it on every restart.
+    if (process.env.NEON_REINDEX_AF_PREDICTIONS === "true") {
+      try {
+        await db.execute(sql`REINDEX TABLE af_predictions`);
+        logger.info("Bundle N.10: REINDEX af_predictions complete");
+      } catch (err) {
+        logger.warn({ err }, "Bundle N.10: REINDEX af_predictions failed (non-fatal)");
+      }
+    }
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
