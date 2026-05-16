@@ -4262,6 +4262,73 @@ router.post("/admin/run-clv-calibration-audit", async (req, res) => {
   }
 });
 
+// Bundle 1P (2026-05-16): scope-edge rankings — answers "where is the soft
+// edge?" by reading v_scope_edge_evidence (created in migrate.ts). Returns
+// per-(league × market_type) Bundle-1O-filtered (sharp-anchored only) CLV
+// stats + Wilson + realised ROI. Default ordering puts proven scopes first,
+// then weak, then inconclusive/inverted, with clv_tstat_sharp DESC inside
+// each verdict bucket. Operator uses this for capital-allocation decisions:
+// "where do I scale up?" reads the top of the proven list; "where do I cut?"
+// reads the inverted list.
+//
+// Query params (all optional, all GET):
+//   verdict   — filter by edge_verdict; comma-separated multiple OK
+//               (e.g. ?verdict=proven,weak)
+//   market    — filter by market_type (e.g. ?market=ASIAN_HANDICAP)
+//   minSharp  — min n_sharp threshold (default 30 — empirical floor for
+//               trustworthy stat-test inference)
+//   limit     — row count (default 50, max 200)
+router.get("/admin/scope-edge-rankings", async (req, res) => {
+  try {
+    const verdict = typeof req.query["verdict"] === "string" ? String(req.query["verdict"]) : null;
+    const market = typeof req.query["market"] === "string" ? String(req.query["market"]) : null;
+    const minSharp = Math.max(0, Number(req.query["minSharp"] ?? 30));
+    const limit = Math.min(200, Math.max(1, Number(req.query["limit"] ?? 50)));
+
+    const verdictList = verdict
+      ? verdict.split(",").map((v) => v.trim()).filter(Boolean)
+      : null;
+
+    const { db } = await import("@workspace/db");
+    const { sql } = await import("drizzle-orm");
+
+    const rows = await db.execute(sql`
+      SELECT
+        league, market_type,
+        n_total, n_sharp, pct_sharp_coverage,
+        win_rate_pct, wilson_lo95_winrate_pct,
+        avg_clv_sharp_pct, clv_tstat_sharp,
+        stake_weighted_roi_sharp_pct, stake_weighted_roi_total_pct,
+        qualifies_live_per_scope, edge_verdict
+      FROM v_scope_edge_evidence
+      WHERE n_sharp >= ${minSharp}
+        ${verdictList ? sql`AND edge_verdict = ANY(${verdictList}::text[])` : sql``}
+        ${market ? sql`AND market_type = ${market}` : sql``}
+      ORDER BY
+        CASE edge_verdict
+          WHEN 'proven'         THEN 1
+          WHEN 'weak'           THEN 2
+          WHEN 'inconclusive'   THEN 3
+          WHEN 'no_sharp_anchor' THEN 4
+          WHEN 'inverted'       THEN 5
+          ELSE 6
+        END,
+        clv_tstat_sharp DESC NULLS LAST,
+        n_sharp DESC
+      LIMIT ${limit}
+    `);
+
+    const resultRows = (rows as { rows?: unknown[] }).rows ?? rows;
+    return res.json({
+      ok: true,
+      count: Array.isArray(resultRows) ? resultRows.length : 0,
+      rows: resultRows,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: String(err) });
+  }
+});
+
 router.post("/admin/set-config", async (req, res) => {
   try {
     const { key, value } = req.body;

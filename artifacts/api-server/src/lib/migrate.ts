@@ -3401,6 +3401,157 @@ export async function runMigrations() {
       ORDER BY s.clv_t_stat DESC NULLS LAST, s.bootstrap_lo95_roi DESC NULLS LAST
     `);
 
+    // Bundle 1P (2026-05-16): per-scope edge-evidence view. Answers the
+    // operator question "where is the soft edge?" by ranking
+    // (league × market_type) scopes by Bundle-1O-filtered (sharp-anchored
+    // only) CLV + Wilson + realised ROI.
+    //
+    // Why: Bundle 1O proved that exchange-anchored CLV (clv_source=
+    // 'betfair_exchange') and legacy market_proxy-anchored CLV are not
+    // edge signals — they're price drift between two of our own
+    // observations. The existing analysis_signal_strength.avg_clv averages
+    // over all anchors (including non-sharp). For the operator to know
+    // which scopes have PROVEN soft edge vs which are noise, the metrics
+    // need a sharp-source filter applied at SQL aggregation time.
+    //
+    // SHARP_CLV_SOURCES mirrors the allow-list in clvCalibrationAudit.ts;
+    // duplication is deliberate (the canonical list lives in
+    // services/oddsPapi.ts TIER_2_PRIORITY_ORDER, this view + the audit
+    // both quote it because crossing TS/SQL boundary is awkward).
+    //
+    // Stake-weighting follows the bet_track convention from analysisJobs.ts:
+    // shadow uses shadow_stake / shadow_pnl, live/paper uses stake / net_pnl.
+    //
+    // Verdict semantics:
+    //   'proven'           — sharp n>=30 AND wilson_lo95>0.50 AND clv_tstat_sharp>1.96 AND avg_clv_sharp>0
+    //   'weak'             — sharp n>=30 AND (wilson_lo95>0.50 OR clv_tstat_sharp>1.96)
+    //                        — one signal but not both
+    //   'inverted'         — sharp n>=30 AND clv_tstat_sharp<-1.96 — actively bad
+    //   'inconclusive'     — sharp n>=10 AND n<30 — sample too thin
+    //   'no_sharp_anchor'  — pct_sharp_coverage<0.10 — structural blind spot
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_scope_edge_evidence AS
+      WITH sharp_sources(src) AS (
+        VALUES
+          ('pinnacle'),
+          ('pinnacle_derived'),
+          ('oddspapi_pinnacle'),
+          ('oddspapi_smarkets'),
+          ('oddspapi_matchbook'),
+          ('oddspapi_sbobet'),
+          ('oddspapi_sbo'),
+          ('oddspapi_bet365')
+      ),
+      bets AS (
+        SELECT
+          COALESCE(m.league, '__unknown__')                            AS league,
+          pb.market_type,
+          (pb.status = 'won')::int                                     AS won,
+          pb.clv_pct::numeric                                          AS clv_pct,
+          (pb.clv_source IN (SELECT src FROM sharp_sources))           AS is_sharp,
+          CASE WHEN pb.bet_track = 'shadow'
+               THEN COALESCE(pb.shadow_stake, 0)
+               ELSE pb.stake END::numeric                              AS stake,
+          CASE WHEN pb.bet_track = 'shadow'
+               THEN COALESCE(pb.shadow_pnl, 0)
+               ELSE COALESCE(pb.net_pnl, pb.settlement_pnl, 0) END::numeric AS pnl
+        FROM paper_bets pb
+        LEFT JOIN matches m ON pb.match_id = m.id
+        WHERE pb.placed_at >= '2026-05-09'::date
+          AND pb.deleted_at IS NULL
+          AND pb.status IN ('won', 'lost')
+          AND pb.bet_track IN ('live', 'shadow')
+      ),
+      agg AS (
+        SELECT
+          league,
+          market_type,
+          COUNT(*)::int                                                AS n_total,
+          COUNT(*) FILTER (WHERE is_sharp)::int                        AS n_sharp,
+          SUM(won)::int                                                AS w_total,
+          SUM(stake)                                                   AS stake_total,
+          SUM(pnl)                                                     AS pnl_total,
+          SUM(stake) FILTER (WHERE is_sharp)                           AS stake_sharp,
+          SUM(pnl)   FILTER (WHERE is_sharp)                           AS pnl_sharp,
+          AVG(clv_pct) FILTER (WHERE is_sharp AND clv_pct IS NOT NULL) AS avg_clv_sharp,
+          STDDEV(clv_pct) FILTER (WHERE is_sharp AND clv_pct IS NOT NULL) AS sd_clv_sharp,
+          COUNT(*) FILTER (WHERE is_sharp AND clv_pct IS NOT NULL)::int AS clv_n_sharp
+        FROM bets
+        GROUP BY league, market_type
+      )
+      SELECT
+        a.league,
+        a.market_type,
+        a.n_total,
+        a.n_sharp,
+        ROUND((a.n_sharp::numeric / NULLIF(a.n_total, 0)) * 100, 1)    AS pct_sharp_coverage,
+        ROUND((a.w_total::numeric / NULLIF(a.n_total, 0)) * 100, 2)    AS win_rate_pct,
+        -- Wilson 95% lower bound on win rate (uses all settled bets — Wilson
+        -- is anchor-agnostic; only CLV needs sharp filtering).
+        ROUND((
+          ((a.w_total + 1.92) / (a.n_total + 3.84)
+            - 1.96 * SQRT(a.w_total::numeric * (a.n_total - a.w_total)::numeric
+                          / NULLIF(a.n_total, 0) + 0.96) / (a.n_total + 3.84))
+          * 100
+        )::numeric, 2)                                                 AS wilson_lo95_winrate_pct,
+        ROUND(a.avg_clv_sharp::numeric, 2)                             AS avg_clv_sharp_pct,
+        -- One-sample t-stat on sharp-anchored CLV vs zero.
+        ROUND((
+          CASE
+            WHEN a.sd_clv_sharp IS NULL OR a.sd_clv_sharp = 0 OR a.clv_n_sharp < 2 THEN NULL
+            ELSE (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp
+          END
+        )::numeric, 3)                                                 AS clv_tstat_sharp,
+        ROUND(((a.pnl_sharp / NULLIF(a.stake_sharp, 0)) * 100)::numeric, 2) AS stake_weighted_roi_sharp_pct,
+        ROUND(((a.pnl_total / NULLIF(a.stake_total, 0)) * 100)::numeric, 2) AS stake_weighted_roi_total_pct,
+        -- Mirror qualifies_live from analysis_signal_strength for cross-reference.
+        COALESCE(
+          (SELECT BOOL_OR(s.qualifies_live)
+             FROM analysis_signal_strength s
+            WHERE s.computed_at = (SELECT MAX(computed_at) FROM analysis_signal_strength)
+              AND s.league = a.league
+              AND s.market_type = a.market_type),
+          FALSE
+        )                                                              AS qualifies_live_per_scope,
+        -- Edge verdict per Bundle 1P semantics. Pinnacle Wilson floor = 0.50.
+        CASE
+          WHEN a.n_sharp::numeric / NULLIF(a.n_total, 0) < 0.10
+            THEN 'no_sharp_anchor'
+          WHEN a.n_sharp < 10
+            THEN 'inconclusive'
+          WHEN a.n_sharp < 30
+            THEN 'inconclusive'
+          WHEN a.avg_clv_sharp IS NOT NULL AND a.sd_clv_sharp > 0
+               AND (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp < -1.96
+            THEN 'inverted'
+          WHEN ((a.w_total + 1.92) / (a.n_total + 3.84)
+                  - 1.96 * SQRT(a.w_total::numeric * (a.n_total - a.w_total)::numeric
+                                / NULLIF(a.n_total, 0) + 0.96) / (a.n_total + 3.84)) > 0.50
+               AND a.avg_clv_sharp IS NOT NULL AND a.sd_clv_sharp > 0
+               AND (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp > 1.96
+               AND a.avg_clv_sharp > 0
+            THEN 'proven'
+          WHEN ((a.w_total + 1.92) / (a.n_total + 3.84)
+                  - 1.96 * SQRT(a.w_total::numeric * (a.n_total - a.w_total)::numeric
+                                / NULLIF(a.n_total, 0) + 0.96) / (a.n_total + 3.84)) > 0.50
+            THEN 'weak'
+          WHEN a.avg_clv_sharp IS NOT NULL AND a.sd_clv_sharp > 0
+               AND (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp > 1.96
+               AND a.avg_clv_sharp > 0
+            THEN 'weak'
+          ELSE 'inconclusive'
+        END                                                            AS edge_verdict
+      FROM agg a
+      WHERE a.n_total >= 5
+      ORDER BY
+        CASE
+          WHEN a.avg_clv_sharp IS NOT NULL AND a.sd_clv_sharp > 0 AND a.clv_n_sharp >= 2
+            THEN (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp
+          ELSE -999
+        END DESC NULLS LAST,
+        a.n_sharp DESC
+    `);
+
     // Task 4 / F.4 (2026-05-11 — back-to-theory plan): banned-market
     // review view. Joins the BANNED_MARKETS list (kept as a static CTE
     // here — single source of truth still lives in paperTrading.ts but
