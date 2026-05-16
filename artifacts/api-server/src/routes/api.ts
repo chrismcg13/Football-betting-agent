@@ -4300,8 +4300,9 @@ router.get("/admin/scope-edge-rankings", async (req, res) => {
     const raw = await db.execute(sql`
       SELECT
         league, market_type,
-        n_total, n_sharp, pct_sharp_coverage,
+        n_total, n_sharp, n_matches, pct_sharp_coverage,
         win_rate_pct, wilson_lo95_winrate_pct,
+        match_win_rate_pct, wilson_lo95_per_match_pct,
         avg_clv_sharp_pct, clv_tstat_sharp,
         stake_weighted_roi_sharp_pct, stake_weighted_roi_total_pct,
         qualifies_live_per_scope, edge_verdict
@@ -4317,6 +4318,7 @@ router.get("/admin/scope-edge-rankings", async (req, res) => {
           ELSE 6
         END,
         clv_tstat_sharp DESC NULLS LAST,
+        n_matches DESC NULLS LAST,
         n_sharp DESC
     `);
 

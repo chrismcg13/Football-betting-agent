@@ -3422,12 +3422,22 @@ export async function runMigrations() {
     // Stake-weighting follows the bet_track convention from analysisJobs.ts:
     // shadow uses shadow_stake / shadow_pnl, live/paper uses stake / net_pnl.
     //
-    // Verdict semantics:
-    //   'proven'           — sharp n>=30 AND wilson_lo95>0.50 AND clv_tstat_sharp>1.96 AND avg_clv_sharp>0
-    //   'weak'             — sharp n>=30 AND (wilson_lo95>0.50 OR clv_tstat_sharp>1.96)
-    //                        — one signal but not both
-    //   'inverted'         — sharp n>=30 AND clv_tstat_sharp<-1.96 — actively bad
-    //   'inconclusive'     — sharp n>=10 AND n<30 — sample too thin
+    // Bundle 1Q hardening (2026-05-16, post-Phase-1 validation):
+    //   (1) Apply analysis_exclusion_rules at view level — match the filter
+    //       Bundle B uses so v_scope_edge_evidence doesn't surface scopes
+    //       whose "edge" is powered by parser-bug-era contaminated data.
+    //   (2) Per-match-level Wilson — collapse multi-bet matches into a
+    //       single binary outcome (positive PnL = match-win). Wilson on
+    //       per-bet count overstates statistical confidence when the model
+    //       fires 7-10 bets per match (different AH lines/sides — observed
+    //       in 13-scope drill 2026-05-16, % unique matches 10-22%). The
+    //       per-match Wilson is the independence-honest measure.
+    //
+    // Verdict semantics (Bundle 1Q):
+    //   'proven'           — n_matches>=30 AND wilson_lo95_per_match>0.50 AND clv_tstat_sharp>1.96 AND avg_clv_sharp>0
+    //   'weak'             — n_matches>=30 AND (wilson_lo95_per_match>0.50 OR clv_tstat_sharp>1.96)
+    //   'inverted'         — n_sharp>=30 AND clv_tstat_sharp<-1.96
+    //   'inconclusive'     — n_sharp>=10 AND n<30 — sample too thin
     //   'no_sharp_anchor'  — pct_sharp_coverage<0.10 — structural blind spot
     await db.execute(sql`
       CREATE OR REPLACE VIEW v_scope_edge_evidence AS
@@ -3446,6 +3456,7 @@ export async function runMigrations() {
         SELECT
           COALESCE(m.league, '__unknown__')                            AS league,
           pb.market_type,
+          pb.match_id,
           (pb.status = 'won')::int                                     AS won,
           pb.clv_pct::numeric                                          AS clv_pct,
           (pb.clv_source IN (SELECT src FROM sharp_sources))           AS is_sharp,
@@ -3461,6 +3472,36 @@ export async function runMigrations() {
           AND pb.deleted_at IS NULL
           AND pb.status IN ('won', 'lost')
           AND pb.bet_track IN ('live', 'shadow')
+          -- Bundle 1Q (2026-05-16): mirror analysis_exclusion_rules filter
+          -- from analysisJobs.ts. Otherwise this view surfaces "edge"
+          -- powered by parser-bug-era contaminated AH bets (the 2026-05-15
+          -- 21:41 rule), which is exactly the false signal that drove the
+          -- original 13 "proven" scopes — 86-100% of which were pre-fix.
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_exclusion_rules r
+            WHERE r.market_type = pb.market_type
+              AND r.bet_track   = pb.bet_track
+              AND r.cleared_at IS NULL
+              AND pb.placed_at < r.exclude_placed_before
+          )
+      ),
+      per_match_sharp AS (
+        -- Bundle 1Q: collapse multi-bet matches to single binary outcome.
+        -- A match "wins" iff the sum of its bets' pnl is positive (the
+        -- model's net call on that match was right). This is the
+        -- independence-honest measure when the model fires 7-10 AH bets
+        -- per match across different lines / sides. Wilson on per-bet
+        -- count was overstating confidence by ~3× on most scopes.
+        SELECT
+          league,
+          market_type,
+          match_id,
+          (SUM(pnl) > 0)::int AS match_won,
+          SUM(pnl) AS match_pnl,
+          SUM(stake) AS match_stake
+        FROM bets
+        WHERE is_sharp AND match_id IS NOT NULL
+        GROUP BY league, market_type, match_id
       ),
       agg AS (
         SELECT
@@ -3478,22 +3519,44 @@ export async function runMigrations() {
           COUNT(*) FILTER (WHERE is_sharp AND clv_pct IS NOT NULL)::int AS clv_n_sharp
         FROM bets
         GROUP BY league, market_type
+      ),
+      agg_per_match AS (
+        SELECT
+          league,
+          market_type,
+          COUNT(*)::int AS n_matches,
+          SUM(match_won)::int AS w_matches
+        FROM per_match_sharp
+        GROUP BY league, market_type
       )
       SELECT
         a.league,
         a.market_type,
         a.n_total,
         a.n_sharp,
+        COALESCE(am.n_matches, 0)                                       AS n_matches,
         ROUND((a.n_sharp::numeric / NULLIF(a.n_total, 0)) * 100, 1)    AS pct_sharp_coverage,
         ROUND((a.w_total::numeric / NULLIF(a.n_total, 0)) * 100, 2)    AS win_rate_pct,
-        -- Wilson 95% lower bound on win rate (uses all settled bets — Wilson
-        -- is anchor-agnostic; only CLV needs sharp filtering).
+        -- Per-BET Wilson (kept for legacy/comparison; overstates confidence
+        -- when multiple bets per match).
         ROUND((
           ((a.w_total + 1.92) / (a.n_total + 3.84)
             - 1.96 * SQRT(a.w_total::numeric * (a.n_total - a.w_total)::numeric
                           / NULLIF(a.n_total, 0) + 0.96) / (a.n_total + 3.84))
           * 100
         )::numeric, 2)                                                 AS wilson_lo95_winrate_pct,
+        -- Bundle 1Q: per-MATCH Wilson — independence-honest measure.
+        -- A match "wins" iff sum of its sharp-anchored bets' pnl > 0.
+        -- Use THIS for capital-allocation decisions, not per-bet Wilson.
+        ROUND((am.w_matches::numeric / NULLIF(am.n_matches, 0)) * 100, 2) AS match_win_rate_pct,
+        ROUND((
+          CASE WHEN am.n_matches > 0 THEN
+            ((am.w_matches + 1.92) / (am.n_matches + 3.84)
+              - 1.96 * SQRT(am.w_matches::numeric * (am.n_matches - am.w_matches)::numeric
+                            / NULLIF(am.n_matches, 0) + 0.96) / (am.n_matches + 3.84))
+            * 100
+          END
+        )::numeric, 2)                                                 AS wilson_lo95_per_match_pct,
         ROUND(a.avg_clv_sharp::numeric, 2)                             AS avg_clv_sharp_pct,
         -- One-sample t-stat on sharp-anchored CLV vs zero.
         ROUND((
@@ -3513,27 +3576,26 @@ export async function runMigrations() {
               AND s.market_type = a.market_type),
           FALSE
         )                                                              AS qualifies_live_per_scope,
-        -- Edge verdict per Bundle 1P semantics. Pinnacle Wilson floor = 0.50.
+        -- Edge verdict per Bundle 1Q semantics. Wilson floor = 0.50 on the
+        -- per-MATCH count (n_matches), NOT per-bet. CLV gate unchanged.
         CASE
           WHEN a.n_sharp::numeric / NULLIF(a.n_total, 0) < 0.10
             THEN 'no_sharp_anchor'
-          WHEN a.n_sharp < 10
-            THEN 'inconclusive'
-          WHEN a.n_sharp < 30
+          WHEN COALESCE(am.n_matches, 0) < 30
             THEN 'inconclusive'
           WHEN a.avg_clv_sharp IS NOT NULL AND a.sd_clv_sharp > 0
                AND (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp < -1.96
             THEN 'inverted'
-          WHEN ((a.w_total + 1.92) / (a.n_total + 3.84)
-                  - 1.96 * SQRT(a.w_total::numeric * (a.n_total - a.w_total)::numeric
-                                / NULLIF(a.n_total, 0) + 0.96) / (a.n_total + 3.84)) > 0.50
+          WHEN ((am.w_matches + 1.92) / (am.n_matches + 3.84)
+                  - 1.96 * SQRT(am.w_matches::numeric * (am.n_matches - am.w_matches)::numeric
+                                / NULLIF(am.n_matches, 0) + 0.96) / (am.n_matches + 3.84)) > 0.50
                AND a.avg_clv_sharp IS NOT NULL AND a.sd_clv_sharp > 0
                AND (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp > 1.96
                AND a.avg_clv_sharp > 0
             THEN 'proven'
-          WHEN ((a.w_total + 1.92) / (a.n_total + 3.84)
-                  - 1.96 * SQRT(a.w_total::numeric * (a.n_total - a.w_total)::numeric
-                                / NULLIF(a.n_total, 0) + 0.96) / (a.n_total + 3.84)) > 0.50
+          WHEN ((am.w_matches + 1.92) / (am.n_matches + 3.84)
+                  - 1.96 * SQRT(am.w_matches::numeric * (am.n_matches - am.w_matches)::numeric
+                                / NULLIF(am.n_matches, 0) + 0.96) / (am.n_matches + 3.84)) > 0.50
             THEN 'weak'
           WHEN a.avg_clv_sharp IS NOT NULL AND a.sd_clv_sharp > 0
                AND (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp > 1.96
@@ -3542,6 +3604,7 @@ export async function runMigrations() {
           ELSE 'inconclusive'
         END                                                            AS edge_verdict
       FROM agg a
+      LEFT JOIN agg_per_match am ON am.league = a.league AND am.market_type = a.market_type
       WHERE a.n_total >= 5
       ORDER BY
         CASE
@@ -3549,6 +3612,7 @@ export async function runMigrations() {
             THEN (a.avg_clv_sharp * SQRT(a.clv_n_sharp::numeric)) / a.sd_clv_sharp
           ELSE -999
         END DESC NULLS LAST,
+        am.n_matches DESC NULLS LAST,
         a.n_sharp DESC
     `);
 
