@@ -3297,46 +3297,69 @@ const TIER_2_SOURCE_PRIORITY = [
 ];
 
 /**
- * Bundle 1T.3 (2026-05-16): Tier-3 last-resort Betfair Exchange anchor.
+ * Bundle 1T.3 (2026-05-16): Tier-3 last-resort fallback anchor.
+ * Bundle 1U.1 (2026-05-16): extended to multiple non-sharp sources.
  *
- * Only invoked when both Pinnacle (tier 1) and Tier-2 sharp brokers
- * (Smarkets / Matchbook / SBO / Bet365 / betfair_exchange-within-24h) return
- * null. Looks for ANY Betfair Exchange snapshot in the last 14 days. Used to
- * ensure every shadow bet has SOME closing-line value populated for the
- * coverage column — even if it's not edge-meaningful (we trade on Betfair
- * Exchange, so price drift between two of our own observations is not edge).
+ * Only invoked when both Pinnacle (tier 1) and Tier-2 sharp brokers return
+ * null. Queries multiple last-resort sources in priority order:
  *
- * clv_source_tier=3 tags these distinctly so the validation pipeline
- * (clvCalibrationAudit.ts, Bundle 2B per-scope Kelly) continues to exclude
- * them from edge gates per Bundle 1O. The SHARP_CLV_SOURCES allow-list
- * already excludes 'betfair_exchange' regardless of tier.
+ *   1. betfair_exchange (market consensus — best non-sharp proxy)
+ *   2. api_football_real:Bet365 (soft book but tracks consensus on big leagues)
+ *   3. api_football_real:Unibet (soft book, similar coverage)
+ *
+ * These three together have ~3.75M rows in odds_snapshots last 24h — by far
+ * the largest non-sharp anchor pool available. Before 1U.1, the api_football_*
+ * sources were ignored because TIER_2_PRIORITY_ORDER looks for oddspapi_*
+ * source strings (which have zero rows since matchbook_ingestion_enabled is
+ * false + Smarkets cron returns 0 events).
+ *
+ * 14-day snapshot window. clv_source_tier=3 tags these distinctly so the
+ * validation pipeline (clvCalibrationAudit.ts SHARP_CLV_SOURCES allow-list,
+ * Bundle 2B per-scope Kelly) continues to exclude them from edge gates — none
+ * of these three are sharp, so they populate the coverage column for
+ * completeness but don't count toward edge-validation.
  *
  * Coverage motivation: Bundle 1R audit found 100% no-anchor on Campeonato
- * Brasileiro Série A (n=116), CONMEBOL Sudamericana (n=65), UEFA Europa
- * League (n=31) — leagues where the tier-2 chain returns null because no
- * sharp source has the fixture mapped. Operator directive 2026-05-16: every
- * shadow bet, every league, every market_type needs SOME CLV.
+ * Brasileiro Série A, CONMEBOL Sudamericana, UEFA Europa League. After 1T.3
+ * Tier-3 Betfair, 754 historical bets rescued but 27 still unanchored
+ * (likely beyond 14-day Betfair snapshot retention). Adding api_football_*
+ * sources widens the net for the stragglers and future bets.
  */
+const TIER_3_FALLBACK_PRIORITY: ReadonlyArray<string> = [
+  "betfair_exchange",
+  "api_football_real:Bet365",
+  "api_football_real:Unibet",
+];
+
 async function resolveTier3BetfairAnchor(args: {
   matchId: number;
   marketType: string;
   selectionName: string;
 }): Promise<{ odds: number; source: string } | null> {
+  const sourceList = sql.join(
+    TIER_3_FALLBACK_PRIORITY.map((s) => sql`${s}`),
+    sql`, `,
+  );
   const rows = await db.execute(sql`
-    SELECT back_odds::float8 AS odds, snapshot_time
+    SELECT source, back_odds::float8 AS odds, snapshot_time
     FROM odds_snapshots
     WHERE match_id = ${args.matchId}
       AND market_type = ${args.marketType}
       AND selection_name = ${args.selectionName}
-      AND source = 'betfair_exchange'
+      AND source IN (${sourceList})
       AND back_odds::numeric > 1.01
       AND snapshot_time > NOW() - INTERVAL '14 days'
     ORDER BY snapshot_time DESC
-    LIMIT 1
+    LIMIT 50
   `);
-  const list = (((rows as { rows?: Array<{ odds: number; snapshot_time: string }> }).rows ?? []));
-  if (list.length === 0 || !list[0]) return null;
-  return { odds: list[0].odds, source: "betfair_exchange" };
+  const list = ((rows as { rows?: Array<{ source: string; odds: number; snapshot_time: string }> }).rows ?? []);
+  if (list.length === 0) return null;
+  // Pick best per priority — earliest in TIER_3_FALLBACK_PRIORITY wins.
+  for (const preferredSource of TIER_3_FALLBACK_PRIORITY) {
+    const match = list.find((r) => r.source === preferredSource);
+    if (match) return { odds: match.odds, source: match.source };
+  }
+  return null;
 }
 
 async function resolveTier2Anchor(args: {
