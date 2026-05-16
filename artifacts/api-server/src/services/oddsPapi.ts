@@ -2548,15 +2548,63 @@ export async function prefetchAndStoreOddsPapiOdds(
 
   if (mappedRows.length === 0) return cache;
 
+  // Bundle 1S (2026-05-16): cadence tuning. Query latest oddspapi snapshot per
+  // match, then skip the fetch when a recent enough snapshot exists relative
+  // to kickoff distance. Pinnacle lines barely move 24h+ out, so 5-min
+  // cadence on early-window matches was burning ~50k requests/month. Tiered:
+  //   >12h to KO → 30 min cadence
+  //   4-12h     → 15 min cadence
+  //   <4h       → 5 min cadence (peak sharp-money window — keep tight)
+  const matchIdsInScope = mappedRows.map((r) => r.matchId);
+  const latestSnapshotMap = new Map<number, Date>();
+  if (matchIdsInScope.length > 0) {
+    const latestRows = await db.execute(sql`
+      SELECT match_id, MAX(snapshot_time) AS latest
+      FROM odds_snapshots
+      WHERE source IN ('oddspapi','oddspapi_pinnacle')
+        AND match_id = ANY(${matchIdsInScope})
+      GROUP BY match_id
+    `);
+    for (const r of ((latestRows as { rows?: Array<{ match_id: number; latest: string }> }).rows ?? [])) {
+      latestSnapshotMap.set(r.match_id, new Date(r.latest));
+    }
+  }
+
+  const HOUR_MS = 60 * 60 * 1000;
+  const cadenceForHours = (hoursToKO: number): number => {
+    if (hoursToKO > 12) return 30 * 60 * 1000;
+    if (hoursToKO > 4) return 15 * 60 * 1000;
+    return 5 * 60 * 1000;
+  };
+
   logger.info({ count: mappedRows.length, limit }, "Pre-fetching OddsPapi Match Odds for value detection");
+
+  let cadenceSkipped = 0;
+  let ahFollowupFired = 0;
+  let bttsFollowupFired = 0;
 
   for (let i = 0; i < mappedRows.length; i++) {
     const row = mappedRows[i];
     if (!row) break;
     const { matchId, fixtureId, homeTeam, awayTeam } = row;
 
-    // Use MATCH_ODDS market ID — but OddsPapi returns ALL markets regardless.
-    // One call per fixture gives us 1x2, goals O/U, corners O/U, BTTS, etc.
+    // Bundle 1S cadence skip: was this match snapshotted recently enough?
+    const hoursToKO = row.kickoffTime
+      ? (row.kickoffTime.getTime() - Date.now()) / HOUR_MS
+      : Number.POSITIVE_INFINITY;
+    const lastFetch = latestSnapshotMap.get(matchId);
+    const minGapMs = cadenceForHours(hoursToKO);
+    if (lastFetch && (Date.now() - lastFetch.getTime()) < minGapMs) {
+      cadenceSkipped++;
+      continue;
+    }
+
+    // Use MATCH_ODDS market ID first. OddsPapi /odds is documented as
+    // returning ALL markets per fixture call but Bundle 1R coverage audit
+    // showed AH coverage at 10-19% and BTTS tier-1 at 0% on mapped fixtures,
+    // suggesting the response does NOT in fact include non-requested markets
+    // for many leagues. Adaptive fallback below fires AH (104) and BTTS (103)
+    // follow-ups only if those markets are missing from the MO response.
     const marketId = MARKET_IDS["MATCH_ODDS"] ?? 101;
     if (!(await canMakeOddspapiRequest(1, "P1"))) break;
 
@@ -2610,23 +2658,84 @@ export async function prefetchAndStoreOddsPapiOdds(
       selectionOdds[target.selectionName] = { best: 0, bookmaker: "", pinnacle: null, sharp: [], soft: [] };
     }
 
-    for (const bm of bookmakers) {
-      const slug = getBookmakerSlug(bm);
-      const name = getBookmakerName(bm);
-      const bmSelections = extractSelections(bm);
+    // Bookmaker → selection extraction helper (Bundle 1S refactor — was inline,
+    // now reusable so AH/BTTS adaptive follow-ups can merge into the same
+    // selectionOdds accumulator without code duplication).
+    const mergeBookmakersIntoSelectionOdds = (bms: ReturnType<typeof extractBookmakers>): void => {
+      for (const bm of bms) {
+        const slug = getBookmakerSlug(bm);
+        const name = getBookmakerName(bm);
+        const bmSelections = extractSelections(bm);
 
+        for (const { marketType, selectionName } of PREFETCH_TARGETS) {
+          const odds = getSelectionOdds(bmSelections, marketType, selectionName);
+          if (!odds) continue;
+
+          const so = selectionOdds[selectionName];
+          if (!so) continue;
+          const implied = 1 / odds;
+
+          if (slug.includes("pinnacle")) so.pinnacle = odds;
+          if (odds > so.best) { so.best = odds; so.bookmaker = name; }
+          if (SHARP_SLUGS.has(slug)) so.sharp.push(implied);
+          if (SOFT_SLUGS.has(slug)) so.soft.push(implied);
+        }
+      }
+    };
+
+    mergeBookmakersIntoSelectionOdds(bookmakers);
+
+    // Bundle 1S (2026-05-16) — adaptive AH + BTTS follow-up fetches. The /odds
+    // endpoint comment claims it returns ALL markets per fixture call, but the
+    // Bundle 1R coverage audit found AH Pinnacle on mapped matches at 10-19%
+    // for European leagues (Serie A 12%, La Liga 14%, Eredivisie 10%) and
+    // BTTS tier-1 at 0% everywhere. If those markets are absent from the MO
+    // response, fire targeted /odds calls with marketId=104 (AH) and 103 (BTTS).
+    // Adaptive: when the MO call DOES return AH/BTTS data, no extra cost.
+    const countPinnacleHitsFor = (mtPredicate: (mt: string) => boolean): number => {
+      let n = 0;
       for (const { marketType, selectionName } of PREFETCH_TARGETS) {
-        const odds = getSelectionOdds(bmSelections, marketType, selectionName);
-        if (!odds) continue;
-
+        if (!mtPredicate(marketType)) continue;
         const so = selectionOdds[selectionName];
-        if (!so) continue;
-        const implied = 1 / odds;
+        if (so?.pinnacle != null) n++;
+      }
+      return n;
+    };
 
-        if (slug.includes("pinnacle")) so.pinnacle = odds;
-        if (odds > so.best) { so.best = odds; so.bookmaker = name; }
-        if (SHARP_SLUGS.has(slug)) so.sharp.push(implied);
-        if (SOFT_SLUGS.has(slug)) so.soft.push(implied);
+    const ahPinnacleHits = countPinnacleHitsFor((mt) => mt === "ASIAN_HANDICAP");
+    const bttsPinnacleHits = countPinnacleHitsFor((mt) => mt === "BTTS");
+
+    if (ahPinnacleHits === 0 && (await canMakeOddspapiRequest(1, "P1"))) {
+      await new Promise((r) => setTimeout(r, 2400));
+      const ahRaw = await fetchOddsPapi<RawOddsResponse>(
+        "/odds",
+        { fixtureId, marketId: MARKET_IDS["ASIAN_HANDICAP"] ?? 104 },
+        "prefetch_odds_ah",
+        "P1",
+      );
+      if (ahRaw) {
+        const ahBms = extractBookmakers(ahRaw);
+        if (ahBms.length > 0) {
+          mergeBookmakersIntoSelectionOdds(ahBms);
+          ahFollowupFired++;
+        }
+      }
+    }
+
+    if (bttsPinnacleHits === 0 && (await canMakeOddspapiRequest(1, "P1"))) {
+      await new Promise((r) => setTimeout(r, 2400));
+      const bttsRaw = await fetchOddsPapi<RawOddsResponse>(
+        "/odds",
+        { fixtureId, marketId: MARKET_IDS["BTTS"] ?? 103 },
+        "prefetch_odds_btts",
+        "P1",
+      );
+      if (bttsRaw) {
+        const bttsBms = extractBookmakers(bttsRaw);
+        if (bttsBms.length > 0) {
+          mergeBookmakersIntoSelectionOdds(bttsBms);
+          bttsFollowupFired++;
+        }
       }
     }
 
@@ -2732,7 +2841,15 @@ export async function prefetchAndStoreOddsPapiOdds(
     }
   }
 
-  logger.info({ fetched: cache.size }, "OddsPapi pre-fetch complete");
+  logger.info(
+    {
+      fetched: cache.size,
+      cadenceSkipped,
+      ahFollowupFired,
+      bttsFollowupFired,
+    },
+    "OddsPapi pre-fetch complete (Bundle 1S cadence + adaptive AH/BTTS)",
+  );
   return cache;
 }
 
