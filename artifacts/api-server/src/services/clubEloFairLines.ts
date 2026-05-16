@@ -134,18 +134,19 @@ export interface EloBackfillResult {
  */
 export async function backfillEloFairLines(opts?: {
   maxBets?: number;
+  lookbackDays?: number;
 }): Promise<EloBackfillResult> {
   const start = Date.now();
   const maxBets = opts?.maxBets ?? 1000;
+  // Bundle 1T.1 (2026-05-16): lookbackDays override lets the admin endpoint
+  // bootstrap the backfill across the post-cutover history when the cron
+  // hasn't been running. Cron continues at 7-day default (steady state).
+  const lookbackDays = opts?.lookbackDays ?? 7;
   const perQuality: Record<string, number> = {};
   const bump = (q: string) => {
     perQuality[q] = (perQuality[q] ?? 0) + 1;
   };
 
-  // Pull pending bets + bets settled in last 7 days where elo line not yet
-  // computed. The 7-day backfill window lets us populate historical bets
-  // for backtest analysis the first time the cron runs after deploy; in
-  // steady state, almost all bets are pending and the join is cheap.
   const pending = await db
     .select({
       id: paperBetsTable.id,
@@ -161,7 +162,7 @@ export async function backfillEloFairLines(opts?: {
     .where(
       and(
         isNull(paperBetsTable.eloDataQuality),
-        sql`${paperBetsTable.placedAt} >= NOW() - INTERVAL '7 days'`,
+        sql`${paperBetsTable.placedAt} >= NOW() - (${lookbackDays}::int * INTERVAL '1 day')`,
       ),
     )
     .limit(maxBets);

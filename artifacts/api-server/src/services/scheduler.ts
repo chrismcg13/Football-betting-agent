@@ -2557,19 +2557,21 @@ export function startSettlementCron(): void {
   // teams have Elo coverage. Independent third CLV anchor alongside Pinnacle
   // (tier 1) and Smarkets (tier 2, Bundle 1B.1 next). Idempotent — only fills
   // rows where elo_data_quality IS NULL.
+  // Bundle 1T.1 (2026-05-16): wrap in runCronWithHealthLog so the operator
+  // can see when it fires + what it returns via compliance_logs.cron_health.
+  // Pre-fix the cron used a bare try/catch — any error was logged to pm2
+  // stdout only, invisible to Neon. With wrap, every run lands a
+  // compliance_logs row with status + result/error.
   cron.schedule("*/15 * * * *", () => {
-    logger.info("Bundle 1B.2 Club Elo fair-line backfill triggered (every 15 min)");
     void (async () => {
-      try {
+      const { runCronWithHealthLog } = await import("./cronHealthLog");
+      await runCronWithHealthLog("elo_fair_line_backfill", async () => {
         const { backfillEloFairLines } = await import("./clubEloFairLines");
-        const r = await backfillEloFairLines();
-        logger.info(r, "Bundle 1B.2 Club Elo fair-line backfill complete");
-      } catch (err) {
-        logger.error({ err }, "Bundle 1B.2 Club Elo fair-line backfill failed");
-      }
+        return backfillEloFairLines();
+      });
     })();
   }, { timezone: "UTC" });
-  logger.info("Bundle 1B.2 Club Elo fair-line backfill scheduler active — every 15 min UTC");
+  logger.info("Bundle 1B.2 Club Elo fair-line backfill scheduler active — every 15 min UTC (health-logged)");
 
   // Bundle N.5 (2026-05-16): daily Neon cost monitor. Single
   // compliance_logs row capturing top-15 table sizes, sequential-scan

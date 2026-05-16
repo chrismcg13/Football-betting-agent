@@ -4348,6 +4348,29 @@ router.get("/admin/scope-edge-rankings", async (req, res) => {
   }
 });
 
+// Bundle 1T.1 (2026-05-16): on-demand Club Elo fair-line backfill. The 15-min
+// cron exists but Bundle 1R audit found 18,784 post-cutover bets with
+// elo_data_quality=NULL — cron wasn't writing anything. Lets the operator
+// force-trigger to bootstrap the backfill + immediately see scanned/computed/
+// perQuality breakdown. Subsequent cron ticks will keep it fresh.
+router.post("/admin/run-elo-backfill", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as { maxBets?: number; lookbackDays?: number };
+    const { backfillEloFairLines } = await import("../services/clubEloFairLines");
+    const result = await backfillEloFairLines({
+      maxBets: body.maxBets,
+      lookbackDays: body.lookbackDays,
+    });
+    return res.json({ ok: true, result });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      message: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack?.slice(0, 1024) : undefined,
+    });
+  }
+});
+
 router.post("/admin/set-config", async (req, res) => {
   try {
     const { key, value } = req.body;
