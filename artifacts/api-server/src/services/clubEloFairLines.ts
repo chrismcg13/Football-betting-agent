@@ -94,11 +94,18 @@ interface EloLookup {
 }
 
 // Fetch latest Elo per team in one batched query. Returns Map<team_name, EloLookup>.
+//
+// Bundle 1T.1 hotfix (2026-05-16): the prior `team_name = ANY(${teamNames}::text[])`
+// binding triggered Drizzle to expand the JS array as a tuple of N positional
+// parameters ($1, $2, …, $N) rather than a single text[] — Postgres then
+// interpreted ANY($1, $2, …) as the variadic function call and threw "cannot
+// cast type record to text[]". Same bug pattern that broke resolveTier2Anchor
+// on 2026-05-09 (oddsPapi.ts:3306). Switched to explicit IN-list via sql.join
+// which is functionally identical and Drizzle-stable.
 async function lookupLatestElos(teamNames: string[]): Promise<Map<string, EloLookup>> {
   const map = new Map<string, EloLookup>();
   if (teamNames.length === 0) return map;
-  // SELECT DISTINCT ON (team_name) team_name, elo, date FROM club_elo_snapshots
-  // WHERE team_name = ANY($1) ORDER BY team_name, date DESC;
+  const teamList = sql.join(teamNames.map((t) => sql`${t}`), sql`, `);
   const rows = await db.execute<{
     team_name: string;
     elo: string;
@@ -106,7 +113,7 @@ async function lookupLatestElos(teamNames: string[]): Promise<Map<string, EloLoo
   }>(sql`
     SELECT DISTINCT ON (team_name) team_name, elo::text AS elo, date::text AS date
     FROM club_elo_snapshots
-    WHERE team_name = ANY(${teamNames}::text[])
+    WHERE team_name IN (${teamList})
     ORDER BY team_name, date DESC
   `);
   for (const r of rows.rows) {
