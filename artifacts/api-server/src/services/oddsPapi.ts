@@ -3480,6 +3480,36 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
         }
 
         if (closingOdds == null) {
+          // Bundle 1B.4 (2026-05-16): miss-case audit. Previously the snap
+          // pipeline wrote pinnacle_close_capture compliance rows ONLY on
+          // success — misses were silent skipped++ increments with no
+          // per-bet diagnostic. This blocked root-cause analysis of
+          // OU/BTTS coverage gaps (audit showed ~30% miss rate on OU_*
+          // / BTTS even when other bets on the SAME match snapped fine —
+          // a per-(market, selection) Pinnacle quote shape, not a cron
+          // timing issue). Fire-and-forget; never blocks the loop.
+          const snapDeltaSeconds = Math.round(
+            (new Date(bet.kickoffTime).getTime() - Date.now()) / 1000,
+          );
+          void db.insert(complianceLogsTable).values({
+            actionType: "pinnacle_close_capture",
+            details: {
+              outcome: "miss",
+              betId: bet.id,
+              matchId,
+              marketType,
+              selectionName: bet.selectionName,
+              snapDeltaSeconds,
+              // reason hints — populated to whatever's available; helps
+              // distinguish "no Pinnacle quote at all" from "tier-2 fallback
+              // also missed". oddspapiPinnacleBookmaker null = OddsPapi
+              // returned no Pinnacle for this market_type (likely line
+              // mismatch on AH / Pinnacle-doesn't-quote on BTTS).
+              oddspapiPinnacleAvailable: oddspapiPinnacleBookmaker !== null,
+              tier2FallbackAttempted: true,
+            },
+            timestamp: new Date(),
+          });
           skipped++;
           continue;
         }
