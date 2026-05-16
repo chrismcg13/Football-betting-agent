@@ -4222,6 +4222,23 @@ router.post("/admin/cancel-bet", async (req, res) => {
   }
 });
 
+// Bundle 1M (2026-05-16): on-demand calibration-fitter trigger. The
+// fitter normally runs Mondays 04:00 UTC; this endpoint lets the
+// operator fire immediately after a Python script change (e.g. window
+// tightening) or to refresh a stale bucket. Spawns the Python fitter
+// as a child process; returns exit code + duration + stderr tail for
+// quick verification. Bucket cache is invalidated on clean exit by
+// the fitter wrapper, so the new params hit the hot path within seconds.
+router.post("/admin/run-calibration-fitter", async (_req, res) => {
+  try {
+    const { runCalibrationFitter } = await import("../services/calibrationCron");
+    const result = await runCalibrationFitter();
+    return res.json({ ok: result.exitCode === 0, ...result });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: String(err) });
+  }
+});
+
 // Bundle 1C.1 (2026-05-16): on-demand CLV calibration audit. Lets the
 // operator fire the regression immediately after deploy / on-demand without
 // waiting for the Mondays 04:30 UTC cron. Optional body: {marketType?, leagueId?}.

@@ -44,7 +44,14 @@ log = logging.getLogger("fit_calibration")
 
 MIN_SAMPLES_PER_BUCKET = 30
 MIN_SAMPLES_PER_GLOBAL = 100
-ANALYSIS_START_DATE = "2026-05-03"
+# Bundle 1M (2026-05-16): tightened from 2026-05-03 (which included 6 days
+# of pre-cutover paper-track rows still labelled bet_track='paper') to
+# 2026-05-09 (the cutover date). Pre-cutover paper was emitted under a
+# different model regime AND different staking logic; mixing it with
+# post-cutover shadow/live as a single training cohort leaves the fitter
+# under-correcting the post-cutover MO over-confidence. Post-cutover MO
+# residual bias (per Bundle 1M audit, 2026-05-16): -55pp at p>=0.70.
+ANALYSIS_START_DATE = "2026-05-09"
 
 
 def fetch_settled(conn) -> list[dict]:
