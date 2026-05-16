@@ -3347,6 +3347,176 @@ const TIER_3_FALLBACK_PRIORITY: ReadonlyArray<string> = [
   "betfair_exchange",
 ];
 
+/**
+ * Bundle 1U.2.1 (2026-05-16): derive AH probability at any line from Bet365
+ * MO odds when Bet365 doesn't directly quote our specific AH selection.
+ *
+ * Root cause for the 1048 betfair-only-anchored bets after Bundle 1U.2:
+ * Bet365 globally quotes 80 distinct AH lines (-5.5 to +4.5) but for any
+ * SPECIFIC match only quotes a narrow window (~6.5 goal spread centred on
+ * the expected goal differential). Our model frequently picks lines outside
+ * that window (e.g. "Away +2.25" when Bet365 only quotes Away +0 to +0.75
+ * for that fixture). The match has Bet365 data; the specific line doesn't.
+ *
+ * Fix: when Bet365 lacks the AH line, derive it from Bet365's MO (Home/Draw/
+ * Away) odds via Poisson scoreline matrix. Algorithm:
+ *
+ *   1. De-vig Bet365 MO via proportional method → (pHome, pDraw, pAway)
+ *   2. Fit Poisson goal model (lambdaH, lambdaA) that produces (pHome, pDraw)
+ *      via 2D Newton-Raphson on (totalGoals, homeBalance)
+ *   3. Build scoreline matrix, sum P(home - away + line > 0) + 0.5 * P(push)
+ *      to get fair AH probability at the target line
+ *   4. Return fair odds with source='bet365_mo_derived_ah'
+ *
+ * Tagged separately from direct-quote sources so the operator can see
+ * derivation rate. Stays excluded from SHARP_CLV_SOURCES allow-list (it's
+ * still Bet365-derived, not sharp).
+ */
+function _poissonPmf(k: number, lambda: number): number {
+  if (lambda <= 0 || k < 0) return 0;
+  let logP = -lambda + k * Math.log(lambda);
+  for (let i = 2; i <= k; i++) logP -= Math.log(i);
+  return Math.exp(logP);
+}
+
+function _scorelineMatrix(lambdaH: number, lambdaA: number, maxGoals: number = 10): number[][] {
+  const M: number[][] = [];
+  for (let h = 0; h <= maxGoals; h++) {
+    const row: number[] = [];
+    for (let a = 0; a <= maxGoals; a++) {
+      row.push(_poissonPmf(h, lambdaH) * _poissonPmf(a, lambdaA));
+    }
+    M.push(row);
+  }
+  return M;
+}
+
+function _pHomeWin(M: number[][]): number {
+  let p = 0;
+  for (let h = 0; h < M.length; h++) {
+    for (let a = 0; a < M[h]!.length; a++) {
+      if (h > a) p += M[h]![a]!;
+    }
+  }
+  return p;
+}
+
+function _pDrawSum(M: number[][]): number {
+  let p = 0;
+  for (let h = 0; h < M.length; h++) p += M[h]![h] ?? 0;
+  return p;
+}
+
+// Returns {win, push} where AH bet: win + 0.5*push = fair probability of the bet succeeding.
+function _pAhCovers(M: number[][], side: "home" | "away", line: number): { win: number; push: number } {
+  let win = 0, push = 0;
+  for (let h = 0; h < M.length; h++) {
+    for (let a = 0; a < M[h]!.length; a++) {
+      const diff = side === "home" ? (h - a + line) : (a - h + line);
+      if (diff > 1e-9) win += M[h]![a]!;
+      else if (diff > -1e-9) push += M[h]![a]!;
+    }
+  }
+  return { win, push };
+}
+
+// Fit Poisson(lambdaH, lambdaA) to match target (pHome, pDraw) via 2D Newton-Raphson
+// on (totalGoals T, homeBalance B). lambdaH = B*T, lambdaA = (1-B)*T.
+function _fitPoissonFromMO(pHomeTarget: number, pDrawTarget: number): { lambdaH: number; lambdaA: number } | null {
+  let T = 2.7; // league-average football total goals as starting guess
+  let B = 0.5 + (pHomeTarget - 0.4) * 0.3; // crude balance estimate from pHome
+  B = Math.max(0.15, Math.min(0.85, B));
+
+  for (let iter = 0; iter < 30; iter++) {
+    const lambdaH = B * T;
+    const lambdaA = (1 - B) * T;
+    const M = _scorelineMatrix(lambdaH, lambdaA, 8);
+    const pH = _pHomeWin(M);
+    const pD = _pDrawSum(M);
+    const errH = pH - pHomeTarget;
+    const errD = pD - pDrawTarget;
+    if (Math.abs(errH) < 0.0005 && Math.abs(errD) < 0.0005) break;
+
+    // Numerical Jacobian
+    const eps = 0.01;
+    const M_T = _scorelineMatrix(B * (T + eps), (1 - B) * (T + eps), 8);
+    const M_B = _scorelineMatrix((B + eps) * T, (1 - (B + eps)) * T, 8);
+    const dpH_dT = (_pHomeWin(M_T) - pH) / eps;
+    const dpD_dT = (_pDrawSum(M_T) - pD) / eps;
+    const dpH_dB = (_pHomeWin(M_B) - pH) / eps;
+    const dpD_dB = (_pDrawSum(M_B) - pD) / eps;
+
+    const det = dpH_dT * dpD_dB - dpH_dB * dpD_dT;
+    if (Math.abs(det) < 1e-9) break;
+    const dT = (-errH * dpD_dB + errD * dpH_dB) / det;
+    const dB = (errH * dpD_dT - errD * dpH_dT) / det;
+
+    T = Math.max(0.5, Math.min(5.0, T + dT * 0.7)); // damping
+    B = Math.max(0.1, Math.min(0.9, B + dB * 0.7));
+  }
+  if (!Number.isFinite(T) || !Number.isFinite(B) || T <= 0) return null;
+  return { lambdaH: B * T, lambdaA: (1 - B) * T };
+}
+
+function _parseAhSelection(name: string): { side: "home" | "away"; line: number } | null {
+  const m = name.trim().match(/^(Home|Away)\s+([+-]?\d+(?:\.\d+)?)$/);
+  if (!m) return null;
+  const side = (m[1]!.toLowerCase() as "home" | "away");
+  const line = parseFloat(m[2]!);
+  if (!Number.isFinite(line)) return null;
+  return { side, line };
+}
+
+async function resolveBet365DerivedAH(args: {
+  matchId: number;
+  marketType: string;
+  selectionName: string;
+}): Promise<{ odds: number; source: string } | null> {
+  if (args.marketType !== "ASIAN_HANDICAP") return null;
+  const parsed = _parseAhSelection(args.selectionName);
+  if (!parsed) return null;
+
+  // Fetch latest Bet365 MO odds for this match
+  const moRows = await db.execute(sql`
+    SELECT DISTINCT ON (selection_name)
+      selection_name, back_odds::float8 AS odds, snapshot_time
+    FROM odds_snapshots
+    WHERE match_id = ${args.matchId}
+      AND market_type = 'MATCH_ODDS'
+      AND source = 'api_football_real:Bet365'
+      AND back_odds::numeric > 1.01
+      AND snapshot_time > NOW() - INTERVAL '14 days'
+    ORDER BY selection_name, snapshot_time DESC
+  `);
+  const list = ((moRows as { rows?: Array<{ selection_name: string; odds: number }> }).rows ?? []);
+  const moMap = new Map<string, number>();
+  for (const r of list) moMap.set(r.selection_name, r.odds);
+
+  const oddsH = moMap.get("Home");
+  const oddsD = moMap.get("Draw");
+  const oddsA = moMap.get("Away");
+  if (!oddsH || !oddsD || !oddsA) return null;
+
+  // De-vig proportional
+  const pHraw = 1 / oddsH, pDraw_raw = 1 / oddsD, pAraw = 1 / oddsA;
+  const total = pHraw + pDraw_raw + pAraw;
+  const pHome = pHraw / total;
+  const pDraw = pDraw_raw / total;
+
+  // Fit Poisson goal model to MO
+  const fit = _fitPoissonFromMO(pHome, pDraw);
+  if (!fit) return null;
+
+  // Build scoreline matrix and compute AH fair probability at target line
+  const M = _scorelineMatrix(fit.lambdaH, fit.lambdaA, 12);
+  const { win, push } = _pAhCovers(M, parsed.side, parsed.line);
+  const fairProb = win + 0.5 * push;
+  if (!Number.isFinite(fairProb) || fairProb < 0.01 || fairProb > 0.99) return null;
+
+  const fairOdds = 1 / fairProb;
+  return { odds: fairOdds, source: "bet365_mo_derived_ah" };
+}
+
 async function resolveTier3BetfairAnchor(args: {
   matchId: number;
   marketType: string;
@@ -3735,9 +3905,28 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
             });
             if (tier3) {
               closingOdds = tier3.odds;
-              clvSourceTag = tier3.source; // 'betfair_exchange'
+              clvSourceTag = tier3.source; // 'betfair_exchange' or 'tier3_consensus:N'
               clvSourceTier = 3;
               dataQuality = "tier_3_betfair_fallback";
+            } else {
+              // Bundle 1U.2.1 (2026-05-16): final fallback — derive AH from
+              // Bet365 MO via Poisson scoreline matrix when no direct AH
+              // quote exists from any Tier-2/3 source. Only fires for AH
+              // bets where Bet365 has the match's MO odds but doesn't quote
+              // the specific AH line we picked. SHARP_CLV_SOURCES allow-list
+              // excludes 'bet365_mo_derived_ah' so this stays out of
+              // edge-validation gates.
+              const derived = await resolveBet365DerivedAH({
+                matchId,
+                marketType,
+                selectionName: bet.selectionName,
+              });
+              if (derived) {
+                closingOdds = derived.odds;
+                clvSourceTag = derived.source;
+                clvSourceTier = 3;
+                dataQuality = "tier_3_bet365_mo_derived";
+              }
             }
           }
         }
@@ -3950,7 +4139,7 @@ export async function backfillClosingPinnacleFromMultiSource(opts: {
           clvSourceTier = 2;
           dataQuality = "tier_2_sharp_anchor";
         } else {
-          // Tier-3 last-resort Betfair Exchange.
+          // Tier-3 last-resort: Bet365/Unibet/Betfair direct quote (median if multiple).
           const tier3 = await resolveTier3BetfairAnchor({
             matchId: bet.matchId,
             marketType: bet.marketType,
@@ -3961,6 +4150,20 @@ export async function backfillClosingPinnacleFromMultiSource(opts: {
             clvSourceTag = tier3.source;
             clvSourceTier = 3;
             dataQuality = "tier_3_betfair_fallback";
+          } else {
+            // Bundle 1U.2.1 final fallback: derive AH from Bet365 MO when no
+            // direct AH quote exists for the specific line.
+            const derived = await resolveBet365DerivedAH({
+              matchId: bet.matchId,
+              marketType: bet.marketType,
+              selectionName: bet.selectionName,
+            });
+            if (derived) {
+              closingOdds = derived.odds;
+              clvSourceTag = derived.source;
+              clvSourceTier = 3;
+              dataQuality = "tier_3_bet365_mo_derived";
+            }
           }
         }
       }
