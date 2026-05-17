@@ -2748,8 +2748,13 @@ export async function placePaperBet(
       pinnacleEdgePp,
       oddspapiFixtureId,
     });
-    if (sharpResult.outcome === "fetched" || sharpResult.outcome === "cached") {
-      logger.info(
+    // Log all outcomes except no_niche_qualifies (the common silent skip).
+    // Spec-qualifying outcomes (fetched/cached) log INFO; degraded outcomes
+    // (budget_exhausted/free_tier_disabled/fetch_failed) log WARN so the
+    // diagnostic is visible without scanning structured logs.
+    if (sharpResult.outcome !== "no_niche_qualifies") {
+      const level = sharpResult.outcome === "fetched" || sharpResult.outcome === "cached" ? "info" : "warn";
+      logger[level](
         {
           matchId,
           marketType,
@@ -2759,8 +2764,13 @@ export async function placePaperBet(
           bookCount: sharpResult.prices.length,
           budgetSpent: sharpResult.budgetSpent,
           pinnacleEdgePp: Number(pinnacleEdgePp.toFixed(2)),
+          hasFixtureId: oddspapiFixtureId != null,
         },
-        "sharpAnchorFetch: multi-book anchors recorded",
+        sharpResult.outcome === "fetched"
+          ? "sharpAnchorFetch: multi-book anchors recorded (fresh)"
+          : sharpResult.outcome === "cached"
+            ? "sharpAnchorFetch: multi-book anchors recorded (cache)"
+            : `sharpAnchorFetch: degraded — ${sharpResult.outcome}`,
       );
     }
   } catch (err) {

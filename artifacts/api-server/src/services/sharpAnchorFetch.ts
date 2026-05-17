@@ -26,8 +26,8 @@
  * share a single budget slot).
  */
 
-import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
-import { db, matchesTable, pinnacleOddsSnapshotsTable } from "@workspace/db";
+import { and, desc, eq, gte, inArray } from "drizzle-orm";
+import { db, oddspapiFixtureMapTable, pinnacleOddsSnapshotsTable } from "@workspace/db";
 import { logger } from "../lib/logger";
 import {
   fetchOddsPapiFree,
@@ -280,12 +280,18 @@ export async function fetchSharpAnchors(input: SharpAnchorInput): Promise<SharpA
  * Lightweight read-only resolver for the oddspapi_fixture_id mapping. Pulled
  * from oddspapi_fixture_map (the writer-cached table that backs prefetch).
  * Returns null if no mapping exists — caller falls back to Pinnacle-only.
+ *
+ * Uses typed Drizzle select. The earlier raw-SQL version of this function
+ * (E.3 initial commit) returned null for every call because
+ * `db.execute<T>(sql...)` doesn't expose a `.rows` array at runtime under
+ * our Drizzle/pg combo — the shape is iterable but doesn't match the
+ * cast. Fixed by using the schema-typed table.
  */
 export async function lookupOddspapiFixtureId(matchId: number): Promise<string | null> {
-  const rows = await db.execute<{ oddspapi_fixture_id: string }>(sql`
-    SELECT oddspapi_fixture_id FROM oddspapi_fixture_map
-    WHERE match_id = ${matchId} LIMIT 1
-  `);
-  const row = (rows as unknown as { rows?: Array<{ oddspapi_fixture_id: string }> }).rows?.[0];
-  return row?.oddspapi_fixture_id ?? null;
+  const rows = await db
+    .select({ oddspapiFixtureId: oddspapiFixtureMapTable.oddspapiFixtureId })
+    .from(oddspapiFixtureMapTable)
+    .where(eq(oddspapiFixtureMapTable.matchId, matchId))
+    .limit(1);
+  return rows[0]?.oddspapiFixtureId ?? null;
 }
