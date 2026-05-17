@@ -7139,55 +7139,99 @@ router.post("/admin/inversion-dry-run", async (req, res) => {
       .slice(0, 15)
       .map(([reason, n]) => ({ reason, n }));
 
-    // Second source: currently-banned / disabled-list rejections from
-    // bet_rejected rows. Post-flip these would flow through to the
-    // inversion gate (Bundle 7.C bypass) instead of being killed
-    // upstream. Show the per-market market_type spread + sample edge
-    // values so operator can see the newly-eligible universe.
+    // Second source (Bundle 8.E.2 fix): the real "what would unlock
+    // post-flip" data lives in paper_bets shadow rows — bets that
+    // demoted to shadow because of upstream gates the inversion would
+    // bypass (disabled_market_types ban, disabled_leagues ban,
+    // min_opportunity_score, etc.). bet_rejected rows are mostly
+    // duplicate/saturation rejections that the inversion DOESN'T touch.
+    //
+    // Per-market_type aggregation with sharp_anchored count + avg
+    // Pinnacle edge gives Chris the full picture across all bettable
+    // market types, including the currently-banned AH/OU_15/OU_05 +
+    // 6 banned leagues.
     const bannedR = await db.execute(sql`
       SELECT
-        details->>'gate' AS gate,
-        details->>'marketType' AS market_type,
+        pb.market_type,
+        m.league,
         COUNT(*)::int AS n,
-        COUNT(DISTINCT details->>'matchId')::int AS distinct_matches,
-        AVG((details->>'edge')::float8) AS avg_edge,
-        AVG((details->>'opportunityScore')::float8) AS avg_score
-      FROM compliance_logs
-      WHERE action_type = 'bet_rejected'
-        AND timestamp >= NOW() - INTERVAL '24 hours'
-        AND details->>'gate' IN (
-          'banned_market',
-          'live_placement_disabled_market_types',
-          'min_opportunity_score',
-          'min_edge_threshold'
-        )
-      GROUP BY 1, 2
+        COUNT(*) FILTER (WHERE pb.candidate_track = 'sharp_anchored')::int AS sharp_anchored_n,
+        COUNT(*) FILTER (WHERE pb.pinnacle_implied IS NOT NULL)::int AS has_pinnacle_n,
+        AVG(pb.opportunity_score::float8)::float8 AS avg_score,
+        AVG(pb.calculated_edge::float8)::float8 AS avg_edge,
+        AVG(CASE
+          WHEN pb.pinnacle_implied IS NOT NULL AND pb.pinnacle_implied > 0
+          THEN (pb.odds_at_placement::float8 * pb.pinnacle_implied::float8 - 1) * 100
+        END)::float8 AS avg_pinnacle_edge_pp
+      FROM paper_bets pb
+      LEFT JOIN matches m ON m.id = pb.match_id
+      WHERE pb.bet_track = 'shadow'
+        AND pb.placed_at >= NOW() - INTERVAL '24 hours'
+        AND pb.deleted_at IS NULL
+        AND pb.legacy_regime = false
+      GROUP BY pb.market_type, m.league
       ORDER BY n DESC
-      LIMIT 50
+      LIMIT 100
     `);
     const newlyEligibleRows = ((bannedR as any).rows ?? []) as Array<{
-      gate: string;
-      market_type: string | null;
+      market_type: string;
+      league: string | null;
       n: number;
-      distinct_matches: number;
-      avg_edge: number | null;
+      sharp_anchored_n: number;
+      has_pinnacle_n: number;
       avg_score: number | null;
+      avg_edge: number | null;
+      avg_pinnacle_edge_pp: number | null;
     }>;
     // Per-market summary across BOTH sources for the "full picture"
     // operator view Chris asked for.
-    const marketUniverse: Record<string, { current_actions: Record<string, number>; would_unlock_post_flip: number }> = {};
+    interface MarketUniverseEntry {
+      current_actions: Record<string, number>;
+      shadow_n_24h: number;
+      sharp_anchored_n: number;
+      has_pinnacle_n: number;
+      avg_pinnacle_edge_pp: number | null;
+      avg_score: number | null;
+    }
+    const marketUniverse: Record<string, MarketUniverseEntry> = {};
     for (const [mkt, actions] of Object.entries(marketActionCounts)) {
       marketUniverse[mkt] = {
         current_actions: actions,
-        would_unlock_post_flip: 0,
+        shadow_n_24h: 0,
+        sharp_anchored_n: 0,
+        has_pinnacle_n: 0,
+        avg_pinnacle_edge_pp: null,
+        avg_score: null,
       };
     }
+    // Aggregate shadow-row data per market_type (collapsing leagues).
     for (const row of newlyEligibleRows) {
-      const mkt = row.market_type ?? "(unknown)";
+      const mkt = row.market_type;
       if (!marketUniverse[mkt]) {
-        marketUniverse[mkt] = { current_actions: {}, would_unlock_post_flip: 0 };
+        marketUniverse[mkt] = {
+          current_actions: {},
+          shadow_n_24h: 0,
+          sharp_anchored_n: 0,
+          has_pinnacle_n: 0,
+          avg_pinnacle_edge_pp: null,
+          avg_score: null,
+        };
       }
-      marketUniverse[mkt].would_unlock_post_flip += row.n;
+      const e = marketUniverse[mkt];
+      const prevN = e.shadow_n_24h;
+      e.shadow_n_24h = prevN + row.n;
+      e.sharp_anchored_n += row.sharp_anchored_n;
+      e.has_pinnacle_n += row.has_pinnacle_n;
+      // Weighted re-average for pinnacle_edge_pp + score
+      if (row.avg_pinnacle_edge_pp != null) {
+        e.avg_pinnacle_edge_pp =
+          ((e.avg_pinnacle_edge_pp ?? 0) * prevN + row.avg_pinnacle_edge_pp * row.n) /
+          e.shadow_n_24h;
+      }
+      if (row.avg_score != null) {
+        e.avg_score =
+          ((e.avg_score ?? 0) * prevN + row.avg_score * row.n) / e.shadow_n_24h;
+      }
     }
 
     res.json({
@@ -7204,17 +7248,17 @@ router.post("/admin/inversion-dry-run", async (req, res) => {
       },
       top_reasons: topReasons,
       per_market_actions: marketActionCounts,
-      // Bundle 8.E: currently-blocked candidates that would unlock under
-      // the inversion flag (7.C gate bypass). Per-market breakdown so
-      // operator can see the newly-eligible universe across all market
-      // types, not just the AH-heavy current sample.
+      // Bundle 8.E.2: currently-shadow-routed candidates that would
+      // unlock to LIVE under the inversion flag (7.C gate bypass + 5.M
+      // sizing). Sourced from paper_bets bet_track='shadow' rows over
+      // the last 24h. Per-(market × league) breakdown shows the
+      // newly-eligible universe across all bettable types — including
+      // the currently-banned AH/OU_15/OU_05 + the 6 banned leagues.
       newly_eligible_post_flip: {
-        total_rows: newlyEligibleRows.reduce((s, r) => s + r.n, 0),
-        by_gate: newlyEligibleRows.reduce((acc, r) => {
-          acc[r.gate] = (acc[r.gate] ?? 0) + r.n;
-          return acc;
-        }, {} as Record<string, number>),
-        by_market: newlyEligibleRows,
+        total_shadow_24h: newlyEligibleRows.reduce((s, r) => s + r.n, 0),
+        total_sharp_anchored: newlyEligibleRows.reduce((s, r) => s + r.sharp_anchored_n, 0),
+        total_with_pinnacle: newlyEligibleRows.reduce((s, r) => s + r.has_pinnacle_n, 0),
+        by_market_league: newlyEligibleRows.slice(0, 50),
       },
       market_universe_summary: marketUniverse,
     });
