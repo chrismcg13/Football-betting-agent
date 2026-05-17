@@ -2901,8 +2901,11 @@ export async function placePaperBet(
       rawModelProbability: modelProbability,
       stage1Source: "kickoff_window",
     });
-    // Fire-and-forget — never block placement on telemetry write.
-    void db.insert(complianceLogsTable).values({
+    // Bundle 8.E (2026-05-17): await the insert so any failure surfaces
+    // via the catch — the prior void-fire-and-forget silently swallowed
+    // any insert errors (zero inversion_gate_shadow rows in 24h despite
+    // 1,310 placements reaching this code path).
+    await db.insert(complianceLogsTable).values({
       actionType: "inversion_gate_shadow",
       details: {
         matchId,
@@ -2914,16 +2917,14 @@ export async function placePaperBet(
         gateAction: decision.action,
         gateReasons: decision.reasons,
         kellyMultiplier:
-          decision.action === "PROCEED" || decision.action === "DOWN_SIZE_HALF"
-            ? decision.kellyMultiplier
-            : null,
+          decision.action === "PROCEED" ? (decision as any).kellyMultiplier : null,
         diagnostics: decision.diagnostics,
       } as Record<string, unknown>,
       timestamp: new Date(),
     } as any);
   } catch (err) {
     logger.warn(
-      { err, matchId, marketType, selectionName },
+      { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
       "inversion-gate shadow telemetry failed (non-blocking)",
     );
   }

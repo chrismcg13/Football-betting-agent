@@ -7060,6 +7060,26 @@ router.post("/admin/inversion-dry-run", async (req, res) => {
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const sampleSize = Math.min(Number(body.sampleSize ?? 50), 500);
+    // Bundle 8.D + 8.E (2026-05-17): dry-run pulls from TWO sources so the
+    // picture spans ALL bettable market types, not just what currently
+    // reaches placePaperBet:
+    //
+    //   1. inversion_gate_shadow rows — candidates that REACHED
+    //      placePaperBet and had the gate evaluated. Covers the markets
+    //      not currently banned upstream.
+    //
+    //   2. bet_rejected rows with gate IN {banned_market,
+    //      live_placement_disabled_market_types, dynamic_block_check} —
+    //      candidates rejected upstream BEFORE reaching the gate. Under
+    //      the inversion flag (7.C), these candidates would bypass those
+    //      gates and flow through. We surface them in the dry-run as
+    //      "would have evaluated" without running the gate (we don't
+    //      have all the gate inputs for a rejected row); aggregated
+    //      separately.
+    //
+    // Operator reads BOTH summaries: source (1) shows the gate's
+    // observed behaviour; source (2) shows the newly-eligible universe
+    // post-flip.
     const r = await db.execute(sql`
       SELECT
         details->>'gateAction' AS action,
@@ -7118,6 +7138,58 @@ router.post("/admin/inversion-dry-run", async (req, res) => {
       .sort((a, b) => b[1] - a[1])
       .slice(0, 15)
       .map(([reason, n]) => ({ reason, n }));
+
+    // Second source: currently-banned / disabled-list rejections from
+    // bet_rejected rows. Post-flip these would flow through to the
+    // inversion gate (Bundle 7.C bypass) instead of being killed
+    // upstream. Show the per-market market_type spread + sample edge
+    // values so operator can see the newly-eligible universe.
+    const bannedR = await db.execute(sql`
+      SELECT
+        details->>'gate' AS gate,
+        details->>'marketType' AS market_type,
+        COUNT(*)::int AS n,
+        COUNT(DISTINCT details->>'matchId')::int AS distinct_matches,
+        AVG((details->>'edge')::float8) AS avg_edge,
+        AVG((details->>'opportunityScore')::float8) AS avg_score
+      FROM compliance_logs
+      WHERE action_type = 'bet_rejected'
+        AND timestamp >= NOW() - INTERVAL '24 hours'
+        AND details->>'gate' IN (
+          'banned_market',
+          'live_placement_disabled_market_types',
+          'min_opportunity_score',
+          'min_edge_threshold'
+        )
+      GROUP BY 1, 2
+      ORDER BY n DESC
+      LIMIT 50
+    `);
+    const newlyEligibleRows = ((bannedR as any).rows ?? []) as Array<{
+      gate: string;
+      market_type: string | null;
+      n: number;
+      distinct_matches: number;
+      avg_edge: number | null;
+      avg_score: number | null;
+    }>;
+    // Per-market summary across BOTH sources for the "full picture"
+    // operator view Chris asked for.
+    const marketUniverse: Record<string, { current_actions: Record<string, number>; would_unlock_post_flip: number }> = {};
+    for (const [mkt, actions] of Object.entries(marketActionCounts)) {
+      marketUniverse[mkt] = {
+        current_actions: actions,
+        would_unlock_post_flip: 0,
+      };
+    }
+    for (const row of newlyEligibleRows) {
+      const mkt = row.market_type ?? "(unknown)";
+      if (!marketUniverse[mkt]) {
+        marketUniverse[mkt] = { current_actions: {}, would_unlock_post_flip: 0 };
+      }
+      marketUniverse[mkt].would_unlock_post_flip += row.n;
+    }
+
     res.json({
       ok: true,
       window: "last 24h",
@@ -7132,6 +7204,19 @@ router.post("/admin/inversion-dry-run", async (req, res) => {
       },
       top_reasons: topReasons,
       per_market_actions: marketActionCounts,
+      // Bundle 8.E: currently-blocked candidates that would unlock under
+      // the inversion flag (7.C gate bypass). Per-market breakdown so
+      // operator can see the newly-eligible universe across all market
+      // types, not just the AH-heavy current sample.
+      newly_eligible_post_flip: {
+        total_rows: newlyEligibleRows.reduce((s, r) => s + r.n, 0),
+        by_gate: newlyEligibleRows.reduce((acc, r) => {
+          acc[r.gate] = (acc[r.gate] ?? 0) + r.n;
+          return acc;
+        }, {} as Record<string, number>),
+        by_market: newlyEligibleRows,
+      },
+      market_universe_summary: marketUniverse,
     });
   } catch (err) {
     logger.error({ err }, "inversion-dry-run failed");
