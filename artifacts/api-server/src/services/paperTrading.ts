@@ -2720,54 +2720,63 @@ export async function placePaperBet(
   // See CLAUDE.md §7 ("No exposure caps"). runLiveConcentrationChecks
   // retained in liveRiskManager.ts for audit-only callers (launchActivation).
 
-  // ── Pinnacle DB fallback (Bundle 11, 2026-05-17: freshness-bounded) ──────
-  // If the trading-cycle cache didn't supply Pinnacle odds, look them up from
-  // the most recent FRESH snapshot in odds_snapshots. Stale snapshots no
-  // longer satisfy the inversion gate per Chris's "live at point of
-  // placement" rule — pinnacle_max_age_seconds (default 180s = 3 min) caps
-  // acceptable age. Beyond that, pinnacleImplied stays null and the pre-gate
-  // coverage check below skips the inversion-gate call entirely.
-  if (pinnacleOdds == null) {
-    try {
-      const maxAgeRaw = await getConfigValue("pinnacle_max_age_seconds");
-      const pinnacleMaxAgeSeconds =
-        maxAgeRaw != null && Number.isFinite(Number(maxAgeRaw)) ? Number(maxAgeRaw) : 180;
-      const variants = Array.from(new Set([
-        selectionName,
-        selectionName.endsWith(" Goals") ? selectionName.replace(/ Goals$/, "") : `${selectionName} Goals`,
-      ]));
-      const latestPin = await db
-        .select({
-          backOdds: oddsSnapshotsTable.backOdds,
-          source: oddsSnapshotsTable.source,
-          snapshotTime: oddsSnapshotsTable.snapshotTime,
-        })
-        .from(oddsSnapshotsTable)
-        .where(and(
-          eq(oddsSnapshotsTable.matchId, matchId),
-          eq(oddsSnapshotsTable.marketType, marketType),
-          inArray(oddsSnapshotsTable.selectionName, variants),
-          or(
-            eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
-            eq(oddsSnapshotsTable.source, "oddspapi"),
-            eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
-          ),
-          sql`${oddsSnapshotsTable.snapshotTime} >= NOW() - INTERVAL '1 second' * ${pinnacleMaxAgeSeconds}`,
-        ))
-        .orderBy(desc(oddsSnapshotsTable.snapshotTime))
-        .limit(1);
-      const fallbackOdds = latestPin[0]?.backOdds ? parseFloat(latestPin[0].backOdds) : null;
-      if (fallbackOdds && fallbackOdds > 1.01) {
-        pinnacleOdds = fallbackOdds;
-        pinnacleImplied = 1 / fallbackOdds;
-        logger.info(
-          { matchId, marketType, selectionName, pinnacleOdds, source: latestPin[0]?.source, snapshotTime: latestPin[0]?.snapshotTime },
-          "Pinnacle odds loaded from DB snapshot fallback (fresh)",
-        );
-      }
-    } catch (err) {
-      logger.warn({ err, matchId, marketType, selectionName }, "Pinnacle DB fallback lookup failed");
+  // ── Pinnacle live-verification (Bundle 11.D, 2026-05-17) ────────────────
+  // UNCONDITIONAL: always re-query the freshest Pinnacle snapshot within
+  // pinnacle_max_age_seconds and OVERWRITE pinnacleImplied with the DB-fresh
+  // value. If no fresh row exists, null it out so the pre-gate coverage
+  // check skips the inversion gate.
+  //
+  // Why unconditional: scheduler.ts:1845 passes options.pinnacleOdds /
+  // .pinnacleImplied from the trading-cycle validation cache. That cache
+  // can be 5-15 min stale by the time placePaperBet runs. Pre-Bundle-11.D,
+  // a non-null cache value short-circuited the freshness fallback and the
+  // gate saw stale data. Now the DB is the single source of truth for
+  // "what does the system know about Pinnacle right now."
+  try {
+    const maxAgeRaw = await getConfigValue("pinnacle_max_age_seconds");
+    const pinnacleMaxAgeSeconds =
+      maxAgeRaw != null && Number.isFinite(Number(maxAgeRaw)) ? Number(maxAgeRaw) : 180;
+    const variants = Array.from(new Set([
+      selectionName,
+      selectionName.endsWith(" Goals") ? selectionName.replace(/ Goals$/, "") : `${selectionName} Goals`,
+    ]));
+    const latestPin = await db
+      .select({
+        backOdds: oddsSnapshotsTable.backOdds,
+        source: oddsSnapshotsTable.source,
+        snapshotTime: oddsSnapshotsTable.snapshotTime,
+      })
+      .from(oddsSnapshotsTable)
+      .where(and(
+        eq(oddsSnapshotsTable.matchId, matchId),
+        eq(oddsSnapshotsTable.marketType, marketType),
+        inArray(oddsSnapshotsTable.selectionName, variants),
+        or(
+          eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
+          eq(oddsSnapshotsTable.source, "oddspapi"),
+          eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
+        ),
+        sql`${oddsSnapshotsTable.snapshotTime} >= NOW() - INTERVAL '1 second' * ${pinnacleMaxAgeSeconds}`,
+      ))
+      .orderBy(desc(oddsSnapshotsTable.snapshotTime))
+      .limit(1);
+    const freshOdds = latestPin[0]?.backOdds ? parseFloat(latestPin[0].backOdds) : null;
+    if (freshOdds && freshOdds > 1.01) {
+      pinnacleOdds = freshOdds;
+      pinnacleImplied = 1 / freshOdds;
+    } else {
+      // No fresh Pinnacle within window. Null out any stale cache value
+      // the caller passed in. Downstream pre-gate check at ~line 2914 will
+      // skip the inversion gate and route to shadow.
+      pinnacleOdds = null;
+      pinnacleImplied = null;
     }
+  } catch (err) {
+    // On DB error, fail safe: null out to force shadow routing rather than
+    // proceeding with potentially-stale cache values.
+    logger.warn({ err, matchId, marketType, selectionName }, "Pinnacle live-verification failed — failing safe to null");
+    pinnacleOdds = null;
+    pinnacleImplied = null;
   }
   // ──────────────────────────────────────────────────────────────────────────
 

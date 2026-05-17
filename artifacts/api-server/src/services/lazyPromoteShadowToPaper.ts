@@ -650,6 +650,14 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
         // defaultP75Slippage fallback. When real per-(market×ttk)
         // slippage data accumulates, the gate uses that; lazy promote
         // can be upgraded to call v_slippage_p75_rolling too (deferred).
+        // Bundle 11.E (2026-05-17): hoist currentBack so the actual
+        // placeLiveBetOnBetfair call below (line ~824) can use the LIVE
+        // Betfair price as its limit, not the stale stored `odds`. Without
+        // this, the band was being validated against currentBack but the
+        // order was being submitted at stored placement-time odds —
+        // explains the 1009 CANCELLED_LOW_FILL bets where orders never
+        // matched (stored odds had drifted past current market).
+        let liveBetfairBack: number | null = null;
         try {
           const pinnMaxAgeRaw = await getConfig("pinnacle_max_age_seconds");
           const bfMaxAgeRaw = await getConfig("betfair_odds_max_age_seconds");
@@ -685,6 +693,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           ]);
           const pinnImplied = pinnRow.rows?.[0]?.pinn_implied;
           const currentBack = bfRow.rows?.[0]?.back_odds;
+          // Hoist for use at the placement call site.
+          liveBetfairBack = currentBack != null && Number.isFinite(currentBack) && currentBack > 1.01 ? currentBack : null;
           if (currentBack == null || !Number.isFinite(currentBack) || currentBack <= 1.01) {
             // Stale or absent Betfair best-back → no live executable
             // price. Bundle 11 removes the stored-odds fallback.
@@ -821,12 +831,18 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
 
         const { placeLiveBetOnBetfair } = await import("./betfairLive");
         const promoteEdge = Number(r.edge);
+        // Bundle 11.E (2026-05-17): use the LIVE Betfair best-back as the
+        // placement limit — the same price the 3-7pp band check just
+        // validated against. Falls back to stored `odds` only if the
+        // liveBetfairBack hoist somehow ended null (shouldn't happen —
+        // the upstream guard would have `continue`d), preserving safety.
+        const placementOdds = liveBetfairBack ?? odds;
         const placeResult = await placeLiveBetOnBetfair({
           internalBetId: r.id,
           betfairEventId: m.betfair_event_id,
           marketType: r.market_type,
           selectionName: r.selection_name,
-          odds,
+          odds: placementOdds,
           stake,
           homeTeam: m.home_team,
           awayTeam: m.away_team,
