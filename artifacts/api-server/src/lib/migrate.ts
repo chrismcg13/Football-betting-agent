@@ -4259,6 +4259,24 @@ export async function runMigrations() {
       }
     }
 
+    // ── Bundle 1 E.2 (2026-05-17): bookmaker_slug column ────────────────────
+    // The table is still named pinnacle_odds_snapshots for historical
+    // compatibility, but rows can now represent any sharp book. Free-tier
+    // OddsPapi client (E.1) and the sharp-anchor fetch service (E.3, pending)
+    // will write rows with bookmaker_slug ∈ {pinnacle, singbet, sbobet,
+    // bet365, 1xbet, ...}. Default 'pinnacle' backfills all existing rows
+    // implicitly so downstream consumers that don't know about the column
+    // keep working unchanged. See docs/bundle-1-sharp-coverage-plan.md §E.2.
+    await db.execute(sql`
+      ALTER TABLE pinnacle_odds_snapshots
+        ADD COLUMN IF NOT EXISTS bookmaker_slug TEXT NOT NULL DEFAULT 'pinnacle'
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_sharp_snapshots_book_lookup
+        ON pinnacle_odds_snapshots (match_id, market_type, selection_name, bookmaker_slug, captured_at DESC)
+    `);
+    logger.info("Bundle 1 E.2: pinnacle_odds_snapshots.bookmaker_slug column + lookup index ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
