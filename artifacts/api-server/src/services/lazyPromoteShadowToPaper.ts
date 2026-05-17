@@ -605,76 +605,117 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           continue;
         }
 
-        // ── Bundle 5.G (2026-05-17): stale-odds leak guards ──────────────
-        // The shadow row's odds_at_placement + calculated_edge were the
-        // snapshot at original emission time, which may be hours stale by
-        // the time the promoter picks them up. Two pre-promotion checks:
+        // ── Bundle 5.G + Bundle 10 (2026-05-17): stale-odds + 3-7pp band ─
+        // Lazy promoter MUST enforce the same gate as direct emission
+        // (Chris 2026-05-17: "any pathway to eligible live bet has to
+        // have a 3-7pp sharp edge found"). Reads min_net_edge_pp (3.0)
+        // and inversion_live_max_edge_pp (7.0) — the same band the
+        // inversion gate uses. Computes post-slip edge against the
+        // CURRENT Betfair best-back (not stored odds) + CURRENT
+        // pinnacle_implied (≤15 min freshness). Outside the band →
+        // stays shadow with a structured compliance_logs row.
         //
-        //   (1) Pinnacle re-check: current pinnacle_implied (latest ≤15 min)
-        //       must still yield identified_edge_pp ≥ floor on the stored
-        //       odds. If Pinnacle has moved against us, the edge has
-        //       evaporated and we should NOT deploy capital.
-        //   (2) Betfair drift check: current best-back vs stored
-        //       odds_at_placement must be within tolerance. If Betfair has
-        //       moved beyond drift_pct, placeLiveBetOnBetfair would fill at
-        //       a price our edge math no longer supports. (The existing
-        //       LIMIT-order slippage path skips Betfair's own slippage
-        //       guard — per reference_live_stake_unblockers — so this
-        //       application-layer check is the binding control.)
+        // PINNACLE-ABSENT scopes (routed via v_live_eligibility market
+        // aggregate) still need a Pinnacle anchor to clear the band —
+        // they can't promote under Bundle 10's discipline. Sharp-anchor
+        // is the gate.
         //
-        // PINNACLE-ABSENT scopes (those routed via the v_live_eligibility
-        // market_type aggregate path) intentionally skip (1) — there's no
-        // Pinnacle anchor to re-check against. They still pass through (2).
-        //
-        // Both floors are operator-tunable; conservative defaults below.
-
-        // (1) Pinnacle edge re-check
+        // Slippage default: 0.015 (1.5pp) — matches the inversion gate's
+        // defaultP75Slippage fallback. When real per-(market×ttk)
+        // slippage data accumulates, the gate uses that; lazy promote
+        // can be upgraded to call v_slippage_p75_rolling too (deferred).
         try {
-          const pinnRow = (await db.execute(sql`
-            SELECT pinnacle_implied::float8 AS pinn_implied
-            FROM pinnacle_odds_snapshots
-            WHERE match_id = ${r.match_id}
-              AND market_type = ${r.market_type}
-              AND selection_name = ${r.selection_name}
-              AND bookmaker_slug = 'pinnacle'
-              AND captured_at >= NOW() - INTERVAL '15 minutes'
-            ORDER BY captured_at DESC
-            LIMIT 1
-          `)) as unknown as { rows?: Array<{ pinn_implied: number | null }> };
+          // Fetch fresh Pinnacle anchor + fresh Betfair best-back in
+          // parallel so we always evaluate against current prices.
+          const [pinnRow, bfRow] = await Promise.all([
+            db.execute(sql`
+              SELECT pinnacle_implied::float8 AS pinn_implied
+              FROM pinnacle_odds_snapshots
+              WHERE match_id = ${r.match_id}
+                AND market_type = ${r.market_type}
+                AND selection_name = ${r.selection_name}
+                AND bookmaker_slug = 'pinnacle'
+                AND captured_at >= NOW() - INTERVAL '15 minutes'
+              ORDER BY captured_at DESC
+              LIMIT 1
+            `) as unknown as Promise<{ rows?: Array<{ pinn_implied: number | null }> }>,
+            db.execute(sql`
+              SELECT back_odds::float8 AS back_odds
+              FROM odds_snapshots
+              WHERE match_id = ${r.match_id}
+                AND market_type = ${r.market_type}
+                AND selection_name = ${r.selection_name}
+                AND source = 'betfair_exchange'
+                AND snapshot_time >= NOW() - INTERVAL '10 minutes'
+              ORDER BY snapshot_time DESC
+              LIMIT 1
+            `) as unknown as Promise<{ rows?: Array<{ back_odds: number | null }> }>,
+          ]);
           const pinnImplied = pinnRow.rows?.[0]?.pinn_implied;
+          const currentBack = bfRow.rows?.[0]?.back_odds ?? odds;
           if (pinnImplied != null && Number.isFinite(pinnImplied) && pinnImplied > 0) {
-            const currentEdgePp = (odds * pinnImplied - 1) * 100;
-            const minEdgeRaw = await getConfig("lazy_promote_min_pinnacle_edge_pp");
-            const minEdgePp = minEdgeRaw != null ? Number(minEdgeRaw) : 1.0;
-            if (Number.isFinite(minEdgePp) && currentEdgePp < minEdgePp) {
+            const minEdgeRaw = await getConfig("min_net_edge_pp");
+            const maxEdgeRaw = await getConfig("inversion_live_max_edge_pp");
+            const minEdgePp = minEdgeRaw != null ? Number(minEdgeRaw) : 3.0;
+            const maxEdgePp = maxEdgeRaw != null ? Number(maxEdgeRaw) : 7.0;
+            const slippage = 0.015;
+            const postSlipEdgePp = (currentBack * (1 - slippage) * pinnImplied - 1) * 100;
+            const belowFloor = postSlipEdgePp < minEdgePp;
+            const aboveCeiling = postSlipEdgePp > maxEdgePp;
+            if (belowFloor || aboveCeiling) {
               result.skipped_edge_evaporated++;
               await db.insert(complianceLogsTable).values({
-                actionType: "lazy_promote_edge_evaporated",
+                actionType: "lazy_promote_edge_outside_band",
                 details: {
                   betId: r.id,
                   matchId: r.match_id,
                   marketType: r.market_type,
                   selectionName: r.selection_name,
                   storedOdds: odds,
-                  storedEdgePp: edge * 100,
+                  currentBack,
                   currentPinnImplied: pinnImplied,
-                  currentEdgePp,
+                  postSlipEdgePp,
                   minEdgePp,
+                  maxEdgePp,
+                  reason: belowFloor ? "below_3pp_floor" : "above_7pp_ceiling",
                   source: "lazy_promote",
                 },
                 timestamp: new Date(),
               } as any);
               continue;
             }
+          } else {
+            // No Pinnacle anchor → no sharp edge → no live placement
+            // under Bundle 10's discipline. Sharp-anchor IS the gate.
+            result.skipped_edge_evaporated++;
+            await db.insert(complianceLogsTable).values({
+              actionType: "lazy_promote_edge_outside_band",
+              details: {
+                betId: r.id,
+                matchId: r.match_id,
+                marketType: r.market_type,
+                selectionName: r.selection_name,
+                storedOdds: odds,
+                currentBack,
+                currentPinnImplied: null,
+                reason: "no_pinnacle_anchor",
+                source: "lazy_promote",
+              },
+              timestamp: new Date(),
+            } as any);
+            continue;
           }
         } catch (err) {
-          // Re-check failed (DB hiccup, schema drift). Don't block promotion
-          // on the audit step — log and proceed. The downstream Betfair
-          // slippage/fill check is still in play.
+          // Edge re-check failed (DB hiccup). FAIL SAFE — do NOT promote
+          // when we can't verify edge. Earlier Bundle 5.G used a "log and
+          // proceed" pattern; Bundle 10 tightens to a hard skip because
+          // the band is the activation discipline.
           logger.warn(
             { err, betId: r.id, matchId: r.match_id },
-            "lazyPromote: Pinnacle edge re-check failed (non-blocking)",
+            "lazyPromote: edge re-check failed — skipping promotion (fail safe)",
           );
+          result.skipped_edge_evaporated++;
+          continue;
         }
 
         // (2) Betfair drift check
