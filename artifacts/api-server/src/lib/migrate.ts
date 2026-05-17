@@ -4463,6 +4463,225 @@ export async function runMigrations() {
     `);
     logger.info("Bundle 6: v_rejected_by_gate_24h view ready");
 
+    // ── Bundle 7.0 (2026-05-17): Stage 0 — universe + heat-map foundation ───
+    // Watch_priority_history tracks (fixture × market_type) priority scores
+    // over time. The 5-min cron in services/watchPriority.ts writes one
+    // snapshot row per active (fixture × market) per tick. 7-day retention
+    // is enough for weight re-tuning + tier-drift analysis.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS watch_priority_history (
+        id BIGSERIAL PRIMARY KEY,
+        fixture_id INTEGER NOT NULL,
+        market_type TEXT NOT NULL,
+        computed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        watch_priority_score NUMERIC(6, 3) NOT NULL,
+        base_priority NUMERIC(6, 3) NOT NULL,
+        model_boost NUMERIC(6, 3) NOT NULL DEFAULT 0,
+        tier SMALLINT NOT NULL,
+        edge_density_score NUMERIC(6, 3),
+        release_proximity_score NUMERIC(6, 3),
+        liquidity_score NUMERIC(6, 3),
+        ttk_score NUMERIC(6, 3),
+        clv_yield_score NUMERIC(6, 3),
+        model_opportunity_score NUMERIC(6, 3),
+        ttk_bucket TEXT,
+        sharp_count_tier SMALLINT
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_watch_priority_lookup
+        ON watch_priority_history (fixture_id, market_type, computed_at DESC)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_watch_priority_tier_recent
+        ON watch_priority_history (tier, computed_at DESC)
+    `);
+    // 7-day retention housekeeping cron is registered in scheduler.ts; the
+    // table itself doesn't enforce a TTL so old rows can be reviewed for
+    // weight re-tune Bayesian optimisation.
+
+    // universe_markets: per (league × market_type) catalogue derived from
+    // historical pinnacle_odds_snapshots — used by the daily universe cron
+    // to know which market types each league supports. Premier League
+    // supports MO/OU/BTTS/AH/Cards/Corners; K-League 1 supports MO/OU/AH
+    // only. Saves polling effort on markets the bookmaker won't price.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS league_market_catalogue (
+        league_id INTEGER NOT NULL,
+        market_type TEXT NOT NULL,
+        first_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        last_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        sample_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (league_id, market_type)
+      )
+    `);
+
+    // Scope CLV rolling view — the closed learning loop. Rolling
+    // 100-bet stake-weighted CLV per (league × market_type × ttk_bucket).
+    // watchPriority.historical_clv_yield_score reads from this view;
+    // scopes with proven CLV rise to TIER 1, scopes that don't, decay.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW scope_clv_rolling_v AS
+      WITH ranked AS (
+        SELECT
+          m.league,
+          pb.market_type,
+          CASE
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '1 hour'   THEN '0_1h'
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '6 hours'  THEN '1_6h'
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '24 hours' THEN '6_24h'
+            ELSE                                                          '24h_plus'
+          END AS ttk_bucket,
+          pb.stake::float8 AS stake,
+          pb.clv_pct::float8 AS clv_pct,
+          ROW_NUMBER() OVER (
+            PARTITION BY m.league, pb.market_type,
+              CASE
+                WHEN m.kickoff_time - pb.placed_at < INTERVAL '1 hour'   THEN '0_1h'
+                WHEN m.kickoff_time - pb.placed_at < INTERVAL '6 hours'  THEN '1_6h'
+                WHEN m.kickoff_time - pb.placed_at < INTERVAL '24 hours' THEN '6_24h'
+                ELSE                                                          '24h_plus'
+              END
+            ORDER BY pb.placed_at DESC
+          ) AS rn
+        FROM paper_bets pb
+        JOIN matches m ON m.id = pb.match_id
+        WHERE pb.bet_track IN ('live','shadow')
+          AND pb.legacy_regime = false
+          AND pb.placed_at >= TIMESTAMP WITH TIME ZONE '2026-05-17 08:40:00+00'
+          AND pb.clv_pct IS NOT NULL
+          AND pb.status IN ('won','lost','void')
+          AND pb.deleted_at IS NULL
+      )
+      SELECT
+        league,
+        market_type,
+        ttk_bucket,
+        COUNT(*)::int AS n,
+        CASE
+          WHEN SUM(stake) > 0
+            THEN (SUM(stake * clv_pct) / SUM(stake))::numeric
+          ELSE AVG(clv_pct)::numeric
+        END AS stake_weighted_clv_pct
+      FROM ranked
+      WHERE rn <= 100
+      GROUP BY league, market_type, ttk_bucket
+    `);
+    logger.info("Bundle 7.0: scope_clv_rolling_v view ready");
+
+    // Scope edge density view — "how often does this scope produce a
+    // candidate at >= 3pp identified edge?" Rolling 90 days. The
+    // expected_edge_density_score component reads from this.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW scope_edge_density_v AS
+      WITH bets AS (
+        SELECT
+          m.league,
+          pb.market_type,
+          CASE
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '1 hour'   THEN '0_1h'
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '6 hours'  THEN '1_6h'
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '24 hours' THEN '6_24h'
+            ELSE                                                          '24h_plus'
+          END AS ttk_bucket,
+          CASE
+            WHEN pb.pinnacle_implied IS NOT NULL AND pb.pinnacle_implied > 0
+              AND (pb.odds_at_placement::float8 * pb.pinnacle_implied::float8 - 1) * 100 >= 3.0
+            THEN 1
+            ELSE 0
+          END AS qualifies
+        FROM paper_bets pb
+        JOIN matches m ON m.id = pb.match_id
+        WHERE pb.placed_at >= NOW() - INTERVAL '90 days'
+          AND pb.bet_track IN ('live','shadow')
+          AND pb.legacy_regime = false
+          AND pb.deleted_at IS NULL
+      )
+      SELECT
+        league,
+        market_type,
+        ttk_bucket,
+        COUNT(*)::int AS scan_count,
+        SUM(qualifies)::int AS edge_count,
+        CASE
+          WHEN COUNT(*) > 0 THEN (100.0 * SUM(qualifies) / COUNT(*))::numeric
+          ELSE 0::numeric
+        END AS density_score
+      FROM bets
+      GROUP BY league, market_type, ttk_bucket
+    `);
+    logger.info("Bundle 7.0: scope_edge_density_v view ready");
+
+    // Pinnacle release-timing view — per (league × market_type) median
+    // hours-to-kickoff at first identification snapshot. Powers the
+    // release_proximity_score component.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW scope_pinnacle_release_timing_v AS
+      WITH ids AS (
+        SELECT
+          s.match_id,
+          s.market_type,
+          MIN(s.captured_at) AS first_seen
+        FROM pinnacle_odds_snapshots s
+        WHERE s.captured_at >= NOW() - INTERVAL '60 days'
+          AND s.snapshot_type = 'identification'
+          AND s.bookmaker_slug = 'pinnacle'
+        GROUP BY s.match_id, s.market_type
+      )
+      SELECT
+        m.league,
+        ids.market_type,
+        COUNT(*)::int AS n,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (
+          ORDER BY EXTRACT(EPOCH FROM (m.kickoff_time - ids.first_seen)) / 3600.0
+        )::numeric AS median_hours_to_kickoff
+      FROM ids JOIN matches m ON m.id = ids.match_id
+      WHERE m.kickoff_time IS NOT NULL
+      GROUP BY m.league, ids.market_type
+      HAVING COUNT(*) >= 10
+    `);
+    logger.info("Bundle 7.0: scope_pinnacle_release_timing_v view ready");
+
+    // Bundle 7.0 config seeds — six new keys for Stage 0. All JSON or
+    // numeric, operator-tunable via /api/admin/set-config without code.
+    const stage0Seed: Array<{ key: string; value: string }> = [
+      // Component weights (refined 2026-05-17: model is accelerator, smallest weight).
+      { key: "watch_score_weights", value: JSON.stringify({
+        W_edge: 0.20,
+        W_release: 0.15,
+        W_liquidity: 0.15,
+        W_ttk: 0.20,
+        W_clv: 0.20,
+        W_model: 0.10,
+      }) },
+      // Tier thresholds (calibrated to MAX-base + additive-model range [0, 30]).
+      { key: "watch_tier_thresholds", value: JSON.stringify({
+        TIER_1_MIN: 20,
+        TIER_2_MIN: 15,
+        TIER_3_MIN: 6,
+      }) },
+      // Tier polling cadences (seconds for Betfair, minutes for Pinnacle).
+      // Tier 1 Pinnacle uses 'signal' meaning event-driven (mover>2%/30min
+      // OR T-30/15/5/0 snapshots), NOT time-driven, to fit budget.
+      { key: "watch_tier_poll_cadences", value: JSON.stringify({
+        TIER_1: { betfair_sec: 30,  pinnacle_min: "signal" },
+        TIER_2: { betfair_sec: 120, pinnacle_min: 15 },
+        TIER_3: { betfair_sec: 300, pinnacle_min: 30 },
+        TIER_4: { betfair_sec: 900, pinnacle_min: "mover_only" },
+      }) },
+      // CLV rolling window size — n bets per scope before the CLV-yield
+      // signal is considered reliable enough to weigh.
+      { key: "scope_clv_window_size", value: "100" },
+      // Mover signal default-on; A/B at n=200 may disable.
+      { key: "mover_signal_enabled", value: "true" },
+      // Watch priority history TTL — cron drops rows older than this.
+      { key: "watch_priority_history_retention_days", value: "7" },
+    ];
+    for (const row of stage0Seed) {
+      await db.insert(agentConfigTable).values(row).onConflictDoNothing({ target: agentConfigTable.key });
+    }
+    logger.info({ count: stage0Seed.length }, "Bundle 7.0: Stage 0 config keys seeded");
+
     // ── Bundle 5.N (2026-05-17): seed inversion-pipeline config keys ──────
     // Nine new operator-tunable keys, defaults match the locked spec
     // (docs/bundle-5-activation-spec.md). Plus the activation switch (kept

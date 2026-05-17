@@ -7050,6 +7050,69 @@ router.post("/admin/phase-0-dedupe-and-backfill", async (_req, res) => {
   }
 });
 
+// ─── Bundle 7.0 (2026-05-17) — Stage 0 watch-priority admin endpoints ──
+// Unit test runner — verifies the R1-preserving rule (model is
+// accelerator, never veto) on the live deployed code. Safe to call any
+// time; pure-function tests, no DB access in the assertions.
+router.post("/admin/run-watch-priority-tests", async (_req, res) => {
+  try {
+    const { runWatchPriorityTests } = await import("../services/watchPriorityTests");
+    const summary = runWatchPriorityTests();
+    res.json({ ok: summary.failed === 0, summary });
+  } catch (err) {
+    logger.error({ err }, "run-watch-priority-tests failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// One-shot manual trigger for the 5-min watch-priority cron — useful
+// after weight or threshold changes via /api/admin/set-config to see
+// the new tier assignments immediately.
+router.post("/admin/run-watch-priority-cron", async (_req, res) => {
+  try {
+    const { runWatchPriorityCron } = await import("../services/watchPriorityCron");
+    const result = await runWatchPriorityCron();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "run-watch-priority-cron failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Current heat map — top N (fixture × market) by latest watch_priority_score.
+// Joins back to matches for league + kickoff_time context.
+router.get("/admin/watch-priority-heatmap", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit ?? 30), 200);
+    const r = await db.execute(sql`
+      WITH latest AS (
+        SELECT DISTINCT ON (fixture_id, market_type)
+          fixture_id, market_type, watch_priority_score, base_priority,
+          model_boost, tier, ttk_bucket,
+          edge_density_score, release_proximity_score, liquidity_score,
+          ttk_score, clv_yield_score, model_opportunity_score, computed_at
+        FROM watch_priority_history
+        WHERE computed_at >= NOW() - INTERVAL '15 minutes'
+        ORDER BY fixture_id, market_type, computed_at DESC
+      )
+      SELECT
+        l.fixture_id, l.market_type, l.watch_priority_score, l.base_priority,
+        l.model_boost, l.tier, l.ttk_bucket,
+        l.edge_density_score, l.release_proximity_score, l.liquidity_score,
+        l.ttk_score, l.clv_yield_score, l.model_opportunity_score,
+        m.league, m.home_team, m.away_team, m.kickoff_time
+      FROM latest l
+      LEFT JOIN matches m ON m.id = l.fixture_id
+      ORDER BY l.watch_priority_score DESC NULLS LAST
+      LIMIT ${limit}
+    `);
+    res.json({ ok: true, rows: (r as any).rows ?? [] });
+  } catch (err) {
+    logger.error({ err }, "watch-priority-heatmap failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // ─── Bundle 6 (2026-05-17) — per-gate rejection counts (last 24h) ───────
 // Convenience wrapper around v_rejected_by_gate_24h. Ops uses this to
 // answer "which gate is throwing out the most candidates right now?" —

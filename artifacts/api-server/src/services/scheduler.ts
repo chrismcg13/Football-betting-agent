@@ -2394,6 +2394,43 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Lazy shadow→paper promoter active — every 5 min UTC");
 
+  // ── Bundle 7.0 (2026-05-17): Stage 0 watch-priority scoring (every 5 min)
+  // For every (fixture × market_type) active in the next 7 days, compute
+  // watch_priority_score (MAX of weighted base components + non-negative
+  // model_boost). Writes one row per (fixture × market) per tick to
+  // watch_priority_history. Powers Stage 1 polling cadence + tier
+  // promotion. Model is ACCELERATOR ONLY — cannot lower priority.
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const { runWatchPriorityCron } = await import("./watchPriorityCron");
+        const r = await runWatchPriorityCron();
+        if (r.fixtures_evaluated > 0) {
+          logger.info(r, "Watch-priority cron tick");
+        }
+      } catch (err) {
+        logger.error({ err }, "Watch-priority cron failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle 7.0: watch-priority cron active — every 5 min UTC");
+
+  // Daily 04:30 UTC retention pruner — drops watch_priority_history rows
+  // older than agent_config.watch_priority_history_retention_days
+  // (default 7). Aligned with the existing daily 04:00 universe fetch.
+  cron.schedule("30 4 * * *", () => {
+    void (async () => {
+      try {
+        const { runWatchPriorityRetention } = await import("./watchPriorityCron");
+        const r = await runWatchPriorityRetention();
+        if (r.deleted > 0) logger.info(r, "Watch-priority history pruned");
+      } catch (err) {
+        logger.error({ err }, "Watch-priority retention pruner failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle 7.0: watch-priority retention pruner active — daily 04:30 UTC");
+
   // ── Bundle 5.L (2026-05-17): CLV circuit breaker ─────────────────────────
   // Every 15 min, evaluate per-market_type rolling stake-weighted CLV. If
   // any market_type drops below clv_circuit_breaker_threshold (default 0.0
