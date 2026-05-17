@@ -40,6 +40,30 @@ export const FEATURE_NAMES = [
   "home_clubelo",
   "away_clubelo",
   "elo_diff",
+  // Bundle 7.F (2026-05-17): §G features wire-in (HIGH + 5-game form).
+  // Storage + ingestion already shipped (match_referees /
+  // referee_card_rates, team_expected_xi via refreshExpectedXi,
+  // injury_reports via /injuries ingestion). FEATURE_NAMES extension is
+  // the §G gap; computations live in featureEngine with neutral defaults
+  // when source data is missing for a fixture. Model retrains
+  // automatically on next startup via the featureMeans.length-mismatch
+  // guard in loadLatestModel.
+  //
+  // referee_avg_cards_per_match: already upserted by featureEngine line
+  //   ~1146; just orphan (computed but not modelled). Adding it here
+  //   wires it in.
+  // home/away_lineup_xi_size: count of distinct players in
+  //   team_expected_xi normalised to /11. Proxy for XI stability.
+  // home/away_injuries_count: count of injury_reports rows for the team
+  //   on the fixture date. Higher = weaker roster.
+  // form_diff_5game: home_form_last5 - away_form_last5. Derived ratio
+  //   per memo §G ("Recent 5-game form comparison ratio").
+  "referee_avg_cards_per_match",
+  "home_lineup_xi_size",
+  "away_lineup_xi_size",
+  "home_injuries_count",
+  "away_injuries_count",
+  "form_diff_5game",
 ] as const;
 
 type FeatureName = (typeof FEATURE_NAMES)[number];

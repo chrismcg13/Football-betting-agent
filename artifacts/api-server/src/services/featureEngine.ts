@@ -563,6 +563,55 @@ export async function computeFeaturesForMatch(
     await upsertFeature(matchId, "elo_diff", homeClubElo - awayClubElo);
   }
 
+  // ── Bundle 7.F (2026-05-17): §G feature wire-in (HIGH + 5-game form) ────
+  // Each feature has a safe neutral default so missing source data
+  // doesn't penalise unfamiliar fixtures. Model retrains automatically
+  // on next bootstrap via the featureMeans-length-mismatch guard in
+  // predictionEngine.loadLatestModel.
+  try {
+    if (Number.isFinite(homeForm5) && Number.isFinite(awayForm5)) {
+      await upsertFeature(matchId, "form_diff_5game", homeForm5 - awayForm5);
+    } else {
+      await upsertFeature(matchId, "form_diff_5game", 0);
+    }
+  } catch (err) {
+    logger.debug({ err, matchId }, "form_diff_5game upsert failed");
+  }
+  try {
+    const lineupSizes = await db.execute(sql`
+      SELECT
+        (SELECT COUNT(*) FROM team_expected_xi WHERE team_name = ${homeTeam})::int AS home_size,
+        (SELECT COUNT(*) FROM team_expected_xi WHERE team_name = ${awayTeam})::int AS away_size
+    `);
+    const lr = ((lineupSizes as any).rows ?? [])[0] as { home_size: number; away_size: number } | undefined;
+    await upsertFeature(matchId, "home_lineup_xi_size", lr?.home_size ?? 11);
+    await upsertFeature(matchId, "away_lineup_xi_size", lr?.away_size ?? 11);
+  } catch (err) {
+    logger.debug({ err, matchId }, "lineup_xi_size upsert failed — defaulting to 11");
+    await upsertFeature(matchId, "home_lineup_xi_size", 11);
+    await upsertFeature(matchId, "away_lineup_xi_size", 11);
+  }
+  try {
+    const inj = await db.execute(sql`
+      WITH fx AS (
+        SELECT api_fixture_id, home_team, away_team
+        FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN ir.team_name = (SELECT home_team FROM fx) THEN 1 ELSE 0 END), 0)::int AS home_count,
+        COALESCE(SUM(CASE WHEN ir.team_name = (SELECT away_team FROM fx) THEN 1 ELSE 0 END), 0)::int AS away_count
+      FROM injury_reports ir
+      WHERE ir.api_fixture_id = (SELECT api_fixture_id FROM fx)
+    `);
+    const ir = ((inj as any).rows ?? [])[0] as { home_count: number; away_count: number } | undefined;
+    await upsertFeature(matchId, "home_injuries_count", ir?.home_count ?? 0);
+    await upsertFeature(matchId, "away_injuries_count", ir?.away_count ?? 0);
+  } catch (err) {
+    logger.debug({ err, matchId }, "injuries_count upsert failed — defaulting to 0");
+    await upsertFeature(matchId, "home_injuries_count", 0);
+    await upsertFeature(matchId, "away_injuries_count", 0);
+  }
+
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
   if (lineupPublishMins !== null) {
     await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
@@ -1130,6 +1179,55 @@ async function computeFeaturesFromDb(
   if (awayClubElo != null) await upsertFeature(matchId, "away_clubelo", awayClubElo);
   if (homeClubElo != null && awayClubElo != null) {
     await upsertFeature(matchId, "elo_diff", homeClubElo - awayClubElo);
+  }
+
+  // ── Bundle 7.F (2026-05-17): §G feature wire-in (HIGH + 5-game form) ────
+  // Each feature has a safe neutral default so missing source data
+  // doesn't penalise unfamiliar fixtures. Model retrains automatically
+  // on next bootstrap via the featureMeans-length-mismatch guard in
+  // predictionEngine.loadLatestModel.
+  try {
+    if (Number.isFinite(homeForm5) && Number.isFinite(awayForm5)) {
+      await upsertFeature(matchId, "form_diff_5game", homeForm5 - awayForm5);
+    } else {
+      await upsertFeature(matchId, "form_diff_5game", 0);
+    }
+  } catch (err) {
+    logger.debug({ err, matchId }, "form_diff_5game upsert failed");
+  }
+  try {
+    const lineupSizes = await db.execute(sql`
+      SELECT
+        (SELECT COUNT(*) FROM team_expected_xi WHERE team_name = ${homeTeam})::int AS home_size,
+        (SELECT COUNT(*) FROM team_expected_xi WHERE team_name = ${awayTeam})::int AS away_size
+    `);
+    const lr = ((lineupSizes as any).rows ?? [])[0] as { home_size: number; away_size: number } | undefined;
+    await upsertFeature(matchId, "home_lineup_xi_size", lr?.home_size ?? 11);
+    await upsertFeature(matchId, "away_lineup_xi_size", lr?.away_size ?? 11);
+  } catch (err) {
+    logger.debug({ err, matchId }, "lineup_xi_size upsert failed — defaulting to 11");
+    await upsertFeature(matchId, "home_lineup_xi_size", 11);
+    await upsertFeature(matchId, "away_lineup_xi_size", 11);
+  }
+  try {
+    const inj = await db.execute(sql`
+      WITH fx AS (
+        SELECT api_fixture_id, home_team, away_team
+        FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN ir.team_name = (SELECT home_team FROM fx) THEN 1 ELSE 0 END), 0)::int AS home_count,
+        COALESCE(SUM(CASE WHEN ir.team_name = (SELECT away_team FROM fx) THEN 1 ELSE 0 END), 0)::int AS away_count
+      FROM injury_reports ir
+      WHERE ir.api_fixture_id = (SELECT api_fixture_id FROM fx)
+    `);
+    const ir = ((inj as any).rows ?? [])[0] as { home_count: number; away_count: number } | undefined;
+    await upsertFeature(matchId, "home_injuries_count", ir?.home_count ?? 0);
+    await upsertFeature(matchId, "away_injuries_count", ir?.away_count ?? 0);
+  } catch (err) {
+    logger.debug({ err, matchId }, "injuries_count upsert failed — defaulting to 0");
+    await upsertFeature(matchId, "home_injuries_count", 0);
+    await upsertFeature(matchId, "away_injuries_count", 0);
   }
 
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
