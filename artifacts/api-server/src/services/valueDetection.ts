@@ -20,14 +20,7 @@ import { eq, desc, and, gte, lte, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { sqlIntList } from "../lib/dbHelpers";
 import { ensureExperimentRegistered, getExperimentTier } from "./promotionEngine";
-import { MARKET_TYPE_MAP } from "./betfairLive";
 
-// Sub-phase 4.B (2026-05-08): set of internal market type keys that have
-// a Betfair Exchange placement path. Pricing pipeline uses this to decide
-// whether to allow Pinnacle-as-actionable shadow capture for markets
-// without an exchange odds row. Markets not in this set are still rejected
-// at the pricing gate so we don't write dead-end shadow rows.
-const MARKET_TYPE_MAP_KEYS: Set<string> = new Set(Object.keys(MARKET_TYPE_MAP));
 import {
   predictOutcome,
   predictBtts,
@@ -806,7 +799,7 @@ import { BANNED_MARKETS } from "./paperTrading";
 
 type PriceQuote = { backOdds: number; source: string };
 type FairValueSource = "oddspapi_pinnacle" | "api_football_real:Pinnacle" | "betfair_exchange";
-type ActionableSource = "betfair_exchange" | "oddspapi_pinnacle" | "api_football_real:Pinnacle";
+type ActionableSource = "betfair_exchange";
 type RejectReason = "no_actionable_source" | "no_fair_value_source";
 type PricingResult =
   | {
@@ -819,16 +812,15 @@ type PricingResult =
     }
   | { ok: false; reason: RejectReason };
 
-// Sub-phase 4.B (2026-05-08): pricing pipeline with gated shadow-only path.
-// betfair_exchange row → use it as actionable (real-stake placeable).
-// No exchange row but marketType IS in MARKET_TYPE_MAP (graduation path
-// exists) → fall through to Pinnacle as actionable + return shadowOnly=true.
-// Markets NOT in MARKET_TYPE_MAP have no graduation path → still rejected
-// to avoid dead-end Neon writes for un-placeable markets.
+// Bundle 3 fix (2026-05-17): actionable_source is betfair_exchange ONLY.
+// Why: the prior fallback chain (Pinnacle via oddspapi/api_football when no
+// Betfair Exchange row) recorded odds_at_placement values inflated by +1.4 to
+// +2.0 vs the actual Betfair best back at write time. That fed the shadow ROI
+// anomaly (~12k shadow bets at 49% win-rate / +34% ROI in the kill-switch
+// memo §A.0). Fair-value sourcing (sharp consensus) still uses Pinnacle, but
+// the price we PLACE ON must be the exchange's real-time best back or no bet.
 function selectPricingSources(
   rows: Array<{ source?: string | null; backOdds: string | number | null }>,
-  marketType: string,
-  placeableMarketTypes: Set<string>,
 ): PricingResult {
   let exchange: PriceQuote | null = null;
   let oddspapiPinnacle: PriceQuote | null = null;
@@ -851,32 +843,15 @@ function selectPricingSources(
   const fv = oddspapiPinnacle ?? afPinnacle ?? exchange;
   if (!fv) return { ok: false, reason: "no_fair_value_source" };
 
-  if (exchange) {
-    return {
-      ok: true,
-      actionablePrice: exchange.backOdds,
-      actionableSource: "betfair_exchange",
-      fairValueOdds: fv.backOdds,
-      fairValueSource: fv.source as FairValueSource,
-      shadowOnly: false,
-    };
-  }
+  if (!exchange) return { ok: false, reason: "no_actionable_source" };
 
-  // No exchange row. Allow Pinnacle as actionable ONLY if marketType has
-  // a graduation path. Otherwise reject — shadow rows on never-placeable
-  // markets are dead-end (no path to real-stake → no Kelly-growth value).
-  if (!placeableMarketTypes.has(marketType)) {
-    return { ok: false, reason: "no_actionable_source" };
-  }
-  const actionable = oddspapiPinnacle ?? afPinnacle;
-  if (!actionable) return { ok: false, reason: "no_actionable_source" };
   return {
     ok: true,
-    actionablePrice: actionable.backOdds,
-    actionableSource: actionable.source as ActionableSource,
+    actionablePrice: exchange.backOdds,
+    actionableSource: "betfair_exchange",
     fairValueOdds: fv.backOdds,
     fairValueSource: fv.source as FairValueSource,
-    shadowOnly: true,
+    shadowOnly: false,
   };
 }
 
@@ -1446,7 +1421,7 @@ export async function detectValueBets(options?: {
         continue;
       }
 
-      const pricing = selectPricingSources(groupRows, marketType, MARKET_TYPE_MAP_KEYS);
+      const pricing = selectPricingSources(groupRows);
       if (!pricing.ok) {
         if (pricing.reason === "no_actionable_source") {
           pricingRejectNoBetfairExchange++; // legacy counter — repurposed
