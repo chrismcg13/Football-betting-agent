@@ -894,9 +894,20 @@ export async function runTradingCycle(options?: {
 
     // In paper mode use daily cap as the per-cycle limit (best N by score).
     // In live mode cap both per-cycle and daily.
-    const maxPerCycle  = paperMode ? dailySlotsLeft : Math.min(Number(cfg.max_bets_per_cycle ?? "5"), dailySlotsLeft);
-    const maxPerLeague = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_league ?? "2");
-    const maxPerMarket = paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_market ?? "2");
+    // Bundle 7.C (2026-05-17): when inversion_pipeline_enabled=true, the
+    // three cron-level diversity caps are uncapped — the Bundle 7.D
+    // prioritiser + Bundle 5.M exposure caps (per-fixture/league/daily)
+    // govern allocation. Pre-flip, behaviour unchanged.
+    const inversionBypassCronCaps = await (await import("./inversionGateBypass")).shouldBypassCronCap();
+    const maxPerCycle  = inversionBypassCronCaps
+      ? Number.MAX_SAFE_INTEGER
+      : (paperMode ? dailySlotsLeft : Math.min(Number(cfg.max_bets_per_cycle ?? "5"), dailySlotsLeft));
+    const maxPerLeague = inversionBypassCronCaps
+      ? Number.MAX_SAFE_INTEGER
+      : (paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_league ?? "2"));
+    const maxPerMarket = inversionBypassCronCaps
+      ? Number.MAX_SAFE_INTEGER
+      : (paperMode ? Number.MAX_SAFE_INTEGER : Number(cfg.max_bets_per_market ?? "2"));
     // Contrarian penalty removed — all bets use minScore threshold (dev data shows +18.4% ROI on contrarian bets)
 
     if (paperMode) {
@@ -2432,6 +2443,27 @@ export function startSettlementCron(): void {
     })();
   }, { timezone: "UTC" });
   logger.info("Bundle 7.0: watch-priority retention pruner active — daily 04:30 UTC");
+
+  // ── Bundle 7.B (2026-05-17): Stage 1 model-blind watchlist ──────────────
+  // Every 5 min, enumerates sharp-anchored candidates from three UNION
+  // signals: liquidity > £500, kickoff < 24h with Pinnacle, qualifying
+  // mover (4%/30min + 4-condition filter). D3 ships the emission +
+  // observability; D4 wires the prioritiser to consume the list and
+  // route through placePaperBet.
+  cron.schedule("*/5 * * * *", () => {
+    void (async () => {
+      try {
+        const { runStage1Watchlist } = await import("./stage1Watchlist");
+        const r = await runStage1Watchlist();
+        if (r.errors > 0 || r.candidates_emitted > 0) {
+          logger.info(r, "Stage 1 watchlist tick");
+        }
+      } catch (err) {
+        logger.error({ err }, "Stage 1 watchlist failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle 7.B: Stage 1 watchlist cron active — every 5 min UTC");
 
   // ── Bundle 5.L (2026-05-17): CLV circuit breaker ─────────────────────────
   // Every 15 min, evaluate per-market_type rolling stake-weighted CLV. If

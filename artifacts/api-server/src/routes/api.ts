@@ -7050,6 +7050,18 @@ router.post("/admin/phase-0-dedupe-and-backfill", async (_req, res) => {
   }
 });
 
+// ─── Bundle 7.B (2026-05-17) — Stage 1 watchlist admin endpoint ─────────
+router.post("/admin/run-stage1-watchlist", async (_req, res) => {
+  try {
+    const { runStage1Watchlist } = await import("../services/stage1Watchlist");
+    const result = await runStage1Watchlist();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "run-stage1-watchlist failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // ─── Bundle 7.0 (2026-05-17) — Stage 0 watch-priority admin endpoints ──
 // Unit test runner — verifies the R1-preserving rule (model is
 // accelerator, never veto) on the live deployed code. Safe to call any

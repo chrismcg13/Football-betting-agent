@@ -220,6 +220,12 @@ export async function checkLivePlacementGates(args: {
   // proceed with other gates) and a warning is logged — caller should
   // always pass it now that the SELECT includes kickoffTime.
   kickoffTime?: Date | null;
+  // Bundle 7.C (2026-05-17): caller passes pinnacleImplied so the
+  // sharp-anchor proxy can decide whether to bypass the
+  // live_placement_disabled_market_types / disabled_leagues lists when
+  // inversion_pipeline_enabled = true. Optional for backward-compat;
+  // missing = treat as model_only (gates apply as today).
+  pinnacleImplied?: number | null;
 }): Promise<LivePlacementCheck> {
   const enabled = await isLivePlacementEnabled();
   if (!enabled) {
@@ -237,9 +243,22 @@ export async function checkLivePlacementGates(args: {
     };
   }
 
+  // Bundle 7.C (2026-05-17): for sharp-anchored candidates with the
+  // inversion flag on, the disabled-market and disabled-league lists
+  // are bypassed. R5: Pinnacle coverage IS the live eligibility
+  // criterion when sharp-anchored. Pre-flip, behaviour unchanged.
+  const bypassDisabledLists = await (async () => {
+    try {
+      const { shouldBypassUpstreamGate } = await import("./inversionGateBypass");
+      return await shouldBypassUpstreamGate({ pinnacleImplied: args.pinnacleImplied ?? null });
+    } catch {
+      return false;
+    }
+  })();
+
   // Per-market-type kill switch — see getDisabledMarkets() above.
   const disabled = await getDisabledMarkets();
-  if (disabled.has(args.marketType.toUpperCase())) {
+  if (!bypassDisabledLists && disabled.has(args.marketType.toUpperCase())) {
     if (args.betId) {
       logger.info(
         { betId: args.betId, marketType: args.marketType, league: args.league },
@@ -259,7 +278,7 @@ export async function checkLivePlacementGates(args: {
   // FIX 1 (most demoted-league bets are 24h+ out and would be filtered by
   // FIX 1 anyway, but the explicit list catches a <24h bet on these scopes).
   const disabledLeagues = await getDisabledLeagues();
-  if (args.league && disabledLeagues.has(args.league.toLowerCase())) {
+  if (!bypassDisabledLists && args.league && disabledLeagues.has(args.league.toLowerCase())) {
     if (args.betId) {
       logger.info(
         { betId: args.betId, marketType: args.marketType, league: args.league },

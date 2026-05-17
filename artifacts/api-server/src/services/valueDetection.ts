@@ -1623,10 +1623,26 @@ export async function detectValueBets(options?: {
       // shadowOnly is still honoured: non-exchange price sources can't
       // place real money, so we force shadow regardless of tier or score.
       const effectiveMinScore = resolveScoped("min_opportunity_score", match.league ?? "", oddsRow.marketType, minOppScore);
+      // Bundle 7.C (2026-05-17): when inversion_pipeline_enabled=true AND
+      // this candidate has a SHARP anchor (fvDegenerate=false means a
+      // non-exchange sharp like Pinnacle priced the fair value), bypass
+      // min_opportunity_score + min_edge_threshold. The inversion gate
+      // (Bundle 5) is the authority for sharp-anchored placement.
+      // Model-only candidates (fvDegenerate=true, sharp fair-value
+      // unavailable) still face both gates as the learning rail.
+      const sharpAnchorProxy = fvDegenerate ? null : (1 / fairValueOdds);
+      const inversionBypassPerCandidate = await (async () => {
+        try {
+          const { shouldBypassUpstreamGate } = await import("./inversionGateBypass");
+          return await shouldBypassUpstreamGate({ pinnacleImplied: sharpAnchorProxy });
+        } catch {
+          return false;
+        }
+      })();
       const meetsProduction =
         !shadowOnly &&
-        opportunityScore >= effectiveMinScore &&
-        edge >= effectiveMinEdge;
+        (inversionBypassPerCandidate || opportunityScore >= effectiveMinScore) &&
+        (inversionBypassPerCandidate || edge >= effectiveMinEdge);
       const meetsShadow = opportunityScore >= shadowMinOppScore;
       // Production-track bets respect the cold-market cooldown (capital-risk
       // gate). Shadow-track bypasses — that's how the model relearns whether
