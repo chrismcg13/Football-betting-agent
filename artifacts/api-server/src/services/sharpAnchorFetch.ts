@@ -264,15 +264,39 @@ export async function fetchSharpAnchors(input: SharpAnchorInput): Promise<SharpA
   }
 
   if (fresh.length === 0) {
-    // Response was OK but no matching selection — the line might not exist for
-    // this book or the parser slug mapping is off. Don't write anything.
+    // Response was OK but no matching selection — either the requested books
+    // didn't price this exact line, OR the parser's outcome-id format
+    // assumptions (built for Pinnacle's "<line>/home"/"<line>/away" labels)
+    // don't hold for Singbet/SBOBet/Bet365/1xBet. Diagnostic dump: how many
+    // selections each requested book returned + sample outcome labels for
+    // the target marketType. This is what we need to debug parser/coverage
+    // mismatches on the next free-tier call.
+    const diagnostic = books
+      .filter((bm) => niches.includes(getBookmakerSlug(bm) as SharpBookSlug))
+      .map((bm) => {
+        const slug = getBookmakerSlug(bm);
+        const sels = extractSelections(bm);
+        const wanted = MARKET_IDS[input.marketType];
+        const inTargetMarket = wanted
+          ? sels.filter((s) => s.marketKey === String(wanted))
+          : sels;
+        return {
+          slug,
+          totalSelections: sels.length,
+          inTargetMarket: inTargetMarket.length,
+          sampleLabelsInTarget: inTargetMarket.slice(0, 6).map((s) => s.label),
+          sampleMarketKeys: [...new Set(sels.map((s) => s.marketKey).filter(Boolean))].slice(0, 8),
+        };
+      });
     logger.warn(
       {
         matchId: input.matchId,
         marketType: input.marketType,
         selectionName: input.selectionName,
+        wantedMarketId: MARKET_IDS[input.marketType] ?? null,
         niches,
         booksInResponse: books.map(getBookmakerSlug),
+        diagnostic,
       },
       "sharpAnchorFetch: no matching selection in free-tier response",
     );
