@@ -4383,6 +4383,54 @@ export async function runMigrations() {
     `);
     logger.info("Bundle 5.I: v_slippage_p75_rolling view ready");
 
+    // ── Bundle 5.L (2026-05-17): per-market_type CLV health view ────────────
+    // Rolling last-100 settled bets per market_type on the cutover universe.
+    // Stake-weighted CLV is the leading indicator of edge decay (memo
+    // Principle 5). The CLV circuit breaker cron reads this view every
+    // 15 min; if stake_weighted_clv_pct drops below
+    // clv_circuit_breaker_threshold (default 0.0) for a market_type, the
+    // cron sets agent_config.clv_paused_<market_type> = 'true' and the
+    // inversion gate demotes shadow on that market_type. Manual unpause
+    // via /api/admin/set-config.
+    //
+    // Same universe filter as v_market_type_mean_bias_rolling (Bundle 5.B):
+    // cutover-clean, post-Bundle-3 fix, settled with non-null clv_pct.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_clv_health_rolling AS
+      WITH ranked AS (
+        SELECT
+          market_type,
+          stake::float8 AS stake,
+          clv_pct::float8 AS clv_pct,
+          placed_at,
+          ROW_NUMBER() OVER (PARTITION BY market_type ORDER BY placed_at DESC) AS rn
+        FROM paper_bets
+        WHERE bet_track IN ('live','shadow')
+          AND legacy_regime = false
+          AND placed_at >= TIMESTAMP WITH TIME ZONE '2026-05-17 08:40:00+00'
+          AND clv_pct IS NOT NULL
+          AND status IN ('won','lost','void')
+          AND deleted_at IS NULL
+      )
+      SELECT
+        market_type,
+        COUNT(*)::int AS n,
+        AVG(clv_pct)::numeric AS mean_clv_pct,
+        CASE
+          WHEN SUM(stake) > 0
+            THEN (SUM(stake * clv_pct) / SUM(stake))::numeric
+          ELSE AVG(clv_pct)::numeric
+        END AS stake_weighted_clv_pct,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY clv_pct)::numeric AS p25_clv_pct,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY clv_pct)::numeric AS p75_clv_pct,
+        MIN(placed_at) AS window_oldest,
+        MAX(placed_at) AS window_newest
+      FROM ranked
+      WHERE rn <= 100
+      GROUP BY market_type
+    `);
+    logger.info("Bundle 5.L: v_clv_health_rolling view ready");
+
     // ── Bundle 5.N (2026-05-17): seed inversion-pipeline config keys ──────
     // Nine new operator-tunable keys, defaults match the locked spec
     // (docs/bundle-5-activation-spec.md). Plus the activation switch (kept

@@ -603,14 +603,23 @@ async function evaluateHighEdgeIntegrity(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Stage 1 — model-blind watchlist eligibility
+// Stage 1 — model-blind watchlist eligibility + CLV-breaker market pause
 // ──────────────────────────────────────────────────────────────────────────
 
-function evaluateStage1(
+async function evaluateStage1(
   candidate: InversionCandidate,
-): { ok: true } | { ok: false; reason: string } {
+): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (candidate.stage1Source === "legacy_model_candidate") {
     return { ok: false, reason: "stage1_model_filtered" };
+  }
+  // Bundle 5.L — CLV circuit breaker. The 15-min cron writes
+  // clv_paused_<MARKET_TYPE>='true' when rolling stake-weighted CLV on a
+  // market_type drops below clv_circuit_breaker_threshold. Demote shadow
+  // until manual unpause.
+  const pauseKey = `clv_paused_${candidate.marketType.toUpperCase()}`;
+  const pauseRaw = (await getConfigValue(pauseKey))?.toLowerCase()?.trim();
+  if (pauseRaw === "true") {
+    return { ok: false, reason: "clv_breaker_market_paused" };
   }
   return { ok: true };
 }
@@ -806,7 +815,7 @@ export async function evaluateInversionGate(
   const thresholds = await readThresholds();
 
   // Stage 1 — model-blind watchlist eligibility
-  const stage1 = evaluateStage1(candidate);
+  const stage1 = await evaluateStage1(candidate);
 
   // Bundle 5.C — multi-book reader (informational at Stage 2; fed into
   // diagnostics whether or not we end up using it for the decision).

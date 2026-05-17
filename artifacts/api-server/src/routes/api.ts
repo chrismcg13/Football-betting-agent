@@ -7050,6 +7050,21 @@ router.post("/admin/phase-0-dedupe-and-backfill", async (_req, res) => {
   }
 });
 
+// ─── Bundle 5.L (2026-05-17) — manual trigger for CLV circuit breaker ──
+// Same logic as the 15-min cron, useful for ops to force a check after
+// changing clv_circuit_breaker_threshold or for one-off audits.
+// Idempotent — running it back-to-back without new CLV data is a no-op.
+router.post("/admin/run-clv-circuit-breaker", async (_req, res) => {
+  try {
+    const { runClvCircuitBreaker } = await import("../services/clvCircuitBreaker");
+    const result = await runClvCircuitBreaker();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "run-clv-circuit-breaker failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // ─── Bundle 5.F (2026-05-17) — inversion-gate one-shot inspector ─────────
 // Debug endpoint. Given a candidate, returns the inversion gate's decision
 // and full diagnostics without firing a placement. Reads from

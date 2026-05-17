@@ -2394,6 +2394,35 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Lazy shadow→paper promoter active — every 5 min UTC");
 
+  // ── Bundle 5.L (2026-05-17): CLV circuit breaker ─────────────────────────
+  // Every 15 min, evaluate per-market_type rolling stake-weighted CLV. If
+  // any market_type drops below clv_circuit_breaker_threshold (default 0.0
+  // pp), set agent_config.clv_paused_<market_type>='true' and the
+  // inversion gate demotes shadow on that market_type. Auto-pause, manual
+  // unpause — incidents force a human review before re-engagement.
+  // Pre-activation (inversion flag off), the flag is written but the gate
+  // is shadow-only so placement isn't affected. Post-activation the same
+  // flag silently gates real placement.
+  cron.schedule("*/15 * * * *", () => {
+    void (async () => {
+      try {
+        const { runClvCircuitBreaker } = await import("./clvCircuitBreaker");
+        const r = await runClvCircuitBreaker();
+        if (
+          r.markets_paused_now.length > 0 ||
+          r.markets_already_paused.length > 0
+        ) {
+          logger.warn(r, "CLV circuit breaker pass — flag state");
+        } else if (r.markets_evaluated > 0) {
+          logger.info(r, "CLV circuit breaker pass — all healthy");
+        }
+      } catch (err) {
+        logger.error({ err }, "CLV circuit breaker failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("CLV circuit breaker active — every 15 min UTC");
+
   // Phase 3 Path C+ (2026-05-08): pre-kickoff feature refresh. Every 15 min,
   // force re-computation of features for matches kicking off within 90 min
   // that have pending bets. Default features cron runs every 6h with 2h
