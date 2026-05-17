@@ -4288,7 +4288,12 @@ export async function runMigrations() {
     // Universe filter (matches the memo's cutover anchor):
     //   bet_track IN ('live','shadow')
     //   AND legacy_regime = false
-    //   AND placed_at >= '2026-05-17'  -- post Bundle 3 selectPricingSources fix
+    //   AND placed_at >= '2026-05-17 08:40:00 UTC'
+    //       Bundle 3 selectPricingSources fix (commit a209758) was committed
+    //       at 07:40:44 UTC and deployed shortly after. 08:40 UTC is the
+    //       conservative post-deploy floor that guarantees every row in the
+    //       universe has clean odds_at_placement (no Pinnacle/oddspapi
+    //       fallback contamination on shadow rows).
     //   AND pinnacle_implied IS NOT NULL AND pinnacle_implied > 0
     //   AND model_probability IS NOT NULL
     //   AND status IN ('won','lost','void')
@@ -4308,7 +4313,7 @@ export async function runMigrations() {
         FROM paper_bets
         WHERE bet_track IN ('live','shadow')
           AND legacy_regime = false
-          AND placed_at >= TIMESTAMP '2026-05-17 00:00:00'
+          AND placed_at >= TIMESTAMP WITH TIME ZONE '2026-05-17 08:40:00+00'
           AND pinnacle_implied IS NOT NULL AND pinnacle_implied > 0
           AND model_probability IS NOT NULL
           AND status IN ('won','lost','void')

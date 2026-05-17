@@ -156,7 +156,7 @@ async function readThresholds(): Promise<InversionThresholds> {
 //
 // Universe filter (encoded in the view):
 //   bet_track IN ('live','shadow') AND legacy_regime = false
-//   AND placed_at >= '2026-05-17'  -- post Bundle 3 selectPricingSources fix
+//   AND placed_at >= '2026-05-17 08:40:00 UTC'  -- post Bundle 3 deploy
 //   AND pinnacle_implied IS NOT NULL
 //   AND model_probability IS NOT NULL
 //   AND status IN ('won','lost','void')
