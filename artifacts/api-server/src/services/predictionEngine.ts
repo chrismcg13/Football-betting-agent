@@ -504,19 +504,43 @@ export async function loadLatestModel(): Promise<boolean> {
   // sized for the old vector cannot score new feature rows — refuse
   // to load and let the startup path fall through to bootstrapModels,
   // which retrains with the current feature shape.
-  if (
-    !Array.isArray(w.featureMeans) ||
-    w.featureMeans.length !== FEATURE_NAMES.length
-  ) {
+  //
+  // Bundle 8.0 (2026-05-17): when FEATURE_NAMES grows again, the
+  // bootstrap path may fail to produce a new model (e.g. football-data
+  // returns 0 historical samples — production hit this on the 15→21
+  // expansion). To avoid a degraded period where currentModel is null
+  // entirely, ACCEPT a persisted model whose feature count is LESS THAN
+  // FEATURE_NAMES.length: callers will slice their feature vectors to
+  // the persisted length, effectively ignoring the new features until
+  // the loop-retrain cycle produces a fresh full-shape model. New
+  // features keep being upserted to the features table — they just
+  // don't influence inference until the model is retrained on them.
+  //
+  // Hard reject only when persisted EXCEEDS FEATURE_NAMES.length —
+  // that's a true mismatch (removed features), still unrecoverable.
+  const persistedLen = w.featureMeans?.length ?? -1;
+  const currentLen = FEATURE_NAMES.length;
+  if (!Array.isArray(w.featureMeans) || persistedLen > currentLen) {
     logger.warn(
       {
         version: row.modelVersion,
-        persistedFeatures: w.featureMeans?.length ?? null,
-        currentFeatures: FEATURE_NAMES.length,
+        persistedFeatures: persistedLen,
+        currentFeatures: currentLen,
       },
-      "Persisted model feature count is stale — triggering retrain via bootstrap",
+      "Persisted model has MORE features than FEATURE_NAMES — unrecoverable; triggering bootstrap",
     );
     return false;
+  }
+  if (persistedLen < currentLen) {
+    logger.warn(
+      {
+        version: row.modelVersion,
+        persistedFeatures: persistedLen,
+        currentFeatures: currentLen,
+        sliceWindow: persistedLen,
+      },
+      "Persisted model feature count is short of FEATURE_NAMES — loading anyway with sliced inference vector. New features ignored until loop-retrain.",
+    );
   }
 
   try {

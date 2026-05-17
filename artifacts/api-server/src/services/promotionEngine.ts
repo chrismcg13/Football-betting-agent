@@ -328,9 +328,9 @@ async function computeMetricsForExperiment(experimentTag: string, tierFilter?: s
       -- LN clip at 0.001 prevents -∞ on full losses.
       COALESCE(SUM(
         LN(GREATEST(0.001,
-          (COALESCE(NULLIF(stake::numeric, 0), shadow_stake::numeric, 1) +
+          (COALESCE(NULLIF(stake::numeric, 0), NULLIF(shadow_stake::numeric, 0), 1) +
            COALESCE(NULLIF(settlement_pnl::numeric, 0), shadow_pnl::numeric, 0)) /
-          COALESCE(NULLIF(stake::numeric, 0), shadow_stake::numeric, 1)
+          COALESCE(NULLIF(stake::numeric, 0), NULLIF(shadow_stake::numeric, 0), 1)
         ))
       ) FILTER (WHERE status IN ('won', 'lost')), 0) as sum_log_growth,
       COUNT(*) FILTER (
@@ -339,9 +339,9 @@ async function computeMetricsForExperiment(experimentTag: string, tierFilter?: s
       ) as settled_30d,
       COALESCE(SUM(
         LN(GREATEST(0.001,
-          (COALESCE(NULLIF(stake::numeric, 0), shadow_stake::numeric, 1) +
+          (COALESCE(NULLIF(stake::numeric, 0), NULLIF(shadow_stake::numeric, 0), 1) +
            COALESCE(NULLIF(settlement_pnl::numeric, 0), shadow_pnl::numeric, 0)) /
-          COALESCE(NULLIF(stake::numeric, 0), shadow_stake::numeric, 1)
+          COALESCE(NULLIF(stake::numeric, 0), NULLIF(shadow_stake::numeric, 0), 1)
         ))
       ) FILTER (
         WHERE status IN ('won', 'lost')
