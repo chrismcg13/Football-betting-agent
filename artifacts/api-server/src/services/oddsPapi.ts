@@ -151,7 +151,7 @@ async function getEffectiveDailyCap(): Promise<number> {
 //   108 = First Half Over/Under (all lines)
 //   112 = Cards Over/Under
 //   113 = Corners Over/Under
-const MARKET_IDS: Record<string, number> = {
+export const MARKET_IDS: Record<string, number> = {
   MATCH_ODDS: 101,
   OVER_UNDER_05: 102,
   OVER_UNDER_15: 102,
@@ -1977,7 +1977,7 @@ interface RawMarket {
   outcomes?: Record<string, RawOutcome>;
 }
 
-interface RawBookmakerOdds {
+export interface RawBookmakerOdds {
   bookmakerSlug?: string;
   bookmakerName?: string;
   bookmakerIsActive?: boolean;
@@ -1992,7 +1992,7 @@ interface RawBookmakerOdds {
   selections?: RawOddsSelection[];
 }
 
-interface RawOddsSelection {
+export interface RawOddsSelection {
   selection?: string;
   label?: string;
   name?: string;
@@ -2011,7 +2011,7 @@ interface RawOddsSelection {
   outcomeKey?: string;
 }
 
-interface RawOddsResponse {
+export interface RawOddsResponse {
   // New format: object keyed by bookmaker slug
   bookmakerOdds?: Record<string, Omit<RawBookmakerOdds, "bookmakerSlug" | "bookmakerName">> | RawBookmakerOdds[];
   // Legacy array formats
@@ -2054,7 +2054,7 @@ function getGenericSelectionKeys(marketType: string): string[] {
   return ["Home", "Draw", "Away", "Yes", "No", "Over", "Under", "1X", "X2", "12"];
 }
 
-function getSelectionOdds(
+export function getSelectionOdds(
   selections: RawOddsSelection[],
   marketType: string,
   selectionName: string,
@@ -2244,7 +2244,7 @@ function logUnknownLabel(marketType: string, label: string, selectionName: strin
   }
 }
 
-function extractSelections(bm: RawBookmakerOdds): RawOddsSelection[] {
+export function extractSelections(bm: RawBookmakerOdds): RawOddsSelection[] {
   const markets = bm.markets;
 
   // ── New OddsPapi format: markets is Record<marketId, RawMarket> ──
@@ -2284,7 +2284,7 @@ function extractSelections(bm: RawBookmakerOdds): RawOddsSelection[] {
   return [];
 }
 
-function getBookmakerSlug(bm: RawBookmakerOdds): string {
+export function getBookmakerSlug(bm: RawBookmakerOdds): string {
   return (bm.bookmakerSlug ?? bm.slug ?? bm.bookmaker ?? bm.bookmakerName ?? bm.name ?? "").toLowerCase();
 }
 
@@ -2293,7 +2293,7 @@ function getBookmakerName(bm: RawBookmakerOdds): string {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-function extractBookmakers(raw: RawOddsResponse): RawBookmakerOdds[] {
+export function extractBookmakers(raw: RawOddsResponse): RawBookmakerOdds[] {
   const bOdds = raw.bookmakerOdds;
 
   // ── New OddsPapi format: bookmakerOdds is object keyed by bookmaker slug ──

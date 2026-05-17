@@ -2723,6 +2723,51 @@ export async function placePaperBet(
     );
   }
 
+  // ── Bundle 1 E.3 (2026-05-17): niche-aligned sharp-anchor fetch ──────────
+  // Synchronous-within-cycle. Non-qualifying candidates skip the IO entirely
+  // (outcome='no_niche_qualifies'); qualifying candidates spend at most one
+  // free-tier OddsPapi request (~200-400ms) to add Singbet/SBOBet on AH or
+  // Bet365/1xBet on PINNACLE-ABSENT MO/OU/BTTS. Rows are written to
+  // pinnacle_odds_snapshots with bookmaker_slug per book so the Bundle 5
+  // inversion gate can read multi-book agreement at placement time. Failure
+  // modes (budget exhausted, missing key, parse failure) degrade silently to
+  // Pinnacle-only — they never block the bet from being recorded.
+  try {
+    const { fetchSharpAnchors, lookupOddspapiFixtureId } = await import("./sharpAnchorFetch");
+    const oddspapiFixtureId = await lookupOddspapiFixtureId(matchId);
+    const pinnacleImpliedNum = pinnacleImplied ?? null;
+    const pinnacleEdgePp =
+      pinnacleImpliedNum != null && pinnacleImpliedNum > 0
+        ? (backOdds * pinnacleImpliedNum - 1) * 100
+        : -Infinity;
+    const sharpResult = await fetchSharpAnchors({
+      matchId,
+      marketType,
+      selectionName,
+      pinnacleImplied: pinnacleImpliedNum,
+      pinnacleEdgePp,
+      oddspapiFixtureId,
+    });
+    if (sharpResult.outcome === "fetched" || sharpResult.outcome === "cached") {
+      logger.info(
+        {
+          matchId,
+          marketType,
+          selectionName,
+          outcome: sharpResult.outcome,
+          niches: sharpResult.niches,
+          bookCount: sharpResult.prices.length,
+          budgetSpent: sharpResult.budgetSpent,
+          pinnacleEdgePp: Number(pinnacleEdgePp.toFixed(2)),
+        },
+        "sharpAnchorFetch: multi-book anchors recorded",
+      );
+    }
+  } catch (err) {
+    // Never block placement on sharp-anchor errors.
+    logger.warn({ err, matchId, marketType, selectionName }, "sharpAnchorFetch threw — Pinnacle-only fallback");
+  }
+
   const { pool } = await import("@workspace/db");
   const pgClient = await pool.connect();
   let bet: any;
