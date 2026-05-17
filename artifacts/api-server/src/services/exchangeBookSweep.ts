@@ -295,9 +295,14 @@ export async function runExchangeBookSweep(
         const homeTeamLower = ctx.match.homeTeam.toLowerCase();
         const awayTeamLower = ctx.match.awayTeam.toLowerCase();
         const catRunners = ctx.catalogue.runners ?? [];
-        // Pass 1: exact name match
+        // Pass 1: exact name match. Defensive null-coalesce on runnerName:
+        // some Betfair AH runner entries arrive without runnerName populated
+        // (handicap-line metadata only) and the previous .trim() call crashed
+        // the entire scheduler cron via unhandled rejection (683 restart-loop
+        // bursts observed 2026-05-17).
         for (const r of catRunners) {
-          const nameLower = r.runnerName.trim().toLowerCase();
+          const nameLower = (r.runnerName ?? "").trim().toLowerCase();
+          if (!nameLower) continue;
           if (homeSelectionId === null && nameLower === homeTeamLower) {
             homeSelectionId = r.selectionId;
           }
@@ -308,7 +313,8 @@ export async function runExchangeBookSweep(
         // Pass 2: prefix / contains match (handles "Torque" vs "Atletico Torque")
         if (homeSelectionId === null || awaySelectionId === null) {
           for (const r of catRunners) {
-            const nameLower = r.runnerName.trim().toLowerCase();
+            const nameLower = (r.runnerName ?? "").trim().toLowerCase();
+            if (!nameLower) continue;
             if (homeSelectionId === null && (
               homeTeamLower.includes(nameLower) || nameLower.includes(homeTeamLower)
             )) homeSelectionId = r.selectionId;
