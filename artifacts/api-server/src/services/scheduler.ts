@@ -2405,7 +2405,9 @@ export function startSettlementCron(): void {
       try {
         const { runWatchPriorityCron } = await import("./watchPriorityCron");
         const r = await runWatchPriorityCron();
-        if (r.fixtures_evaluated > 0) {
+        if (r.errors > 0) {
+          logger.warn(r, "Watch-priority cron tick — completed with errors");
+        } else if (r.fixtures_evaluated > 0) {
           logger.info(r, "Watch-priority cron tick");
         }
       } catch (err) {

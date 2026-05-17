@@ -4500,21 +4500,50 @@ export async function runMigrations() {
     // table itself doesn't enforce a TTL so old rows can be reviewed for
     // weight re-tune Bayesian optimisation.
 
-    // universe_markets: per (league × market_type) catalogue derived from
-    // historical pinnacle_odds_snapshots — used by the daily universe cron
-    // to know which market types each league supports. Premier League
-    // supports MO/OU/BTTS/AH/Cards/Corners; K-League 1 supports MO/OU/AH
-    // only. Saves polling effort on markets the bookmaker won't price.
+    // league_market_catalogue: per (league × market_type) catalogue derived
+    // from historical pinnacle_odds_snapshots — used by Stage 0 to know
+    // which market types each league supports. Premier League supports
+    // MO/OU/BTTS/AH/Cards/Corners; K-League 1 supports MO/OU/AH only.
+    // Saves polling effort on markets the bookmaker won't price.
+    //
+    // 2026-05-17 hotfix: matches table doesn't have league_id (int) —
+    // only league (text). Re-keyed on league text so the cron's JOIN
+    // works against matches.league directly. Original CREATE was empty
+    // so no data lost on schema swap.
+    await db.execute(sql`DROP TABLE IF EXISTS league_market_catalogue`);
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS league_market_catalogue (
-        league_id INTEGER NOT NULL,
+        league TEXT NOT NULL,
         market_type TEXT NOT NULL,
         first_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
         last_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
         sample_count INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (league_id, market_type)
+        PRIMARY KEY (league, market_type)
       )
     `);
+    // Seed from historical pinnacle_odds_snapshots — every (league ×
+    // market_type) with ≥5 snapshots in the last 60 days. Idempotent
+    // via ON CONFLICT: re-running the migration refreshes counts +
+    // last_seen, never duplicates.
+    await db.execute(sql`
+      INSERT INTO league_market_catalogue (league, market_type, first_seen, last_seen, sample_count)
+      SELECT
+        m.league,
+        s.market_type,
+        MIN(s.captured_at) AS first_seen,
+        MAX(s.captured_at) AS last_seen,
+        COUNT(*)::int AS sample_count
+      FROM pinnacle_odds_snapshots s
+      JOIN matches m ON m.id = s.match_id
+      WHERE m.league IS NOT NULL
+        AND s.captured_at >= NOW() - INTERVAL '60 days'
+      GROUP BY m.league, s.market_type
+      HAVING COUNT(*) >= 5
+      ON CONFLICT (league, market_type) DO UPDATE SET
+        last_seen = EXCLUDED.last_seen,
+        sample_count = EXCLUDED.sample_count
+    `);
+    logger.info("Bundle 7.0 hotfix: league_market_catalogue re-keyed on league text + seeded from pinnacle snapshots");
 
     // Scope CLV rolling view — the closed learning loop. Rolling
     // 100-bet stake-weighted CLV per (league × market_type × ttk_bucket).

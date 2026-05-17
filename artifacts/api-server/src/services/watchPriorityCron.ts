@@ -113,27 +113,55 @@ export async function runWatchPriorityCron(): Promise<WatchPriorityCronResult> {
   // matches without a league_id catalogue row fall back to MATCH_ODDS.
   let activeRows: ActiveFixtureRow[] = [];
   try {
+    // 2026-05-17 hotfix: matches table has neither deleted_at nor
+    // league_id. Keyed on league text instead.
+    //
+    // Active universe: fixtures kicking off in the [-1h, +7d] window.
+    // Each fixture cross-joined with its supported market_types from
+    // league_market_catalogue (seeded from historical pinnacle snapshots).
+    // Fixtures whose league has no catalogue rows fall back to
+    // ['MATCH_ODDS'] — every Pinnacle-covered league prices MO so it's
+    // a safe default.
     const r = await db.execute(sql`
       WITH active AS (
         SELECT
           m.id AS fixture_id,
           m.league,
-          m.league_id,
           EXTRACT(EPOCH FROM (m.kickoff_time - NOW())) / 3600.0 AS hours_to_kickoff
         FROM matches m
         WHERE m.kickoff_time IS NOT NULL
           AND m.kickoff_time >= NOW() - INTERVAL '1 hour'
           AND m.kickoff_time <= NOW() + INTERVAL '7 days'
-          AND m.deleted_at IS NULL
+      ),
+      league_markets AS (
+        SELECT league, market_type
+        FROM league_market_catalogue
+        WHERE sample_count >= 5
+      ),
+      catalogued AS (
+        SELECT
+          a.fixture_id,
+          a.league,
+          lm.market_type,
+          a.hours_to_kickoff::float8 AS hours_to_kickoff
+        FROM active a
+        JOIN league_markets lm ON lm.league = a.league
+      ),
+      uncatalogued AS (
+        -- Leagues with no catalogue entries → default to MATCH_ODDS only
+        SELECT
+          a.fixture_id,
+          a.league,
+          'MATCH_ODDS'::text AS market_type,
+          a.hours_to_kickoff::float8 AS hours_to_kickoff
+        FROM active a
+        WHERE NOT EXISTS (
+          SELECT 1 FROM league_markets lm WHERE lm.league = a.league
+        )
       )
-      SELECT
-        a.fixture_id,
-        a.league,
-        COALESCE(c.market_type, 'MATCH_ODDS') AS market_type,
-        a.hours_to_kickoff::float8 AS hours_to_kickoff
-      FROM active a
-      LEFT JOIN league_market_catalogue c
-        ON c.league_id = a.league_id AND c.sample_count >= 5
+      SELECT * FROM catalogued
+      UNION ALL
+      SELECT * FROM uncatalogued
     `);
     activeRows = ((r as any).rows ?? []) as ActiveFixtureRow[];
   } catch (err) {
