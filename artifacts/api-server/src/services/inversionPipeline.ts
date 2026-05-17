@@ -80,8 +80,16 @@ export type Stage1Source =
   | "legacy_model_candidate"; // present for migration; auto-rejects in Stage 1
 
 export type InversionDecision =
-  | { action: "PROCEED"; kellyMultiplier: 1.0; reasons: string[]; diagnostics: InversionDiagnostics }
-  | { action: "DOWN_SIZE_HALF"; kellyMultiplier: 0.5; reasons: string[]; diagnostics: InversionDiagnostics }
+  | {
+      action: "PROCEED";
+      /**
+       * Bundle 5.J — driven by sharp-count tier, not the legacy fixed 1.0×.
+       * 0.5 (1 sharp) | 1.0 (2 sharps) | 1.0 (3 sharps + HIGH_CONVICTION).
+       */
+      kellyMultiplier: number;
+      reasons: string[];
+      diagnostics: InversionDiagnostics;
+    }
   | { action: "VETO"; reasons: string[]; diagnostics: InversionDiagnostics }
   | { action: "DEMOTE_SHADOW"; reasons: string[]; diagnostics: InversionDiagnostics };
 
@@ -101,6 +109,10 @@ export interface InversionDiagnostics {
   pinnacleImplied: number | null;
   multiBookConsensusP: number | null;
   multiBookCount: number;
+  /** Bundle 5.J — count of sharps agreeing with Pinnacle (within 1pp implied, same direction). */
+  sharpCount: number;
+  agreeingSlugs: string[];
+  isHighConviction: boolean;
   disagreementPp: number | null;
   disagreementZ: number | null;
   stage1Source: Stage1Source;
@@ -132,6 +144,10 @@ export interface InversionThresholds {
   slippageCautionThreshold: number;
   /** Fallback p75_slippage (fraction) when neither cell nor market aggregate has n>=30. */
   defaultP75Slippage: number;
+  /** Bundle 5.J — Kelly tier multipliers per agreeing-sharp count. */
+  kellySingleSharp: number;
+  kellyTwoSharps: number;
+  kellyThreeSharps: number;
 }
 
 export interface InversionCandidate {
@@ -175,6 +191,9 @@ async function readThresholds(): Promise<InversionThresholds> {
     meanBiasWindowN: await num("mean_bias_window_n", 200),
     slippageCautionThreshold: await num("slippage_caution_threshold", 0.05),
     defaultP75Slippage: await num("default_p75_slippage", 0.015),
+    kellySingleSharp: await num("kelly_multiplier_single_sharp", 0.5),
+    kellyTwoSharps: await num("kelly_multiplier_two_sharp", 1.0),
+    kellyThreeSharps: await num("kelly_multiplier_three_sharp", 1.0),
   };
 }
 
@@ -327,6 +346,76 @@ export function computeMultiBookConsensus(snapshots: MultiBookSnapshot[]): {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Bundle 5.J — sharp-agreement count + Kelly tiering
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Per the locked spec (docs/bundle-5-activation-spec.md §5):
+//   1 sharp  (Pinnacle alone)      → 0.5× Kelly
+//   2 sharps (Pinnacle + 1 niche)  → 1.0× Kelly
+//   3 sharps (Pinnacle + 2 niches) → 1.0× Kelly + HIGH_CONVICTION flag
+//
+// "Agreeing" non-Pinnacle sharp = raw_implied within 1pp of Pinnacle AND
+// same edge direction (both think the bet is +EV or both -EV vs backOdds).
+// The 3pp floor is identical across tiers — only the Kelly multiplier
+// reflects conviction.
+//
+// Books not in SHARP_BOOK_SLUGS (Bet365, 1xBet, etc.) are softs and never
+// contribute to the sharp count even if they appear in pinnacle_odds_snapshots
+// (defensive — pre-E.5 we may have stored some soft rows).
+
+export const SHARP_BOOK_SLUGS = new Set<string>(["pinnacle", "singbet", "sbobet", "ps3838"]);
+const SHARP_AGREEMENT_TOLERANCE = 0.01; // 1pp implied-prob agreement band
+
+export interface SharpAgreementResult {
+  sharpCount: number;
+  agreeingSlugs: string[];
+}
+
+export function countAgreeingSharps(
+  pinnacleImplied: number,
+  backOdds: number,
+  snapshots: MultiBookSnapshot[],
+): SharpAgreementResult {
+  // Pinnacle is the always-on anchor via the paid prefetch; it counts as 1
+  // sharp regardless of whether a row appears in the multi-book snapshot
+  // result (the snapshot reader's freshness window may have just missed it
+  // — Pinnacle data is authoritative via the candidate's pinnacleImplied).
+  const agreeingSlugs: string[] = ["pinnacle"];
+  if (!Number.isFinite(pinnacleImplied) || pinnacleImplied <= 0) {
+    return { sharpCount: 0, agreeingSlugs: [] };
+  }
+  const pinnEdge = backOdds * pinnacleImplied - 1; // +ve if +EV per Pinnacle
+  const pinnDirection = pinnEdge > 0 ? 1 : -1;
+
+  for (const s of snapshots) {
+    const slug = (s.bookmakerSlug ?? "").toLowerCase();
+    if (slug === "pinnacle") continue; // already counted above
+    if (!SHARP_BOOK_SLUGS.has(slug)) continue; // softs skipped (defensive)
+    if (!Number.isFinite(s.rawImpliedProbability)) continue;
+    const delta = Math.abs(s.rawImpliedProbability - pinnacleImplied);
+    if (delta > SHARP_AGREEMENT_TOLERANCE) continue;
+    const snapEdge = backOdds * s.rawImpliedProbability - 1;
+    const snapDirection = snapEdge > 0 ? 1 : -1;
+    if (snapDirection !== pinnDirection) continue;
+    agreeingSlugs.push(slug);
+  }
+  return { sharpCount: agreeingSlugs.length, agreeingSlugs };
+}
+
+export function kellyMultiplierForSharpCount(
+  sharpCount: number,
+  thresholds: InversionThresholds,
+): { multiplier: number; highConviction: boolean } {
+  if (sharpCount >= 3) {
+    return { multiplier: thresholds.kellyThreeSharps, highConviction: true };
+  }
+  if (sharpCount === 2) {
+    return { multiplier: thresholds.kellyTwoSharps, highConviction: false };
+  }
+  return { multiplier: thresholds.kellySingleSharp, highConviction: false };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Bundle 5.I — per-(market × ttk) p75_slippage reader
 // ──────────────────────────────────────────────────────────────────────────
 //
@@ -422,6 +511,96 @@ export async function getP75Slippage(
 }
 
 const MARKETS_FORCE_CAUTION = new Set(["FIRST_HALF_RESULT"]);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Bundle 5.K — high-edge integrity check (≥7pp identified edge)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Per the locked spec (docs/bundle-5-activation-spec.md §6) + memo §A.1
+// bucket-8 lesson (-80% ROI at 10%+ edge = pure artifact):
+//
+//   When identified_edge_pp >= high_edge_flag_threshold (default 7.0),
+//   three integrity checks must all pass; ANY failure → VETO with reason
+//   'reject_high_edge_integrity'.
+//
+//   (a) A fresh Pinnacle snapshot exists for the EXACT (matchId,
+//       marketType, selectionName) tuple captured within 30 minutes.
+//       Catches stale-anchor leaks.
+//
+//   (b) The snapshot's pinnacle_implied matches the candidate's
+//       pinnacleImplied within 0.005 (0.5pp). Catches plumbing
+//       inconsistencies where the candidate was sized against one
+//       snapshot but a different snapshot is now authoritative.
+//
+//   (c) For ASIAN_HANDICAP, the selectionName parses cleanly as
+//       "Home/Away ±N" (line spec well-formed). Bundle 4 canonicalisation
+//       already enforces this at the writer, but a high-edge bet with a
+//       malformed line is exactly the bucket-8 failure mode — re-check
+//       defensively.
+//
+// The Betfair side check from the spec (listMarketBook outcome name
+// match) is intentionally deferred to a separate cron-style audit, not
+// a gate-time blocking call — it would add ~200ms per high-edge candidate
+// and triple the relay-API budget. The (a)+(b)+(c) checks above catch the
+// internal-data-flow leak class; Betfair-side drift is caught by the
+// existing slippage / fill-price reconciliation in placeLiveBetOnBetfair.
+
+interface HighEdgeIntegrityResult {
+  ok: boolean;
+  reasons: string[];
+}
+
+async function evaluateHighEdgeIntegrity(
+  candidate: InversionCandidate,
+): Promise<HighEdgeIntegrityResult> {
+  const reasons: string[] = [];
+
+  // (a) + (b): fresh Pinnacle snapshot exists and matches candidate's
+  //            pinnacleImplied.
+  try {
+    const r = await db.execute(sql`
+      SELECT pinnacle_implied::float8 AS pi
+      FROM pinnacle_odds_snapshots
+      WHERE match_id = ${candidate.matchId}
+        AND market_type = ${candidate.marketType}
+        AND selection_name = ${candidate.selectionName}
+        AND bookmaker_slug = 'pinnacle'
+        AND captured_at >= NOW() - INTERVAL '30 minutes'
+      ORDER BY captured_at DESC
+      LIMIT 1
+    `);
+    const row = ((r as any).rows ?? [])[0] as { pi: number | null } | undefined;
+    if (!row || row.pi == null || !Number.isFinite(row.pi)) {
+      reasons.push("integrity_no_fresh_pinnacle_snapshot");
+      return { ok: false, reasons };
+    }
+    if (candidate.pinnacleImplied != null) {
+      const diff = Math.abs(row.pi - candidate.pinnacleImplied);
+      if (diff > 0.005) {
+        reasons.push("integrity_pinnacle_implied_mismatch");
+        return { ok: false, reasons };
+      }
+    }
+  } catch (err) {
+    // DB hiccup — fail SAFE on a high-edge candidate (better to skip a
+    // suspect bet than to fire one with unverified anchor data). The
+    // logger.debug here surfaces the underlying error for ops.
+    logger.debug({ err, matchId: candidate.matchId }, "high-edge integrity query failed — failing safe");
+    reasons.push("integrity_check_query_failed");
+    return { ok: false, reasons };
+  }
+
+  // (c) AH line spec well-formed.
+  if (candidate.marketType === "ASIAN_HANDICAP") {
+    const ahLineSpec = /^(Home|Away)\s+([+-]?\d+(?:\.\d+)?)$/;
+    if (!ahLineSpec.test(candidate.selectionName)) {
+      reasons.push("integrity_ah_line_unparseable");
+      return { ok: false, reasons };
+    }
+  }
+
+  return { ok: true, reasons: [] };
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Stage 1 — model-blind watchlist eligibility
@@ -667,11 +846,24 @@ export async function evaluateInversionGate(
           reasons: ["stage3_no_edge_input"],
         } satisfies Stage3Output);
 
+  // Bundle 5.J — sharp-count tiering. Always computed (even when we'll
+  // ultimately veto/demote) so diagnostics shows the count we would have
+  // staked at. Pinnacle is the always-on anchor when candidate.pinnacleImplied
+  // is non-null; non-Pinnacle sharps in multiBook are agreement-checked.
+  const sharpAgreement = candidate.pinnacleImplied != null && candidate.pinnacleImplied > 0
+    ? countAgreeingSharps(candidate.pinnacleImplied, candidate.backOdds, multiBook)
+    : { sharpCount: 0, agreeingSlugs: [] };
+  const { multiplier: sharpMultiplier, highConviction: isHighConviction } =
+    kellyMultiplierForSharpCount(sharpAgreement.sharpCount, thresholds);
+
   // HIGH_EDGE telemetry flag (Bundle 5.H §1) — does NOT gate; just surfaces.
   // The actual high-edge integrity check (gate) ships in Bundle 5.K.
   const flags = [...stage3.flags];
   if (stage2.identifiedEdgePp != null && stage2.identifiedEdgePp >= thresholds.highEdgeFlagThresholdPp) {
     flags.push("high_edge");
+  }
+  if (isHighConviction) {
+    flags.push("high_conviction");
   }
 
   const diagnostics: InversionDiagnostics = {
@@ -688,6 +880,9 @@ export async function evaluateInversionGate(
     pinnacleImplied: candidate.pinnacleImplied,
     multiBookConsensusP: consensusP,
     multiBookCount: bookCount,
+    sharpCount: sharpAgreement.sharpCount,
+    agreeingSlugs: sharpAgreement.agreeingSlugs,
+    isHighConviction,
     disagreementPp: stage2.disagreementPp,
     disagreementZ: stage2.disagreementZ,
     stage1Source: candidate.stage1Source,
@@ -699,9 +894,10 @@ export async function evaluateInversionGate(
   //   1. Stage 1 reject → VETO (structural failure: model-filtered candidate)
   //   2. Stage 2 veto    → VETO (catastrophic disagreement)
   //   3. Stage 2 no anchor OR Stage 3 demote → DEMOTE_SHADOW
-  //   4. Stage 2 down-size → DOWN_SIZE_HALF (fallback; superseded by
-  //                          multi-sharp tiering in Bundle 5.J)
-  //   5. Else → PROCEED
+  //   4. PROCEED with multiplier from sharp-count tiering. The legacy R3
+  //      disagreement-based downsize remains as a SAFETY OVERRIDE — if
+  //      Stage 2 flagged catastrophic disagreement (below veto threshold
+  //      but still extreme), force 0.5× even if the sharp tier said 1.0×.
 
   if (!stage1.ok) {
     return { action: "VETO", reasons: [stage1.reason], diagnostics };
@@ -716,19 +912,184 @@ export async function evaluateInversionGate(
       diagnostics,
     };
   }
-  if (stage2.downsize) {
-    return {
-      action: "DOWN_SIZE_HALF",
-      kellyMultiplier: 0.5,
-      reasons: stage2.reasons,
-      diagnostics,
-    };
+
+  // Bundle 5.K — high-edge integrity check. Runs ONLY when identified
+  // edge is high enough to be suspicious. Failure → VETO (better to skip
+  // a suspicious bet than to fire one with unverified plumbing). Implements
+  // the §A.1 bucket-8 lesson: 10%+ edge bets historically posted -80% ROI,
+  // pure artifact.
+  if (
+    stage2.identifiedEdgePp != null &&
+    stage2.identifiedEdgePp >= thresholds.highEdgeFlagThresholdPp
+  ) {
+    const integrity = await evaluateHighEdgeIntegrity(candidate);
+    if (!integrity.ok) {
+      return {
+        action: "VETO",
+        reasons: ["reject_high_edge_integrity", ...integrity.reasons],
+        diagnostics,
+      };
+    }
   }
+  // Apply the sharp-tier multiplier, with the R3 disagreement override as a
+  // safety floor (never UP-size from a downsize signal, only down-size from
+  // an up-size signal).
+  const finalMultiplier = stage2.downsize
+    ? Math.min(sharpMultiplier, thresholds.kellySingleSharp)
+    : sharpMultiplier;
   return {
     action: "PROCEED",
-    kellyMultiplier: 1.0,
-    reasons: [],
+    kellyMultiplier: finalMultiplier,
+    reasons: stage2.downsize ? ["stage2_downsize_override_applied"] : [],
     diagnostics,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Bundle 5.M — exposure-caps trim (replaces 0.02 single-bet cap)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Per the locked spec (docs/bundle-5-activation-spec.md §8): when the
+// inversion flag is on, the 0.02 single-bet cap is bypassed (Bundle 5.D
+// already does this) and replaced with three new caps applied at the
+// stake-clamp step in paperTrading.ts:
+//
+//   per_fixture_exposure_pct (default 5.0)  — max % bankroll across all
+//                                              bets on the same matchId
+//   per_league_exposure_pct  (default 15.0) — max % bankroll across all
+//                                              open bets in the same league
+//   daily_stake_cap_pct      (default 8.0)  — max % bankroll staked in a
+//                                              rolling 24h
+//
+// The helper returns the (possibly trimmed) stake plus the binding-cap
+// reason so callers can log structured rejections. When trimmed below the
+// £2 Betfair minimum, the existing kelly_below_min_stake demote-shadow
+// path in paperTrading kicks in unchanged.
+
+export interface ExposureCapsResult {
+  stake: number;
+  trimmed: boolean;
+  bindingCap: "fixture" | "league" | "daily" | null;
+  caps: {
+    perFixturePct: number;
+    perLeaguePct: number;
+    dailyStakeCapPct: number;
+  };
+  exposure: {
+    fixtureAlreadyStaked: number;
+    leagueAlreadyStaked: number;
+    dailyAlreadyStaked: number;
+  };
+}
+
+const exposureCache = new Map<string, { value: number; expiresAt: number }>();
+const EXPOSURE_TTL_MS = 30_000;
+
+async function readExposure(cacheKey: string, queryFn: () => Promise<number>): Promise<number> {
+  const now = Date.now();
+  const hit = exposureCache.get(cacheKey);
+  if (hit && hit.expiresAt > now) return hit.value;
+  try {
+    const value = await queryFn();
+    exposureCache.set(cacheKey, { value, expiresAt: now + EXPOSURE_TTL_MS });
+    return value;
+  } catch (err) {
+    logger.debug({ err, cacheKey }, "exposure lookup failed — defaulting to 0");
+    return 0;
+  }
+}
+
+export async function applyInversionExposureCaps(args: {
+  proposedStake: number;
+  bankroll: number;
+  matchId: number;
+  league: string | null;
+}): Promise<ExposureCapsResult> {
+  const { proposedStake, bankroll, matchId, league } = args;
+
+  const num = async (key: string, fallback: number): Promise<number> => {
+    const raw = await getConfigValue(key);
+    const parsed = raw != null ? Number(raw) : NaN;
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  const caps = {
+    perFixturePct: await num("per_fixture_exposure_pct", 5.0),
+    perLeaguePct: await num("per_league_exposure_pct", 15.0),
+    dailyStakeCapPct: await num("daily_stake_cap_pct", 8.0),
+  };
+
+  // Current exposure — three lookups, all cached briefly. Each is filtered
+  // to live bets only (shadow doesn't consume bankroll).
+  const fixtureAlreadyStaked = await readExposure(`fix|${matchId}`, async () => {
+    const r = await db.execute(sql`
+      SELECT COALESCE(SUM(stake::float8), 0) AS s
+      FROM paper_bets
+      WHERE match_id = ${matchId}
+        AND bet_track = 'live'
+        AND status IN ('pending', 'pending_placement')
+        AND deleted_at IS NULL
+    `);
+    return Number(((r as any).rows ?? [])[0]?.s ?? 0);
+  });
+
+  const leagueAlreadyStaked = league
+    ? await readExposure(`lge|${league}`, async () => {
+        const r = await db.execute(sql`
+          SELECT COALESCE(SUM(pb.stake::float8), 0) AS s
+          FROM paper_bets pb
+          JOIN matches m ON m.id = pb.match_id
+          WHERE m.league = ${league}
+            AND pb.bet_track = 'live'
+            AND pb.status IN ('pending', 'pending_placement')
+            AND pb.deleted_at IS NULL
+        `);
+        return Number(((r as any).rows ?? [])[0]?.s ?? 0);
+      })
+    : 0;
+
+  const dailyAlreadyStaked = await readExposure("daily|24h", async () => {
+    const r = await db.execute(sql`
+      SELECT COALESCE(SUM(stake::float8), 0) AS s
+      FROM paper_bets
+      WHERE bet_track = 'live'
+        AND placed_at >= NOW() - INTERVAL '24 hours'
+        AND deleted_at IS NULL
+    `);
+    return Number(((r as any).rows ?? [])[0]?.s ?? 0);
+  });
+
+  const fixtureBudget = Math.max(0, bankroll * caps.perFixturePct / 100 - fixtureAlreadyStaked);
+  const leagueBudget = Math.max(0, bankroll * caps.perLeaguePct / 100 - leagueAlreadyStaked);
+  const dailyBudget = Math.max(0, bankroll * caps.dailyStakeCapPct / 100 - dailyAlreadyStaked);
+
+  // Find the binding cap, if any.
+  const candidates: Array<{ stake: number; cap: ExposureCapsResult["bindingCap"] }> = [
+    { stake: fixtureBudget, cap: "fixture" },
+    { stake: leagueBudget, cap: "league" },
+    { stake: dailyBudget, cap: "daily" },
+  ];
+  let stake = proposedStake;
+  let bindingCap: ExposureCapsResult["bindingCap"] = null;
+  for (const c of candidates) {
+    if (c.stake < stake) {
+      stake = c.stake;
+      bindingCap = c.cap;
+    }
+  }
+  // Round to 2dp.
+  stake = Math.round(stake * 100) / 100;
+
+  return {
+    stake,
+    trimmed: bindingCap !== null,
+    bindingCap,
+    caps,
+    exposure: {
+      fixtureAlreadyStaked,
+      leagueAlreadyStaked,
+      dailyAlreadyStaked,
+    },
   };
 }
 
@@ -737,4 +1098,5 @@ export function _resetCalibrationCacheForTests(): void {
   calibrationCache.clear();
   slippageCache.clear();
   kickoffCache.clear();
+  exposureCache.clear();
 }

@@ -2550,6 +2550,64 @@ export async function placePaperBet(
   // -£3.09 PnL on £327 stake — break-even on volume with zero growth
   // contribution. The signal lives in shadow now; the lazyPromote service
   // rescues bets back to live if Kelly recovers above £2 before kickoff.
+  // ── Bundle 5.M (2026-05-17): inversion-mode exposure caps ──────────────
+  // When inversion_pipeline_enabled = true, the 0.02 single-bet cap is
+  // bypassed (Bundle 5.D) and replaced with three new caps applied here:
+  // per_fixture / per_league / daily_stake_cap. If the binding cap trims
+  // the stake below £2, the existing kelly_below_min_stake demote-shadow
+  // path below catches it unchanged. Defaults off — pre-flip, behaviour
+  // unchanged.
+  if (!isShadowBet && stake > 0) {
+    try {
+      const { isInversionPipelineEnabled, applyInversionExposureCaps } = await import(
+        "./inversionPipeline"
+      );
+      if (await isInversionPipelineEnabled()) {
+        const capResult = await applyInversionExposureCaps({
+          proposedStake: stake,
+          bankroll: stakingBankroll,
+          matchId,
+          league: scopeLeague,
+        });
+        if (capResult.trimmed) {
+          logger.info(
+            {
+              matchId,
+              marketType,
+              selectionName,
+              proposed: stake,
+              trimmed: capResult.stake,
+              bindingCap: capResult.bindingCap,
+              caps: capResult.caps,
+              exposure: capResult.exposure,
+            },
+            "Bundle 5.M: exposure cap trimmed stake",
+          );
+          void db.insert(complianceLogsTable).values({
+            actionType: "inversion_exposure_cap_trimmed",
+            details: {
+              matchId,
+              marketType,
+              selectionName,
+              proposed: stake,
+              trimmed: capResult.stake,
+              bindingCap: capResult.bindingCap,
+              caps: capResult.caps,
+              exposure: capResult.exposure,
+            } as Record<string, unknown>,
+            timestamp: new Date(),
+          } as any);
+          stake = capResult.stake;
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err, matchId, marketType },
+        "Bundle 5.M exposure-cap check failed (non-blocking)",
+      );
+    }
+  }
+
   if (!isShadowBet && stake < 2) {
     const fullKellyStake = stake;
     // 2026-05-11: same theory-driven Kelly fraction as the primary shadow
