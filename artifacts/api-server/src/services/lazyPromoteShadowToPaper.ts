@@ -605,26 +605,37 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           continue;
         }
 
-        // ── Bundle 5.G + Bundle 10 (2026-05-17): stale-odds + 3-7pp band ─
+        // ── Bundle 5.G + Bundle 10 + Bundle 11 (2026-05-17): freshness + band ─
         // Lazy promoter MUST enforce the same gate as direct emission
         // (Chris 2026-05-17: "any pathway to eligible live bet has to
-        // have a 3-7pp sharp edge found"). Reads min_net_edge_pp (3.0)
-        // and inversion_live_max_edge_pp (7.0) — the same band the
-        // inversion gate uses. Computes post-slip edge against the
-        // CURRENT Betfair best-back (not stored odds) + CURRENT
-        // pinnacle_implied (≤15 min freshness). Outside the band →
-        // stays shadow with a structured compliance_logs row.
+        // have a 3-7pp sharp edge found... pinnacle odds [must be]
+        // valid at the point of bet placement and the odds betfair is
+        // giving"). Reads min_net_edge_pp (3.0) and
+        // inversion_live_max_edge_pp (7.0) — same band the inversion
+        // gate uses. Both Pinnacle and Betfair freshness windows are
+        // config-driven: pinnacle_max_age_seconds (default 180s),
+        // betfair_odds_max_age_seconds (default 180s).
         //
         // PINNACLE-ABSENT scopes (routed via v_live_eligibility market
         // aggregate) still need a Pinnacle anchor to clear the band —
         // they can't promote under Bundle 10's discipline. Sharp-anchor
         // is the gate.
         //
+        // Bundle 11 (2026-05-17): stale-Betfair fallback to stored
+        // `odds` REMOVED. Stored odds violate "live at placement";
+        // promotion requires a fresh Betfair best-back, or skip.
+        //
         // Slippage default: 0.015 (1.5pp) — matches the inversion gate's
         // defaultP75Slippage fallback. When real per-(market×ttk)
         // slippage data accumulates, the gate uses that; lazy promote
         // can be upgraded to call v_slippage_p75_rolling too (deferred).
         try {
+          const pinnMaxAgeRaw = await getConfig("pinnacle_max_age_seconds");
+          const bfMaxAgeRaw = await getConfig("betfair_odds_max_age_seconds");
+          const pinnMaxAgeSec =
+            pinnMaxAgeRaw != null && Number.isFinite(Number(pinnMaxAgeRaw)) ? Number(pinnMaxAgeRaw) : 180;
+          const bfMaxAgeSec =
+            bfMaxAgeRaw != null && Number.isFinite(Number(bfMaxAgeRaw)) ? Number(bfMaxAgeRaw) : 180;
           // Fetch fresh Pinnacle anchor + fresh Betfair best-back in
           // parallel so we always evaluate against current prices.
           const [pinnRow, bfRow] = await Promise.all([
@@ -635,7 +646,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
                 AND market_type = ${r.market_type}
                 AND selection_name = ${r.selection_name}
                 AND bookmaker_slug = 'pinnacle'
-                AND captured_at >= NOW() - INTERVAL '15 minutes'
+                AND captured_at >= NOW() - INTERVAL '1 second' * ${pinnMaxAgeSec}
               ORDER BY captured_at DESC
               LIMIT 1
             `) as unknown as Promise<{ rows?: Array<{ pinn_implied: number | null }> }>,
@@ -646,13 +657,35 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
                 AND market_type = ${r.market_type}
                 AND selection_name = ${r.selection_name}
                 AND source = 'betfair_exchange'
-                AND snapshot_time >= NOW() - INTERVAL '10 minutes'
+                AND snapshot_time >= NOW() - INTERVAL '1 second' * ${bfMaxAgeSec}
               ORDER BY snapshot_time DESC
               LIMIT 1
             `) as unknown as Promise<{ rows?: Array<{ back_odds: number | null }> }>,
           ]);
           const pinnImplied = pinnRow.rows?.[0]?.pinn_implied;
-          const currentBack = bfRow.rows?.[0]?.back_odds ?? odds;
+          const currentBack = bfRow.rows?.[0]?.back_odds;
+          if (currentBack == null || !Number.isFinite(currentBack) || currentBack <= 1.01) {
+            // Stale or absent Betfair best-back → no live executable
+            // price. Bundle 11 removes the stored-odds fallback.
+            result.skipped_edge_evaporated++;
+            await db.insert(complianceLogsTable).values({
+              actionType: "lazy_promote_edge_outside_band",
+              details: {
+                betId: r.id,
+                matchId: r.match_id,
+                marketType: r.market_type,
+                selectionName: r.selection_name,
+                storedOdds: odds,
+                currentBack: null,
+                currentPinnImplied: pinnImplied ?? null,
+                bfMaxAgeSec,
+                reason: "stale_or_absent_betfair",
+                source: "lazy_promote",
+              },
+              timestamp: new Date(),
+            } as any);
+            continue;
+          }
           if (pinnImplied != null && Number.isFinite(pinnImplied) && pinnImplied > 0) {
             const minEdgeRaw = await getConfig("min_net_edge_pp");
             const maxEdgeRaw = await getConfig("inversion_live_max_edge_pp");
@@ -685,8 +718,9 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
               continue;
             }
           } else {
-            // No Pinnacle anchor → no sharp edge → no live placement
-            // under Bundle 10's discipline. Sharp-anchor IS the gate.
+            // No fresh Pinnacle anchor → no sharp edge → no live
+            // placement under Bundle 10/11 discipline. Sharp-anchor IS
+            // the gate. Pinnacle absent OR stale beyond pinnMaxAgeSec.
             result.skipped_edge_evaporated++;
             await db.insert(complianceLogsTable).values({
               actionType: "lazy_promote_edge_outside_band",
@@ -698,7 +732,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
                 storedOdds: odds,
                 currentBack,
                 currentPinnImplied: null,
-                reason: "no_pinnacle_anchor",
+                pinnMaxAgeSec,
+                reason: "no_fresh_pinnacle_anchor",
                 source: "lazy_promote",
               },
               timestamp: new Date(),

@@ -4767,6 +4767,15 @@ export async function runMigrations() {
       // 7pp picked from Bundle 9 retrospective — 7-15pp and 15-50pp
       // brackets LOST money today. Widen as data accumulates.
       { key: "inversion_live_max_edge_pp", value: "7.0" },
+      // Bundle 11 (2026-05-17): freshness windows for "live at point of
+      // placement". Pinnacle implied + Betfair best-back used by the
+      // inversion gate (paperTrading.ts) and lazy promoter
+      // (lazyPromoteShadowToPaper.ts) must be ≤ N seconds old. 180s = 3
+      // min — tight enough that no inversion-gate decision uses a
+      // significantly out-of-date sharp anchor. Widen if OddspaPI
+      // polling can't keep up; tighten as polling cadence improves.
+      { key: "pinnacle_max_age_seconds", value: "180" },
+      { key: "betfair_odds_max_age_seconds", value: "180" },
       { key: "high_edge_flag_threshold", value: "7.0" },
       { key: "kelly_multiplier_single_sharp", value: "0.5" },
       { key: "kelly_multiplier_two_sharp", value: "1.0" },

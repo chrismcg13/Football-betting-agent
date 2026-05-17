@@ -116,6 +116,24 @@ accumulates on the wider band, Stage 3 demotes-to-shadow ANY candidate
 whose post-slip edge exceeds `inversion_live_max_edge_pp` (default
 7.0). The shadow track still records these for future analysis.
 
+**Bundle 11 (2026-05-17) — live-at-placement Pinnacle + Betfair
+freshness.** Chris's clarification: "Pinnacle odds of 3-7pp [edge]
+must be valid at the point of bet placement and the odds Betfair is
+giving." Two config knobs cap the age of any sharp anchor or
+executable price used by the gate:
+
+- `pinnacle_max_age_seconds` (default 180s = 3 min)
+- `betfair_odds_max_age_seconds` (default 180s)
+
+Three call sites enforce: paperTrading.ts Pinnacle DB fallback
+(stale rows ignored), pre-gate Pinnacle-coverage prefilter (skip the
+gate entirely when no fresh Pinnacle — saves cycles + log noise +
+force-shadow demotes when inversion pipeline is active), and the
+lazy promoter (both Pinnacle and Betfair freshness windows, plus the
+stored-odds fallback REMOVED — promotion now requires a live Betfair
+best-back). New compliance log action_type
+`inversion_skipped_no_fresh_pinnacle` exposes coverage gaps.
+
 Widen the ceiling as confidence grows:
 
 ```sql

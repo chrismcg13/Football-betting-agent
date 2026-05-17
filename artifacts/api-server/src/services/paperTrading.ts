@@ -2720,18 +2720,28 @@ export async function placePaperBet(
   // See CLAUDE.md §7 ("No exposure caps"). runLiveConcentrationChecks
   // retained in liveRiskManager.ts for audit-only callers (launchActivation).
 
-  // ── Pinnacle DB fallback ─────────────────────────────────────────────────
+  // ── Pinnacle DB fallback (Bundle 11, 2026-05-17: freshness-bounded) ──────
   // If the trading-cycle cache didn't supply Pinnacle odds, look them up from
-  // the most recent snapshot in odds_snapshots. This unblocks Tier 1B for
-  // matches whose Pinnacle data exists in DB but missed the in-memory cache.
+  // the most recent FRESH snapshot in odds_snapshots. Stale snapshots no
+  // longer satisfy the inversion gate per Chris's "live at point of
+  // placement" rule — pinnacle_max_age_seconds (default 180s = 3 min) caps
+  // acceptable age. Beyond that, pinnacleImplied stays null and the pre-gate
+  // coverage check below skips the inversion-gate call entirely.
   if (pinnacleOdds == null) {
     try {
+      const maxAgeRaw = await getConfigValue("pinnacle_max_age_seconds");
+      const pinnacleMaxAgeSeconds =
+        maxAgeRaw != null && Number.isFinite(Number(maxAgeRaw)) ? Number(maxAgeRaw) : 180;
       const variants = Array.from(new Set([
         selectionName,
         selectionName.endsWith(" Goals") ? selectionName.replace(/ Goals$/, "") : `${selectionName} Goals`,
       ]));
       const latestPin = await db
-        .select({ backOdds: oddsSnapshotsTable.backOdds, source: oddsSnapshotsTable.source })
+        .select({
+          backOdds: oddsSnapshotsTable.backOdds,
+          source: oddsSnapshotsTable.source,
+          snapshotTime: oddsSnapshotsTable.snapshotTime,
+        })
         .from(oddsSnapshotsTable)
         .where(and(
           eq(oddsSnapshotsTable.matchId, matchId),
@@ -2742,6 +2752,7 @@ export async function placePaperBet(
             eq(oddsSnapshotsTable.source, "oddspapi"),
             eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
           ),
+          sql`${oddsSnapshotsTable.snapshotTime} >= NOW() - INTERVAL '1 second' * ${pinnacleMaxAgeSeconds}`,
         ))
         .orderBy(desc(oddsSnapshotsTable.snapshotTime))
         .limit(1);
@@ -2750,8 +2761,8 @@ export async function placePaperBet(
         pinnacleOdds = fallbackOdds;
         pinnacleImplied = 1 / fallbackOdds;
         logger.info(
-          { matchId, marketType, selectionName, pinnacleOdds, source: latestPin[0]?.source },
-          "Pinnacle odds loaded from DB snapshot fallback",
+          { matchId, marketType, selectionName, pinnacleOdds, source: latestPin[0]?.source, snapshotTime: latestPin[0]?.snapshotTime },
+          "Pinnacle odds loaded from DB snapshot fallback (fresh)",
         );
       }
     } catch (err) {
@@ -2881,9 +2892,9 @@ export async function placePaperBet(
     logger.warn({ err, matchId, marketType, selectionName }, "sharpAnchorFetch threw — Pinnacle-only fallback");
   }
 
-  // ── Bundle 5.E + Bundle 10 (2026-05-17): inversion gate ─────────────────
-  // Evaluates the gate on every candidate. ALWAYS logs the decision to
-  // compliance_logs (shadow telemetry). When
+  // ── Bundle 5.E + Bundle 10 + Bundle 11 (2026-05-17): inversion gate ─────
+  // Evaluates the gate on every candidate that has fresh Pinnacle coverage.
+  // ALWAYS logs the decision to compliance_logs (shadow telemetry). When
   // agent_config.inversion_pipeline_enabled='true', the decision also
   // CONTROLS placement:
   //   VETO          → reject (catastrophic disagreement OR high-edge
@@ -2892,44 +2903,96 @@ export async function placePaperBet(
   //                    7pp ceiling OR no Pinnacle anchor)
   //   PROCEED       → apply gate's kellyMultiplier to stake
   //                    (sharp-count tier: 1=0.5×, 2/3=1.0×)
-  // Stage1Source='kickoff_window' bypasses Stage 1's legacy-candidate
-  // veto since Stage 1 model-blind watchlist isn't built; Stages 2 + 3
-  // are the active decision-makers.
+  //
+  // Bundle 11: pre-gate Pinnacle-coverage prefilter. If pinnacleImplied is
+  // null AFTER the freshness-bounded DB fallback, the (match × market ×
+  // selection) tuple has no live Pinnacle anchor — no live placement is
+  // possible under strategy inversion. Skip the gate call entirely AND
+  // force-demote to shadow when inversion pipeline is enabled (matches
+  // what the gate would have done with stage2_no_pinnacle_anchor). Saves
+  // cycles + compliance noise while preserving the live-placement guard.
   let inversionDecision: import("./inversionPipeline").InversionDecision | null = null;
-  try {
-    const { evaluateInversionGate } = await import("./inversionPipeline");
-    inversionDecision = await evaluateInversionGate({
-      matchId,
-      marketType,
-      selectionName,
-      backOdds,
-      pinnacleImplied: pinnacleImplied ?? null,
-      rawModelProbability: modelProbability,
-      stage1Source: "kickoff_window",
-    });
-    await db.insert(complianceLogsTable).values({
-      actionType: "inversion_gate_shadow",
-      details: {
+  if (pinnacleImplied == null) {
+    try {
+      await db.insert(complianceLogsTable).values({
+        actionType: "inversion_skipped_no_fresh_pinnacle",
+        details: {
+          matchId,
+          marketType,
+          selectionName,
+          backOdds,
+          modelProbability,
+          reason: "no_fresh_pinnacle_within_max_age",
+        } as Record<string, unknown>,
+        timestamp: new Date(),
+      } as any);
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "inversion_skipped_no_fresh_pinnacle log failed (non-blocking)",
+      );
+    }
+    // Force shadow demotion when inversion pipeline is the active
+    // placement gate. Bet still routes shadow for learning telemetry.
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if ((await isInversionPipelineEnabled()) && !isShadowBet) {
+        const fullKellyStake = stake;
+        const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+        shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+        shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+        stake = 0;
+        isShadowBet = true;
+        await logShadowGateExemption(
+          "inversion_no_fresh_pinnacle",
+          experimentTag ?? null,
+          "Inversion no-fresh-Pinnacle demote (Bundle 11)",
+          shadowStake,
+          universeTier,
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "Bundle 11 force-shadow demote failed (non-blocking)",
+      );
+    }
+  } else {
+    try {
+      const { evaluateInversionGate } = await import("./inversionPipeline");
+      inversionDecision = await evaluateInversionGate({
         matchId,
         marketType,
         selectionName,
         backOdds,
-        modelProbability,
         pinnacleImplied: pinnacleImplied ?? null,
-        gateAction: inversionDecision.action,
-        gateReasons: inversionDecision.reasons,
-        kellyMultiplier:
-          inversionDecision.action === "PROCEED" ? (inversionDecision as any).kellyMultiplier : null,
-        diagnostics: inversionDecision.diagnostics,
-      } as Record<string, unknown>,
-      timestamp: new Date(),
-    } as any);
-  } catch (err) {
-    logger.warn(
-      { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
-      "inversion-gate evaluation failed (non-blocking)",
-    );
-    inversionDecision = null;
+        rawModelProbability: modelProbability,
+        stage1Source: "kickoff_window",
+      });
+      await db.insert(complianceLogsTable).values({
+        actionType: "inversion_gate_shadow",
+        details: {
+          matchId,
+          marketType,
+          selectionName,
+          backOdds,
+          modelProbability,
+          pinnacleImplied: pinnacleImplied ?? null,
+          gateAction: inversionDecision.action,
+          gateReasons: inversionDecision.reasons,
+          kellyMultiplier:
+            inversionDecision.action === "PROCEED" ? (inversionDecision as any).kellyMultiplier : null,
+          diagnostics: inversionDecision.diagnostics,
+        } as Record<string, unknown>,
+        timestamp: new Date(),
+      } as any);
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "inversion-gate evaluation failed (non-blocking)",
+      );
+      inversionDecision = null;
+    }
   }
 
   // ── Bundle 10 (2026-05-17): apply the gate decision when active ─────────
