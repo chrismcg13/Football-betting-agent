@@ -1,5 +1,38 @@
 import { logger } from "../lib/logger";
 
+// Query-string keys whose VALUES must never reach logs. Lower-case match.
+// Anything matching gets replaced with <REDACTED> before the URL is logged
+// — applies to retry / circuit-breaker / failure messages in resilientFetch.
+// Added 2026-05-17 after an oddspapi 429 retry log line leaked the paid
+// Pinnacle apiKey value to chat during Bundle 1 debugging.
+const SENSITIVE_QUERY_PARAMS = new Set([
+  "apikey",
+  "api_key",
+  "key",
+  "token",
+  "auth",
+  "secret",
+  "password",
+]);
+
+function redactSensitiveQueryParams(url: string): string {
+  try {
+    const u = new URL(url);
+    let mutated = false;
+    for (const param of [...u.searchParams.keys()]) {
+      if (SENSITIVE_QUERY_PARAMS.has(param.toLowerCase())) {
+        u.searchParams.set(param, "<REDACTED>");
+        mutated = true;
+      }
+    }
+    return mutated ? u.toString() : url;
+  } catch {
+    // Non-URL string (extremely unlikely given upstream callers). Fallback
+    // regex strip — preserves the param name and replaces only the value.
+    return url.replace(/([?&](?:apikey|api_key|key|token|auth|secret|password)=)[^&#]*/gi, "$1<REDACTED>");
+  }
+}
+
 interface CircuitBreakerState {
   failures: number;
   firstFailureAt: number;
@@ -114,10 +147,15 @@ export async function resilientFetch<T = unknown>(
     headers,
   } = opts;
 
+  // Sanitised version used in ALL log lines below. The actual fetch still
+  // uses the original `url` with its real apiKey; only structured log fields
+  // see the redacted form.
+  const loggedUrl = redactSensitiveQueryParams(url);
+
   if (isCircuitOpen(service)) {
     const cb = getCircuitBreaker(service);
     if (!cb.halfOpenAttemptInProgress) {
-      logger.warn({ service, url }, `Circuit breaker OPEN — skipping ${service} call`);
+      logger.warn({ service, url: loggedUrl }, `Circuit breaker OPEN — skipping ${service} call`);
       return null;
     }
   }
@@ -137,12 +175,12 @@ export async function resilientFetch<T = unknown>(
       if (!res.ok) {
         const statusText = `${res.status} ${res.statusText}`;
         if (attempt === maxRetries) {
-          logger.warn({ service, url, status: res.status, attempt }, `${service} HTTP error after ${maxRetries} attempts: ${statusText}`);
+          logger.warn({ service, url: loggedUrl, status: res.status, attempt }, `${service} HTTP error after ${maxRetries} attempts: ${statusText}`);
           recordFailure(service);
           return null;
         }
         const backoff = backoffBaseMs * Math.pow(2, attempt - 1);
-        logger.warn({ service, url, status: res.status, attempt, backoffMs: backoff }, `${service} HTTP error — retrying`);
+        logger.warn({ service, url: loggedUrl, status: res.status, attempt, backoffMs: backoff }, `${service} HTTP error — retrying`);
         await new Promise((r) => setTimeout(r, backoff));
         continue;
       }
@@ -157,13 +195,13 @@ export async function resilientFetch<T = unknown>(
       const errMsg = isTimeout ? "Request timed out" : (err instanceof Error ? err.message : String(err));
 
       if (attempt === maxRetries) {
-        logger.error({ service, url, err: errMsg, attempt }, `${service} fetch failed after ${maxRetries} attempts`);
+        logger.error({ service, url: loggedUrl, err: errMsg, attempt }, `${service} fetch failed after ${maxRetries} attempts`);
         recordFailure(service);
         return null;
       }
 
       const backoff = backoffBaseMs * Math.pow(2, attempt - 1);
-      logger.warn({ service, url, err: errMsg, attempt, backoffMs: backoff }, `${service} fetch failed — retrying`);
+      logger.warn({ service, url: loggedUrl, err: errMsg, attempt, backoffMs: backoff }, `${service} fetch failed — retrying`);
       await new Promise((r) => setTimeout(r, backoff));
     }
   }
