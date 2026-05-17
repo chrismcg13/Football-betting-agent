@@ -85,19 +85,33 @@ const MO_OU_BTTS_MARKETS = new Set([
 
 // Niche-aligned slug selection. Returns [] if the candidate doesn't qualify
 // for any free-tier supplement; callers then proceed on Pinnacle alone.
+//
+// Singbet is the global #1 sharp for Asian Handicap (G5) regardless of
+// Pinnacle availability — so AH always gets Singbet treatment:
+//   - Pinnacle present + edge ≥3pp:  Singbet confirms. +SBOBet on ≥5pp.
+//   - Pinnacle absent (no anchor):   Singbet IS the primary AH anchor.
+// Bet365/1xBet are the coverage-gap fill for non-AH markets where Pinnacle
+// is silent (PINNACLE-ABSENT MO/OU/BTTS).
 function pickNiches(input: SharpAnchorInput): SharpBookSlug[] {
   const { marketType, pinnacleImplied, pinnacleEdgePp } = input;
   const pinnacleAvailable = pinnacleImplied != null && pinnacleImplied > 0;
   const niches: SharpBookSlug[] = [];
 
-  if (marketType === "ASIAN_HANDICAP" && pinnacleAvailable && pinnacleEdgePp >= 3) {
-    niches.push("singbet");
-    if (pinnacleEdgePp >= 5) niches.push("sbobet");
+  if (marketType === "ASIAN_HANDICAP") {
+    if (pinnacleAvailable && pinnacleEdgePp >= 3) {
+      niches.push("singbet");
+      if (pinnacleEdgePp >= 5) niches.push("sbobet");
+    } else if (!pinnacleAvailable) {
+      // PINNACLE-ABSENT AH: Singbet is the primary sharp signal, replacing
+      // the missing Pinnacle anchor. Single book to be budget-conservative
+      // on the coverage-gap case.
+      niches.push("singbet");
+    }
     return niches;
   }
 
   if (!pinnacleAvailable && MO_OU_BTTS_MARKETS.has(marketType)) {
-    // PINNACLE-ABSENT coverage-gap fill
+    // PINNACLE-ABSENT non-AH coverage-gap fill
     niches.push("bet365", "1xbet");
     return niches;
   }
