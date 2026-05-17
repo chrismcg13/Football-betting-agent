@@ -989,6 +989,8 @@ export interface ExposureCapsResult {
     leagueAlreadyStaked: number;
     dailyAlreadyStaked: number;
   };
+  /** Bundle 7.E — which bankroll-tier band selected the caps. */
+  tierLabel?: string;
 }
 
 const exposureCache = new Map<string, { value: number; expiresAt: number }>();
@@ -1008,6 +1010,69 @@ async function readExposure(cacheKey: string, queryFn: () => Promise<number>): P
   }
 }
 
+/**
+ * Bundle 7.E — bankroll-tier auto-scaling.
+ *
+ * The 4-tier table lives in agent_config.exposure_cap_tiers (JSON).
+ * Detected live bankroll picks the matching band; per-key overrides
+ * in agent_config (per_fixture_exposure_pct etc.) win over the table
+ * for that specific cap — provides a "pin this cap" escape hatch.
+ */
+interface ExposureCapTier {
+  max_bankroll_gbp: number | null; // null = top tier (unbounded)
+  per_fixture_pct: number;
+  per_league_pct: number;
+  daily_cap_pct: number;
+  label: string;
+}
+
+const DEFAULT_CAP_TIERS: ExposureCapTier[] = [
+  { max_bankroll_gbp: 500,   per_fixture_pct: 3.0, per_league_pct: 10.0, daily_cap_pct: 6.0,  label: "ramp" },
+  { max_bankroll_gbp: 2000,  per_fixture_pct: 5.0, per_league_pct: 15.0, daily_cap_pct: 8.0,  label: "default" },
+  { max_bankroll_gbp: 10000, per_fixture_pct: 6.0, per_league_pct: 18.0, daily_cap_pct: 10.0, label: "moderate" },
+  { max_bankroll_gbp: null,  per_fixture_pct: 8.0, per_league_pct: 20.0, daily_cap_pct: 12.0, label: "mature" },
+];
+
+export async function getExposureCapsForBankroll(bankroll: number): Promise<{
+  perFixturePct: number;
+  perLeaguePct: number;
+  dailyStakeCapPct: number;
+  tierLabel: string;
+}> {
+  let tiers: ExposureCapTier[] = DEFAULT_CAP_TIERS;
+  try {
+    const raw = await getConfigValue("exposure_cap_tiers");
+    if (raw) {
+      const parsed = JSON.parse(raw) as { tiers?: ExposureCapTier[] };
+      if (Array.isArray(parsed?.tiers) && parsed.tiers.length > 0) tiers = parsed.tiers;
+    }
+  } catch (err) {
+    logger.warn({ err }, "exposure_cap_tiers JSON parse failed — using defaults");
+  }
+  // Pick the first tier whose max_bankroll_gbp is null OR >= bankroll.
+  // Iterate in declared order — assumes table is sorted ascending by cap.
+  const tier =
+    tiers.find((t) => t.max_bankroll_gbp == null || bankroll <= t.max_bankroll_gbp) ??
+    tiers[tiers.length - 1]!;
+
+  // Per-key explicit overrides — operator can pin any single cap.
+  const overrideNum = async (key: string): Promise<number | null> => {
+    const raw = await getConfigValue(key);
+    const parsed = raw != null ? Number(raw) : NaN;
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const fixtureOverride = await overrideNum("per_fixture_exposure_pct");
+  const leagueOverride = await overrideNum("per_league_exposure_pct");
+  const dailyOverride = await overrideNum("daily_stake_cap_pct");
+
+  return {
+    perFixturePct: fixtureOverride ?? tier.per_fixture_pct,
+    perLeaguePct: leagueOverride ?? tier.per_league_pct,
+    dailyStakeCapPct: dailyOverride ?? tier.daily_cap_pct,
+    tierLabel: tier.label,
+  };
+}
+
 export async function applyInversionExposureCaps(args: {
   proposedStake: number;
   bankroll: number;
@@ -1016,16 +1081,13 @@ export async function applyInversionExposureCaps(args: {
 }): Promise<ExposureCapsResult> {
   const { proposedStake, bankroll, matchId, league } = args;
 
-  const num = async (key: string, fallback: number): Promise<number> => {
-    const raw = await getConfigValue(key);
-    const parsed = raw != null ? Number(raw) : NaN;
-    return Number.isFinite(parsed) ? parsed : fallback;
-  };
-
+  // Bundle 7.E — bankroll-tier auto-scaling. Tier picked from
+  // exposure_cap_tiers JSON; per-key explicit overrides win.
+  const tierCaps = await getExposureCapsForBankroll(bankroll);
   const caps = {
-    perFixturePct: await num("per_fixture_exposure_pct", 5.0),
-    perLeaguePct: await num("per_league_exposure_pct", 15.0),
-    dailyStakeCapPct: await num("daily_stake_cap_pct", 8.0),
+    perFixturePct: tierCaps.perFixturePct,
+    perLeaguePct: tierCaps.perLeaguePct,
+    dailyStakeCapPct: tierCaps.dailyStakeCapPct,
   };
 
   // Current exposure — three lookups, all cached briefly. Each is filtered
@@ -1099,6 +1161,7 @@ export async function applyInversionExposureCaps(args: {
       leagueAlreadyStaked,
       dailyAlreadyStaked,
     },
+    tierLabel: tierCaps.tierLabel,
   };
 }
 

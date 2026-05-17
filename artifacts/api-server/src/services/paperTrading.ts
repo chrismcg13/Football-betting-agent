@@ -2950,6 +2950,30 @@ export async function placePaperBet(
       );
       return { placed: false, reason: "ghost_zero_stake" };
     }
+
+    // ── Bundle 7.A (2026-05-17): dual-track classification ─────────────────
+    // Tags the bet as 'sharp_anchored' (Pinnacle or non-Pinnacle sharp
+    // present) or 'model_only' (no sharp anchor). Downstream Bundle 7.C
+    // gate bypass and per-track Wilson ROI aggregation both key on this
+    // column. Cheap — fast-path returns sharp_anchored when pinnacleImplied
+    // is non-null without any DB query.
+    let candidateTrack: "sharp_anchored" | "model_only" = "sharp_anchored";
+    try {
+      const { classifyCandidateTrack } = await import("./candidateTracking");
+      const cls = await classifyCandidateTrack({
+        matchId,
+        marketType,
+        selectionName,
+        pinnacleImpliedFromBet: pinnacleImplied ?? null,
+      });
+      candidateTrack = cls.track;
+    } catch (err) {
+      // Track classification failed (DB hiccup). Default to sharp_anchored
+      // — Bundle 7.C gate bypass is flag-gated so default has zero
+      // production effect until inversion is on.
+      logger.warn({ err, matchId, marketType, selectionName }, "candidateTrack classification failed — defaulting to sharp_anchored");
+    }
+
     const betResult = await db
       .insert(paperBetsTable)
       .values({
@@ -3022,6 +3046,21 @@ export async function placePaperBet(
             : (postCutover ? "live" : "paper"),
       })
       .returning();
+
+    // Bundle 7.A — dual-track tag. Written as a raw UPDATE rather than
+    // an insert column because the lib/db Drizzle schema doesn't carry
+    // candidate_track yet (would need a lib/db dist rebuild — orthogonal
+    // to placement). Idempotent; fires after RETURNING so bet.id exists.
+    if (betResult[0]?.id) {
+      try {
+        await pgClient.query(
+          `UPDATE paper_bets SET candidate_track = $1 WHERE id = $2`,
+          [candidateTrack, betResult[0].id],
+        );
+      } catch (err) {
+        logger.warn({ err, betId: betResult[0].id, candidateTrack }, "candidate_track UPDATE failed (non-blocking)");
+      }
+    }
 
     bet = betResult[0];
 

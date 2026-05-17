@@ -4711,6 +4711,49 @@ export async function runMigrations() {
     }
     logger.info({ count: stage0Seed.length }, "Bundle 7.0: Stage 0 config keys seeded");
 
+    // ── Bundle 7.A (2026-05-17): dual-track candidate classifier ─────────────
+    // Every candidate is classified as 'sharp_anchored' (Pinnacle and/or
+    // non-Pinnacle sharp present within freshness window) or 'model_only'
+    // (no sharp anchor; gated by model + opportunity_score, shadow-only,
+    // graduates via Wilson 95% LCB once scope proves edge). Stored on the
+    // bet row so downstream analysis can split per-track Wilson ROI / CLV.
+    //
+    // Default 'sharp_anchored' for legacy rows pre-Bundle-7.A — the inversion
+    // gate (Bundle 5) only fires shadow telemetry today, so legacy rows tagged
+    // sharp_anchored have no behavioural impact. New rows are tagged at write
+    // time via classifyCandidateTrack().
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+      ADD COLUMN IF NOT EXISTS candidate_track TEXT NOT NULL DEFAULT 'sharp_anchored'
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_paper_bets_candidate_track
+        ON paper_bets (candidate_track, bet_track, placed_at DESC)
+    `);
+    logger.info("Bundle 7.A: paper_bets.candidate_track column + index ready");
+
+    // ── Bundle 7.E (2026-05-17): bankroll-tier auto-scaling for caps ────────
+    // Replaces Bundle 5.M's static defaults with a 4-tier table indexed by
+    // detected live Betfair balance. Caps scale with proven edge without
+    // manual intervention. Operator can override any tier by editing the
+    // JSON, or override a specific cap by setting the matching agent_config
+    // key (per_fixture_exposure_pct etc.) — explicit per-key wins.
+    await db
+      .insert(agentConfigTable)
+      .values({
+        key: "exposure_cap_tiers",
+        value: JSON.stringify({
+          tiers: [
+            { max_bankroll_gbp: 500,    per_fixture_pct: 3.0, per_league_pct: 10.0, daily_cap_pct: 6.0,  label: "ramp" },
+            { max_bankroll_gbp: 2000,   per_fixture_pct: 5.0, per_league_pct: 15.0, daily_cap_pct: 8.0,  label: "default" },
+            { max_bankroll_gbp: 10000,  per_fixture_pct: 6.0, per_league_pct: 18.0, daily_cap_pct: 10.0, label: "moderate" },
+            { max_bankroll_gbp: null,   per_fixture_pct: 8.0, per_league_pct: 20.0, daily_cap_pct: 12.0, label: "mature" },
+          ],
+        }),
+      })
+      .onConflictDoNothing({ target: agentConfigTable.key });
+    logger.info("Bundle 7.E: exposure_cap_tiers seeded (4 bankroll bands)");
+
     // ── Bundle 5.N (2026-05-17): seed inversion-pipeline config keys ──────
     // Nine new operator-tunable keys, defaults match the locked spec
     // (docs/bundle-5-activation-spec.md). Plus the activation switch (kept
