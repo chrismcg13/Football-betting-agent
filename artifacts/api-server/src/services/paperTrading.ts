@@ -1589,8 +1589,13 @@ export async function placePaperBet(
   let pinnacleImplied: number | null = options.pinnacleImplied ?? null;
   const score = opportunityScore ?? 65;
 
-  const logReject = async (reason: string) => {
-    logger.info({ matchId, marketType, selectionName, reason }, "Bet rejected");
+  const logReject = async (
+    gate: import("./rejectionGateEnum").RejectionGate,
+    reason: string,
+  ) => {
+    logger.info({ matchId, marketType, selectionName, gate, reason }, "Bet rejected");
+    // Bundle 6: details.gate is the structured pivot for v_rejected_by_gate_*
+    // aggregations. details.reason kept as human-readable supplement.
     await db.insert(complianceLogsTable).values({
       actionType: "bet_rejected",
       details: {
@@ -1601,6 +1606,7 @@ export async function placePaperBet(
         modelProbability,
         edge,
         opportunityScore: score,
+        gate,
         reason,
       },
       timestamp: new Date(),
@@ -1616,7 +1622,7 @@ export async function placePaperBet(
   // risk; correlation + duplicate-bet rejection still apply.
   if (BANNED_MARKETS.has(marketType) && !isShadowBet) {
     logger.warn({ matchId, marketType, selectionName }, "HARDSTOP: Banned market — bet blocked at placement");
-    return logReject(`Banned market: ${marketType}`);
+    return logReject("banned_market", `Banned market: ${marketType}`);
   }
   if (BANNED_MARKETS.has(marketType) && isShadowBet) {
     logger.info(
@@ -1670,6 +1676,7 @@ export async function placePaperBet(
         "Bet blocked by autonomous pause (self-audit)",
       );
       return logReject(
+        "autonomous_scope_pause",
         `Autonomous pause active on ${pauseCheck.pauseRow?.scopeType} ${pauseCheck.pauseRow?.scopeValue} (reason: ${pauseCheck.pauseRow?.reason}, until ${pauseCheck.pauseRow?.pausedUntil})`,
       );
     }
@@ -1727,7 +1734,7 @@ export async function placePaperBet(
           { matchId, marketType, selectionName, backOdds, reason: blockCheck.reason },
           "EDGE CONCENTRATION: bet blocked",
         );
-        return logReject(blockCheck.reason!);
+        return logReject("dynamic_block_check", blockCheck.reason!);
       }
     }
   }
@@ -1740,7 +1747,7 @@ export async function placePaperBet(
       .where(eq(matchesTable.id, matchId))
       .limit(1);
     if (!match) {
-      return logReject(`Cannot verify stats coverage — match ${matchId} not found`);
+      return logReject("match_not_found", `Cannot verify stats coverage — match ${matchId} not found`);
     }
     const [config] = await db
       .select({ hasStatistics: competitionConfigTable.hasStatistics })
@@ -1758,7 +1765,7 @@ export async function placePaperBet(
       // bypass stats-coverage requirements per "shadow bypasses every capital-
       // risk gate" durable rule. Production-track real-stake still rejected.
       if (!isShadowBet) {
-        return logReject(`No ${isCornersMarket ? "corners" : "cards"} stats coverage for league: ${match.league} (${match.country})`);
+        return logReject("stats_coverage_missing", `No ${isCornersMarket ? "corners" : "cards"} stats coverage for league: ${match.league} (${match.country})`);
       }
       await logShadowGateExemption(
         "stats_coverage_required",
@@ -1776,6 +1783,7 @@ export async function placePaperBet(
     const tightenedMin = score - API_FOOTBALL_DEGRADATION_BOOST;
     if (score < 70 + API_FOOTBALL_DEGRADATION_BOOST) {
       return logReject(
+        "api_football_circuit_open",
         `API-Football circuit open — opportunity score ${score} < tightened threshold ${70 + API_FOOTBALL_DEGRADATION_BOOST} (normal 70 + ${API_FOOTBALL_DEGRADATION_BOOST} degradation penalty)`,
       );
     }
@@ -1810,7 +1818,7 @@ export async function placePaperBet(
         );
         isShadowBet = true;
       } else {
-        return logReject(`Production quarantine: ${dataTier}-tier bets blocked in prod`);
+        return logReject("production_quarantine_data_tier", `Production quarantine: ${dataTier}-tier bets blocked in prod`);
       }
     }
     if (opportunityBoosted) {
@@ -1885,6 +1893,7 @@ export async function placePaperBet(
           isShadowBet = true;
         } else {
           return logReject(
+            "production_quarantine_boosted_score",
             `Production quarantine: opportunity-boosted bet not Tier 1B-qualified (${preCheck.reason})`,
           );
         }
@@ -1919,7 +1928,7 @@ export async function placePaperBet(
         universeTier,
       );
     } else {
-      return logReject(`Agent is not running (status: ${status})`);
+      return logReject("agent_not_running", `Agent is not running (status: ${status})`);
     }
   }
 
@@ -1935,7 +1944,7 @@ export async function placePaperBet(
         universeTier,
       );
     } else {
-      return logReject("Betfair API error rate pause active — skipping bet placement");
+      return logReject("betfair_api_paused", "Betfair API error rate pause active — skipping bet placement");
     }
   }
 
@@ -1964,7 +1973,7 @@ export async function placePaperBet(
         universeTier,
       );
     } else {
-      return logReject(`Live circuit breaker: ${liveCircuitBreaker.reason}`);
+      return logReject("live_circuit_breaker", `Live circuit breaker: ${liveCircuitBreaker.reason}`);
     }
   }
 
@@ -2007,7 +2016,7 @@ export async function placePaperBet(
           universeTier,
         );
       } else {
-        return logReject(reason);
+        return logReject("daily_loss_limit", reason);
       }
     }
 
@@ -2031,7 +2040,7 @@ export async function placePaperBet(
           universeTier,
         );
       } else {
-        return logReject(reason);
+        return logReject("weekly_loss_limit", reason);
       }
     }
   }
@@ -2079,6 +2088,7 @@ export async function placePaperBet(
     );
     if (exactDup) {
       return logReject(
+        "duplicate_selection_pending",
         `Duplicate: ${exactDup.status} bet already exists for ${marketType}:${selectionName} (canonical "${selectionCanonical}") on match ${matchId}`,
       );
     }
@@ -2091,6 +2101,7 @@ export async function placePaperBet(
       );
       if (catDup) {
         return logReject(
+          "duplicate_threshold_category",
           `Threshold category "${thisCat}" already covered by ${catDup.status} ${catDup.marketType}:${catDup.selectionName} on match ${matchId}`,
         );
       }
@@ -2141,11 +2152,13 @@ export async function placePaperBet(
           isShadowBet = true;
         } else {
           return logReject(
+            "match_saturated_both_rails",
             `Match ${matchId} saturated on both rails (paper ${sameTrackPending.length}/4, shadow ${shadowPending.length}/24) — dropping ${marketType}:${selectionName}`,
           );
         }
       } else {
         return logReject(
+          "match_saturated_same_rail",
           `Match ${matchId} already has ${sameTrackPending.length} pending ${incomingTrack} bets (max ${cap}) — skipping ${marketType}:${selectionName}`,
         );
       }
@@ -2647,7 +2660,7 @@ export async function placePaperBet(
           universeTier,
         );
       } else {
-        return logReject(`Slippage guard: ${slippageResult.reason}`);
+        return logReject("slippage_guard", `Slippage guard: ${slippageResult.reason}`);
       }
     }
   }
@@ -2689,6 +2702,7 @@ export async function placePaperBet(
         );
       } else {
         return logReject(
+          "exposure_limit",
           `Exposure limit reached (£${(currentExposure + stake).toFixed(0)}/£${maxExposure.toFixed(0)} = ${(maxExposurePct * 100).toFixed(0)}% of ${liveLimits ? `live balance, Level ${liveLimits.level}` : "paper bankroll"}). Skipping bet on match ${matchId}.`,
         );
       }
@@ -3081,6 +3095,7 @@ export async function placePaperBet(
       );
       // Fall through to finally — single release path. The `return` triggers finally.
       return logReject(
+        "duplicate_selection_db_race",
         `Duplicate (race-blocked at DB): ${marketType}:${selectionName} on match ${matchId}`,
       );
     }

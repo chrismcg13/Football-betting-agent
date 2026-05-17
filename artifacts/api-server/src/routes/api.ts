@@ -7050,6 +7050,25 @@ router.post("/admin/phase-0-dedupe-and-backfill", async (_req, res) => {
   }
 });
 
+// ─── Bundle 6 (2026-05-17) — per-gate rejection counts (last 24h) ───────
+// Convenience wrapper around v_rejected_by_gate_24h. Ops uses this to
+// answer "which gate is throwing out the most candidates right now?" —
+// supports the REMOVE/RETAIN/REWORK calibration loop from memo §F.
+router.get("/admin/rejection-counts-24h", async (_req, res) => {
+  try {
+    const r = await db.execute(sql`
+      SELECT gate, n, distinct_matches, distinct_market_types,
+             first_seen_24h, last_seen_24h
+      FROM v_rejected_by_gate_24h
+      ORDER BY n DESC
+    `);
+    res.json({ ok: true, rows: (r as any).rows ?? [] });
+  } catch (err) {
+    logger.error({ err }, "rejection-counts-24h failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // ─── Bundle 5.L (2026-05-17) — manual trigger for CLV circuit breaker ──
 // Same logic as the 15-min cron, useful for ops to force a check after
 // changing clv_circuit_breaker_threshold or for one-off audits.

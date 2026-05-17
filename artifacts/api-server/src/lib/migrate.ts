@@ -4431,6 +4431,38 @@ export async function runMigrations() {
     `);
     logger.info("Bundle 5.L: v_clv_health_rolling view ready");
 
+    // ── Bundle 6 (2026-05-17): structured-rejection-by-gate aggregator ──────
+    // SQL pivot for the "candidates lost per gate" measurement. paperTrading's
+    // logReject() (post Bundle 6 refactor) emits action_type='bet_rejected'
+    // with details.gate set to a value from RejectionGate enum
+    // (services/rejectionGateEnum.ts). lazy_promote_* and other distinct
+    // action_types are unified into the same view via COALESCE so a single
+    // query gives the operator a complete per-gate funnel for the last 24h.
+    //
+    // Memo §F prerequisite: makes the REMOVE/RETAIN/REWORK decisions in
+    // Bundle 5 data-validatable (which gates actually fire, and how often).
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_rejected_by_gate_24h AS
+      SELECT
+        COALESCE(details->>'gate', action_type) AS gate,
+        COUNT(*)::int AS n,
+        COUNT(DISTINCT (details->>'matchId'))::int AS distinct_matches,
+        COUNT(DISTINCT (details->>'marketType'))::int AS distinct_market_types,
+        MIN(timestamp) AS first_seen_24h,
+        MAX(timestamp) AS last_seen_24h
+      FROM compliance_logs
+      WHERE timestamp >= NOW() - INTERVAL '24 hours'
+        AND (
+          action_type = 'bet_rejected'
+          OR action_type LIKE 'lazy_promote_%'
+          OR action_type = 'inversion_exposure_cap_trimmed'
+          OR action_type = 'clv_circuit_breaker_tripped'
+        )
+      GROUP BY 1
+      ORDER BY n DESC
+    `);
+    logger.info("Bundle 6: v_rejected_by_gate_24h view ready");
+
     // ── Bundle 5.N (2026-05-17): seed inversion-pipeline config keys ──────
     // Nine new operator-tunable keys, defaults match the locked spec
     // (docs/bundle-5-activation-spec.md). Plus the activation switch (kept
