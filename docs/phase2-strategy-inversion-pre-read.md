@@ -346,19 +346,29 @@ League One (UK) 15%, USL League Two 2%, Druha Liga 0%, Second League 0%, Liga II
 
 The Premier League "PARTIAL" classification surprises — but reflects 60-day coverage including pre-release periods and post-season gaps; it is not a Phase 2 blocker. Top-league live placement remains the priority universe.
 
-### C.2 — Second-book recommendation: USE THE FREE-TIER NICHE SUPPLEMENT (NO PAID COMMITMENT)
+### C.2 — Second-book recommendation: SHARP-ONLY FREE-TIER NICHE (no paid commitment)
 
-**Per Section 0.1 (corrected 2026-05-17, Bundle 0):** the paid plan is Pinnacle-only and the free tier (250/month, separate account) delivers multi-book. Bundle 1 has already shipped the wiring (E.1 client + budget primitives, E.2 `bookmaker_slug` column, E.3 niche-aligned synchronous fetch in `sharpAnchorFetch.ts`).
+**Per Section 0.1 (corrected 2026-05-17, Bundle 0):** the paid plan is Pinnacle-only and the free tier (250/month, separate account) delivers multi-book. Bundle 1 shipped E.1–E.3 the same day, then immediately ran into a parser/format mismatch on the first 9 free-tier burns (zero rows written). The diagnostic burns and subsequent E.5 redesign settled the niche table.
 
-**Recommendation:** keep the paid Pinnacle stream as the always-on anchor. Spend the 250-req free-tier budget on niche-aligned multi-book queries inside the placement decision cycle (Stage 2 of the inversion pipeline). Niche allocation (decided 2026-05-17):
-- **AH with Pinnacle present and edge ≥ 3pp** → Singbet primary; SBOBet cross-validator if edge ≥ 5pp.
-- **AH with Pinnacle absent** → Singbet as primary anchor.
-- **MO / O-U / BTTS with Pinnacle absent** → Bet365 + 1xBet.
-- **All markets with Pinnacle edge ≥ 5pp** → Singbet + Bet365 as second opinion.
+**E.5 niche allocation (final, shipped 2026-05-17):**
+| Market | Pinnacle status | Free-tier supplement |
+|---|---|---|
+| AH | present, edge ≥ 5pp | Singbet + SBOBet (two-sharp confirmation) |
+| AH | present, edge 3–5pp | Singbet only |
+| AH | absent | Singbet (primary AH anchor) |
+| All other markets | present | none — Pinnacle alone is the sharp anchor |
+| All other markets | absent | none — stays shadow until Wilson 95% LCB + CLV t-stat proves edge against the bias-corrected model |
 
-This is a synchronous-within-cycle fetch — no separate cron, no caching layer beyond the standard 60s read-through. Burn is bounded by `MONTHLY_CAP_FREE = 250` and `DEFAULT_DAILY_CAP_FREE = 9`, tracked in `api_usage` under the `oddspapi_F*` prefix to keep paid-vs-free budget visibility clean. The trust-weight integration into `sharp_consensus_snapshots` is Bundle 5 work (pre-staged below).
+**Why sharps only.** Sharps (Pinnacle, Singbet, SBOBet, PS3838) find/decide edge. Softs (Bet365, 1xBet, William Hill, etc.) are what we bet INTO — they're the mis-pricing population, not the truth source. Original E.3 design included Bet365/1xBet as "PINNACLE-ABSENT MO/OU/BTTS coverage-gap fill" — that was a category error: averaging soft prices into a pseudo-consensus doesn't produce a sharp anchor. Removed in E.5.
 
-**Worst case rule from spec:** Section A returned a WAIT verdict, not NO-GO. The second-book question collapses to "use the free-tier multi-book budget Bundle 1 already wired" — no new commercial commitment.
+**Per-book parser details:**
+- **Singbet:** outcome IDs follow `IOR_R{H|C}/<line> / <leg>` (e.g. `IOR_RH/0.5 / 1` = home side, abs(line)=0.5). Direct-line decoder; sign disambiguated by price (favourite < 2.0, dog > 2.0).
+- **SBOBet:** outcome IDs are just `"h"`/`"a"`; line lives only in the opaque `bookmakerMarketId` first segment. Decoder uses **price-proximity** against the bet's Betfair odds with 25% tolerance — sharps quote within ~5-10% on the same line; cross-line markets diverge 30%+.
+- **Bet365/1xBet:** softs, dropped. (Bet365's outcome IDs are pure opaque numerics like `"1179904266"` — undecodable without an external Bet365 dictionary, but moot since they're softs anyway.)
+
+This is a synchronous-within-cycle fetch — no separate cron, no caching layer beyond the standard 60s read-through. Burn is bounded by `MONTHLY_CAP_FREE = 250` and `DEFAULT_DAILY_CAP_FREE = 9`, tracked in `api_usage` under the `oddspapi_F*` prefix to keep paid-vs-free budget visibility clean. The multi-book reader in `inversionPipeline.ts` (Bundle 5.C) pulls these rows via `bookmaker_slug` for Stage-2 sharp-agreement decisions.
+
+**Worst case rule from spec:** Section A returned a WAIT verdict, not NO-GO. The second-book question collapses to "use the free-tier sharp-only niche Bundle 1 E.5 already wired" — no new commercial commitment.
 
 ## Section D — Shadow→live divergence decomposition · serves R1, R3
 

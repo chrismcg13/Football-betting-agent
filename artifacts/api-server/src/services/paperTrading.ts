@@ -2745,15 +2745,15 @@ export async function placePaperBet(
     );
   }
 
-  // ── Bundle 1 E.3 (2026-05-17): niche-aligned sharp-anchor fetch ──────────
+  // ── Bundle 1 E.3 + E.5 (2026-05-17): niche-aligned sharp-anchor fetch ───
   // Synchronous-within-cycle. Non-qualifying candidates skip the IO entirely
-  // (outcome='no_niche_qualifies'); qualifying candidates spend at most one
-  // free-tier OddsPapi request (~200-400ms) to add Singbet/SBOBet on AH or
-  // Bet365/1xBet on PINNACLE-ABSENT MO/OU/BTTS. Rows are written to
-  // pinnacle_odds_snapshots with bookmaker_slug per book so the Bundle 5
-  // inversion gate can read multi-book agreement at placement time. Failure
-  // modes (budget exhausted, missing key, parse failure) degrade silently to
-  // Pinnacle-only — they never block the bet from being recorded.
+  // (outcome='no_niche_qualifies'); qualifying AH candidates spend at most
+  // one free-tier OddsPapi request (~200-400ms) to add Singbet (and SBOBet
+  // on high-conviction ≥5pp). Rows are written to pinnacle_odds_snapshots
+  // with bookmaker_slug per book so the Bundle 5 inversion gate can read
+  // multi-book sharp agreement at placement time. Failure modes (budget
+  // exhausted, missing key, parse failure) degrade silently to Pinnacle-
+  // only — they never block the bet from being recorded.
   try {
     const { fetchSharpAnchors, lookupOddspapiFixtureId } = await import("./sharpAnchorFetch");
     const oddspapiFixtureId = await lookupOddspapiFixtureId(matchId);
@@ -2766,16 +2766,23 @@ export async function placePaperBet(
       matchId,
       marketType,
       selectionName,
+      backOdds,
       pinnacleImplied: pinnacleImpliedNum,
       pinnacleEdgePp,
       oddspapiFixtureId,
     });
     // Log all outcomes except no_niche_qualifies (the common silent skip).
-    // Spec-qualifying outcomes (fetched/cached) log INFO; degraded outcomes
-    // (budget_exhausted/free_tier_disabled/fetch_failed) log WARN so the
-    // diagnostic is visible without scanning structured logs.
+    // Spec-qualifying outcomes (fetched/cached) log INFO. pinnacle_fallback
+    // is also INFO — Pinnacle anchors the bet via the paid prefetch, so
+    // free-tier degradation is acceptable when Pinnacle is present. Hard
+    // degradations (budget_exhausted/free_tier_disabled/fetch_failed —
+    // these only fire when Pinnacle is ALSO absent) log WARN.
     if (sharpResult.outcome !== "no_niche_qualifies") {
-      const level = sharpResult.outcome === "fetched" || sharpResult.outcome === "cached" ? "info" : "warn";
+      const isInfo =
+        sharpResult.outcome === "fetched" ||
+        sharpResult.outcome === "cached" ||
+        sharpResult.outcome === "pinnacle_fallback";
+      const level = isInfo ? "info" : "warn";
       logger[level](
         {
           matchId,
@@ -2792,7 +2799,9 @@ export async function placePaperBet(
           ? "sharpAnchorFetch: multi-book anchors recorded (fresh)"
           : sharpResult.outcome === "cached"
             ? "sharpAnchorFetch: multi-book anchors recorded (cache)"
-            : `sharpAnchorFetch: degraded — ${sharpResult.outcome}`,
+            : sharpResult.outcome === "pinnacle_fallback"
+              ? "sharpAnchorFetch: free-tier supplement missed — Pinnacle anchors"
+              : `sharpAnchorFetch: degraded — ${sharpResult.outcome}`,
       );
     }
   } catch (err) {
