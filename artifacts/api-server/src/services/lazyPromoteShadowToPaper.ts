@@ -555,6 +555,27 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
         // 2026-05-15 — per-market-type kill switch. Mirrors the check in
         // paperTrading.placePaperBet so lazy-promote doesn't bypass the
         // gate on the ~79% of capital that flows through this path.
+        //
+        // Bundle 11.C (2026-05-17): mirror the Bundle 7.C sharp-anchored
+        // bypass that valueDetection.ts + paperTrading.ts (via Fix B)
+        // already apply. When inversion_pipeline_enabled = true, the
+        // disabled-markets list is bypassed for this path too — the
+        // inversion gate (downstream Bundle 11 freshness + 3-7pp band
+        // check, lines ~628-740) becomes the active gate. Without this
+        // bypass, ASIAN_HANDICAP / OVER_UNDER_15 / OVER_UNDER_05 are
+        // blocked from lazy promote even when they have a fresh Pinnacle
+        // anchor inside the 3-7pp band — defeats the purpose of the
+        // inversion strategy. Pinnacle-anchor requirement is still
+        // enforced downstream by the freshness query, so we don't risk
+        // promoting a non-sharp-anchored disabled-market bet.
+        const inversionOn = await (async () => {
+          try {
+            const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+            return await isInversionPipelineEnabled();
+          } catch {
+            return false;
+          }
+        })();
         const disabledCsv = (await getConfig("live_placement_disabled_market_types")) ?? "";
         const disabledSet = new Set(
           disabledCsv
@@ -562,7 +583,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
             .map((s) => s.trim().toUpperCase())
             .filter(Boolean),
         );
-        if (disabledSet.has(r.market_type.toUpperCase())) {
+        if (!inversionOn && disabledSet.has(r.market_type.toUpperCase())) {
           result.skipped_kelly_below_min++;  // reuse counter
           continue;
         }

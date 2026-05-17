@@ -3326,11 +3326,19 @@ export async function placePaperBet(
     // enough to be a paper bet, it's good enough to be a live bet.
     // Bundle 1L (2026-05-16): kickoffTime now passed so the gate can apply
     // the 24h cap (FIX 1) + per-league demote (FIX 2).
+    // Bundle 11.B (2026-05-17): pinnacleImplied wired so the Bundle 7.C
+    // sharp-anchored bypass actually fires. Without this, the bypass
+    // condition `pi != null && pi > 0` always fails silently and the
+    // disabled_market_types / disabled_leagues lists block ASIAN_HANDICAP
+    // (etc.) candidates that the inversion gate qualifies. By the time
+    // this call site is reached, pinnacleImplied has been resolved via
+    // the freshness-bounded fallback at ~line 2727.
     const liveGates = await checkLivePlacementGates({
       marketType,
       league: match?.league ?? "",
       betId: bet.id,
       kickoffTime: match?.kickoffTime ?? null,
+      pinnacleImplied: pinnacleImplied ?? null,
     });
 
     // Fail-loud guard (Amendment 1). live_whitelist is deprecated; the
