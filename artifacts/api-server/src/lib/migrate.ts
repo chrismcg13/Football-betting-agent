@@ -4277,6 +4277,54 @@ export async function runMigrations() {
     `);
     logger.info("Bundle 1 E.2: pinnacle_odds_snapshots.bookmaker_slug column + lookup index ready");
 
+    // ── Bundle 5.B (2026-05-17): rolling-window mean_bias + model_se ─────────
+    // Per memo §J: every market_type shows positive model-vs-Pinnacle bias
+    // (12–31pp). The inversion pipeline (Bundle 5.A) bias-corrects the model
+    // probability before computing R2's disagreement_z. This view exposes
+    // the rolling-window mean_bias and stddev_samp(model_p − pinnacle_implied)
+    // for each market_type so the gate can read the freshest calibration
+    // without scanning paper_bets per placement.
+    //
+    // Universe filter (matches the memo's cutover anchor):
+    //   bet_track IN ('live','shadow')
+    //   AND legacy_regime = false
+    //   AND placed_at >= '2026-05-17'  -- post Bundle 3 selectPricingSources fix
+    //   AND pinnacle_implied IS NOT NULL AND pinnacle_implied > 0
+    //   AND model_probability IS NOT NULL
+    //   AND status IN ('won','lost','void')
+    //   AND deleted_at IS NULL
+    // Window: last 200 rows per market_type by placed_at DESC (the constant
+    // 200 lives here, not in TS — Bundle 5.A's `mean_bias_window_n` config key
+    // is read by the *reader* to gate the view's freshness, but the window
+    // size itself is encoded in the SQL to keep the view planner-friendly).
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_market_type_mean_bias_rolling AS
+      WITH ranked AS (
+        SELECT
+          market_type,
+          model_probability,
+          pinnacle_implied,
+          ROW_NUMBER() OVER (PARTITION BY market_type ORDER BY placed_at DESC) AS rn
+        FROM paper_bets
+        WHERE bet_track IN ('live','shadow')
+          AND legacy_regime = false
+          AND placed_at >= TIMESTAMP '2026-05-17 00:00:00'
+          AND pinnacle_implied IS NOT NULL AND pinnacle_implied > 0
+          AND model_probability IS NOT NULL
+          AND status IN ('won','lost','void')
+          AND deleted_at IS NULL
+      )
+      SELECT
+        market_type,
+        COUNT(*)::int AS n,
+        AVG(model_probability - pinnacle_implied)::numeric AS mean_bias,
+        STDDEV_SAMP(model_probability - pinnacle_implied)::numeric AS model_se
+      FROM ranked
+      WHERE rn <= 200
+      GROUP BY market_type
+    `);
+    logger.info("Bundle 5.B: v_market_type_mean_bias_rolling view ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

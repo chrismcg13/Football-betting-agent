@@ -2152,9 +2152,31 @@ export async function placePaperBet(
     }
   }
 
-  const maxStakePct = liveLimits
+  let maxStakePct = liveLimits
     ? liveLimits.config.maxSingleBetPct
     : Number((await getConfigValue("max_stake_pct")) ?? "0.02");
+  // ── Bundle 5.D (2026-05-17, gated, NOT shipped) ──────────────────────────
+  // When agent_config.inversion_pipeline_enabled = 'true', the 0.02 absolute
+  // single-bet cap (and its 0.025-0.035 live-mode risk-level equivalent) is
+  // bypassed — Kelly fractioning + correlation 1/√k shrinkage + portfolio
+  // fixture cap + open-exposure ceiling are the binding controls. The cap
+  // was the conservative pre-inversion default for an over-confident model;
+  // post-inversion, edge sizing comes from Pinnacle directly (memo §A, §J)
+  // and the 0.02 cap is a duplicative throttle on top of Kelly itself.
+  // SAFETY: defaults OFF. Bundle 5 enable sequence must be: (i) confirm
+  // inversion gate stable in shadow for n>=200; (ii) operator flips the
+  // agent_config flag; (iii) cap bypass activates atomically.
+  try {
+    const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+    if (await isInversionPipelineEnabled()) {
+      maxStakePct = 1.0; // no absolute cap; Kelly self-limits per memo §7
+    }
+  } catch (err) {
+    logger.warn(
+      { err },
+      "Bundle 5.D: inversion-flag check failed — retaining default max_stake_pct",
+    );
+  }
   const stakingBankroll = liveLimits ? liveLimits.liveBalance : bankroll;
   // Task 1 (2026-05-11): p_fair source priority. Prefer the Pinnacle-derived
   // sharp probability (1/fairValueOdds) when a non-degenerate fair value
