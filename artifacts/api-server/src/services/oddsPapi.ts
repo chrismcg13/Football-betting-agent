@@ -37,6 +37,14 @@ const ODDSPAPI_SERVICE = "oddspapi";
 const MONTHLY_CAP = 100_000;
 const DEFAULT_DAILY_CAP = 5_000;
 
+// Bundle 1 (2026-05-17): the paid plan above is per-bookmaker entitled — only
+// Pinnacle accessible. A separate free-tier account (ODDSPAPI_FREE_KEY) gets
+// 250 requests/month and returns multi-book responses (verified: Singbet,
+// SBOBet, Bet365, 1xBet, Pinnacle in one call). See
+// docs/bundle-1-sharp-coverage-plan.md for the budget allocation plan.
+const MONTHLY_CAP_FREE = 250;
+const DEFAULT_DAILY_CAP_FREE = 9;
+
 const GOALS_OU_ALIASES: Record<string, string> = {
   "Over 0.5": "Over 0.5 Goals",
   "Under 0.5": "Under 0.5 Goals",
@@ -212,11 +220,13 @@ function monthStr(): string {
 }
 
 export async function getOddspapiUsageToday(): Promise<number> {
+  // Bundle 1: paid-tier rollup tightened to `oddspapi_P%` so free-tier writes
+  // (oddspapi_free_*) don't drain the paid budget tracker.
   const today = todayStr();
   const rows = await db
     .select({ total: sql<number>`sum(${apiUsageTable.requestCount})::int` })
     .from(apiUsageTable)
-    .where(and(eq(apiUsageTable.date, today), like(apiUsageTable.endpoint, "oddspapi_%")));
+    .where(and(eq(apiUsageTable.date, today), like(apiUsageTable.endpoint, "oddspapi_P%")));
   return Number(rows[0]?.total ?? 0);
 }
 
@@ -225,7 +235,7 @@ export async function getOddspapiUsageThisMonth(): Promise<number> {
   const rows = await db
     .select({ total: sql<number>`sum(${apiUsageTable.requestCount})::int` })
     .from(apiUsageTable)
-    .where(and(like(apiUsageTable.date, `${month}%`), like(apiUsageTable.endpoint, "oddspapi_%")));
+    .where(and(like(apiUsageTable.date, `${month}%`), like(apiUsageTable.endpoint, "oddspapi_P%")));
   return Number(rows[0]?.total ?? 0);
 }
 
@@ -244,6 +254,52 @@ async function getOddspapiUsageByPriority(priority: string): Promise<number> {
     .from(apiUsageTable)
     .where(and(like(apiUsageTable.date, `${month}%`), like(apiUsageTable.endpoint, `oddspapi_${priority}_%`)));
   return Number(rows[0]?.total ?? 0);
+}
+
+// ─── Free-tier budget primitives (Bundle 1) ──────────────────────────────────
+
+export async function getOddspapiFreeUsageToday(): Promise<number> {
+  const today = todayStr();
+  const rows = await db
+    .select({ total: sql<number>`sum(${apiUsageTable.requestCount})::int` })
+    .from(apiUsageTable)
+    .where(and(eq(apiUsageTable.date, today), like(apiUsageTable.endpoint, "oddspapi_free_%")));
+  return Number(rows[0]?.total ?? 0);
+}
+
+export async function getOddspapiFreeUsageThisMonth(): Promise<number> {
+  const month = monthStr();
+  const rows = await db
+    .select({ total: sql<number>`sum(${apiUsageTable.requestCount})::int` })
+    .from(apiUsageTable)
+    .where(and(like(apiUsageTable.date, `${month}%`), like(apiUsageTable.endpoint, "oddspapi_free_%")));
+  return Number(rows[0]?.total ?? 0);
+}
+
+async function trackOddspapiFreeCall(endpoint: string, count = 1): Promise<void> {
+  await db.insert(apiUsageTable).values({
+    date: todayStr(),
+    endpoint: `oddspapi_free_${endpoint}`,
+    requestCount: count,
+  });
+}
+
+async function canMakeOddspapiFreeRequest(needed = 1): Promise<boolean> {
+  const key = process.env.ODDSPAPI_FREE_KEY;
+  if (!key) return false;
+  const [daily, monthly] = await Promise.all([
+    getOddspapiFreeUsageToday(),
+    getOddspapiFreeUsageThisMonth(),
+  ]);
+  if (daily + needed > DEFAULT_DAILY_CAP_FREE) {
+    logger.warn({ daily, cap: DEFAULT_DAILY_CAP_FREE }, "OddsPapi FREE-tier daily budget exhausted");
+    return false;
+  }
+  if (monthly + needed > MONTHLY_CAP_FREE) {
+    logger.warn({ monthly, cap: MONTHLY_CAP_FREE }, "OddsPapi FREE-tier monthly budget exhausted");
+    return false;
+  }
+  return true;
 }
 
 async function canMakeOddspapiRequest(needed = 1, priority = "P1"): Promise<boolean> {
@@ -355,6 +411,47 @@ async function fetchOddsPapi<T = unknown>(
 
   if (json) {
     await trackOddspapiCall(trackAs, 1, priority);
+    if ((json as any).data !== undefined) return (json as any).data as T;
+    if (Array.isArray(json)) return json as unknown as T;
+    return json as unknown as T;
+  }
+
+  return null;
+}
+
+// Bundle 1 (2026-05-17): free-tier client. Drains ODDSPAPI_FREE_KEY's 250/month
+// budget, not the paid Pinnacle plan's 100k. Use for multi-book sharp-anchor
+// fetches (Singbet, SBOBet, etc.) by passing `bookmakers=...` in params. The
+// `trackAs` label flows into api_usage as `oddspapi_free_<trackAs>` so the
+// allocation table in docs/bundle-1-sharp-coverage-plan.md §C is queryable.
+export async function fetchOddsPapiFree<T = unknown>(
+  path: string,
+  params: Record<string, string | number> = {},
+  trackAs = "sharp_anchor",
+): Promise<T | null> {
+  const key = process.env.ODDSPAPI_FREE_KEY;
+  if (!key) {
+    logger.debug("ODDSPAPI_FREE_KEY not set — skipping free-tier OddsPapi call");
+    return null;
+  }
+
+  if (!(await canMakeOddspapiFreeRequest(1))) return null;
+
+  const url = new URL(`${BASE_URL}${path}`);
+  url.searchParams.set("apiKey", key);
+  for (const [k, v] of Object.entries(params)) {
+    url.searchParams.set(k, String(v));
+  }
+
+  const json = await resilientFetch<Record<string, unknown>>(url.toString(), {
+    service: ODDSPAPI_SERVICE,
+    timeoutMs: 30_000,
+    maxRetries: 3,
+    backoffBaseMs: 1000,
+  });
+
+  if (json) {
+    await trackOddspapiFreeCall(trackAs, 1);
     if ((json as any).data !== undefined) return (json as any).data as T;
     if (Array.isArray(json)) return json as unknown as T;
     return json as unknown as T;
