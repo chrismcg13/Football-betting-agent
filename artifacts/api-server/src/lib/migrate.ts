@@ -4330,6 +4330,88 @@ export async function runMigrations() {
     `);
     logger.info("Bundle 5.B: v_market_type_mean_bias_rolling view ready");
 
+    // ── Bundle 5.I (2026-05-17): per-(market × ttk) slippage p75 view ────────
+    // Multiplicative slippage formula needs p75 of adverse fills (positive
+    // slippage = matched worse than offered). Negative slippage (better
+    // fill than offered) is clamped to 0 — we don't plan around tailwinds.
+    //
+    // Universe: cutover-clean live bets with a real Betfair fill price
+    // (`betfair_avg_price_matched > 0`). Excludes paper-track, legacy
+    // regime, and pre-Bundle-3 contaminated rows.
+    //
+    // TTK buckets per the locked spec: 0_1h / 1_6h / 6_24h / 24h_plus.
+    // Rolling 60-day window. Cells with n<30 fall back via the reader chain
+    // (cell → market aggregate → 1.5pp default).
+    //
+    // Recomputed on every query — view is over ~5k rows, planner-friendly.
+    // Promote to a materialised view only if load profile demands.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_slippage_p75_rolling AS
+      WITH bets AS (
+        SELECT
+          pb.market_type,
+          CASE
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '1 hour'   THEN '0_1h'
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '6 hours'  THEN '1_6h'
+            WHEN m.kickoff_time - pb.placed_at < INTERVAL '24 hours' THEN '6_24h'
+            ELSE                                                          '24h_plus'
+          END AS ttk_bucket,
+          GREATEST(
+            (pb.odds_at_placement - pb.betfair_avg_price_matched) / NULLIF(pb.odds_at_placement, 0),
+            0
+          )::float8 AS slip_frac
+        FROM paper_bets pb
+        JOIN matches m ON m.id = pb.match_id
+        WHERE pb.bet_track = 'live'
+          AND pb.legacy_regime = false
+          AND pb.placed_at >= NOW() - INTERVAL '60 days'
+          AND pb.placed_at >= TIMESTAMP WITH TIME ZONE '2026-05-17 08:40:00+00'
+          AND pb.deleted_at IS NULL
+          AND pb.status IN ('won','lost','void')
+          AND pb.betfair_avg_price_matched IS NOT NULL
+          AND pb.betfair_avg_price_matched > 0
+          AND pb.odds_at_placement IS NOT NULL
+          AND pb.odds_at_placement > 1
+      )
+      SELECT
+        market_type,
+        ttk_bucket,
+        COUNT(*)::int AS n,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY slip_frac)::numeric AS p75_slippage
+      FROM bets
+      GROUP BY market_type, ttk_bucket
+    `);
+    logger.info("Bundle 5.I: v_slippage_p75_rolling view ready");
+
+    // ── Bundle 5.N (2026-05-17): seed inversion-pipeline config keys ──────
+    // Nine new operator-tunable keys, defaults match the locked spec
+    // (docs/bundle-5-activation-spec.md). Plus the activation switch (kept
+    // 'false' until the operator is ready). ON CONFLICT DO NOTHING — never
+    // overwrite an operator-set value on re-deploy.
+    const inversionSeed: Array<{ key: string; value: string }> = [
+      { key: "inversion_pipeline_enabled", value: "false" },
+      { key: "min_net_edge_pp", value: "3.0" },
+      { key: "high_edge_flag_threshold", value: "7.0" },
+      { key: "kelly_multiplier_single_sharp", value: "0.5" },
+      { key: "kelly_multiplier_two_sharp", value: "1.0" },
+      { key: "kelly_multiplier_three_sharp", value: "1.0" },
+      { key: "clv_circuit_breaker_threshold", value: "0.0" },
+      { key: "per_fixture_exposure_pct", value: "5.0" },
+      { key: "per_league_exposure_pct", value: "15.0" },
+      { key: "daily_stake_cap_pct", value: "8.0" },
+      // Lazy-promote leak-guard knobs (Bundle 5.G) — also seeded here so
+      // they appear in agent_config without a manual UPDATE.
+      { key: "lazy_promote_min_pinnacle_edge_pp", value: "1.0" },
+      { key: "lazy_promote_max_betfair_drift_pct", value: "0.05" },
+    ];
+    for (const row of inversionSeed) {
+      await db
+        .insert(agentConfigTable)
+        .values(row)
+        .onConflictDoNothing({ target: agentConfigTable.key });
+    }
+    logger.info({ count: inversionSeed.length }, "Bundle 5.N: inversion-pipeline config keys seeded (ON CONFLICT DO NOTHING)");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

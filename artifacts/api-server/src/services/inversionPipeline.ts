@@ -85,9 +85,15 @@ export type InversionDecision =
   | { action: "VETO"; reasons: string[]; diagnostics: InversionDiagnostics }
   | { action: "DEMOTE_SHADOW"; reasons: string[]; diagnostics: InversionDiagnostics };
 
+export type TtkBucket = "0_1h" | "1_6h" | "6_24h" | "24h_plus";
+
 export interface InversionDiagnostics {
   identifiedEdgePp: number | null;
   postSlippageEdgePp: number | null;
+  expectedFillOdds: number | null;
+  p75Slippage: number | null;
+  slippageSource: "cell" | "market_aggregate" | "default" | null;
+  ttkBucket: TtkBucket | null;
   rawModelP: number | null;
   biasCorrectedModelP: number | null;
   meanBias: number | null;
@@ -99,15 +105,33 @@ export interface InversionDiagnostics {
   disagreementZ: number | null;
   stage1Source: Stage1Source;
   thresholds: InversionThresholds;
+  /** Telemetry-only flags — don't gate, just surface for review. */
+  flags: string[];
 }
 
 export interface InversionThresholds {
-  minPostSlippageEdgePp: number;
+  /**
+   * Bundle 5.H locked spec: MIN_NET_EDGE (post-slippage) is the single
+   * floor. Replaces the earlier minPostSlippageEdgePp + minIdentifiedEdgePp
+   * split. Default 3.0pp.
+   */
+  minNetEdgePp: number;
+  /** Telemetry-only flag threshold; does NOT gate. Default 7.0pp. */
+  highEdgeFlagThresholdPp: number;
   vetoZ: number;
   vetoAbsPp: number;
+  /**
+   * R3 down-size from earlier spec is superseded by multi-sharp Kelly
+   * tiering (Bundle 5.J). Retained here as a fallback in case the
+   * sharp-count signal is unavailable.
+   */
   downsizeZ: number;
   downsizeAbsPp: number;
   meanBiasWindowN: number;
+  /** PROCEED_WITH_CAUTION threshold — flagged if p75_slippage > this. */
+  slippageCautionThreshold: number;
+  /** Fallback p75_slippage (fraction) when neither cell nor market aggregate has n>=30. */
+  defaultP75Slippage: number;
 }
 
 export interface InversionCandidate {
@@ -118,6 +142,12 @@ export interface InversionCandidate {
   pinnacleImplied: number | null;
   rawModelProbability: number;
   stage1Source: Stage1Source;
+  /**
+   * Optional kickoff_time. When omitted, evaluateInversionGate looks it
+   * up from the matches table. Pass it through when the caller already
+   * has the value to save one round-trip per gate call.
+   */
+  kickoffTime?: Date | null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -136,12 +166,15 @@ async function readThresholds(): Promise<InversionThresholds> {
     return Number.isFinite(parsed) ? parsed : fallback;
   };
   return {
-    minPostSlippageEdgePp: await num("inversion_min_post_slip_edge", 3.0),
+    minNetEdgePp: await num("min_net_edge_pp", 3.0),
+    highEdgeFlagThresholdPp: await num("high_edge_flag_threshold", 7.0),
     vetoZ: await num("inversion_veto_z", 4.0),
     vetoAbsPp: await num("inversion_veto_abs_pp", 25.0),
     downsizeZ: await num("inversion_downsize_z", 2.0),
     downsizeAbsPp: await num("inversion_downsize_abs_pp", 15.0),
     meanBiasWindowN: await num("mean_bias_window_n", 200),
+    slippageCautionThreshold: await num("slippage_caution_threshold", 0.05),
+    defaultP75Slippage: await num("default_p75_slippage", 0.015),
   };
 }
 
@@ -294,25 +327,101 @@ export function computeMultiBookConsensus(snapshots: MultiBookSnapshot[]): {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Slippage floor table — memo §I
+// Bundle 5.I — per-(market × ttk) p75_slippage reader
 // ──────────────────────────────────────────────────────────────────────────
+//
+// Reads from v_slippage_p75_rolling (Bundle 5.I migration). Fallback chain
+// per the locked spec (docs/bundle-5-activation-spec.md §3):
+//   1. (market_type, ttk_bucket) cell with n >= 30
+//   2. market_type aggregate across all ttks with n >= 30
+//   3. default p75_slippage from agent_config (defaultP75Slippage, 0.015)
+//
+// p75_slippage is a FRACTION (e.g. 0.015 = 1.5% odds compression). The view
+// already computes it as GREATEST((offered − matched) / offered, 0) — adverse
+// fills only; negative slippage clamped to 0. The reader returns the source
+// so diagnostics can show whether the cell, aggregate, or default fired.
 
-const P75_SLIPPAGE_PP: Record<string, number> = {
-  MATCH_ODDS: 0.0,
-  BTTS: 0.0,
-  OVER_UNDER_15: 0.0,
-  OVER_UNDER_25: 2.2,
-  OVER_UNDER_35: 2.2,
-  FIRST_HALF_RESULT: 11.8,
-  // ASIAN_HANDICAP intentionally absent — Bundle 4 follow-up. Falls through
-  // to the default below until selection canonicalisation re-validates the
-  // §I slippage signal for AH.
-};
-const P75_SLIPPAGE_DEFAULT_PP = 2.0;
-
-function getP75SlippagePp(marketType: string): number {
-  return P75_SLIPPAGE_PP[marketType] ?? P75_SLIPPAGE_DEFAULT_PP;
+export interface SlippageLookup {
+  p75Slippage: number;
+  source: "cell" | "market_aggregate" | "default";
+  n: number;
 }
+
+const slippageCache = new Map<string, { value: SlippageLookup; expiresAt: number }>();
+const SLIPPAGE_TTL_MS = 15 * 60 * 1000;
+
+export function computeTtkBucket(kickoffTime: Date, decisionTime: Date = new Date()): TtkBucket {
+  const hoursToKickoff = (kickoffTime.getTime() - decisionTime.getTime()) / 3_600_000;
+  if (hoursToKickoff < 1) return "0_1h";
+  if (hoursToKickoff < 6) return "1_6h";
+  if (hoursToKickoff < 24) return "6_24h";
+  return "24h_plus";
+}
+
+export async function getP75Slippage(
+  marketType: string,
+  ttkBucket: TtkBucket,
+  defaultP75: number,
+): Promise<SlippageLookup> {
+  const cacheKey = `${marketType}|${ttkBucket}|${defaultP75}`;
+  const now = Date.now();
+  const hit = slippageCache.get(cacheKey);
+  if (hit && hit.expiresAt > now) return hit.value;
+
+  try {
+    // Cell lookup first
+    const cell = await db.execute(sql`
+      SELECT n::int AS n, p75_slippage::float8 AS p75
+      FROM v_slippage_p75_rolling
+      WHERE market_type = ${marketType} AND ttk_bucket = ${ttkBucket}
+      LIMIT 1
+    `);
+    const cellRow = ((cell as any).rows ?? [])[0] as { n: number; p75: number } | undefined;
+    if (cellRow && cellRow.n >= 30 && Number.isFinite(cellRow.p75)) {
+      const value: SlippageLookup = { p75Slippage: cellRow.p75, source: "cell", n: cellRow.n };
+      slippageCache.set(cacheKey, { value, expiresAt: now + SLIPPAGE_TTL_MS });
+      return value;
+    }
+
+    // Market-type aggregate (sum n, weighted p75) — done via the same view
+    // by aggregating across all ttk buckets. We use SUM(n) and a
+    // re-percentile over the underlying raw data isn't available from the
+    // grouped view, so approximate via n-weighted mean of cell p75s. This
+    // is a coarse fallback; the spec accepts it for sparse markets.
+    const agg = await db.execute(sql`
+      SELECT
+        SUM(n)::int AS n,
+        SUM(p75_slippage::float8 * n) / NULLIF(SUM(n), 0) AS p75_weighted
+      FROM v_slippage_p75_rolling
+      WHERE market_type = ${marketType}
+    `);
+    const aggRow = ((agg as any).rows ?? [])[0] as { n: number; p75_weighted: number | null } | undefined;
+    if (aggRow && aggRow.n >= 30 && aggRow.p75_weighted != null && Number.isFinite(aggRow.p75_weighted)) {
+      const value: SlippageLookup = {
+        p75Slippage: aggRow.p75_weighted,
+        source: "market_aggregate",
+        n: aggRow.n,
+      };
+      slippageCache.set(cacheKey, { value, expiresAt: now + SLIPPAGE_TTL_MS });
+      return value;
+    }
+  } catch (err) {
+    // View unavailable (pre-migration deploy) or query failed. Fall through
+    // to the safe default — never block the gate on telemetry-source
+    // problems.
+    logger.debug({ err, marketType, ttkBucket }, "v_slippage_p75_rolling unavailable — using default");
+  }
+
+  const value: SlippageLookup = {
+    p75Slippage: defaultP75,
+    source: "default",
+    n: 0,
+  };
+  slippageCache.set(cacheKey, { value, expiresAt: now + 30_000 });
+  return value;
+}
+
+const MARKETS_FORCE_CAUTION = new Set(["FIRST_HALF_RESULT"]);
 
 // ──────────────────────────────────────────────────────────────────────────
 // Stage 1 — model-blind watchlist eligibility
@@ -417,22 +526,95 @@ async function evaluateStage2(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Stage 3 — Post-slippage edge gate
+// Stage 3 — Multiplicative post-slippage net-edge gate (Bundle 5.I)
 // ──────────────────────────────────────────────────────────────────────────
+//
+// Per the locked spec (docs/bundle-5-activation-spec.md §2):
+//   expected_fill_odds    = betfair_offered × (1 − p75_slippage)
+//   pinnacle_fair_odds    = 1 / pinnacle_implied
+//   post_slippage_edge_pp = (expected_fill_odds / pinnacle_fair_odds − 1) × 100
+//                         = (expected_fill_odds × pinnacle_implied − 1) × 100
+//   PROCEED IF post_slippage_edge_pp >= MIN_NET_EDGE (default 3.0pp)
+//
+// The 3pp floor is the SOLE placement gate. TTK is not a hard exclusion —
+// the watchlist already biases toward sub-24h placement via the kickoff +
+// liquidity + 4%/30min mover criteria (no double-gating).
 
-function evaluateStage3(
-  identifiedEdgePp: number,
+interface Stage3Output {
+  postSlippageEdgePp: number | null;
+  expectedFillOdds: number | null;
+  p75Slippage: number | null;
+  slippageSource: SlippageLookup["source"] | null;
+  ttkBucket: TtkBucket;
+  demote: boolean;
+  flags: string[];
+  reasons: string[];
+}
+
+async function evaluateStage3(
+  backOdds: number,
+  pinnacleImplied: number,
   marketType: string,
+  ttkBucket: TtkBucket,
   thresholds: InversionThresholds,
-): { postSlippageEdgePp: number; demote: boolean; reasons: string[] } {
-  const p75Slip = getP75SlippagePp(marketType);
-  const postSlippageEdgePp = identifiedEdgePp - p75Slip;
-  const demote = postSlippageEdgePp < thresholds.minPostSlippageEdgePp;
+): Promise<Stage3Output> {
+  const slip = await getP75Slippage(marketType, ttkBucket, thresholds.defaultP75Slippage);
+  const expectedFillOdds = backOdds * (1 - slip.p75Slippage);
+  const postSlippageEdgePp = (expectedFillOdds * pinnacleImplied - 1) * 100;
+  const demote = postSlippageEdgePp < thresholds.minNetEdgePp;
   const reasons: string[] = [];
-  if (demote) {
-    reasons.push("stage3_below_post_slippage_floor");
+  const flags: string[] = [];
+  if (demote) reasons.push("stage3_below_net_edge_floor");
+  // PROCEED_WITH_CAUTION flag — informational only, never gates (per spec).
+  if (MARKETS_FORCE_CAUTION.has(marketType)) {
+    flags.push("proceed_with_caution_first_half_result");
   }
-  return { postSlippageEdgePp, demote, reasons };
+  if (slip.p75Slippage > thresholds.slippageCautionThreshold) {
+    flags.push("proceed_with_caution_high_slippage");
+  }
+  return {
+    postSlippageEdgePp,
+    expectedFillOdds,
+    p75Slippage: slip.p75Slippage,
+    slippageSource: slip.source,
+    ttkBucket,
+    demote,
+    flags,
+    reasons,
+  };
+}
+
+// Helper for the top-level evaluator: get the candidate's kickoff time
+// when caller didn't pass it. One small query per gate call; cached briefly
+// since the gate may fire multiple times in a single trading cycle for the
+// same fixture.
+const kickoffCache = new Map<number, { value: Date | null; expiresAt: number }>();
+const KICKOFF_CACHE_TTL_MS = 60_000;
+
+async function resolveKickoffTime(
+  matchId: number,
+  override: Date | null | undefined,
+): Promise<Date | null> {
+  if (override) return override;
+  const now = Date.now();
+  const hit = kickoffCache.get(matchId);
+  if (hit && hit.expiresAt > now) return hit.value;
+  try {
+    const r = await db.execute(sql`
+      SELECT kickoff_time FROM matches WHERE id = ${matchId} LIMIT 1
+    `);
+    const row = ((r as any).rows ?? [])[0] as { kickoff_time: string | Date | null } | undefined;
+    const value = row?.kickoff_time
+      ? row.kickoff_time instanceof Date
+        ? row.kickoff_time
+        : new Date(row.kickoff_time)
+      : null;
+    kickoffCache.set(matchId, { value, expiresAt: now + KICKOFF_CACHE_TTL_MS });
+    return value;
+  } catch (err) {
+    logger.debug({ err, matchId }, "resolveKickoffTime failed — falling back to no-ttk");
+    return null;
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -459,15 +641,46 @@ export async function evaluateInversionGate(
   // Stage 2 — Pinnacle confirm + sanity check
   const stage2 = await evaluateStage2(candidate, thresholds);
 
-  // Stage 3 — Post-slippage edge gate (only meaningful when Stage 2 returned
-  // an identified edge; otherwise demote)
-  const stage3 = stage2.identifiedEdgePp != null
-    ? evaluateStage3(stage2.identifiedEdgePp, candidate.marketType, thresholds)
-    : { postSlippageEdgePp: null as number | null, demote: true, reasons: ["stage3_no_edge_input"] };
+  // Stage 3 — Multiplicative post-slippage net-edge gate (Bundle 5.I).
+  // Needs kickoff time to bucket TTK. Resolve from the candidate's
+  // override or the matches table (60s cache).
+  const kickoff = await resolveKickoffTime(candidate.matchId, candidate.kickoffTime);
+  const ttkBucket: TtkBucket = kickoff ? computeTtkBucket(kickoff) : "24h_plus";
+
+  const stage3 =
+    stage2.identifiedEdgePp != null && candidate.pinnacleImplied != null && candidate.pinnacleImplied > 0
+      ? await evaluateStage3(
+          candidate.backOdds,
+          candidate.pinnacleImplied,
+          candidate.marketType,
+          ttkBucket,
+          thresholds,
+        )
+      : ({
+          postSlippageEdgePp: null,
+          expectedFillOdds: null,
+          p75Slippage: null,
+          slippageSource: null,
+          ttkBucket,
+          demote: true,
+          flags: [],
+          reasons: ["stage3_no_edge_input"],
+        } satisfies Stage3Output);
+
+  // HIGH_EDGE telemetry flag (Bundle 5.H §1) — does NOT gate; just surfaces.
+  // The actual high-edge integrity check (gate) ships in Bundle 5.K.
+  const flags = [...stage3.flags];
+  if (stage2.identifiedEdgePp != null && stage2.identifiedEdgePp >= thresholds.highEdgeFlagThresholdPp) {
+    flags.push("high_edge");
+  }
 
   const diagnostics: InversionDiagnostics = {
     identifiedEdgePp: stage2.identifiedEdgePp,
     postSlippageEdgePp: stage3.postSlippageEdgePp,
+    expectedFillOdds: stage3.expectedFillOdds,
+    p75Slippage: stage3.p75Slippage,
+    slippageSource: stage3.slippageSource,
+    ttkBucket: stage3.ttkBucket,
     rawModelP: candidate.rawModelProbability,
     biasCorrectedModelP: stage2.biasCorrectedModelP,
     meanBias: stage2.meanBias,
@@ -479,28 +692,22 @@ export async function evaluateInversionGate(
     disagreementZ: stage2.disagreementZ,
     stage1Source: candidate.stage1Source,
     thresholds,
+    flags,
   };
 
   // Order of precedence:
   //   1. Stage 1 reject → VETO (structural failure: model-filtered candidate)
   //   2. Stage 2 veto    → VETO (catastrophic disagreement)
   //   3. Stage 2 no anchor OR Stage 3 demote → DEMOTE_SHADOW
-  //   4. Stage 2 down-size → DOWN_SIZE_HALF
+  //   4. Stage 2 down-size → DOWN_SIZE_HALF (fallback; superseded by
+  //                          multi-sharp tiering in Bundle 5.J)
   //   5. Else → PROCEED
 
   if (!stage1.ok) {
-    return {
-      action: "VETO",
-      reasons: [stage1.reason],
-      diagnostics,
-    };
+    return { action: "VETO", reasons: [stage1.reason], diagnostics };
   }
   if (stage2.veto) {
-    return {
-      action: "VETO",
-      reasons: stage2.reasons,
-      diagnostics,
-    };
+    return { action: "VETO", reasons: stage2.reasons, diagnostics };
   }
   if (stage2.identifiedEdgePp == null || stage3.demote) {
     return {
@@ -525,7 +732,9 @@ export async function evaluateInversionGate(
   };
 }
 
-// Test seam: clear the calibration cache between unit-test runs.
+// Test seam: clear all caches between unit-test runs.
 export function _resetCalibrationCacheForTests(): void {
   calibrationCache.clear();
+  slippageCache.clear();
+  kickoffCache.clear();
 }
