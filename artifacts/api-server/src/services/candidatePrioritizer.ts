@@ -42,24 +42,96 @@ export interface PrioritisableCandidate {
 }
 
 /**
- * Sort candidates in priority order. Stable for equal keys. Designed so
- * higher-scoring candidates are consumed first — the allocator just
- * iterates the sorted array.
+ * Bundle 10 (2026-05-17) — sweet-spot edge-quality function.
+ *
+ * Bundle 9 retroactive analysis on today's 4,511 settled shadow bets
+ * proved that bigger Pinnacle edges DO NOT mean better bets — the
+ * relationship is non-monotonic:
+ *
+ *   < 3pp        : −4% ROI on n=83          → filtered by gate (skip)
+ *   3-7pp        : +200% ROI on n=48        → SWEET SPOT
+ *   7-15pp       : −37% ROI on n=43         → losing (Bundle 5.K catches >=7pp)
+ *   15-50pp      : −31% ROI on n=89         → losing (model says "huge edge", reality says no)
+ *   ≥50pp        : +8% ROI on n=324 mostly synthetic Pinnacle artifacts
+ *
+ * Sorting by edge DESC pushes the JUNK to the top of the queue. The
+ * fix: edge-quality score that PEAKS in the 3-7pp range and tapers off
+ * symmetrically. Combined with opportunity score so the model's own
+ * conviction still factors in.
+ *
+ *   3-7pp    plateau at 100      (the sweet spot)
+ *   7-15pp   taper 100 → 40      (Bundle 5.K integrity-check territory)
+ *   15-50pp  taper 40 → 15       (statistically unreliable)
+ *   >50pp    floor at 5          (synthetic Bet365→AH derivation artifacts)
+ *   <3pp     0                   (gate rejects anyway; defensive)
+ *
+ * Composite priority = 0.65 × edge_quality + 0.35 × opp_score
+ *
+ * Higher composite = placed first. A 5pp post-slip bet with opp=80
+ * scores 65 + 28 = 93. A 20pp bet with opp=80 scores 23.7 + 28 = 51.7.
+ * The sweet-spot bet wins the queue.
+ */
+export function edgeQualityScore(postSlipEdgePp: number | null): number {
+  if (postSlipEdgePp == null || postSlipEdgePp < 3) return 0;
+  if (postSlipEdgePp <= 7) return 100;
+  if (postSlipEdgePp <= 15) {
+    // 7pp → 100, 15pp → 40 (linear taper, slope = -7.5)
+    return Math.max(40, 100 - (postSlipEdgePp - 7) * 7.5);
+  }
+  if (postSlipEdgePp <= 50) {
+    // 15pp → 40, 50pp → 15 (slope = -0.714)
+    return Math.max(15, 40 - (postSlipEdgePp - 15) * (25 / 35));
+  }
+  // >50pp = synthetic Pinnacle territory (Bundle 1U.2.1 derivation).
+  // Floor at 5 so they're never zero (gate's high-edge integrity check
+  // in Bundle 5.K vetoes them anyway when reality fails the spec).
+  return 5;
+}
+
+/**
+ * Composite priority — sweet-spot edge quality + model opportunity score.
+ * 0.65/0.35 weighting: edge is the primary signal (sharps decide), opp
+ * score is the model's nuance contribution.
+ */
+export function compositePriority(args: {
+  postSlipEdgePp: number | null;
+  opportunityScore: number | null;
+  identifiedEdgePp?: number | null;
+}): number {
+  const edgeQ = edgeQualityScore(args.postSlipEdgePp);
+  const oppN = Math.max(0, Math.min(100, args.opportunityScore ?? 0));
+  return 0.65 * edgeQ + 0.35 * oppN;
+}
+
+/**
+ * Sort candidates in priority order. Stable for equal keys.
+ *
+ * Bundle 10 refinement (2026-05-17): primary key is the composite
+ * priority (sweet-spot edge quality × opportunity score). Old
+ * edge-DESC primary was overweighting high-edge artifacts that LOSE
+ * money. Identified-edge stays as the final tie-break.
  */
 export function prioritise<T extends PrioritisableCandidate>(candidates: T[]): T[] {
   return [...candidates].sort((a, b) => {
-    // 1. post_slippage_edge_pp DESC (treat null as -Infinity so unscored
-    //    candidates lose to scored ones)
-    const ap = a.postSlippageEdgePp ?? -Infinity;
-    const bp = b.postSlippageEdgePp ?? -Infinity;
-    if (ap !== bp) return bp - ap;
+    // 1. Composite priority DESC (sweet-spot edge × opp score).
+    const ac = compositePriority({
+      postSlipEdgePp: a.postSlippageEdgePp,
+      opportunityScore: a.opportunityScore,
+      identifiedEdgePp: a.identifiedEdgePp,
+    });
+    const bc = compositePriority({
+      postSlipEdgePp: b.postSlippageEdgePp,
+      opportunityScore: b.opportunityScore,
+      identifiedEdgePp: b.identifiedEdgePp,
+    });
+    if (ac !== bc) return bc - ac;
 
-    // 2. opportunity_score DESC
+    // 2. opportunity_score DESC (when composites tie — secondary nudge).
     const as = a.opportunityScore ?? -Infinity;
     const bs = b.opportunityScore ?? -Infinity;
     if (as !== bs) return bs - as;
 
-    // 3. identified_edge_pp DESC
+    // 3. identified_edge_pp DESC (final tie-break — rare).
     const ai = a.identifiedEdgePp ?? -Infinity;
     const bi = b.identifiedEdgePp ?? -Infinity;
     if (ai !== bi) return bi - ai;

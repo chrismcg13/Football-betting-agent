@@ -128,6 +128,12 @@ export interface InversionThresholds {
    * split. Default 3.0pp.
    */
   minNetEdgePp: number;
+  /**
+   * Bundle 10 (2026-05-17): live-edge ceiling. Post-slip edge above
+   * this demotes to shadow — only the 3-7pp sweet-spot proceeds live
+   * while we accumulate data on higher brackets.
+   */
+  liveEdgeCeilingPp: number;
   /** Telemetry-only flag threshold; does NOT gate. Default 7.0pp. */
   highEdgeFlagThresholdPp: number;
   vetoZ: number;
@@ -183,6 +189,15 @@ async function readThresholds(): Promise<InversionThresholds> {
   };
   return {
     minNetEdgePp: await num("min_net_edge_pp", 3.0),
+    /**
+     * Bundle 10 (2026-05-17): live-edge ceiling. Post-slip edge above
+     * this value demotes to shadow even though it clears the 3pp floor.
+     * Bundle 9 retrospective: 7-15pp and 15-50pp brackets LOST money
+     * (−37%, −31% ROI), >50pp is synthetic-Pinnacle territory. Only
+     * the 3-7pp sweet spot showed positive ROI (+200% on n=48).
+     * Operator-tunable to widen the band as data accumulates.
+     */
+    liveEdgeCeilingPp: await num("inversion_live_max_edge_pp", 7.0),
     highEdgeFlagThresholdPp: await num("high_edge_flag_threshold", 7.0),
     vetoZ: await num("inversion_veto_z", 4.0),
     vetoAbsPp: await num("inversion_veto_abs_pp", 25.0),
@@ -749,10 +764,17 @@ async function evaluateStage3(
   const slip = await getP75Slippage(marketType, ttkBucket, thresholds.defaultP75Slippage);
   const expectedFillOdds = backOdds * (1 - slip.p75Slippage);
   const postSlippageEdgePp = (expectedFillOdds * pinnacleImplied - 1) * 100;
-  const demote = postSlippageEdgePp < thresholds.minNetEdgePp;
+  // Bundle 10 (2026-05-17): TWO demote paths — below floor OR above
+  // ceiling. Above-ceiling bets get a distinct reason
+  // 'stage3_above_live_edge_ceiling' so compliance_logs analytics can
+  // separate sub-floor noise from high-edge artifact territory.
+  const belowFloor = postSlippageEdgePp < thresholds.minNetEdgePp;
+  const aboveCeiling = postSlippageEdgePp > thresholds.liveEdgeCeilingPp;
+  const demote = belowFloor || aboveCeiling;
   const reasons: string[] = [];
   const flags: string[] = [];
-  if (demote) reasons.push("stage3_below_net_edge_floor");
+  if (belowFloor) reasons.push("stage3_below_net_edge_floor");
+  if (aboveCeiling) reasons.push("stage3_above_live_edge_ceiling");
   // PROCEED_WITH_CAUTION flag — informational only, never gates (per spec).
   if (MARKETS_FORCE_CAUTION.has(marketType)) {
     flags.push("proceed_with_caution_first_half_result");

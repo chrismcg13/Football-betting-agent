@@ -99,12 +99,29 @@ this to gut-check what activation will look like.
 Once 0.1-0.7 are green:
 
 ```sql
+-- Activate the inversion pipeline (atomic, reversible)
 INSERT INTO agent_config (key, value)
 VALUES ('inversion_pipeline_enabled', 'true')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 ```
 
 That's it. Atomic. Reversible.
+
+**Bundle 10 (2026-05-17) — live placement is restricted to the 3-7pp
+post-slip sweet spot.** Bundle 9 retrospective on 4,511 settled bets
+proved 3-7pp is the only Pinnacle-edge bracket with positive ROI
+(+200% on n=48). 7-15pp lost −37%, 15-50pp lost −31%, >50pp is
+synthetic-Pinnacle artifact territory. To protect capital while data
+accumulates on the wider band, Stage 3 demotes-to-shadow ANY candidate
+whose post-slip edge exceeds `inversion_live_max_edge_pp` (default
+7.0). The shadow track still records these for future analysis.
+
+Widen the ceiling as confidence grows:
+
+```sql
+-- Once 7-15pp has accumulated 100+ settled bets and ROI is positive
+UPDATE agent_config SET value = '15.0' WHERE key = 'inversion_live_max_edge_pp';
+```
 
 What activates the instant the flag flips:
 - The 0.02 single-bet cap is bypassed; Bundle 5.M exposure caps apply

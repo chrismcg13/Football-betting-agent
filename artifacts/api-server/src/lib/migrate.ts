@@ -4762,6 +4762,11 @@ export async function runMigrations() {
     const inversionSeed: Array<{ key: string; value: string }> = [
       { key: "inversion_pipeline_enabled", value: "false" },
       { key: "min_net_edge_pp", value: "3.0" },
+      // Bundle 10 (2026-05-17): live-edge ceiling. Post-slip edge above
+      // this value demotes to shadow even though it clears the 3pp floor.
+      // 7pp picked from Bundle 9 retrospective — 7-15pp and 15-50pp
+      // brackets LOST money today. Widen as data accumulates.
+      { key: "inversion_live_max_edge_pp", value: "7.0" },
       { key: "high_edge_flag_threshold", value: "7.0" },
       { key: "kelly_multiplier_single_sharp", value: "0.5" },
       { key: "kelly_multiplier_two_sharp", value: "1.0" },

@@ -2881,18 +2881,24 @@ export async function placePaperBet(
     logger.warn({ err, matchId, marketType, selectionName }, "sharpAnchorFetch threw — Pinnacle-only fallback");
   }
 
-  // ── Bundle 5.E (2026-05-17): inversion-gate shadow telemetry ────────────
-  // Unconditional observational call. The gate's decision is logged but
-  // NOT applied — placement proceeds via the existing model-driven flow.
-  // Telemetry rows in compliance_logs (action_type='inversion_gate_shadow')
-  // accumulate the empirical evidence needed before operator flips the
-  // inversion_pipeline_enabled flag. Stage 1's model-blind watchlist
-  // doesn't exist yet, so we declare stage1Source='kickoff_window' to
-  // bypass Stage 1's legacy-candidate veto and observe Stages 2 + 3
-  // decisions on every real candidate.
+  // ── Bundle 5.E + Bundle 10 (2026-05-17): inversion gate ─────────────────
+  // Evaluates the gate on every candidate. ALWAYS logs the decision to
+  // compliance_logs (shadow telemetry). When
+  // agent_config.inversion_pipeline_enabled='true', the decision also
+  // CONTROLS placement:
+  //   VETO          → reject (catastrophic disagreement OR high-edge
+  //                    integrity failure)
+  //   DEMOTE_SHADOW → force isShadowBet=true (below 3pp floor OR above
+  //                    7pp ceiling OR no Pinnacle anchor)
+  //   PROCEED       → apply gate's kellyMultiplier to stake
+  //                    (sharp-count tier: 1=0.5×, 2/3=1.0×)
+  // Stage1Source='kickoff_window' bypasses Stage 1's legacy-candidate
+  // veto since Stage 1 model-blind watchlist isn't built; Stages 2 + 3
+  // are the active decision-makers.
+  let inversionDecision: import("./inversionPipeline").InversionDecision | null = null;
   try {
     const { evaluateInversionGate } = await import("./inversionPipeline");
-    const decision = await evaluateInversionGate({
+    inversionDecision = await evaluateInversionGate({
       matchId,
       marketType,
       selectionName,
@@ -2901,10 +2907,6 @@ export async function placePaperBet(
       rawModelProbability: modelProbability,
       stage1Source: "kickoff_window",
     });
-    // Bundle 8.E (2026-05-17): await the insert so any failure surfaces
-    // via the catch — the prior void-fire-and-forget silently swallowed
-    // any insert errors (zero inversion_gate_shadow rows in 24h despite
-    // 1,310 placements reaching this code path).
     await db.insert(complianceLogsTable).values({
       actionType: "inversion_gate_shadow",
       details: {
@@ -2914,19 +2916,77 @@ export async function placePaperBet(
         backOdds,
         modelProbability,
         pinnacleImplied: pinnacleImplied ?? null,
-        gateAction: decision.action,
-        gateReasons: decision.reasons,
+        gateAction: inversionDecision.action,
+        gateReasons: inversionDecision.reasons,
         kellyMultiplier:
-          decision.action === "PROCEED" ? (decision as any).kellyMultiplier : null,
-        diagnostics: decision.diagnostics,
+          inversionDecision.action === "PROCEED" ? (inversionDecision as any).kellyMultiplier : null,
+        diagnostics: inversionDecision.diagnostics,
       } as Record<string, unknown>,
       timestamp: new Date(),
     } as any);
   } catch (err) {
     logger.warn(
       { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
-      "inversion-gate shadow telemetry failed (non-blocking)",
+      "inversion-gate evaluation failed (non-blocking)",
     );
+    inversionDecision = null;
+  }
+
+  // ── Bundle 10 (2026-05-17): apply the gate decision when active ─────────
+  if (inversionDecision != null) {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if (await isInversionPipelineEnabled()) {
+        if (inversionDecision.action === "VETO") {
+          // Catastrophic Stage 2 disagreement OR Bundle 5.K high-edge
+          // integrity check failure. Reject outright — don't even shadow.
+          return logReject(
+            "reject_high_edge_integrity",
+            `Inversion VETO: ${(inversionDecision.reasons ?? []).join("; ")}`,
+          );
+        }
+        if (inversionDecision.action === "DEMOTE_SHADOW" && !isShadowBet) {
+          // Force shadow track. Reasons include stage3_below_net_edge_floor,
+          // stage3_above_live_edge_ceiling (Bundle 10), stage2_no_pinnacle_anchor.
+          const reason = (inversionDecision.reasons ?? []).join("; ");
+          logger.info(
+            { matchId, marketType, selectionName, reasons: inversionDecision.reasons },
+            "Inversion gate demoting to shadow",
+          );
+          const fullKellyStake = stake;
+          const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+          shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+          shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+          stake = 0;
+          isShadowBet = true;
+          await logShadowGateExemption(
+            "inversion_gate_demote",
+            experimentTag ?? null,
+            `Inversion gate DEMOTE_SHADOW: ${reason}`,
+            shadowStake,
+            universeTier,
+          );
+        }
+        if (inversionDecision.action === "PROCEED" && !isShadowBet) {
+          // Multi-sharp Kelly tiering (Bundle 5.J): 1 sharp = 0.5×,
+          // 2 sharps = 1.0×, 3 sharps = 1.0× + HIGH_CONVICTION flag.
+          const mult = (inversionDecision as any).kellyMultiplier ?? 1.0;
+          if (Number.isFinite(mult) && mult > 0 && mult <= 1.0 && mult !== 1.0) {
+            const before = stake;
+            stake = Math.round(stake * mult * 100) / 100;
+            logger.info(
+              { matchId, marketType, selectionName, before, after: stake, multiplier: mult },
+              "Inversion gate Kelly multiplier applied",
+            );
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType },
+        "Inversion-gate application failed (non-blocking) — proceeding without override",
+      );
+    }
   }
 
   const { pool } = await import("@workspace/db");
