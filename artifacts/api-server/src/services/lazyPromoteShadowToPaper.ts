@@ -235,6 +235,19 @@ export interface LazyPromoteResult {
   // these were bucketed into `errors`; splitting them out lets the operator
   // distinguish "Betfair said no" from "code threw".
   betfair_rejected: number;
+  // 2026-05-17 (Bundle 5.G) — leak guards before promotion. Stale shadow odds
+  // can drift far from current Pinnacle/Betfair pricing by the time the
+  // promoter picks them up; promoting blindly against the stored odds_at_
+  // placement would route capital based on an edge that no longer exists.
+  // skipped_edge_evaporated: latest Pinnacle implied says edge_pp dropped
+  //   below lazy_promote_min_pinnacle_edge_pp (default 1pp) on the stored
+  //   odds.
+  // skipped_betfair_drift_too_large: latest Betfair best-back differs from
+  //   stored odds_at_placement by more than lazy_promote_max_betfair_drift_pct
+  //   (default 5%) — placeLiveBetOnBetfair would fill at a price our edge
+  //   calc never assumed.
+  skipped_edge_evaporated: number;
+  skipped_betfair_drift_too_large: number;
   errors: number;
 }
 
@@ -252,6 +265,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     skipped_adaptive_wilson_lcb_negative: 0,
     skipped_agent_paused: 0,
     betfair_rejected: 0,
+    skipped_edge_evaporated: 0,
+    skipped_betfair_drift_too_large: 0,
     errors: 0,
   };
 
@@ -588,6 +603,123 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
         if (isCachedAsUnavailable(m.betfair_event_id, r.market_type)) {
           result.skipped_event_unavailable_cached++;
           continue;
+        }
+
+        // ── Bundle 5.G (2026-05-17): stale-odds leak guards ──────────────
+        // The shadow row's odds_at_placement + calculated_edge were the
+        // snapshot at original emission time, which may be hours stale by
+        // the time the promoter picks them up. Two pre-promotion checks:
+        //
+        //   (1) Pinnacle re-check: current pinnacle_implied (latest ≤15 min)
+        //       must still yield identified_edge_pp ≥ floor on the stored
+        //       odds. If Pinnacle has moved against us, the edge has
+        //       evaporated and we should NOT deploy capital.
+        //   (2) Betfair drift check: current best-back vs stored
+        //       odds_at_placement must be within tolerance. If Betfair has
+        //       moved beyond drift_pct, placeLiveBetOnBetfair would fill at
+        //       a price our edge math no longer supports. (The existing
+        //       LIMIT-order slippage path skips Betfair's own slippage
+        //       guard — per reference_live_stake_unblockers — so this
+        //       application-layer check is the binding control.)
+        //
+        // PINNACLE-ABSENT scopes (those routed via the v_live_eligibility
+        // market_type aggregate path) intentionally skip (1) — there's no
+        // Pinnacle anchor to re-check against. They still pass through (2).
+        //
+        // Both floors are operator-tunable; conservative defaults below.
+
+        // (1) Pinnacle edge re-check
+        try {
+          const pinnRow = (await db.execute(sql`
+            SELECT pinnacle_implied::float8 AS pinn_implied
+            FROM pinnacle_odds_snapshots
+            WHERE match_id = ${r.match_id}
+              AND market_type = ${r.market_type}
+              AND selection_name = ${r.selection_name}
+              AND bookmaker_slug = 'pinnacle'
+              AND captured_at >= NOW() - INTERVAL '15 minutes'
+            ORDER BY captured_at DESC
+            LIMIT 1
+          `)) as unknown as { rows?: Array<{ pinn_implied: number | null }> };
+          const pinnImplied = pinnRow.rows?.[0]?.pinn_implied;
+          if (pinnImplied != null && Number.isFinite(pinnImplied) && pinnImplied > 0) {
+            const currentEdgePp = (odds * pinnImplied - 1) * 100;
+            const minEdgeRaw = await getConfig("lazy_promote_min_pinnacle_edge_pp");
+            const minEdgePp = minEdgeRaw != null ? Number(minEdgeRaw) : 1.0;
+            if (Number.isFinite(minEdgePp) && currentEdgePp < minEdgePp) {
+              result.skipped_edge_evaporated++;
+              await db.insert(complianceLogsTable).values({
+                actionType: "lazy_promote_edge_evaporated",
+                details: {
+                  betId: r.id,
+                  matchId: r.match_id,
+                  marketType: r.market_type,
+                  selectionName: r.selection_name,
+                  storedOdds: odds,
+                  storedEdgePp: edge * 100,
+                  currentPinnImplied: pinnImplied,
+                  currentEdgePp,
+                  minEdgePp,
+                  source: "lazy_promote",
+                },
+                timestamp: new Date(),
+              } as any);
+              continue;
+            }
+          }
+        } catch (err) {
+          // Re-check failed (DB hiccup, schema drift). Don't block promotion
+          // on the audit step — log and proceed. The downstream Betfair
+          // slippage/fill check is still in play.
+          logger.warn(
+            { err, betId: r.id, matchId: r.match_id },
+            "lazyPromote: Pinnacle edge re-check failed (non-blocking)",
+          );
+        }
+
+        // (2) Betfair drift check
+        try {
+          const bfRow = (await db.execute(sql`
+            SELECT back_odds::float8 AS back_odds
+            FROM odds_snapshots
+            WHERE match_id = ${r.match_id}
+              AND market_type = ${r.market_type}
+              AND selection_name = ${r.selection_name}
+              AND source = 'betfair_exchange'
+              AND snapshot_time >= NOW() - INTERVAL '10 minutes'
+            ORDER BY snapshot_time DESC
+            LIMIT 1
+          `)) as unknown as { rows?: Array<{ back_odds: number | null }> };
+          const bestBack = bfRow.rows?.[0]?.back_odds;
+          if (bestBack != null && Number.isFinite(bestBack) && bestBack > 1) {
+            const driftPct = Math.abs((bestBack - odds) / odds);
+            const maxDriftRaw = await getConfig("lazy_promote_max_betfair_drift_pct");
+            const maxDrift = maxDriftRaw != null ? Number(maxDriftRaw) : 0.05;
+            if (Number.isFinite(maxDrift) && driftPct > maxDrift) {
+              result.skipped_betfair_drift_too_large++;
+              await db.insert(complianceLogsTable).values({
+                actionType: "lazy_promote_betfair_drift",
+                details: {
+                  betId: r.id,
+                  matchId: r.match_id,
+                  marketType: r.market_type,
+                  selectionName: r.selection_name,
+                  storedOdds: odds,
+                  currentBestBack: bestBack,
+                  driftPct,
+                  maxDrift,
+                  source: "lazy_promote",
+                },
+                timestamp: new Date(),
+              } as any);
+              continue;
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            { err, betId: r.id, matchId: r.match_id },
+            "lazyPromote: Betfair drift re-check failed (non-blocking)",
+          );
         }
 
         const { placeLiveBetOnBetfair } = await import("./betfairLive");

@@ -2809,6 +2809,53 @@ export async function placePaperBet(
     logger.warn({ err, matchId, marketType, selectionName }, "sharpAnchorFetch threw — Pinnacle-only fallback");
   }
 
+  // ── Bundle 5.E (2026-05-17): inversion-gate shadow telemetry ────────────
+  // Unconditional observational call. The gate's decision is logged but
+  // NOT applied — placement proceeds via the existing model-driven flow.
+  // Telemetry rows in compliance_logs (action_type='inversion_gate_shadow')
+  // accumulate the empirical evidence needed before operator flips the
+  // inversion_pipeline_enabled flag. Stage 1's model-blind watchlist
+  // doesn't exist yet, so we declare stage1Source='kickoff_window' to
+  // bypass Stage 1's legacy-candidate veto and observe Stages 2 + 3
+  // decisions on every real candidate.
+  try {
+    const { evaluateInversionGate } = await import("./inversionPipeline");
+    const decision = await evaluateInversionGate({
+      matchId,
+      marketType,
+      selectionName,
+      backOdds,
+      pinnacleImplied: pinnacleImplied ?? null,
+      rawModelProbability: modelProbability,
+      stage1Source: "kickoff_window",
+    });
+    // Fire-and-forget — never block placement on telemetry write.
+    void db.insert(complianceLogsTable).values({
+      actionType: "inversion_gate_shadow",
+      details: {
+        matchId,
+        marketType,
+        selectionName,
+        backOdds,
+        modelProbability,
+        pinnacleImplied: pinnacleImplied ?? null,
+        gateAction: decision.action,
+        gateReasons: decision.reasons,
+        kellyMultiplier:
+          decision.action === "PROCEED" || decision.action === "DOWN_SIZE_HALF"
+            ? decision.kellyMultiplier
+            : null,
+        diagnostics: decision.diagnostics,
+      } as Record<string, unknown>,
+      timestamp: new Date(),
+    } as any);
+  } catch (err) {
+    logger.warn(
+      { err, matchId, marketType, selectionName },
+      "inversion-gate shadow telemetry failed (non-blocking)",
+    );
+  }
+
   const { pool } = await import("@workspace/db");
   const pgClient = await pool.connect();
   let bet: any;

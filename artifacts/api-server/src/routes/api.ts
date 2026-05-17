@@ -7050,5 +7050,77 @@ router.post("/admin/phase-0-dedupe-and-backfill", async (_req, res) => {
   }
 });
 
+// ─── Bundle 5.F (2026-05-17) — inversion-gate one-shot inspector ─────────
+// Debug endpoint. Given a candidate, returns the inversion gate's decision
+// and full diagnostics without firing a placement. Reads from
+// v_market_type_mean_bias_rolling for the bias-correction step and from
+// pinnacle_odds_snapshots for any multi-book sharp snapshots already
+// written by Bundle 1 E.5. Safe to call any time.
+//
+// POST /api/admin/inspect-inversion-gate
+// Body: {
+//   matchId: number,
+//   marketType: string,
+//   selectionName: string,
+//   backOdds: number,
+//   pinnacleImplied: number | null,
+//   rawModelProbability: number,
+//   stage1Source?: "liquidity_watchlist" | "kickoff_window" | "pinnacle_release" | "legacy_model_candidate"
+// }
+router.post("/admin/inspect-inversion-gate", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const matchId = Number(body.matchId);
+    const marketType = String(body.marketType ?? "");
+    const selectionName = String(body.selectionName ?? "");
+    const backOdds = Number(body.backOdds);
+    const rawModelProbability = Number(body.rawModelProbability);
+    const pinnacleImplied = body.pinnacleImplied == null ? null : Number(body.pinnacleImplied);
+    const stage1Source = (body.stage1Source as string | undefined) ?? "kickoff_window";
+
+    if (!Number.isFinite(matchId) || !marketType || !selectionName) {
+      res.status(400).json({ error: "matchId, marketType, selectionName are required" });
+      return;
+    }
+    if (!Number.isFinite(backOdds) || backOdds <= 1) {
+      res.status(400).json({ error: "backOdds must be > 1" });
+      return;
+    }
+    if (!Number.isFinite(rawModelProbability) || rawModelProbability <= 0 || rawModelProbability >= 1) {
+      res.status(400).json({ error: "rawModelProbability must be in (0, 1)" });
+      return;
+    }
+    const validSources = new Set([
+      "liquidity_watchlist",
+      "kickoff_window",
+      "pinnacle_release",
+      "legacy_model_candidate",
+    ]);
+    if (!validSources.has(stage1Source)) {
+      res.status(400).json({ error: `stage1Source must be one of ${[...validSources].join(", ")}` });
+      return;
+    }
+
+    const { evaluateInversionGate, isInversionPipelineEnabled } = await import("../services/inversionPipeline");
+    const decision = await evaluateInversionGate({
+      matchId,
+      marketType,
+      selectionName,
+      backOdds,
+      pinnacleImplied,
+      rawModelProbability,
+      stage1Source: stage1Source as any,
+    });
+    res.json({
+      ok: true,
+      flagState: { inversion_pipeline_enabled: await isInversionPipelineEnabled() },
+      decision,
+    });
+  } catch (err) {
+    logger.error({ err }, "inspect-inversion-gate failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 export default router;
 
