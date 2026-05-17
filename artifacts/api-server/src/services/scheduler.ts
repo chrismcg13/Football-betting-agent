@@ -1807,6 +1807,38 @@ export async function runTradingCycle(options?: {
     let funnelQuarantineReject = 0, funnelExposureReject = 0, funnelOtherReject = 0;
     const executionTimings: Array<{ matchId: number; market: string; executionMs: number }> = [];
 
+    // Bundle 8.A (2026-05-17): when inversion_pipeline_enabled=true,
+    // sort betOrders by the locked priority key before placement:
+    //   (edge DESC, effectiveScore DESC).
+    // post_slippage_edge_pp would be the primary key per the locked spec
+    // but isn't pre-computed on betOrders; identified-edge serves as the
+    // proxy (post-slip floor is enforced downstream in the inversion
+    // gate's Stage 3 anyway). The capacity allocator (per_fixture /
+    // per_league / daily caps) is already wired via Bundle 5.M's
+    // applyInversionExposureCaps at the stake-clamp step inside
+    // placePaperBet. Pre-flip, betOrders are placed in their existing
+    // post-correlation-detection order.
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if (await isInversionPipelineEnabled()) {
+        const before = betOrders.map((o) => ({ matchId: o.matchId, edge: o.edge, score: o.effectiveScore }));
+        betOrders.sort((a, b) => {
+          const ae = a.edge ?? -Infinity;
+          const be = b.edge ?? -Infinity;
+          if (ae !== be) return be - ae;
+          const as = a.effectiveScore ?? -Infinity;
+          const bs = b.effectiveScore ?? -Infinity;
+          return bs - as;
+        });
+        logger.info(
+          { count: betOrders.length, sample: before.slice(0, 3) },
+          "Bundle 8.A: betOrders sorted by inversion priority key (edge DESC, score DESC)",
+        );
+      }
+    } catch (err) {
+      logger.warn({ err }, "Bundle 8.A inversion-flag sort failed (non-blocking) — proceeding with existing order");
+    }
+
     for (const order of betOrders) {
       const execStartMs = Date.now();
 

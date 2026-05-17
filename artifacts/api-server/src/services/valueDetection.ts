@@ -1643,7 +1643,12 @@ export async function detectValueBets(options?: {
         !shadowOnly &&
         (inversionBypassPerCandidate || opportunityScore >= effectiveMinScore) &&
         (inversionBypassPerCandidate || edge >= effectiveMinEdge);
-      const meetsShadow = opportunityScore >= shadowMinOppScore;
+      // Bundle 8.B (2026-05-17): close 7.C.2 — bypass
+      // shadow_min_opportunity_score for sharp-anchored candidates under
+      // inversion mode. Sharps justify a shadow record regardless of the
+      // model's opportunity score (the model isn't the gate; sharps are).
+      const meetsShadow =
+        inversionBypassPerCandidate || opportunityScore >= shadowMinOppScore;
       // Production-track bets respect the cold-market cooldown (capital-risk
       // gate). Shadow-track bypasses — that's how the model relearns whether
       // a chronically-losing segment has recovered.

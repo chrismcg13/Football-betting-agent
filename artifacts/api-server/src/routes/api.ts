@@ -7050,6 +7050,117 @@ router.post("/admin/phase-0-dedupe-and-backfill", async (_req, res) => {
   }
 });
 
+// ─── Bundle 8.D (2026-05-17) — inversion gate dry-run on recent shadow telemetry ──
+// Replays the inversion gate against the last N candidates that
+// produced shadow telemetry. Returns: would-have-placed count,
+// distribution of decisions, gate-action breakdown, top reasons.
+// Pre-flip activation sanity check — answers "what does the inversion
+// look like on real recent data?"
+router.post("/admin/inversion-dry-run", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const sampleSize = Math.min(Number(body.sampleSize ?? 50), 500);
+    const r = await db.execute(sql`
+      SELECT
+        details->>'gateAction' AS action,
+        details->'reasons' AS reasons,
+        details->'diagnostics'->>'sharpCount' AS sharp_count,
+        details->>'kellyMultiplier' AS kelly_mult,
+        details->'diagnostics'->>'identifiedEdgePp' AS identified_edge_pp,
+        details->'diagnostics'->>'postSlippageEdgePp' AS post_slip_edge_pp,
+        details->'diagnostics'->'flags' AS flags,
+        details->>'marketType' AS market_type,
+        timestamp
+      FROM compliance_logs
+      WHERE action_type = 'inversion_gate_shadow'
+        AND timestamp >= NOW() - INTERVAL '24 hours'
+      ORDER BY timestamp DESC
+      LIMIT ${sampleSize}
+    `);
+    const rows = ((r as any).rows ?? []) as Array<{
+      action: string;
+      reasons: unknown;
+      sharp_count: string | null;
+      kelly_mult: string | null;
+      identified_edge_pp: string | null;
+      post_slip_edge_pp: string | null;
+      flags: unknown;
+      market_type: string | null;
+      timestamp: Date;
+    }>;
+    // Aggregate
+    const actionCounts: Record<string, number> = {};
+    const reasonCounts: Record<string, number> = {};
+    const marketActionCounts: Record<string, Record<string, number>> = {};
+    let wouldHavePlaced = 0;
+    let wouldHaveTrimmed = 0;
+    let highEdgeRows = 0;
+    let highConvictionRows = 0;
+    const kellyMultiplierBuckets: Record<string, number> = { "0.5": 0, "1.0": 0, other: 0 };
+    for (const row of rows) {
+      actionCounts[row.action] = (actionCounts[row.action] ?? 0) + 1;
+      const reasons = Array.isArray(row.reasons) ? (row.reasons as string[]) : [];
+      for (const r of reasons) reasonCounts[r] = (reasonCounts[r] ?? 0) + 1;
+      const mkt = row.market_type ?? "(unknown)";
+      if (!marketActionCounts[mkt]) marketActionCounts[mkt] = {};
+      marketActionCounts[mkt][row.action] = (marketActionCounts[mkt][row.action] ?? 0) + 1;
+      if (row.action === "PROCEED" || row.action === "DOWN_SIZE_HALF") wouldHavePlaced++;
+      if (row.action === "DEMOTE_SHADOW") wouldHaveTrimmed++;
+      const flags = Array.isArray(row.flags) ? (row.flags as string[]) : [];
+      if (flags.includes("high_edge")) highEdgeRows++;
+      if (flags.includes("high_conviction")) highConvictionRows++;
+      const km = row.kelly_mult != null ? Number(row.kelly_mult) : null;
+      if (km === 0.5) kellyMultiplierBuckets["0.5"]!++;
+      else if (km === 1.0) kellyMultiplierBuckets["1.0"]!++;
+      else if (km != null) kellyMultiplierBuckets.other!++;
+    }
+    const topReasons = Object.entries(reasonCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([reason, n]) => ({ reason, n }));
+    res.json({
+      ok: true,
+      window: "last 24h",
+      sample_size: rows.length,
+      summary: {
+        would_have_placed: wouldHavePlaced,
+        would_have_demoted_shadow: wouldHaveTrimmed,
+        high_edge_flagged: highEdgeRows,
+        high_conviction_flagged: highConvictionRows,
+        action_counts: actionCounts,
+        kelly_multiplier_distribution: kellyMultiplierBuckets,
+      },
+      top_reasons: topReasons,
+      per_market_actions: marketActionCounts,
+    });
+  } catch (err) {
+    logger.error({ err }, "inversion-dry-run failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ─── Bundle 8.0.b (2026-05-17) — force-retrain on paper_bets ────────────
+// Triggers predictionEngine.forceRetrain on demand. Useful after a
+// FEATURE_NAMES expansion (Bundle 7.F) to produce a model that
+// actually uses the new features rather than waiting for the daily
+// loop-retrain cycle. Pulls samples from settled paper_bets via
+// buildSamplesFromDb (NOT football-data — that's the bootstrap path
+// which returned 0 samples in production).
+router.post("/admin/force-retrain", async (_req, res) => {
+  try {
+    const { forceRetrain } = await import("../services/predictionEngine");
+    const result = await forceRetrain();
+    if (!result) {
+      res.status(409).json({ ok: false, error: "Insufficient samples for retrain (need >=20 settled bets with full feature vectors)" });
+      return;
+    }
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "force-retrain failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // ─── Bundle 7.B (2026-05-17) — Stage 1 watchlist admin endpoint ─────────
 router.post("/admin/run-stage1-watchlist", async (_req, res) => {
   try {

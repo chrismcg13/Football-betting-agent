@@ -83,11 +83,35 @@ function imputeMissingFeature(name: FeatureName): number {
 // included in all three: team strength is informative for outcome,
 // goals-scored shape (Elo gap drives both BTTS rate and total goals),
 // and over/under.
+// IDX arrays — pick which FEATURE_NAMES indices feed each model head.
+//
+// Bundle 8.0.b (2026-05-17): extended with the 6 new §G features
+// (15..20: referee, lineup_size × 2, injuries × 2, form_diff_5game).
+//
+// Sliced at inference / training time based on the model's actual
+// featureMeans.length (Bundle 8.0 defensive loader). When the
+// persisted model is 15-feature, normalizeRow only reads positions
+// 0..14 because the 15-feature persisted model's featureMeans/stds
+// arrays don't have indices 15+ — so accessing IDX values > 14 is
+// safe (means[15] ?? 0 contributes 0 / 1 = 0 → no-op for the model).
+// Once a fresh 21-feature model trains via forceRetrain, the same
+// IDX arrays start contributing real weights for the new features.
 const OUTCOME_IDX = [
   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+  15, 16, 17, 18, 19, 20,
 ] as const;
-const BTTS_IDX = [0, 1, 2, 3, 4, 5, 8, 9, 12, 13, 14] as const;
-const OVER_UNDER_IDX = [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14] as const;
+// BTTS — drops league_position, h2h, elo (kept goal-related + new
+// features that plausibly affect goal markets: lineup/injuries + form).
+const BTTS_IDX = [
+  0, 1, 2, 3, 4, 5, 8, 9, 12, 13, 14,
+  15, 16, 17, 18, 19, 20,
+] as const;
+// Over/Under — same shape as BTTS but with the OU rate features (10,11)
+// in place of BTTS rates (8,9).
+const OVER_UNDER_IDX = [
+  0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14,
+  15, 16, 17, 18, 19, 20,
+] as const;
 
 // Outcome class labels
 const OUTCOME_HOME = 0;
@@ -134,6 +158,17 @@ function getProbabilities(
   const total = rawProbs.reduce((a, b) => a + b, 0);
   if (total === 0) return rawProbs.map(() => 1 / rawProbs.length);
   return rawProbs.map((p) => p / total);
+}
+
+// Bundle 8.0.b (2026-05-17): IDX values filtered to indices < model
+// featureMeans length. When the persisted model is 15-feature but
+// IDX arrays were extended to 21, this filter drops the 6 new
+// feature positions until a fresh 21-feature model is trained. The
+// LR weights count must match the input vector length.
+function effectiveIdxForModel(idx: readonly number[]): number[] {
+  if (!currentModel) return [...idx];
+  const max = currentModel.featureMeans.length;
+  return idx.filter((i) => i < max);
 }
 
 function normalizeRow(
@@ -769,7 +804,7 @@ export function predictOutcome(
   );
   const normRow = normalizeRow(
     fullRow,
-    OUTCOME_IDX,
+    effectiveIdxForModel(OUTCOME_IDX),
     currentModel.featureMeans,
     currentModel.featureStds,
   );
@@ -790,7 +825,7 @@ export function predictBtts(
   );
   const normRow = normalizeRow(
     fullRow,
-    BTTS_IDX,
+    effectiveIdxForModel(BTTS_IDX),
     currentModel.featureMeans,
     currentModel.featureStds,
   );
@@ -810,7 +845,7 @@ export function predictOverUnder(
   );
   const normRow = normalizeRow(
     fullRow,
-    OVER_UNDER_IDX,
+    effectiveIdxForModel(OVER_UNDER_IDX),
     currentModel.featureMeans,
     currentModel.featureStds,
   );
