@@ -53,30 +53,38 @@ const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   "TEAM_B_1",
   "TEAM_B_2",
   "TEAM_B_3",
-  // ── Bundle F2.A.9 (2026-05-19): corner + cards Betfair market types ───
-  // Per Chris directive: poll Betfair for cards, corners, all other
-  // markets Pinnacle covers. Common Betfair market type names per their
-  // documentation; the exact set per event varies. Discovery logger
-  // (below) surfaces any unknown variant Betfair returns so we can
-  // extend this set after first sightings.
-  "TOTAL_CORNERS",
-  "OVER_UNDER_85_CORNERS",
-  "OVER_UNDER_95_CORNERS",
-  "OVER_UNDER_105_CORNERS",
-  "OVER_UNDER_115_CORNERS",
-  "OVER_UNDER_125_CORNERS",
-  "TOTAL_CORNERS_OU",
-  "MATCH_CORNERS",
-  "ASIAN_CORNERS",
-  // Cards / booking points
-  "TOTAL_BOOKINGS",
-  "OVER_UNDER_BKD_PT_25",
-  "OVER_UNDER_BKD_PT_35",
-  "OVER_UNDER_BKD_PT_45",
-  "OVER_UNDER_BKD_PT_55",
-  "BOOKING_POINTS",
-  "TOTAL_CARDS",
-  "MATCH_CARDS",
+  // ── Bundle F2.A.9.2 (2026-05-19): VERIFIED corner + card Betfair types ───
+  // Per Chris pasting the official Betfair Betting Type Definitions:
+  // https://betfair-developer-docs.atlassian.net/wiki/spaces/1smk3cen4v3lu3yomq5qye0ni/pages/2687465/Betting+Type+Definitions
+  //
+  // Corner markets (4 canonical types):
+  "TOTAL_CORNERS",          // multi-line: runners "Over 8.5", "Under 8.5", "Over 9.5"...
+  "OVER_UNDER_CORNERS",     // multi-line single market
+  "MATCH_CORNERS",          // 2-way: "More Corners Home" vs "Away" (handicap-style)
+  "FIRST_HALF_CORNERS",     // 1st-half-only version
+  // Booking-point (cards) markets (2 canonical types):
+  "TOTAL_BOOKING_POINTS",      // multi-line, runners "Over 35", "Under 35", "Over 45"...
+                               // NOTE: Betfair uses BOOKING POINTS not raw cards.
+                               // Yellow=10, Red=25; line of 35 ≈ "over 3.5 yellows"
+  "OVER_UNDER_BOOKING_POINTS", // multi-line alternative naming
+
+  // Additional canonical types from the docs we should also capture:
+  "HALF_TIME_MATCH_ODDS",      // 1st half MO (was HALF_TIME, may be either name)
+  "SECOND_HALF_MATCH_ODDS",    // 2nd half MO
+  "HALF_TIME_FULL_TIME",       // HT/FT combination (9 outcomes)
+  "TEAM_A_TOTAL_GOALS",        // multi-line variant of TEAM_A_x
+  "TEAM_B_TOTAL_GOALS",
+  "EUROPEAN_HANDICAP",         // 3-way handicap (Win/Draw/Lose with handicap)
+  "HANDICAP",                  // standard handicap
+  // Bundle F2.A.9.3 (2026-05-19): additional non-player match-level
+  // markets per Chris's docs paste — exclude all player props.
+  "CORRECT_SCORE",             // full-time exact scoreline
+  "HALF_TIME_SCORE",           // half-time exact scoreline
+  "NEXT_GOAL",                 // who scores next (Home/Away/No more goals)
+  "TO_SCORE_IN_BOTH_HALVES",   // team scores in both halves (per team)
+  "TO_WIN_TO_NIL",             // team wins without conceding
+  "CLEAN_SHEET_TEAM_A",        // team A keeps clean sheet
+  "CLEAN_SHEET_TEAM_B",        // team B keeps clean sheet
 ]);
 
 function toInternalMarketType(bfMarketType: string): string {
@@ -96,29 +104,32 @@ function toInternalMarketType(bfMarketType: string): string {
     case "FIRST_HALF_GOALS_15": return "FIRST_HALF_OU_15";
     case "FIRST_HALF_GOALS_25": return "FIRST_HALF_OU_25";
     case "ALT_TOTAL_GOALS": return "ASIAN_TOTAL_GOALS";
-    // ── Bundle F2.A.9 (2026-05-19): corner + cards mappings ─────────────
-    // Multi-line markets (TOTAL_CORNERS, TOTAL_BOOKINGS, MATCH_CORNERS,
-    // MATCH_CARDS) map to a generic internal code. Runners carry the
-    // line as part of runnerName ("Over 8.5", "Over 9.5", etc.) and
-    // deriveSelectionName parses the specific line. Per-line Betfair
-    // markets (OVER_UNDER_85_CORNERS etc.) map to specific TOTAL_CORNERS_xx.
-    case "TOTAL_CORNERS": return "TOTAL_CORNERS_MULTI";
-    case "TOTAL_CORNERS_OU": return "TOTAL_CORNERS_MULTI";
-    case "MATCH_CORNERS": return "TOTAL_CORNERS_MULTI";
-    case "ASIAN_CORNERS": return "ASIAN_CORNERS";
-    case "OVER_UNDER_85_CORNERS": return "TOTAL_CORNERS_85";
-    case "OVER_UNDER_95_CORNERS": return "TOTAL_CORNERS_95";
-    case "OVER_UNDER_105_CORNERS": return "TOTAL_CORNERS_105";
-    case "OVER_UNDER_115_CORNERS": return "TOTAL_CORNERS_115";
-    case "OVER_UNDER_125_CORNERS": return "TOTAL_CORNERS_125";
-    case "TOTAL_BOOKINGS": return "TOTAL_BOOKINGS_MULTI";
-    case "TOTAL_CARDS": return "TOTAL_CARDS_MULTI";
-    case "MATCH_CARDS": return "TOTAL_CARDS_MULTI";
-    case "BOOKING_POINTS": return "TOTAL_BOOKINGS_MULTI";
-    case "OVER_UNDER_BKD_PT_25": return "TOTAL_CARDS_25";
-    case "OVER_UNDER_BKD_PT_35": return "TOTAL_CARDS_35";
-    case "OVER_UNDER_BKD_PT_45": return "TOTAL_CARDS_45";
-    case "OVER_UNDER_BKD_PT_55": return "TOTAL_CARDS_55";
+    // ── Bundle F2.A.9.2 (2026-05-19): VERIFIED corner + card mappings ───
+    // Per Chris's Betfair docs paste:
+    // Corner markets:
+    case "TOTAL_CORNERS":         return "TOTAL_CORNERS_MULTI";
+    case "OVER_UNDER_CORNERS":    return "TOTAL_CORNERS_MULTI";
+    case "MATCH_CORNERS":         return "MATCH_CORNERS_2WAY";
+    case "FIRST_HALF_CORNERS":    return "FIRST_HALF_CORNERS_MULTI";
+    // Booking points (Betfair's "cards" — yellow=10pts, red=25pts):
+    case "TOTAL_BOOKING_POINTS":     return "TOTAL_BOOKINGS_MULTI";
+    case "OVER_UNDER_BOOKING_POINTS": return "TOTAL_BOOKINGS_MULTI";
+    // Other canonical types from docs (capture for future model use):
+    case "HALF_TIME_MATCH_ODDS":   return "HALF_TIME_RESULT";
+    case "SECOND_HALF_MATCH_ODDS": return "SECOND_HALF_RESULT";
+    case "TEAM_A_TOTAL_GOALS":    return "TEAM_TOTAL_HOME_MULTI";
+    case "TEAM_B_TOTAL_GOALS":    return "TEAM_TOTAL_AWAY_MULTI";
+    case "EUROPEAN_HANDICAP":     return "EUROPEAN_HANDICAP";
+    case "HANDICAP":              return "STANDARD_HANDICAP";
+    // Bundle F2.A.9.3 (2026-05-19): additional match/team-level markets
+    case "HALF_TIME_FULL_TIME":   return "HTFT";
+    case "CORRECT_SCORE":         return "CORRECT_SCORE";
+    case "HALF_TIME_SCORE":       return "HALF_TIME_SCORE";
+    case "NEXT_GOAL":             return "NEXT_GOAL";
+    case "TO_SCORE_IN_BOTH_HALVES": return "BOTH_HALVES_TEAM_SCORE";
+    case "TO_WIN_TO_NIL":         return "WIN_TO_NIL";
+    case "CLEAN_SHEET_TEAM_A":    return "CLEAN_SHEET_HOME";
+    case "CLEAN_SHEET_TEAM_B":    return "CLEAN_SHEET_AWAY";
     default: return bfMarketType; // OVER_UNDER_*, DRAW_NO_BET, ASIAN_HANDICAP map 1:1
   }
 }
@@ -169,15 +180,11 @@ function deriveSelectionName(
     return null;
   }
 
-  // Bundle F2.A.9 (2026-05-19): corner + cards market runner parsers.
-  // Multi-line markets carry runners like "Over 8.5", "Under 9.5".
-  // Per-line markets carry "Over <line>" / "Under <line>" too.
-  // Selection names normalized to "Over X.5 Corners" / "Over X.5 Cards"
-  // to match internal naming used in apiFootball.ts mapping.
+  // Bundle F2.A.9.2 (2026-05-19): corner + cards runner parsers
+  // (verified against Betfair docs).
   if (
-    bfMarketType === "TOTAL_CORNERS" || bfMarketType === "TOTAL_CORNERS_OU" ||
-    bfMarketType === "MATCH_CORNERS" || bfMarketType === "ASIAN_CORNERS" ||
-    bfMarketType.endsWith("_CORNERS")
+    bfMarketType === "TOTAL_CORNERS" || bfMarketType === "OVER_UNDER_CORNERS" ||
+    bfMarketType === "FIRST_HALF_CORNERS"
   ) {
     const m = lower.match(/^(over|under)\s+(\d+(?:\.\d+)?)/);
     if (m) {
@@ -186,16 +193,84 @@ function deriveSelectionName(
     }
     return null;
   }
+  if (bfMarketType === "MATCH_CORNERS") {
+    // 2-way market: "More Corners <Team>" / handicap-style
+    if (lower === homeTeam.toLowerCase()) return "Home";
+    if (lower === awayTeam.toLowerCase()) return "Away";
+    if (lower === "the draw" || lower === "draw") return "Draw";
+    if (runner.sortPriority === 1) return "Home";
+    if (runner.sortPriority === 2) return "Away";
+    return null;
+  }
   if (
-    bfMarketType === "TOTAL_BOOKINGS" || bfMarketType === "TOTAL_CARDS" ||
-    bfMarketType === "MATCH_CARDS" || bfMarketType === "BOOKING_POINTS" ||
-    bfMarketType.startsWith("OVER_UNDER_BKD_")
+    bfMarketType === "TOTAL_BOOKING_POINTS" ||
+    bfMarketType === "OVER_UNDER_BOOKING_POINTS"
+  ) {
+    // Betfair uses BOOKING POINTS (yellow=10, red=25). Lines typically
+    // 25, 35, 45, 55 (i.e., "Over 35" = over 35 booking points).
+    const m = lower.match(/^(over|under)\s+(\d+(?:\.\d+)?)/);
+    if (m) {
+      const side = m[1] === "over" ? "Over" : "Under";
+      return `${side} ${m[2]} BookingPoints`;
+    }
+    return null;
+  }
+  if (
+    bfMarketType === "TEAM_A_TOTAL_GOALS" || bfMarketType === "TEAM_B_TOTAL_GOALS"
   ) {
     const m = lower.match(/^(over|under)\s+(\d+(?:\.\d+)?)/);
     if (m) {
       const side = m[1] === "over" ? "Over" : "Under";
-      return `${side} ${m[2]} Cards`;
+      return `${side} ${m[2]}`;
     }
+    return null;
+  }
+  if (bfMarketType === "HALF_TIME_MATCH_ODDS" || bfMarketType === "SECOND_HALF_MATCH_ODDS") {
+    if (lower === "the draw" || lower === "draw") return "Draw";
+    if (lower === homeTeam.toLowerCase()) return "Home";
+    if (lower === awayTeam.toLowerCase()) return "Away";
+    if (runner.sortPriority === 1) return "Home";
+    if (runner.sortPriority === 2) return "Away";
+    if (runner.sortPriority === 3) return "Draw";
+    return null;
+  }
+  if (bfMarketType === "EUROPEAN_HANDICAP" || bfMarketType === "HANDICAP") {
+    // 3-way handicap; runnerName carries team + line offset.
+    // Pass through the runnerName so we don't lose context. The model
+    // doesn't price these yet — captured for future use.
+    return name;
+  }
+  // Bundle F2.A.9.3 (2026-05-19): non-player match/team-level markets.
+  if (bfMarketType === "HALF_TIME_FULL_TIME") {
+    // Runners are 9 outcomes: "Home/Home", "Home/Draw", "Home/Away", ...
+    // Pass through runnerName as selection (model doesn't price yet).
+    return name;
+  }
+  if (bfMarketType === "CORRECT_SCORE" || bfMarketType === "HALF_TIME_SCORE") {
+    // Runners are scores like "0 - 0", "1 - 0", "Any Other Home Win" etc.
+    return name;
+  }
+  if (bfMarketType === "NEXT_GOAL") {
+    if (lower === homeTeam.toLowerCase()) return "Home";
+    if (lower === awayTeam.toLowerCase()) return "Away";
+    if (lower.includes("no goal") || lower === "no more goals") return "NoGoal";
+    if (runner.sortPriority === 1) return "Home";
+    if (runner.sortPriority === 2) return "Away";
+    if (runner.sortPriority === 3) return "NoGoal";
+    return null;
+  }
+  if (bfMarketType === "TO_SCORE_IN_BOTH_HALVES") {
+    if (lower === "yes") return "Yes";
+    if (lower === "no") return "No";
+    return null;
+  }
+  if (
+    bfMarketType === "TO_WIN_TO_NIL" ||
+    bfMarketType === "CLEAN_SHEET_TEAM_A" ||
+    bfMarketType === "CLEAN_SHEET_TEAM_B"
+  ) {
+    if (lower === "yes") return "Yes";
+    if (lower === "no") return "No";
     return null;
   }
 
