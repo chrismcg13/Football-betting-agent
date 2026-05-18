@@ -327,18 +327,30 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
   // numbers it produces already average across the tier mix in that scope.
   // Promoting any tier in an eligible scope is consistent with the proof.
   //
-  // Per project_shadow_bets_principle: previously Tier B/C £0 bets bypassed
-  // every capital-risk gate. That made sense when there was no empirical
-  // signal to override the tier ladder. With Bundle B + the eligibility
-  // view, the data-driven gate exists and supersedes.
-  // 2026-05-13 Lever A+G — selector now reads BOTH eligibility paths:
-  //   (a) per-scope qualification via v_live_eligibility_candidates, OR
-  //   (b) market_type aggregate qualification via v_live_eligibility_market_types
-  //       with three-signal disproof carve-out (n>=30 AND roi<0 AND clv_t_stat<0
-  //       at the per-(league × market) scope). Identical disjunction as the
-  //       placement gate in paperTrading.ts so shadow inventory can flow live
-  //       through the same statistical reasoning that authorises fresh
-  //       placements.
+  // 2026-05-18 Bundle 13.B: the v_live_eligibility_candidates /
+  // v_live_eligibility_market_types filter is a LEGACY gate. Under
+  // inversion strategy (Bundle 11/12 + R5), eligibility is "fresh
+  // Pinnacle + 3-7pp band + direct-Pinnacle source" — enforced by the
+  // downstream freshness query (lines ~660-740) and Bundle 12.E.2 source
+  // gate. The view-based gate was the Wilson/CLV pre-cutover discipline
+  // that pre-dated the inversion pipeline. Diagnosis at 17:00 UTC showed
+  // 1,431 pending shadow bets including 59 in the 3-7pp band could not
+  // reach evaluation because both views are nearly empty (6 + 0 scopes)
+  // post-cutover, blocking every candidate at the SQL filter.
+  //
+  // Fix: when inversion_pipeline_enabled = true, drop the view filter.
+  // Bundle 11.C already bypasses the placement-time disabled-markets
+  // list for the same reason; this is the SQL-level analogue. The
+  // disproven-scope set is also no longer relevant since the band check
+  // (3-7pp post-slip) is the active per-bet discipline.
+  const inversionOn = await (async () => {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      return await isInversionPipelineEnabled();
+    } catch {
+      return false;
+    }
+  })();
   const candidates = await db.execute(sql`
     WITH latest_signal AS (
       SELECT league, market_type, n, roi, clv_t_stat
@@ -366,7 +378,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       AND pb.placed_at >= ${new Date(evalStartStr)}
       AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '${sql.raw(String(KICKOFF_LOOKAHEAD_HOURS))} hours'
       AND (
-        (m.league, pb.market_type) IN (
+        ${inversionOn}::boolean = true
+        OR (m.league, pb.market_type) IN (
           SELECT league, market_type FROM v_live_eligibility_candidates
         )
         OR (
