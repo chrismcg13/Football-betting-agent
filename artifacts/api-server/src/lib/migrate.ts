@@ -4799,6 +4799,11 @@ export async function runMigrations() {
       // Default 1.10 (10% uplift). Capped at 1.0 in code if config is
       // wrong, so safe ceiling.
       { key: "inversion_model_agree_multiplier", value: "1.10" },
+      // Bundle 16.B (2026-05-18): symmetric to Bundle 16. When Pinnacle
+      // implied is RISING (moving toward Betfair price), sharp money is
+      // confirming the Betfair mispricing → uplift stake. Default 1.10×,
+      // hard-capped at 1.25× in code. Same threshold as Bundle 16 drop.
+      { key: "pinnacle_direction_uplift_multiplier", value: "1.10" },
       // Bundle 13.D.2 (2026-05-18): halt counter windowing. Counts
       // consecutive live losses only on bets placed+settled within
       // these recent windows. Prevents bulk-reconciled historical bets

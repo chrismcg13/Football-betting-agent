@@ -974,6 +974,19 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
                 result.skipped_edge_evaporated++;
                 continue;
               }
+              // 16.B: symmetric uplift — Pinnacle moving TOWARD Betfair
+              // back-price (deltaPp > +threshold) = sharp confirms Betfair
+              // mispricing. Stack onto promoterUpliftMultiplier.
+              if (deltaPp > threshold) {
+                const upliftRaw = await getConfig("pinnacle_direction_uplift_multiplier");
+                const uplift =
+                  upliftRaw != null && Number.isFinite(Number(upliftRaw))
+                    ? Math.min(Math.max(Number(upliftRaw), 1.0), 1.25)
+                    : 1.10;
+                if (uplift > 1.0) {
+                  promoterUpliftMultiplier *= uplift;
+                }
+              }
             }
 
             // 15.C: TTK-weighted Kelly multiplier

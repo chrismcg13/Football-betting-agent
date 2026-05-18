@@ -2997,6 +2997,26 @@ export async function placePaperBet(
           if (olderOdds > 1.01) {
             const olderImplied = 1 / olderOdds;
             const deltaPp = (pinnacleImplied - olderImplied) * 100;
+            // ── Bundle 16.B (2026-05-18): symmetric uplift ────────────────
+            // Pinnacle moving TOWARD Betfair price = sharp money confirming
+            // the Betfair mispricing → uplift stake. Symmetric to the
+            // drop-demote below; same threshold (dropThresholdPp).
+            // Default uplift 1.10×, hard-capped 1.25× in code.
+            if (deltaPp > dropThresholdPp && stake > 0) {
+              const upliftRaw = await getConfigValue("pinnacle_direction_uplift_multiplier");
+              const uplift =
+                upliftRaw != null && Number.isFinite(Number(upliftRaw))
+                  ? Math.min(Math.max(Number(upliftRaw), 1.0), 1.25)
+                  : 1.10;
+              if (uplift > 1.0) {
+                const before = stake;
+                stake = Math.round(stake * uplift * 100) / 100;
+                logger.info(
+                  { matchId, marketType, before, after: stake, uplift, deltaPp, threshold: dropThresholdPp },
+                  "Bundle 16.B Pinnacle direction uplift applied",
+                );
+              }
+            }
             // Negative delta = Pinnacle implied dropped = back odds rose
             // = Pinnacle now thinks less likely = edge closing.
             if (deltaPp < -dropThresholdPp) {
