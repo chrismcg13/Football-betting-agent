@@ -348,36 +348,40 @@ export async function readMultiBookSnapshots(
   marketType: string,
   selectionName: string,
 ): Promise<MultiBookSnapshot[]> {
+  // ── Bundle F1.2 (2026-05-18): read fresh Pinnacle from odds_snapshots ──
+  // Previous read used pinnacle_odds_snapshots which only carries the
+  // STRUCTURED-PHASE rows (identification, closing, t60/30/15/5,
+  // pre_kickoff) — bookmaker_slug='pinnacle' was the only slug there
+  // anyway (verified via Neon). The continuous mid-window Pinnacle
+  // stream lives in odds_snapshots with source IN (api_football_real:
+  // Pinnacle, oddspapi_pinnacle). Stage 2 multi-book consensus was
+  // seeing stale Pinnacle as its sole "multi-book" reference.
   const cutoff = new Date(Date.now() - MULTIBOOK_FRESHNESS_MS);
-  const rows = await db
-    .select({
-      bookmakerSlug: pinnacleOddsSnapshotsTable.bookmakerSlug,
-      pinnacleOdds: pinnacleOddsSnapshotsTable.pinnacleOdds,
-      pinnacleImplied: pinnacleOddsSnapshotsTable.pinnacleImplied,
-      capturedAt: pinnacleOddsSnapshotsTable.capturedAt,
-    })
-    .from(pinnacleOddsSnapshotsTable)
-    .where(
-      and(
-        eq(pinnacleOddsSnapshotsTable.matchId, matchId),
-        eq(pinnacleOddsSnapshotsTable.marketType, marketType),
-        eq(pinnacleOddsSnapshotsTable.selectionName, selectionName),
-        gte(pinnacleOddsSnapshotsTable.capturedAt, cutoff),
-      ),
-    )
-    .orderBy(desc(pinnacleOddsSnapshotsTable.capturedAt));
+  const result = await db.execute(sql`
+    SELECT DISTINCT ON (source)
+      source,
+      back_odds::float8 AS back_odds,
+      snapshot_time AS captured_at
+    FROM odds_snapshots
+    WHERE match_id = ${matchId}
+      AND market_type = ${marketType}
+      AND selection_name = ${selectionName}
+      AND source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+      AND back_odds > 1.01
+      AND snapshot_time >= ${cutoff}
+    ORDER BY source, snapshot_time DESC
+  `) as unknown as { rows?: Array<{ source: string; back_odds: number; captured_at: string }> };
 
-  // De-duplicate to the latest snapshot per bookmaker_slug.
   const latestPerSlug = new Map<string, MultiBookSnapshot>();
-  for (const r of rows) {
-    const slug = r.bookmakerSlug ?? "pinnacle";
+  for (const r of result.rows ?? []) {
+    const slug = "pinnacle"; // both sources are Pinnacle
     if (latestPerSlug.has(slug)) continue;
-    const odds = r.pinnacleOdds != null ? Number(r.pinnacleOdds) : null;
-    if (odds == null || !Number.isFinite(odds) || odds <= 1) continue;
+    const odds = r.back_odds;
+    if (!Number.isFinite(odds) || odds <= 1) continue;
     latestPerSlug.set(slug, {
       bookmakerSlug: slug,
       rawImpliedProbability: 1 / odds,
-      capturedAt: r.capturedAt ?? new Date(),
+      capturedAt: r.captured_at ? new Date(r.captured_at) : new Date(),
     });
   }
   return [...latestPerSlug.values()];
@@ -617,15 +621,22 @@ async function evaluateHighEdgeIntegrity(
   // (a) + (b): fresh Pinnacle snapshot exists and matches candidate's
   //            pinnacleImplied.
   try {
+    // Bundle F1.2 (2026-05-18): read fresh Pinnacle from odds_snapshots
+    // (continuous stream), not pinnacle_odds_snapshots (structured-phase
+    // table — stale between identification and t60). Bundle 5.K's
+    // high-edge integrity check was silently rejecting most high-edge
+    // candidates because pinnacle_odds_snapshots had no rows within the
+    // 30-min window for many active scopes.
     const r = await db.execute(sql`
-      SELECT pinnacle_implied::float8 AS pi
-      FROM pinnacle_odds_snapshots
+      SELECT (1.0 / back_odds::float8)::float8 AS pi
+      FROM odds_snapshots
       WHERE match_id = ${candidate.matchId}
         AND market_type = ${candidate.marketType}
         AND selection_name = ${candidate.selectionName}
-        AND bookmaker_slug = 'pinnacle'
-        AND captured_at >= NOW() - INTERVAL '30 minutes'
-      ORDER BY captured_at DESC
+        AND source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+        AND back_odds > 1.01
+        AND snapshot_time >= NOW() - INTERVAL '30 minutes'
+      ORDER BY snapshot_time DESC
       LIMIT 1
     `);
     const row = ((r as any).rows ?? [])[0] as { pi: number | null } | undefined;
