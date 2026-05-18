@@ -3254,53 +3254,18 @@ export async function placePaperBet(
   // Betfair" is the trustworthy live cohort the live track showed -3.5pp
   // calibration gap on (n=239 pre-fix, with the +1.40 to +2.03 inflation
   // mostly cleaned up).
-  const DIRECT_PINNACLE_SOURCES = new Set([
-    "api_football_real:Pinnacle",
-    "oddspapi_pinnacle",
-  ]);
-  const isDirectPinnacleSource =
-    fairValueSource != null &&
-    DIRECT_PINNACLE_SOURCES.has(fairValueSource);
-  if (!isShadowBet) {
-    try {
-      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
-      if ((await isInversionPipelineEnabled()) && !isDirectPinnacleSource) {
-        const fullKellyStake = stake;
-        const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
-        shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
-        shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
-        stake = 0;
-        isShadowBet = true;
-        await db.insert(complianceLogsTable).values({
-          actionType: "inversion_non_direct_pinnacle_demote",
-          details: {
-            matchId,
-            marketType,
-            selectionName,
-            fairValueSource: fairValueSource ?? null,
-            actionableSource: actionableSource ?? null,
-            backOdds,
-            modelProbability,
-            reason: "non_direct_pinnacle_source_routes_shadow",
-            shadowStake,
-          } as Record<string, unknown>,
-          timestamp: new Date(),
-        } as any);
-        await logShadowGateExemption(
-          "inversion_non_direct_pinnacle",
-          experimentTag ?? null,
-          `Non-direct-Pinnacle demote (Bundle 12.E): fv=${fairValueSource ?? "null"}, act=${actionableSource ?? "null"}`,
-          shadowStake,
-          universeTier,
-        );
-      }
-    } catch (err) {
-      logger.warn(
-        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
-        "Bundle 12.E direct-Pinnacle source check failed (non-blocking)",
-      );
-    }
-  }
+  // Bundle 12.E.2 REMOVED 2026-05-18 (post-F2.A): the historical
+  // fair_value_source check was a snapshot of the EMITTER's anchor and
+  // routed non-direct-Pinnacle candidates to shadow regardless of
+  // whether fresh Pinnacle was actually available at evaluation time.
+  //
+  // Under F2.A architecture (locked 2026-05-18) the agreement gate
+  // pulls fresh Pinnacle from the DB at evaluation time and runs a
+  // direct model+Pinnacle direction check. If Pinnacle is unavailable
+  // the agreement gate demotes to shadow naturally. The Bundle 12.E.2
+  // check was redundant and was blocking 2,699 candidates per
+  // lazy-promote cycle from being evaluated under F2.A's canonical
+  // gate. Block removed.
 
   // ── Bundle 5.E + Bundle 10 + Bundle 11 (2026-05-17): inversion gate ─────
   // Evaluates the gate on every candidate that has fresh Pinnacle coverage.

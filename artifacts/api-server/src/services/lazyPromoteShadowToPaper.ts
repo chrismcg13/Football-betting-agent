@@ -581,39 +581,16 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           continue;
         }
 
-        // Bundle 12.E.2 (2026-05-18): Pinnacle-anchored fair-value gate.
-        // selectPricingSources hardcodes actionable_source =
-        // "betfair_exchange" (we always place on Betfair). Only
-        // fair_value_source needs to be direct Pinnacle to confirm the
-        // sharp anchor priced THIS exact selection_name (no line
-        // mismatch). See paperTrading.ts equivalent block for the full
-        // rationale. Requiring actionable in direct-Pinnacle here would
-        // block every lazy-promote candidate.
-        const DIRECT_PINNACLE_SOURCES = new Set([
-          "api_football_real:Pinnacle",
-          "oddspapi_pinnacle",
-        ]);
-        const isDirectPinnacleSource =
-          r.fair_value_source != null &&
-          DIRECT_PINNACLE_SOURCES.has(r.fair_value_source);
-        if (!isDirectPinnacleSource) {
-          result.skipped_kelly_below_min++;  // reuse counter
-          await db.insert(complianceLogsTable).values({
-            actionType: "lazy_promote_non_direct_pinnacle",
-            details: {
-              betId: r.id,
-              matchId: r.match_id,
-              marketType: r.market_type,
-              selectionName: r.selection_name,
-              fairValueSource: r.fair_value_source,
-              actionableSource: r.actionable_source,
-              reason: "non_direct_pinnacle_source_stays_shadow",
-              source: "lazy_promote",
-            },
-            timestamp: new Date(),
-          } as any);
-          continue;
-        }
+        // Bundle 12.E.2 REMOVED 2026-05-18 (post-F2.A): the historical
+        // fair_value_source field was a snapshot of the EMITTER's anchor.
+        // Under F2.A architecture the agreement gate at line ~1058 pulls
+        // FRESH Pinnacle from pinnacle_odds_snapshots and runs the
+        // model+Pinnacle direction check directly. If fresh Pinnacle is
+        // unavailable the agreement gate demotes to shadow naturally.
+        // The Bundle 12.E.2 check was blocking 2,699 candidates per
+        // 30-min cycle (verified via compliance_logs) — all of which
+        // could have been live-eligible under F2.A's fresh-Pinnacle
+        // canonical evaluation. Gate removed.
 
         // 2026-05-15 — per-market-type kill switch. Mirrors the check in
         // paperTrading.placePaperBet so lazy-promote doesn't bypass the
