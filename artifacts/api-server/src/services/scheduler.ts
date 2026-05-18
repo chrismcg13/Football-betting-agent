@@ -1821,22 +1821,51 @@ export async function runTradingCycle(options?: {
     try {
       const { isInversionPipelineEnabled } = await import("./inversionPipeline");
       if (await isInversionPipelineEnabled()) {
+        // ── Bundle 14 (2026-05-18): prioritiseAndAllocate wire-in ─────────
+        // Replace edge-DESC sort with compositePriority sorting from
+        // candidatePrioritizer.ts. Bundle 9 retrospective proved that
+        // bigger Pinnacle edges do NOT correlate with better ROI — the
+        // 3-7pp sweet spot was +200% ROI on n=48; 15-50pp was −31% on
+        // n=89. Sorting by edge DESC pushed losing high-edge artifacts
+        // to the top of the queue. compositePriority peaks in the
+        // 3-7pp range and combines with opportunity_score.
+        //
+        // Exposure cap allocation is enforced downstream by Bundle 5.M
+        // applyInversionExposureCaps inside placePaperBet, so this
+        // wire-in is the prioritise() half of prioritiseAndAllocate()
+        // for now. Full allocator (with running per-fixture/league/daily
+        // cap tracking across the cycle) is a follow-up bundle.
+        const { compositePriority } = await import("./candidatePrioritizer");
         const before = betOrders.map((o) => ({ matchId: o.matchId, edge: o.edge, score: o.effectiveScore }));
         betOrders.sort((a, b) => {
-          const ae = a.edge ?? -Infinity;
-          const be = b.edge ?? -Infinity;
-          if (ae !== be) return be - ae;
+          const aEdgePp = a.edge != null ? a.edge * 100 : null;
+          const bEdgePp = b.edge != null ? b.edge * 100 : null;
+          const aComp = compositePriority({
+            postSlipEdgePp: aEdgePp,
+            opportunityScore: a.effectiveScore,
+            identifiedEdgePp: aEdgePp,
+          });
+          const bComp = compositePriority({
+            postSlipEdgePp: bEdgePp,
+            opportunityScore: b.effectiveScore,
+            identifiedEdgePp: bEdgePp,
+          });
+          if (aComp !== bComp) return bComp - aComp;
+          // Tie-break on opportunity score, then identified edge
           const as = a.effectiveScore ?? -Infinity;
           const bs = b.effectiveScore ?? -Infinity;
-          return bs - as;
+          if (as !== bs) return bs - as;
+          const ae = a.edge ?? -Infinity;
+          const be = b.edge ?? -Infinity;
+          return be - ae;
         });
         logger.info(
           { count: betOrders.length, sample: before.slice(0, 3) },
-          "Bundle 8.A: betOrders sorted by inversion priority key (edge DESC, score DESC)",
+          "Bundle 14: betOrders sorted by compositePriority (sweet-spot edge × opp score)",
         );
       }
     } catch (err) {
-      logger.warn({ err }, "Bundle 8.A inversion-flag sort failed (non-blocking) — proceeding with existing order");
+      logger.warn({ err }, "Bundle 14 prioritiseAndAllocate sort failed (non-blocking) — proceeding with existing order");
     }
 
     for (const order of betOrders) {
