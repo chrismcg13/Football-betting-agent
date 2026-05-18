@@ -6287,6 +6287,32 @@ router.post("/admin/run-kelly-montecarlo", async (_req, res) => {
   }
 });
 
+// Bundle F0 (2026-05-18): freshness observability — one-shot JSON dump
+// of the three views. Caller can pass ?days=N to limit lookback (default
+// 7, max 14 since the view itself caps at 14d).
+router.get("/admin/freshness-metrics", async (req, res) => {
+  try {
+    const daysRaw = req.query.days;
+    const days = typeof daysRaw === "string" && Number.isFinite(Number(daysRaw))
+      ? Math.max(1, Math.min(14, Number(daysRaw)))
+      : 7;
+    const [actionable, perWrite, byBand] = await Promise.all([
+      db.execute(sql`SELECT * FROM v_freshness_actionable_writes_daily WHERE day >= CURRENT_DATE - ${days}::int ORDER BY day DESC`),
+      db.execute(sql`SELECT * FROM v_freshness_placement_per_write_daily WHERE day >= CURRENT_DATE - ${days}::int ORDER BY day DESC`),
+      db.execute(sql`SELECT * FROM v_freshness_clv_by_age_band_daily WHERE day >= CURRENT_DATE - ${days}::int ORDER BY day DESC, age_band`),
+    ]);
+    res.json({
+      lookback_days: days,
+      actionable_writes: (actionable as any).rows ?? actionable,
+      placements_per_write: (perWrite as any).rows ?? perWrite,
+      clv_by_age_band: (byBand as any).rows ?? byBand,
+    });
+  } catch (err) {
+    logger.error({ err }, "Freshness metrics dump failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // 2026-05-11: manual trigger for the lazy shadow→live promoter. The 5-min
 // cron in scheduler.ts runs this automatically; this endpoint lets the
 // operator force a pass immediately (e.g. after raising the dynamic Kelly

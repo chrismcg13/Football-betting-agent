@@ -732,7 +732,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           // parallel so we always evaluate against current prices.
           const [pinnRow, bfRow] = await Promise.all([
             db.execute(sql`
-              SELECT pinnacle_implied::float8 AS pinn_implied
+              SELECT pinnacle_implied::float8 AS pinn_implied,
+                     captured_at
               FROM pinnacle_odds_snapshots
               WHERE match_id = ${r.match_id}
                 AND market_type = ${r.market_type}
@@ -741,7 +742,7 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
                 AND captured_at >= NOW() - INTERVAL '1 second' * ${pinnMaxAgeSec}
               ORDER BY captured_at DESC
               LIMIT 1
-            `) as unknown as Promise<{ rows?: Array<{ pinn_implied: number | null }> }>,
+            `) as unknown as Promise<{ rows?: Array<{ pinn_implied: number | null; captured_at: string | null }> }>,
             db.execute(sql`
               SELECT back_odds::float8 AS back_odds
               FROM odds_snapshots
@@ -755,6 +756,10 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
             `) as unknown as Promise<{ rows?: Array<{ back_odds: number | null }> }>,
           ]);
           const pinnImplied = pinnRow.rows?.[0]?.pinn_implied;
+          const pinnCapturedAt = pinnRow.rows?.[0]?.captured_at;
+          const pinnAgeSecAtEval = pinnCapturedAt
+            ? Math.max(0, (Date.now() - new Date(pinnCapturedAt).getTime()) / 1000)
+            : null;
           const currentBack = bfRow.rows?.[0]?.back_odds;
           // Hoist for use at the placement call site.
           liveBetfairBack = currentBack != null && Number.isFinite(currentBack) && currentBack > 1.01 ? currentBack : null;
@@ -810,6 +815,31 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
                 timestamp: new Date(),
               } as any);
               continue;
+            }
+            // ── Bundle F4 (2026-05-18): edge-asymmetric freshness ──────
+            // Marginal-edge bets demand tighter Pinnacle freshness.
+            if (pinnAgeSecAtEval != null) {
+              const { effectivePinnacleMaxAgeSeconds } = await import("./inversionPipeline");
+              const ceilingSec = await effectivePinnacleMaxAgeSeconds(postSlipEdgePp);
+              if (pinnAgeSecAtEval > ceilingSec) {
+                result.skipped_edge_evaporated++;
+                await db.insert(complianceLogsTable).values({
+                  actionType: "lazy_promote_f4_freshness_band",
+                  details: {
+                    betId: r.id,
+                    matchId: r.match_id,
+                    marketType: r.market_type,
+                    selectionName: r.selection_name,
+                    postSlipEdgePp,
+                    pinnAgeSecAtEval,
+                    ceilingSec,
+                    reason: "f4_edge_banded_freshness_exceeded",
+                    source: "lazy_promote",
+                  },
+                  timestamp: new Date(),
+                } as any);
+                continue;
+              }
             }
           } else {
             // No fresh Pinnacle anchor → no sharp edge → no live

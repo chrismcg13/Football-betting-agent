@@ -3441,6 +3441,42 @@ export async function placePaperBet(
           );
         }
         if (inversionDecision.action === "PROCEED" && !isShadowBet) {
+          // ── Bundle F4 (2026-05-18): edge-asymmetric freshness gate ────
+          // Marginal-edge bets (3-4pp, 4-5pp) require tighter Pinnacle
+          // freshness than 5+pp bets. Helper reads three config keys.
+          try {
+            const postSlipEdgePp = inversionDecision.diagnostics?.postSlippageEdgePp ?? null;
+            if (pinnacleSnapshotAgeSeconds != null && postSlipEdgePp != null) {
+              const { effectivePinnacleMaxAgeSeconds } = await import("./inversionPipeline");
+              const ceilingSec = await effectivePinnacleMaxAgeSeconds(postSlipEdgePp);
+              if (pinnacleSnapshotAgeSeconds > ceilingSec) {
+                logger.info(
+                  { matchId, marketType, selectionName, postSlipEdgePp, pinnacleSnapshotAgeSeconds, ceilingSec },
+                  "Bundle F4 edge-asymmetric freshness demote",
+                );
+                const fullKellyStake = stake;
+                const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+                shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+                shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+                stake = 0;
+                isShadowBet = true;
+                await logShadowGateExemption(
+                  "f4_freshness_band_demote",
+                  experimentTag ?? null,
+                  `F4 freshness ceiling exceeded: edge=${postSlipEdgePp.toFixed(2)}pp, age=${pinnacleSnapshotAgeSeconds.toFixed(0)}s, ceiling=${ceilingSec}s`,
+                  shadowStake,
+                  universeTier,
+                );
+              }
+            }
+          } catch (err) {
+            logger.warn(
+              { err: (err as Error)?.message ?? String(err), matchId, marketType },
+              "Bundle F4 freshness check failed (non-blocking)",
+            );
+          }
+        }
+        if (inversionDecision.action === "PROCEED" && !isShadowBet) {
           // Multi-sharp Kelly tiering (Bundle 5.J): 1 sharp = 0.5×,
           // 2 sharps = 1.0×, 3 sharps = 1.0× + HIGH_CONVICTION flag.
           const mult = (inversionDecision as any).kellyMultiplier ?? 1.0;

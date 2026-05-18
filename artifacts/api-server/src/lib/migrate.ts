@@ -4804,6 +4804,15 @@ export async function runMigrations() {
       // confirming the Betfair mispricing → uplift stake. Default 1.10×,
       // hard-capped at 1.25× in code. Same threshold as Bundle 16 drop.
       { key: "pinnacle_direction_uplift_multiplier", value: "1.10" },
+      // Bundle F4 (2026-05-18): edge-asymmetric Pinnacle freshness gate.
+      // Tighter ceilings for marginal-edge bets where freshness matters
+      // most. Calibrated against the CLV-vs-age gradient on settled live
+      // bets (−4.15% ≤90s, −7.89% ≤10m, −12.66% older). Cell counts at
+      // 90-180s are thin (n<10) so thresholds are starting points;
+      // recalibrate after Bundle 17 / F0 accumulates more data.
+      { key: "pinnacle_max_age_seconds_3to4pp", value: "90" },
+      { key: "pinnacle_max_age_seconds_4to5pp", value: "120" },
+      { key: "pinnacle_max_age_seconds_5plus", value: "180" },
       // Bundle 13.D.2 (2026-05-18): halt counter windowing. Counts
       // consecutive live losses only on bets placed+settled within
       // these recent windows. Prevents bulk-reconciled historical bets
@@ -4830,6 +4839,117 @@ export async function runMigrations() {
         .onConflictDoNothing({ target: agentConfigTable.key });
     }
     logger.info({ count: inversionSeed.length }, "Bundle 5.N: inversion-pipeline config keys seeded (ON CONFLICT DO NOTHING)");
+
+    // ── Bundle F0 (2026-05-18): freshness observability views ──────────
+    // Three views to quantify whether F1's event-driven placement
+    // actually lifts the eval-while-fresh ratio from ~4% baseline.
+    // Land BEFORE F1 so we have a measurable baseline.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_freshness_actionable_writes_daily AS
+      WITH pinn AS (
+        SELECT snapshot_time, match_id, market_type, selection_name
+        FROM odds_snapshots
+        WHERE source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+          AND snapshot_time >= NOW() - INTERVAL '14 days'
+      ),
+      tagged AS (
+        SELECT
+          DATE(p.snapshot_time AT TIME ZONE 'UTC') AS day,
+          EXISTS (
+            SELECT 1 FROM paper_bets pb
+            WHERE pb.match_id = p.match_id
+              AND pb.market_type = p.market_type
+              AND pb.selection_name = p.selection_name
+              AND pb.bet_track = 'shadow'
+              AND pb.status = 'pending'
+              AND pb.placed_at <= p.snapshot_time
+          ) AS is_actionable
+        FROM pinn p
+      )
+      SELECT
+        day,
+        COUNT(*)::int AS total_writes,
+        COUNT(*) FILTER (WHERE is_actionable)::int AS actionable_writes,
+        ROUND(COUNT(*) FILTER (WHERE is_actionable) * 100.0 / NULLIF(COUNT(*), 0), 2) AS actionable_pct
+      FROM tagged
+      GROUP BY day
+      ORDER BY day DESC
+    `);
+    logger.info("Bundle F0: v_freshness_actionable_writes_daily view ready");
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_freshness_placement_per_write_daily AS
+      WITH pinn AS (
+        SELECT DATE(snapshot_time AT TIME ZONE 'UTC') AS day, COUNT(*)::int AS pinn_writes
+        FROM odds_snapshots
+        WHERE source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+          AND snapshot_time >= NOW() - INTERVAL '14 days'
+        GROUP BY 1
+      ),
+      placements AS (
+        SELECT
+          DATE(placed_at AT TIME ZONE 'UTC') AS day,
+          COUNT(*) FILTER (WHERE bet_track = 'live')::int AS live_placed,
+          COUNT(*) FILTER (WHERE bet_track = 'shadow')::int AS shadow_placed
+        FROM paper_bets
+        WHERE placed_at >= NOW() - INTERVAL '14 days'
+        GROUP BY 1
+      )
+      SELECT
+        COALESCE(p.day, pl.day) AS day,
+        COALESCE(p.pinn_writes, 0)::int AS pinn_writes,
+        COALESCE(pl.live_placed, 0)::int AS live_placed,
+        COALESCE(pl.shadow_placed, 0)::int AS shadow_placed,
+        ROUND(COALESCE(pl.live_placed, 0) * 10000.0 / NULLIF(p.pinn_writes, 0), 2) AS live_per_10k_writes,
+        ROUND(COALESCE(pl.shadow_placed, 0) * 10000.0 / NULLIF(p.pinn_writes, 0), 2) AS shadow_per_10k_writes
+      FROM pinn p FULL OUTER JOIN placements pl USING (day)
+      ORDER BY 1 DESC
+    `);
+    logger.info("Bundle F0: v_freshness_placement_per_write_daily view ready");
+
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_freshness_clv_by_age_band_daily AS
+      WITH lb AS (
+        SELECT
+          DATE(pb.placed_at AT TIME ZONE 'UTC') AS day,
+          pb.calculated_edge, pb.placed_at, pb.odds_at_placement,
+          pb.closing_pinnacle_odds, pb.status,
+          EXTRACT(EPOCH FROM (
+            pb.placed_at - (
+              SELECT MAX(os.snapshot_time)
+              FROM odds_snapshots os
+              WHERE os.match_id = pb.match_id
+                AND os.market_type = pb.market_type
+                AND os.source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+                AND os.snapshot_time <= pb.placed_at
+            )
+          )) AS pinn_age_s
+        FROM paper_bets pb
+        WHERE pb.bet_track = 'live'
+          AND pb.placed_at >= NOW() - INTERVAL '14 days'
+          AND pb.status IN ('won','lost')
+          AND pb.calculated_edge IS NOT NULL
+          AND pb.closing_pinnacle_odds IS NOT NULL
+          AND pb.odds_at_placement IS NOT NULL
+      )
+      SELECT
+        day,
+        CASE
+          WHEN pinn_age_s <= 90 THEN '1_le_90s'
+          WHEN pinn_age_s <= 120 THEN '2_le_120s'
+          WHEN pinn_age_s <= 180 THEN '3_le_180s'
+          WHEN pinn_age_s <= 600 THEN '4_le_10m'
+          ELSE '5_older'
+        END AS age_band,
+        COUNT(*)::int AS n,
+        ROUND(AVG((1.0/odds_at_placement - 1.0/closing_pinnacle_odds) * 100)::numeric, 2) AS avg_clv_pct,
+        ROUND(AVG(CASE WHEN status='won' THEN 1 ELSE 0 END)::numeric, 3) AS win_rate
+      FROM lb
+      WHERE pinn_age_s IS NOT NULL
+      GROUP BY day, age_band
+      ORDER BY day DESC, age_band
+    `);
+    logger.info("Bundle F0: v_freshness_clv_by_age_band_daily view ready");
 
     logger.info("Migrations complete");
   } catch (err) {

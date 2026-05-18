@@ -181,6 +181,42 @@ export async function isInversionPipelineEnabled(): Promise<boolean> {
   return raw === "true";
 }
 
+/**
+ * Bundle F4 (2026-05-18): edge-asymmetric Pinnacle freshness ceiling.
+ *
+ * Returns the maximum allowable Pinnacle snapshot age (seconds) for a
+ * candidate at the given post-slip edge. Tighter for marginal edges
+ * where freshness matters most:
+ *
+ *   3-4pp edge → pinnacle_max_age_seconds_3to4pp  (default  90s)
+ *   4-5pp edge → pinnacle_max_age_seconds_4to5pp  (default 120s)
+ *   >= 5pp     → pinnacle_max_age_seconds_5plus   (default 180s)
+ *
+ * When postSlipEdgePp is null/non-finite, returns the most permissive
+ * (5+pp) ceiling so we never tighten without knowing the edge.
+ *
+ * Calibration note: thresholds are starting points. The CLV-vs-age
+ * gradient on settled live bets is monotonic (−4.15% at ≤90s vs
+ * −12.66% beyond 10min) but cells at 90-120s and 120-180s have n < 10
+ * — these cuts ARE educated guesses. Recalibrate after Bundle 17 / F0
+ * accumulates more (edge × age) cells.
+ */
+export async function effectivePinnacleMaxAgeSeconds(
+  postSlipEdgePp: number | null,
+): Promise<number> {
+  const read = async (key: string, fallback: number): Promise<number> => {
+    const raw = await getConfigValue(key);
+    const n = raw != null ? Number(raw) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  if (postSlipEdgePp == null || !Number.isFinite(postSlipEdgePp)) {
+    return read("pinnacle_max_age_seconds_5plus", 180);
+  }
+  if (postSlipEdgePp < 4) return read("pinnacle_max_age_seconds_3to4pp", 90);
+  if (postSlipEdgePp < 5) return read("pinnacle_max_age_seconds_4to5pp", 120);
+  return read("pinnacle_max_age_seconds_5plus", 180);
+}
+
 async function readThresholds(): Promise<InversionThresholds> {
   const num = async (key: string, fallback: number): Promise<number> => {
     const raw = await getConfigValue(key);
