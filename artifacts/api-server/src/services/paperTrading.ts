@@ -2842,6 +2842,60 @@ export async function placePaperBet(
     );
   }
 
+  // ── Bundle 15.A (2026-05-18): liquidity-at-price floor ───────────────────
+  // Per Chris diagnostic #4: "A 7% edge on £20 of matchable volume isn't a
+  // strategy." Demote to shadow when best-back size is below the floor.
+  // Default £20 absolute. Operator-tunable via agent_config.
+  // betfair_liquidity_floor_gbp. Only fires under inversion mode — pre-
+  // inversion paper bets don't need this gate. Direct emission only here;
+  // lazy promoter equivalent can be added when relayGetLiquidity is wired.
+  if (exchangeSnapshot != null && exchangeSnapshot.bestBackSize != null && !isShadowBet) {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if (await isInversionPipelineEnabled()) {
+        const liquidityFloorRaw = await getConfigValue("betfair_liquidity_floor_gbp");
+        const liquidityFloorGbp =
+          liquidityFloorRaw != null && Number.isFinite(Number(liquidityFloorRaw))
+            ? Number(liquidityFloorRaw)
+            : 20;
+        const bestBackSize = Number(exchangeSnapshot.bestBackSize);
+        if (Number.isFinite(bestBackSize) && bestBackSize < liquidityFloorGbp) {
+          await db.insert(complianceLogsTable).values({
+            actionType: "inversion_liquidity_below_floor",
+            details: {
+              matchId,
+              marketType,
+              selectionName,
+              backOdds,
+              bestBackSize,
+              liquidityFloorGbp,
+              reason: "betfair_size_at_price_below_floor",
+            } as Record<string, unknown>,
+            timestamp: new Date(),
+          } as any);
+          const fullKellyStake = stake;
+          const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+          shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+          shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+          stake = 0;
+          isShadowBet = true;
+          await logShadowGateExemption(
+            "inversion_liquidity_below_floor",
+            experimentTag ?? null,
+            `Liquidity-at-price below floor (Bundle 15.A): size=${bestBackSize}, floor=${liquidityFloorGbp}`,
+            shadowStake,
+            universeTier,
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "Bundle 15.A liquidity-floor check failed (non-blocking)",
+      );
+    }
+  }
+
   // ── Bundle 1 E.3 + E.5 (2026-05-17): niche-aligned sharp-anchor fetch ───
   // Synchronous-within-cycle. Non-qualifying candidates skip the IO entirely
   // (outcome='no_niche_qualifies'); qualifying AH candidates spend at most

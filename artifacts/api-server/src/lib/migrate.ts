@@ -4776,6 +4776,20 @@ export async function runMigrations() {
       // polling can't keep up; tighten as polling cadence improves.
       { key: "pinnacle_max_age_seconds", value: "180" },
       { key: "betfair_odds_max_age_seconds", value: "180" },
+      // Bundle 15.A (2026-05-18): minimum Betfair size at best-back
+      // before live placement. Per Chris diagnostic #4 — "a 7% edge on
+      // £20 of matchable volume isn't a strategy." Default £20 absolute.
+      { key: "betfair_liquidity_floor_gbp", value: "20" },
+      // Bundle 15.B (2026-05-18): max delta between Pinnacle and
+      // Betfair snapshot ages. If Pinnacle is much staler than Betfair,
+      // the "edge" likely reflects stale Pinnacle data not real
+      // mispricing. Default 90 seconds.
+      { key: "freshness_asymmetry_max_delta_seconds", value: "90" },
+      // Bundle 15.C (2026-05-18): TTK-weighted Kelly multiplier curve.
+      // ttk_factor = clamp(1.0 - (hours_to_ko - 1) / 23, 0.25, 1.0).
+      // So T-1h ≈ 1.0, T-12h ≈ 0.52, T-23h ≈ 0.04 (clamped to 0.25).
+      // Operator can tighten the floor via this knob.
+      { key: "ttk_kelly_floor", value: "0.25" },
       { key: "high_edge_flag_threshold", value: "7.0" },
       { key: "kelly_multiplier_single_sharp", value: "0.5" },
       { key: "kelly_multiplier_two_sharp", value: "1.0" },
