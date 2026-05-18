@@ -1385,19 +1385,22 @@ export async function fetchAndStoreOddsForAllUpcoming(
       leagueTierCache.set(m.league, fetchTier);
     }
 
-    // Bundle F2.A.5 (2026-05-18): when caller passes fixtureIdAllowlist
-    // (F2 tier-aware cron path), bypass the legacy league_fetch_tier
-    // filter. The watch_priority tier system has already selected these
-    // fixtures as high-priority; gating again on the league_fetch_tier
-    // (which marks leagues NOT in competition_config as "dormant",
-    // never polling them) discards Tier 1 watch-priority fixtures whose
-    // leagues happen to be unfamiliar to competition_config. Verified
-    // root cause of zero Pinnacle writes on tier-aware cron despite
-    // 7-10 fixtures being eligible.
-    if (!allowlist && !shouldFetchOddsThisCycle(fetchTier)) {
-      skippedByTier++;
-      continue;
-    }
+    // Bundle F2.A.5 / F2.A.6 (2026-05-18 → 2026-05-19): legacy
+    // league_fetch_tier filter REMOVED entirely per Chris locked
+    // architecture: "we need all mapped leagues with pinacle coverage
+    // to have cycles and be scanned so opportunities can be found with
+    // the true probability calculation".
+    //
+    // The legacy filter (shouldFetchOddsThisCycle) gated polling by
+    // hour-of-day (medium=4x/day, low=2x/day, dormant=never). Under
+    // F2.A the watch_priority tier system + F2 tier-aware crons (Tier
+    // 1 every 5 min, Tier 2 every 30 min, Tier 3 every 1 hour, Tier
+    // 4 every 6 hours) control WHEN to poll based on signal quality,
+    // not on legacy league_fetch_tier. Budget is naturally bounded by
+    // the cron cadence × fixture count.
+    //
+    // fetchTier value is still computed for telemetry only — useful
+    // for log filtering / future tier-specific behaviors.
 
     const count = await fetchAndStoreOddsForFixture(m.matchId, m.fixtureId, m.kickoffTime);
     oddsStored += count;
