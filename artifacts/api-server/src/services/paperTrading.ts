@@ -2901,29 +2901,35 @@ export async function placePaperBet(
     logger.warn({ err, matchId, marketType, selectionName }, "sharpAnchorFetch threw — Pinnacle-only fallback");
   }
 
-  // ── Bundle 12.E (2026-05-18): direct-Pinnacle source gate ─────────────
-  // Data analysis on bets since 2026-05-09 (Chris 2026-05-18 directive):
-  // direct_pinnacle source (fair_value AND actionable both ∈
-  // {api_football_real:Pinnacle, oddspapi_pinnacle}) is the ONLY source
-  // class with trustworthy implied probability. Live calibration gap on
-  // direct_pinnacle: -3.5pp (n=239, within sampling noise). Derived
-  // sources show massive calibration errors:
-  //   - pinn_fv_betfair_actionable AH gap: -27.4pp (n=549)
-  //   - betfair_only AH gap: -17.5pp (n=111)
-  // The mismatched-line / Betfair-derived implied probability is
-  // INFLATED relative to actual win rate — live-betting these would
-  // systematically lose (the n=25 / -80% ROI in §A.1's 10%+ edge bucket
-  // is almost certainly this source). Demote ALL non-direct-Pinnacle
-  // candidates to shadow when inversion pipeline is active.
+  // ── Bundle 12.E.2 (2026-05-18): Pinnacle-anchored fair-value gate ─────
+  // Original 12.E required BOTH fair_value AND actionable in direct-Pinnacle.
+  // That was wrong: selectPricingSources (valueDetection.ts:851) hardcodes
+  // actionableSource = "betfair_exchange" because we place bets on Betfair
+  // Exchange — Pinnacle is never the placement venue. The pre-2026-05-09
+  // cohort with actionable=Pinnacle were synthetic shadow bets that no
+  // longer exist in current code. Requiring actionable ∈ direct-Pinnacle
+  // blocked 100% of live candidates.
+  //
+  // Correct semantic: fair_value_source = Pinnacle (sharp anchor priced
+  // THIS selection_name — selectPricingSources iterates per-selection rows
+  // so a Pinnacle fair_value confirms Pinnacle priced the exact line, no
+  // mismatch). actionable_source = betfair_exchange (placement venue).
+  //
+  // The -27pp gap on the historical "pinn_fv_betfair_actionable" cohort
+  // was a different population — pre-Bundle-3 (a209758, 2026-05-17) the
+  // pricing pipeline produced inflated odds_at_placement when Betfair was
+  // thin. That fix narrowed actionable to betfair_exchange ONLY when a
+  // real exchange row exists. Going-forward "fair=Pinnacle, actionable=
+  // Betfair" is the trustworthy live cohort the live track showed -3.5pp
+  // calibration gap on (n=239 pre-fix, with the +1.40 to +2.03 inflation
+  // mostly cleaned up).
   const DIRECT_PINNACLE_SOURCES = new Set([
     "api_football_real:Pinnacle",
     "oddspapi_pinnacle",
   ]);
   const isDirectPinnacleSource =
     fairValueSource != null &&
-    actionableSource != null &&
-    DIRECT_PINNACLE_SOURCES.has(fairValueSource) &&
-    DIRECT_PINNACLE_SOURCES.has(actionableSource);
+    DIRECT_PINNACLE_SOURCES.has(fairValueSource);
   if (!isShadowBet) {
     try {
       const { isInversionPipelineEnabled } = await import("./inversionPipeline");

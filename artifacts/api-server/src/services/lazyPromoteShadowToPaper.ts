@@ -556,22 +556,21 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           continue;
         }
 
-        // Bundle 12.E (2026-05-18): direct-Pinnacle source gate.
-        // Lazy-promote is forbidden when the shadow bet's stored
-        // fair_value_source or actionable_source is not a direct
-        // Pinnacle source. Data analysis (Chris 2026-05-18) showed
-        // non-direct sources mis-calibrate by -17 to -27pp on AH.
-        // Stays shadow forever for those bets; they're learning
-        // telemetry only.
+        // Bundle 12.E.2 (2026-05-18): Pinnacle-anchored fair-value gate.
+        // selectPricingSources hardcodes actionable_source =
+        // "betfair_exchange" (we always place on Betfair). Only
+        // fair_value_source needs to be direct Pinnacle to confirm the
+        // sharp anchor priced THIS exact selection_name (no line
+        // mismatch). See paperTrading.ts equivalent block for the full
+        // rationale. Requiring actionable in direct-Pinnacle here would
+        // block every lazy-promote candidate.
         const DIRECT_PINNACLE_SOURCES = new Set([
           "api_football_real:Pinnacle",
           "oddspapi_pinnacle",
         ]);
         const isDirectPinnacleSource =
           r.fair_value_source != null &&
-          r.actionable_source != null &&
-          DIRECT_PINNACLE_SOURCES.has(r.fair_value_source) &&
-          DIRECT_PINNACLE_SOURCES.has(r.actionable_source);
+          DIRECT_PINNACLE_SOURCES.has(r.fair_value_source);
         if (!isDirectPinnacleSource) {
           result.skipped_kelly_below_min++;  // reuse counter
           await db.insert(complianceLogsTable).values({
