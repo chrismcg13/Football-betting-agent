@@ -3615,7 +3615,22 @@ export function startScheduler(): void {
   // The original 0 */2 broad 7-day refresh cron remains unchanged for
   // farther-out matches and line-movement detection on long-horizon
   // fixtures.
+  // Bundle 13.E (2026-05-18): cron-overlap protection. fetchAndStoreOddsForAllUpcoming
+  // takes 4-5 min to iterate 30-50 upcoming-24h matches (~2.4s per-match rate-limit
+  // delay × matches). At */2 cadence, fires overlap and back-pressure builds.
+  // Use a module-level lock + skip pattern: if the previous run is still in flight
+  // when the next tick fires, skip this tick. Same pattern used by
+  // runSettlementPipeline (scheduler.ts:2249). Ensures the cron is reliable: it
+  // may skip ticks under load but never piles up parallel executions, and any
+  // single iteration always completes before the next starts.
+  let nearKickoffPrefetchRunning = false;
   cron.schedule("*/2 * * * *", () => {
+    if (nearKickoffPrefetchRunning) {
+      logger.info("API-Football near-kickoff prefetch already running — skipping this tick");
+      return;
+    }
+    nearKickoffPrefetchRunning = true;
+    const startedAt = Date.now();
     logger.info("API-Football near-kickoff odds refresh triggered (24h window, 2-min cadence)");
     void fetchAndStoreOddsForAllUpcoming({ maxHoursAhead: 24 })
       .then(async () => {
@@ -3626,9 +3641,14 @@ export function startScheduler(): void {
       })
       .catch((err) => {
         logger.error({ err }, "API-Football near-kickoff odds refresh failed");
+      })
+      .finally(() => {
+        nearKickoffPrefetchRunning = false;
+        const durMs = Date.now() - startedAt;
+        logger.info({ durationMs: durMs }, "API-Football near-kickoff prefetch finished");
       });
   }, { timezone: "UTC" });
-  logger.info("API-Football near-kickoff odds scheduler active — every 2 min UTC (upcoming-24h window, Bundle 13.A)");
+  logger.info("API-Football near-kickoff odds scheduler active — every 2 min UTC (upcoming-24h window, Bundle 13.A + 13.E overlap-skip)");
 
   // API-Football: fetch team stats every 12 hours (~20 req)
   cron.schedule("0 */12 * * *", () => {
@@ -3686,9 +3706,17 @@ export function startScheduler(): void {
   // T-to-kickoff buckets (T-0-1h drained first, T-72h+ last). Same monthly
   // budget (100k cap, ~3300/day average), redistributed toward the high-
   // information window where Pinnacle prices sharpen.
+  // Bundle 13.E (2026-05-18): overlap-skip lock for OddsPapi prefetch too.
+  let oddsPapiPrefetchRunning = false;
   cron.schedule("*/15 * * * *", () => {
+    if (oddsPapiPrefetchRunning) {
+      logger.info("OddsPapi prefetch already running — skipping this tick");
+      return;
+    }
+    oddsPapiPrefetchRunning = true;
     logger.info("OddsPapi kickoff-proximity prefetch triggered (every 15 min)");
     void runKickoffProximityPrefetch()
+      .finally(() => { oddsPapiPrefetchRunning = false; })
       .then(async (r) => {
         logger.info(r, "OddsPapi kickoff-proximity prefetch complete");
         // 2026-05-16 subtract bundle: derivePinnacleDCFromMatchOdds() call
