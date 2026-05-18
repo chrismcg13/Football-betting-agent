@@ -1287,7 +1287,7 @@ function shouldFetchOddsThisCycle(fetchTier: "high" | "medium" | "low" | "dorman
 }
 
 export async function fetchAndStoreOddsForAllUpcoming(
-  opts?: { maxHoursAhead?: number },
+  opts?: { maxHoursAhead?: number; fixtureIdAllowlist?: ReadonlySet<number>; tierLabel?: string },
 ): Promise<{
   fixturesProcessed: number;
   oddsStored: number;
@@ -1301,14 +1301,23 @@ export async function fetchAndStoreOddsForAllUpcoming(
   // Pinnacle freshness within Bundle 11's 180s gate. The existing 2-hour
   // broad cron continues to refresh the full 7-day window for line-movement
   // and farther-out matches.
+  //
+  // Bundle F2.A (2026-05-18): fixtureIdAllowlist lets tier-aware crons
+  // restrict the universe to the specific fixtures in a watch-priority
+  // tier. Bypasses the maxHoursAhead filter when present so tier polling
+  // respects only the tier assignment, not the kickoff window.
   const maxHoursAhead = opts?.maxHoursAhead;
+  const allowlist = opts?.fixtureIdAllowlist;
+  const tierLabel = opts?.tierLabel ?? "default";
   logger.info(
-    { maxHoursAhead: maxHoursAhead ?? "unbounded" },
+    { maxHoursAhead: maxHoursAhead ?? "unbounded", allowlistSize: allowlist?.size ?? null, tierLabel },
     "Starting API-Football odds ingestion for upcoming fixtures",
   );
 
   const allMappings = await discoverFixtureMappings();
-  const mappings = maxHoursAhead != null
+  const mappings = allowlist != null
+    ? allMappings.filter((m) => m.fixtureId != null && allowlist.has(m.fixtureId))
+    : maxHoursAhead != null
     ? allMappings.filter((m) => {
         if (!m.kickoffTime) return false;
         const ko = m.kickoffTime instanceof Date ? m.kickoffTime : new Date(m.kickoffTime);

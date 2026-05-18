@@ -1052,6 +1052,42 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
                 }
               }
             }
+            // ── Bundle F2.A (2026-05-18): model+Pinnacle agreement HARD gate ──
+            // Per locked architecture (2026-05-18): if model and Pinnacle
+            // disagree on direction, promotion to live is blocked. Bet
+            // stays as shadow so we still learn. Same logic as paperTrading
+            // agreement gate at line ~3479.
+            if (pinnImpliedNow != null) {
+              const gateEnabledRaw = await getConfig("f2a_agreement_gate_enabled");
+              const gateEnabled = gateEnabledRaw == null
+                ? true
+                : String(gateEnabledRaw).toLowerCase().trim() !== "false";
+              if (gateEnabled) {
+                const backImplied = 1 / liveBetfairBack;
+                const storedEdge = Number(r.edge);
+                const modelP = Number.isFinite(storedEdge) && odds > 1.01
+                  ? (1 / odds) + storedEdge
+                  : null;
+                const pinnSaysEdge = pinnImpliedNow > backImplied;
+                const modelSaysEdge = modelP != null && modelP > backImplied;
+                const modelHasView = modelP != null && Number.isFinite(modelP) && modelP > 0;
+                const agree = pinnSaysEdge && modelSaysEdge && modelHasView;
+                if (!agree) {
+                  await db.insert(complianceLogsTable).values({
+                    actionType: "lazy_promote_f2a_agreement_demote",
+                    details: {
+                      betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                      selectionName: r.selection_name,
+                      modelP, pinnImpliedNow, backImplied, pinnSaysEdge, modelSaysEdge, modelHasView,
+                      reason: "f2a_model_pinnacle_disagreement",
+                    },
+                    timestamp: new Date(),
+                  } as any);
+                  result.skipped_edge_evaporated++;
+                  continue;
+                }
+              }
+            }
           }
         } catch (err) {
           logger.warn(

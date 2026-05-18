@@ -6290,6 +6290,42 @@ router.post("/admin/run-kelly-montecarlo", async (_req, res) => {
 // Bundle F0 (2026-05-18): freshness observability — one-shot JSON dump
 // of the three views. Caller can pass ?days=N to limit lookback (default
 // 7, max 14 since the view itself caps at 14d).
+// Bundle F2.A (2026-05-18): set/clear competition_config.bootstrap_priority
+// for accelerated polling cadence. Operator-only override — e.g., flag
+// the men's WC group stage to get every-30-min polling regardless of
+// the natural watch_priority tier (which may be Tier 3 for unknown teams).
+router.post("/admin/set-bootstrap-priority", async (req, res) => {
+  try {
+    const league = typeof req.query.league === "string" ? req.query.league : null;
+    const enabledRaw = typeof req.query.enabled === "string" ? req.query.enabled : "true";
+    const enabled = String(enabledRaw).toLowerCase().trim() !== "false";
+    if (!league) {
+      res.status(400).json({ error: "missing query param: league" });
+      return;
+    }
+    const result = await db.execute(sql`
+      UPDATE competition_config
+      SET bootstrap_priority = ${enabled}
+      WHERE name = ${league}
+      RETURNING name, bootstrap_priority
+    `);
+    const rows = (result as any).rows ?? [];
+    if (rows.length === 0) {
+      res.status(404).json({ error: `competition_config row not found for league: ${league}` });
+      return;
+    }
+    await db.insert(complianceLogsTable).values({
+      actionType: "f2a_bootstrap_priority_set",
+      details: { league, enabled, source: "admin_endpoint" },
+      timestamp: new Date(),
+    } as any);
+    res.json({ ok: true, league, enabled, row: rows[0] });
+  } catch (err) {
+    logger.error({ err }, "Set bootstrap_priority failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 router.get("/admin/freshness-metrics", async (req, res) => {
   try {
     const daysRaw = req.query.days;

@@ -4913,6 +4913,94 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F0: v_freshness_placement_per_write_daily view ready");
 
+    // ── Bundle F2.A (2026-05-18): bootstrap_priority on competition_config ────
+    // Operator override for the polling system — flag a competition for
+    // accelerated discovery cadence (e.g., new WC, women's expansion).
+    // Bootstrap-priority fixtures get polled every 30 min regardless of
+    // their watch_priority tier.
+    await db.execute(sql`
+      ALTER TABLE competition_config
+      ADD COLUMN IF NOT EXISTS bootstrap_priority BOOLEAN NOT NULL DEFAULT false
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_competition_config_bootstrap
+        ON competition_config(bootstrap_priority) WHERE bootstrap_priority = true
+    `);
+    logger.info("Bundle F2.A: competition_config.bootstrap_priority column ready");
+
+    // ── Bundle F2.A (2026-05-18): model calibration audit view ────────────
+    // Daily per-scope CLV-vs-opportunity_score check. If a scope's
+    // avg_opportunity_score is high but realised CLV is negative, the
+    // model is over-confident there → flag for retraining. Read by
+    // admin/freshness-metrics (extended) + a daily cron writes a
+    // compliance alert if global stake-weighted CLV < tripwire on
+    // n >= tripwire_min_n bets post-F2.A.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_model_calibration_by_scope_daily AS
+      WITH base AS (
+        SELECT
+          DATE(pb.placed_at AT TIME ZONE 'UTC') AS day,
+          m.league,
+          pb.market_type,
+          pb.bet_track,
+          pb.stake::float8 AS stake,
+          pb.shadow_stake::float8 AS shadow_stake,
+          pb.clv_pct::float8 AS clv_pct,
+          pb.model_probability::float8 AS model_p,
+          (1.0 / NULLIF(pb.odds_at_placement::float8, 0)) AS bf_implied,
+          pb.status
+        FROM paper_bets pb
+        JOIN matches m ON m.id = pb.match_id
+        WHERE pb.placed_at >= NOW() - INTERVAL '14 days'
+          AND pb.bet_track IN ('live','shadow')
+          AND pb.legacy_regime = false
+          AND pb.status IN ('won','lost','void')
+          AND pb.clv_pct IS NOT NULL
+      )
+      SELECT
+        day,
+        league,
+        market_type,
+        bet_track,
+        COUNT(*)::int AS n,
+        ROUND(AVG(model_p)::numeric, 4) AS avg_model_p,
+        ROUND(AVG(bf_implied)::numeric, 4) AS avg_bf_implied,
+        ROUND(AVG(clv_pct)::numeric, 2) AS avg_clv_pct,
+        ROUND(
+          CASE
+            WHEN SUM(COALESCE(stake, shadow_stake, 0)) > 0
+            THEN SUM(COALESCE(stake, shadow_stake, 0) * clv_pct) / SUM(COALESCE(stake, shadow_stake, 0))
+            ELSE AVG(clv_pct)
+          END::numeric, 2
+        ) AS stake_weighted_clv_pct,
+        ROUND(AVG(CASE WHEN status='won' THEN 1.0 ELSE 0.0 END)::numeric, 3) AS win_rate
+      FROM base
+      GROUP BY day, league, market_type, bet_track
+      HAVING COUNT(*) >= 5
+      ORDER BY day DESC, n DESC
+    `);
+    logger.info("Bundle F2.A: v_model_calibration_by_scope_daily view ready");
+
+    // ── Bundle F2.A (2026-05-18): config seeds ──────────────────────────
+    // The polling tier-cadence + agreement gate + tripwire knobs.
+    const f2aSeeds: Array<{ key: string; value: string }> = [
+      // Polling cadences in minutes — operator-tunable
+      { key: "f2a_tier1_cadence_minutes", value: "5" },
+      { key: "f2a_tier2_cadence_minutes", value: "30" },
+      { key: "f2a_tier3_cadence_minutes", value: "60" },
+      { key: "f2a_tier4_cadence_minutes", value: "360" },
+      { key: "f2a_bootstrap_cadence_minutes", value: "30" },
+      // Tripwire (audit-only, no auto-pause — money guardrail boundary)
+      { key: "f2a_tripwire_clv_threshold_pct", value: "-1.0" },
+      { key: "f2a_tripwire_min_n", value: "50" },
+      // Agreement gate kill-switch (default ON)
+      { key: "f2a_agreement_gate_enabled", value: "true" },
+    ];
+    for (const row of f2aSeeds) {
+      await db.insert(agentConfigTable).values(row).onConflictDoNothing({ target: agentConfigTable.key });
+    }
+    logger.info({ count: f2aSeeds.length }, "Bundle F2.A: config keys seeded");
+
     await db.execute(sql`
       CREATE OR REPLACE VIEW v_freshness_clv_by_age_band_daily AS
       WITH lb AS (

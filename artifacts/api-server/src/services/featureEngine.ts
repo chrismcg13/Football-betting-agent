@@ -612,6 +612,52 @@ export async function computeFeaturesForMatch(
     await upsertFeature(matchId, "away_injuries_count", 0);
   }
 
+  // ── Bundle FP1 (2026-05-18): xG features from team_xg_rolling ────────
+  // 56k+ rows of rolling 5-match xG-for, xG-against per team. Single
+  // highest-value unused predictor. Missing → impute at 1.3 league-avg
+  // so featureless fixtures don't get a structural penalty. Model
+  // retrains automatically on next bootstrap via featureMeans-length
+  // mismatch guard.
+  try {
+    const xgRows = await db.execute(sql`
+      WITH fx AS (
+        SELECT home_team, away_team FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        (SELECT xg_for_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT home_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS home_xg_for,
+        (SELECT xg_against_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT home_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS home_xg_against,
+        (SELECT xg_for_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT away_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS away_xg_for,
+        (SELECT xg_against_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT away_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS away_xg_against
+    `);
+    const xg = ((xgRows as any).rows ?? [])[0] as
+      | { home_xg_for: number | null; home_xg_against: number | null; away_xg_for: number | null; away_xg_against: number | null }
+      | undefined;
+    const homeFor = xg?.home_xg_for != null && Number.isFinite(xg.home_xg_for) ? xg.home_xg_for : 1.3;
+    const homeAgainst = xg?.home_xg_against != null && Number.isFinite(xg.home_xg_against) ? xg.home_xg_against : 1.3;
+    const awayFor = xg?.away_xg_for != null && Number.isFinite(xg.away_xg_for) ? xg.away_xg_for : 1.3;
+    const awayAgainst = xg?.away_xg_against != null && Number.isFinite(xg.away_xg_against) ? xg.away_xg_against : 1.3;
+    await upsertFeature(matchId, "home_xg_for_avg", homeFor);
+    await upsertFeature(matchId, "home_xg_against_avg", homeAgainst);
+    await upsertFeature(matchId, "away_xg_for_avg", awayFor);
+    await upsertFeature(matchId, "away_xg_against_avg", awayAgainst);
+    await upsertFeature(matchId, "xg_diff", (homeFor - homeAgainst) - (awayFor - awayAgainst));
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP1 xG features upsert failed — defaulting");
+    await upsertFeature(matchId, "home_xg_for_avg", 1.3);
+    await upsertFeature(matchId, "home_xg_against_avg", 1.3);
+    await upsertFeature(matchId, "away_xg_for_avg", 1.3);
+    await upsertFeature(matchId, "away_xg_against_avg", 1.3);
+    await upsertFeature(matchId, "xg_diff", 0);
+  }
+
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
   if (lineupPublishMins !== null) {
     await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
@@ -1228,6 +1274,52 @@ async function computeFeaturesFromDb(
     logger.debug({ err, matchId }, "injuries_count upsert failed — defaulting to 0");
     await upsertFeature(matchId, "home_injuries_count", 0);
     await upsertFeature(matchId, "away_injuries_count", 0);
+  }
+
+  // ── Bundle FP1 (2026-05-18): xG features from team_xg_rolling ────────
+  // 56k+ rows of rolling 5-match xG-for, xG-against per team. Single
+  // highest-value unused predictor. Missing → impute at 1.3 league-avg
+  // so featureless fixtures don't get a structural penalty. Model
+  // retrains automatically on next bootstrap via featureMeans-length
+  // mismatch guard.
+  try {
+    const xgRows = await db.execute(sql`
+      WITH fx AS (
+        SELECT home_team, away_team FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        (SELECT xg_for_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT home_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS home_xg_for,
+        (SELECT xg_against_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT home_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS home_xg_against,
+        (SELECT xg_for_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT away_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS away_xg_for,
+        (SELECT xg_against_5::float8 FROM team_xg_rolling
+         WHERE team_name = (SELECT away_team FROM fx)
+         ORDER BY computed_at DESC LIMIT 1) AS away_xg_against
+    `);
+    const xg = ((xgRows as any).rows ?? [])[0] as
+      | { home_xg_for: number | null; home_xg_against: number | null; away_xg_for: number | null; away_xg_against: number | null }
+      | undefined;
+    const homeFor = xg?.home_xg_for != null && Number.isFinite(xg.home_xg_for) ? xg.home_xg_for : 1.3;
+    const homeAgainst = xg?.home_xg_against != null && Number.isFinite(xg.home_xg_against) ? xg.home_xg_against : 1.3;
+    const awayFor = xg?.away_xg_for != null && Number.isFinite(xg.away_xg_for) ? xg.away_xg_for : 1.3;
+    const awayAgainst = xg?.away_xg_against != null && Number.isFinite(xg.away_xg_against) ? xg.away_xg_against : 1.3;
+    await upsertFeature(matchId, "home_xg_for_avg", homeFor);
+    await upsertFeature(matchId, "home_xg_against_avg", homeAgainst);
+    await upsertFeature(matchId, "away_xg_for_avg", awayFor);
+    await upsertFeature(matchId, "away_xg_against_avg", awayAgainst);
+    await upsertFeature(matchId, "xg_diff", (homeFor - homeAgainst) - (awayFor - awayAgainst));
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP1 xG features upsert failed — defaulting");
+    await upsertFeature(matchId, "home_xg_for_avg", 1.3);
+    await upsertFeature(matchId, "home_xg_against_avg", 1.3);
+    await upsertFeature(matchId, "away_xg_for_avg", 1.3);
+    await upsertFeature(matchId, "away_xg_against_avg", 1.3);
+    await upsertFeature(matchId, "xg_diff", 0);
   }
 
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).

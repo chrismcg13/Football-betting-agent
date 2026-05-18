@@ -64,6 +64,17 @@ export const FEATURE_NAMES = [
   "home_injuries_count",
   "away_injuries_count",
   "form_diff_5game",
+  // Bundle FP1 (2026-05-18): xG features from team_xg_rolling (56k+ rows).
+  // The single highest-value unused predictor — xG vs actual goals is the
+  // canonical football modelling signal. Used by featureEngine.ts to pull
+  // rolling 5-match xG for/against per team. Imputation defaults to league-
+  // average goals (1.3) when data missing so new-league fixtures aren't
+  // structurally penalised; xg_diff defaults to 0 (matched teams).
+  "home_xg_for_avg",
+  "away_xg_for_avg",
+  "home_xg_against_avg",
+  "away_xg_against_avg",
+  "xg_diff",
 ] as const;
 
 type FeatureName = (typeof FEATURE_NAMES)[number];
@@ -76,6 +87,11 @@ const ELO_BASELINE = 1500;
 function imputeMissingFeature(name: FeatureName): number {
   if (name === "home_clubelo" || name === "away_clubelo") return ELO_BASELINE;
   if (name === "elo_diff") return 0;
+  // Bundle FP1: xG defaults at league-average so featureless fixtures
+  // don't get a structural penalty. 1.3 ≈ goals-per-game elite leagues.
+  if (name === "home_xg_for_avg" || name === "away_xg_for_avg") return 1.3;
+  if (name === "home_xg_against_avg" || name === "away_xg_against_avg") return 1.3;
+  if (name === "xg_diff") return 0;
   return 0;
 }
 

@@ -3411,12 +3411,32 @@ export async function placePaperBet(
       const { isInversionPipelineEnabled } = await import("./inversionPipeline");
       if (await isInversionPipelineEnabled()) {
         if (inversionDecision.action === "VETO") {
-          // Catastrophic Stage 2 disagreement OR Bundle 5.K high-edge
-          // integrity check failure. Reject outright — don't even shadow.
-          return logReject(
-            "reject_high_edge_integrity",
-            `Inversion VETO: ${(inversionDecision.reasons ?? []).join("; ")}`,
+          // Bundle F2.A (2026-05-18): per Chris locked architecture, model
+          // decisions never reject — always demote to shadow so the system
+          // learns. Catastrophic Stage 2 disagreement and Bundle 5.K
+          // high-edge integrity failures both fall under model decisions.
+          // Safety / structural rejects (collapse guard, kill switch, etc.)
+          // continue to reject outright.
+          const reasonStr = (inversionDecision.reasons ?? []).join("; ");
+          logger.info(
+            { matchId, marketType, selectionName, reasons: inversionDecision.reasons },
+            "Inversion VETO — demoting to shadow (F2.A: no rejection for model decisions)",
           );
+          if (!isShadowBet) {
+            const fullKellyStake = stake;
+            const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+            shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+            shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+            stake = 0;
+            isShadowBet = true;
+            await logShadowGateExemption(
+              "f2a_inversion_veto_demote",
+              experimentTag ?? null,
+              `F2.A demote (was VETO): ${reasonStr}`,
+              shadowStake,
+              universeTier,
+            );
+          }
         }
         if (inversionDecision.action === "DEMOTE_SHADOW" && !isShadowBet) {
           // Force shadow track. Reasons include stage3_below_net_edge_floor,
@@ -3473,6 +3493,57 @@ export async function placePaperBet(
             logger.warn(
               { err: (err as Error)?.message ?? String(err), matchId, marketType },
               "Bundle F4 freshness check failed (non-blocking)",
+            );
+          }
+        }
+        // ── Bundle F2.A (2026-05-18): model+Pinnacle agreement gate ───────
+        // Per Chris's locked architecture (2026-05-18): the model's "true
+        // probability" must AGREE WITH Pinnacle on direction. Pinnacle finds
+        // the edge; model validates with features. If model disagrees with
+        // Pinnacle's direction → demote to shadow (no rejection — always
+        // learn). Requires opp_score > 0 (model has formed a view).
+        if (inversionDecision.action === "PROCEED" && !isShadowBet) {
+          try {
+            const { getConfigValue } = await import("./paperTrading");
+            const gateEnabledRaw = await getConfigValue("f2a_agreement_gate_enabled");
+            const gateEnabled = gateEnabledRaw == null
+              ? true
+              : String(gateEnabledRaw).toLowerCase().trim() !== "false";
+            if (gateEnabled) {
+              const diag = inversionDecision.diagnostics;
+              const modelP = diag?.biasCorrectedModelP ?? diag?.rawModelP ?? null;
+              const pinnImplied = diag?.pinnacleImplied ?? null;
+              const backImplied = backOdds > 1.01 ? 1 / backOdds : null;
+              // Agreement = both model and Pinnacle agree Betfair is mispriced
+              // in the same direction (back side underpriced).
+              const pinnSaysEdge = pinnImplied != null && backImplied != null && pinnImplied > backImplied;
+              const modelSaysEdge = modelP != null && backImplied != null && modelP > backImplied;
+              const modelHasView = modelP != null && Number.isFinite(modelP) && modelP > 0;
+              const agree = pinnSaysEdge && modelSaysEdge && modelHasView;
+              if (!agree) {
+                logger.info(
+                  { matchId, marketType, selectionName, modelP, pinnImplied, backImplied, pinnSaysEdge, modelSaysEdge, modelHasView },
+                  "Bundle F2.A model+Pinnacle disagreement — demoting to shadow",
+                );
+                const fullKellyStake = stake;
+                const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+                shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+                shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+                stake = 0;
+                isShadowBet = true;
+                await logShadowGateExemption(
+                  "f2a_agreement_demote",
+                  experimentTag ?? null,
+                  `F2.A model+Pinnacle disagreement: modelP=${modelP?.toFixed(4) ?? "null"}, pinnImplied=${pinnImplied?.toFixed(4) ?? "null"}, backImplied=${backImplied?.toFixed(4) ?? "null"}`,
+                  shadowStake,
+                  universeTier,
+                );
+              }
+            }
+          } catch (err) {
+            logger.warn(
+              { err: (err as Error)?.message ?? String(err), matchId, marketType },
+              "Bundle F2.A agreement gate failed (non-blocking)",
             );
           }
         }

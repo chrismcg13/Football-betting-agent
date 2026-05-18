@@ -3623,32 +3623,103 @@ export function startScheduler(): void {
   // runSettlementPipeline (scheduler.ts:2249). Ensures the cron is reliable: it
   // may skip ticks under load but never piles up parallel executions, and any
   // single iteration always completes before the next starts.
-  let nearKickoffPrefetchRunning = false;
-  cron.schedule("*/2 * * * *", () => {
-    if (nearKickoffPrefetchRunning) {
-      logger.info("API-Football near-kickoff prefetch already running — skipping this tick");
-      return;
-    }
-    nearKickoffPrefetchRunning = true;
-    const startedAt = Date.now();
-    logger.info("API-Football near-kickoff odds refresh triggered (24h window, 2-min cadence)");
-    void fetchAndStoreOddsForAllUpcoming({ maxHoursAhead: 24 })
-      .then(async () => {
-        const r = await backfillPinnacleSnapshotsFromAf();
-        if (r.rowsInserted > 0) {
-          logger.info(r, "Post-AF near-kickoff Pinnacle snapshot backfill complete");
+  // ── Bundle F2.A (2026-05-18): tier-aware polling ────────────────────────
+  // Replaces the single */2 24h-window cron with FIVE tier-driven crons.
+  // Each cron polls a subset of fixtures at its tier's cadence. Every
+  // Pinnacle-covered fixture in the universe gets polled at SOME cadence
+  // (no rotation skip) — the watch_priority_score is a polling-cadence
+  // optimizer, not a placement gate. Live placement is gated downstream
+  // by Pinnacle edge + model agreement (paperTrading.ts).
+  //
+  // Budget arithmetic on 75k/day API-Football cap:
+  //   Tier 1 (~52 fixtures × 12/hr × 24 = ~15k)
+  //   Tier 2 (~52 fixtures × 2/hr × 24 = ~2.5k)
+  //   Tier 3 (~810 fixtures × 1/hr × 24 = ~19k)
+  //   Tier 4 (~few × 0.16/hr × 24 = trivial)
+  //   Bootstrap (~20 × 2/hr × 24 = ~1k)
+  //   Total: ~38k/day, leaves ~37k/day headroom for other endpoints.
+  function makeTierCron(
+    cronSpec: string,
+    tierLabel: string,
+    fetcherName: "tier1" | "tier2" | "tier3" | "tier4" | "bootstrap",
+  ): void {
+    let running = false;
+    cron.schedule(cronSpec, () => {
+      if (running) {
+        logger.info({ tierLabel }, `F2.A ${tierLabel} polling already running — skipping this tick`);
+        return;
+      }
+      running = true;
+      const startedAt = Date.now();
+      void (async () => {
+        try {
+          const { getFixturesByTier, getBootstrapFixtures } = await import("./tieredPolling");
+          const fixtureIds = fetcherName === "bootstrap"
+            ? await getBootstrapFixtures()
+            : await getFixturesByTier(fetcherName === "tier1" ? 1 : fetcherName === "tier2" ? 2 : fetcherName === "tier3" ? 3 : 4);
+          if (fixtureIds.length === 0) {
+            logger.info({ tierLabel }, `F2.A ${tierLabel}: no fixtures in tier this tick`);
+            return;
+          }
+          logger.info({ tierLabel, fixtureCount: fixtureIds.length }, `F2.A ${tierLabel} polling triggered`);
+          await fetchAndStoreOddsForAllUpcoming({
+            fixtureIdAllowlist: new Set(fixtureIds),
+            tierLabel,
+          });
+          const r = await backfillPinnacleSnapshotsFromAf();
+          if (r.rowsInserted > 0) {
+            logger.info({ ...r, tierLabel }, `F2.A ${tierLabel}: Pinnacle snapshot backfill complete`);
+          }
+        } catch (err) {
+          logger.error({ err, tierLabel }, `F2.A ${tierLabel} polling failed`);
+        } finally {
+          running = false;
+          const durMs = Date.now() - startedAt;
+          logger.info({ tierLabel, durationMs: durMs }, `F2.A ${tierLabel} polling finished`);
         }
-      })
-      .catch((err) => {
-        logger.error({ err }, "API-Football near-kickoff odds refresh failed");
-      })
-      .finally(() => {
-        nearKickoffPrefetchRunning = false;
-        const durMs = Date.now() - startedAt;
-        logger.info({ durationMs: durMs }, "API-Football near-kickoff prefetch finished");
-      });
+      })();
+    }, { timezone: "UTC" });
+  }
+
+  makeTierCron("*/5 * * * *",   "tier1_hot",   "tier1");
+  makeTierCron("*/30 * * * *",  "tier2_warm",  "tier2");
+  makeTierCron("0 * * * *",     "tier3_cool",  "tier3");
+  makeTierCron("0 */6 * * *",   "tier4_cold",  "tier4");
+  makeTierCron("*/30 * * * *",  "bootstrap",   "bootstrap");
+  logger.info("Bundle F2.A: tier-aware polling crons active (Tier 1 every 5m, Tier 2 every 30m, Tier 3 every 1h, Tier 4 every 6h, Bootstrap every 30m)");
+
+  // ── Bundle F2.A (2026-05-18): calibration tripwire daily audit ──────────
+  // Reads model_calibration view, logs alert when global stake-weighted
+  // CLV trips below threshold on n >= min_n. AUDIT ONLY — no auto-pause
+  // (money guardrail; operator must intervene).
+  cron.schedule("17 4 * * *", () => {
+    void (async () => {
+      try {
+        const { getConfigValue } = await import("./paperTrading");
+        const { checkCalibrationTripwire } = await import("./tieredPolling");
+        const thresholdRaw = await getConfigValue("f2a_tripwire_clv_threshold_pct");
+        const minNRaw = await getConfigValue("f2a_tripwire_min_n");
+        const threshold = thresholdRaw != null && Number.isFinite(Number(thresholdRaw)) ? Number(thresholdRaw) : -1.0;
+        const minN = minNRaw != null && Number.isFinite(Number(minNRaw)) ? Number(minNRaw) : 50;
+        const result = await checkCalibrationTripwire(threshold, minN);
+        const { db, complianceLogsTable } = await import("@workspace/db");
+        const action = result.tripped ? "f2a_calibration_tripwire_tripped" : "f2a_calibration_tripwire_ok";
+        await db.insert(complianceLogsTable).values({
+          actionType: action,
+          details: { ...result, threshold, minN, source: "f2a_daily_audit" },
+          timestamp: new Date(),
+        } as any);
+        if (result.tripped) {
+          logger.warn(result, "Bundle F2.A calibration tripwire TRIPPED — operator review required");
+        } else {
+          logger.info(result, "Bundle F2.A calibration tripwire daily audit OK");
+        }
+      } catch (err) {
+        logger.error({ err }, "F2.A calibration tripwire audit failed");
+      }
+    })();
   }, { timezone: "UTC" });
-  logger.info("API-Football near-kickoff odds scheduler active — every 2 min UTC (upcoming-24h window, Bundle 13.A + 13.E overlap-skip)");
+  logger.info("Bundle F2.A: calibration tripwire audit cron active — daily 04:17 UTC");
 
   // API-Football: fetch team stats every 12 hours (~20 req)
   cron.schedule("0 */12 * * *", () => {
