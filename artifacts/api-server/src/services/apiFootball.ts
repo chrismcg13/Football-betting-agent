@@ -1385,7 +1385,16 @@ export async function fetchAndStoreOddsForAllUpcoming(
       leagueTierCache.set(m.league, fetchTier);
     }
 
-    if (!shouldFetchOddsThisCycle(fetchTier)) {
+    // Bundle F2.A.5 (2026-05-18): when caller passes fixtureIdAllowlist
+    // (F2 tier-aware cron path), bypass the legacy league_fetch_tier
+    // filter. The watch_priority tier system has already selected these
+    // fixtures as high-priority; gating again on the league_fetch_tier
+    // (which marks leagues NOT in competition_config as "dormant",
+    // never polling them) discards Tier 1 watch-priority fixtures whose
+    // leagues happen to be unfamiliar to competition_config. Verified
+    // root cause of zero Pinnacle writes on tier-aware cron despite
+    // 7-10 fixtures being eligible.
+    if (!allowlist && !shouldFetchOddsThisCycle(fetchTier)) {
       skippedByTier++;
       continue;
     }

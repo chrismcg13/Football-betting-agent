@@ -6326,6 +6326,26 @@ router.post("/admin/set-bootstrap-priority", async (req, res) => {
   }
 });
 
+// Bundle F2.A.5 (2026-05-18): force an immediate api-football Pinnacle
+// poll on all upcoming-24h fixtures. Bypasses the legacy
+// league_fetch_tier cadence filter. Useful after a deploy / config
+// change to seed fresh Pinnacle data immediately without waiting for
+// the next tier cron tick. Returns fixturesProcessed + oddsStored.
+router.post("/admin/force-pinnacle-poll", async (_req, res) => {
+  try {
+    logger.info("Manual F2.A.5 Pinnacle poll triggered (24h window, allowlist bypass)");
+    // Empty allowlist means iterate ALL upcoming fixtures within 24h,
+    // bypassing league_fetch_tier filter via the allowlist sentinel.
+    const result = await fetchAndStoreOddsForAllUpcoming({
+      maxHoursAhead: 24,
+    });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "Force Pinnacle poll failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Bundle FP-retrain (2026-05-18): force model retrain. Used when new
 // features land (FP1 xG, FP3 standings/h2h, FP4 transfers) and the
 // bootstrap featureMeans-length-mismatch guard didn't trigger
