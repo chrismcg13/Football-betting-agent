@@ -840,23 +840,25 @@ function selectPricingSources(
     }
   }
 
-  // ── Bundle F2.A.2 (2026-05-18) ────────────────────────────────────────
-  // Per Chris locked architecture: Pinnacle IS the edge-finder anchor.
-  // Refuse to emit candidates that lack a Pinnacle source — both for
-  // live AND shadow. Pre-fix, when neither api_football_real:Pinnacle
-  // nor oddspapi_pinnacle was available, the function fell back to
-  // betfair_exchange as fair_value_source. That produced "edges" of
-  // model_p vs betfair_implied — meaningless under inversion because
-  // Betfair IS the action, not the sharp anchor. 391/476 shadows in
-  // last 24h had no Pinnacle anchor (82%) — pure ledger pollution
-  // that could never go live under F2.A's agreement gate.
+  // ── Bundle F2.A.3 (2026-05-18) — demote, don't reject ─────────────────
+  // Allow Betfair fallback as fair_value when Pinnacle is absent, but
+  // flag the candidate as shadowOnly=true so it routes to shadow track.
+  // The lazy promoter (F1.1 reads fresh Pinnacle from odds_snapshots)
+  // re-evaluates these shadows on every tick + on every F1 queue event.
+  // When Pinnacle eventually quotes the scope, the agreement gate runs
+  // and the candidate can be promoted to live.
   //
-  // No Pinnacle source → no_pinnacle_anchor → no bet. Wait for the
-  // F2 tier polling + F1 event loop to capture a Pinnacle quote.
-  const fv = oddspapiPinnacle ?? afPinnacle;
-  if (!fv) return { ok: false, reason: "no_pinnacle_anchor" };
+  // Rationale (Chris 2026-05-18): "if they don't have pinacle they
+  // should be demoted then picked up by lazy promoter instead of just
+  // rejecting and missing the opportunity." F2.A.2's reject path
+  // discarded ~80% of trading-cycle candidates that could have become
+  // live the moment Pinnacle quoted them.
+  const fv = oddspapiPinnacle ?? afPinnacle ?? exchange;
+  if (!fv) return { ok: false, reason: "no_fair_value_source" };
 
   if (!exchange) return { ok: false, reason: "no_actionable_source" };
+
+  const hasPinnacle = fv.source === "oddspapi_pinnacle" || fv.source === "api_football_real:Pinnacle";
 
   return {
     ok: true,
@@ -864,7 +866,9 @@ function selectPricingSources(
     actionableSource: "betfair_exchange",
     fairValueOdds: fv.backOdds,
     fairValueSource: fv.source as FairValueSource,
-    shadowOnly: false,
+    // shadowOnly when no Pinnacle anchor — bet emits to shadow track,
+    // lazy promoter retries with fresh Pinnacle on each cycle / F1 event.
+    shadowOnly: !hasPinnacle,
   };
 }
 
