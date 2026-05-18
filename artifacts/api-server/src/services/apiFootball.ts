@@ -1286,7 +1286,9 @@ function shouldFetchOddsThisCycle(fetchTier: "high" | "medium" | "low" | "dorman
   return false;
 }
 
-export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
+export async function fetchAndStoreOddsForAllUpcoming(
+  opts?: { maxHoursAhead?: number },
+): Promise<{
   fixturesProcessed: number;
   oddsStored: number;
   mappings: number;
@@ -1294,10 +1296,30 @@ export async function fetchAndStoreOddsForAllUpcoming(): Promise<{
   pinnacleLeaguesFetched: number;
   pinnacleLeaguesTotal: number;
 }> {
-  logger.info("Starting API-Football odds ingestion for upcoming fixtures");
+  // Bundle 11.F (2026-05-18): optional maxHoursAhead lets a separate cron
+  // refresh ONLY the near-kickoff window at a tight cadence (15 min) for
+  // Pinnacle freshness within Bundle 11's 180s gate. The existing 2-hour
+  // broad cron continues to refresh the full 7-day window for line-movement
+  // and farther-out matches.
+  const maxHoursAhead = opts?.maxHoursAhead;
+  logger.info(
+    { maxHoursAhead: maxHoursAhead ?? "unbounded" },
+    "Starting API-Football odds ingestion for upcoming fixtures",
+  );
 
-  const mappings = await discoverFixtureMappings();
-  logger.info({ count: mappings.length }, "Fixture mappings discovered");
+  const allMappings = await discoverFixtureMappings();
+  const mappings = maxHoursAhead != null
+    ? allMappings.filter((m) => {
+        if (!m.kickoffTime) return false;
+        const ko = m.kickoffTime instanceof Date ? m.kickoffTime : new Date(m.kickoffTime);
+        const hoursToKo = (ko.getTime() - Date.now()) / (1000 * 60 * 60);
+        return hoursToKo >= 0 && hoursToKo <= maxHoursAhead;
+      })
+    : allMappings;
+  logger.info(
+    { count: mappings.length, totalDiscovered: allMappings.length, maxHoursAhead: maxHoursAhead ?? "unbounded" },
+    "Fixture mappings selected for ingestion",
+  );
 
   const leagueTierCache = new Map<string, "high" | "medium" | "low" | "dormant">();
 
