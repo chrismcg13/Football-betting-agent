@@ -8,7 +8,7 @@ import {
   competitionConfigTable,
   modelDecisionAuditLogTable,
 } from "@workspace/db";
-import { eq, and, gte, lt, lte, inArray, desc, sql, isNull, or } from "drizzle-orm";
+import { eq, and, gte, lt, lte, inArray, asc, desc, sql, isNull, or } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { retrainIfNeeded } from "./predictionEngine";
 import { fetchMatchStatsForSettlement, getFixturesForDate, teamNameMatch, isApiFootballCircuitOpen } from "./apiFootball";
@@ -2426,6 +2426,51 @@ export async function placePaperBet(
     );
   }
 
+  // ── Bundle 18 (2026-05-18): model + Pinnacle agreement upside ──────────
+  // Per Chris diagnostic #6: "If your own model also says Betfair is
+  // mispriced in the same direction as Pinnacle, you have two sharp
+  // opinions agreeing. If your model disagrees with Pinnacle, something's
+  // worth investigating before betting."
+  //
+  // Sign of bet: backing on Betfair means we think the selection wins
+  // more often than the back price implies. So:
+  //   - Pinnacle agrees: pinn_implied > 1/backOdds
+  //   - Model agrees:   model_p     > 1/backOdds
+  // If BOTH agree, apply uplift multiplier (default 1.10× = 10% boost).
+  //
+  // Conservative — capped at 1.0 if config is misconfigured, so we never
+  // over-stake on misconfigured uplift.
+  if (!isShadowBet && stake > 0 && pinnacleImplied != null && modelProbability != null) {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if (await isInversionPipelineEnabled()) {
+        const backImplied = 1 / backOdds;
+        const pinnAgrees = pinnacleImplied > backImplied;
+        const modelAgrees = modelProbability > backImplied;
+        if (pinnAgrees && modelAgrees) {
+          const uplifRaw = await getConfigValue("inversion_model_agree_multiplier");
+          const uplift =
+            uplifRaw != null && Number.isFinite(Number(uplifRaw))
+              ? Math.min(Math.max(Number(uplifRaw), 1.0), 1.25)
+              : 1.10;
+          if (uplift > 1.0) {
+            const before = stake;
+            stake = Math.round(stake * uplift * 100) / 100;
+            logger.info(
+              { matchId, marketType, before, after: stake, uplift, pinnImplied: pinnacleImplied, modelP: modelProbability, backImplied },
+              "Bundle 18 model+Pinnacle agreement uplift applied",
+            );
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "Bundle 18 model-agreement uplift check failed (non-blocking)",
+      );
+    }
+  }
+
   // ── Bundle 15.C (2026-05-18): TTK-weighted Kelly factor ──────────────────
   // Per Chris diagnostic #3: "a 7% gap 4 hours out is much weaker evidence
   // than 7% at T-30 minutes." Pinnacle lines tighten as kickoff approaches
@@ -2901,6 +2946,97 @@ export async function placePaperBet(
     exchangeCaptureCounters.queue_position_samples.push(
       exchangeSnapshot.bestBack - backOdds,
     );
+  }
+
+  // ── Bundle 16 (2026-05-18): Pinnacle line-movement direction ───────────
+  // Per Chris diagnostic #2: "If Pinnacle is drifting toward Betfair, the
+  // edge is closing — Pinnacle was the stale side. If Betfair is drifting
+  // toward Pinnacle, the edge is real." Direction is more informative
+  // than the point-in-time gap.
+  //
+  // Implementation: pull Pinnacle implied probability ~10 min ago vs now
+  // for THIS (match × market × selection). If pinnacle_implied is FALLING
+  // (i.e. Pinnacle now thinks the selection LESS likely), the edge against
+  // Betfair is closing — demote. If rising or stable, edge is real.
+  //
+  // Threshold: if pinn_implied has dropped by > 1pp in last 10 min, demote.
+  // Tunable via agent_config.pinnacle_direction_drop_threshold_pp (default 1.0).
+  if (pinnacleImplied != null && !isShadowBet) {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if (await isInversionPipelineEnabled()) {
+        const thresholdRaw = await getConfigValue("pinnacle_direction_drop_threshold_pp");
+        const dropThresholdPp =
+          thresholdRaw != null && Number.isFinite(Number(thresholdRaw))
+            ? Number(thresholdRaw)
+            : 1.0;
+        const variants = Array.from(new Set([
+          selectionName,
+          selectionName.endsWith(" Goals") ? selectionName.replace(/ Goals$/, "") : `${selectionName} Goals`,
+        ]));
+        // Pull oldest Pinnacle snapshot in the 10-15 min window
+        const lookbackRows = await db
+          .select({ backOdds: oddsSnapshotsTable.backOdds, snapshotTime: oddsSnapshotsTable.snapshotTime })
+          .from(oddsSnapshotsTable)
+          .where(and(
+            eq(oddsSnapshotsTable.matchId, matchId),
+            eq(oddsSnapshotsTable.marketType, marketType),
+            inArray(oddsSnapshotsTable.selectionName, variants),
+            or(
+              eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
+              eq(oddsSnapshotsTable.source, "oddspapi"),
+              eq(oddsSnapshotsTable.source, "oddspapi_pinnacle"),
+            ),
+            sql`${oddsSnapshotsTable.snapshotTime} < NOW() - INTERVAL '5 minutes'`,
+            sql`${oddsSnapshotsTable.snapshotTime} > NOW() - INTERVAL '15 minutes'`,
+          ))
+          .orderBy(asc(oddsSnapshotsTable.snapshotTime))
+          .limit(1);
+        if (lookbackRows[0]?.backOdds) {
+          const olderOdds = parseFloat(lookbackRows[0].backOdds);
+          if (olderOdds > 1.01) {
+            const olderImplied = 1 / olderOdds;
+            const deltaPp = (pinnacleImplied - olderImplied) * 100;
+            // Negative delta = Pinnacle implied dropped = back odds rose
+            // = Pinnacle now thinks less likely = edge closing.
+            if (deltaPp < -dropThresholdPp) {
+              await db.insert(complianceLogsTable).values({
+                actionType: "inversion_pinnacle_direction_demote",
+                details: {
+                  matchId,
+                  marketType,
+                  selectionName,
+                  pinnacleImpliedNow: pinnacleImplied,
+                  pinnacleImpliedOlder: olderImplied,
+                  deltaPp,
+                  dropThresholdPp,
+                  reason: "pinnacle_drifting_toward_betfair",
+                } as Record<string, unknown>,
+                timestamp: new Date(),
+              } as any);
+              const fullKellyStake = stake;
+              const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+              shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+              shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+              stake = 0;
+              isShadowBet = true;
+              await logShadowGateExemption(
+                "inversion_pinnacle_direction",
+                experimentTag ?? null,
+                `Pinnacle implied dropped ${deltaPp.toFixed(2)}pp in last 10min (threshold -${dropThresholdPp}pp) — gap closing, edge fake`,
+                shadowStake,
+                universeTier,
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "Bundle 16 Pinnacle-direction check failed (non-blocking)",
+      );
+    }
   }
 
   // ── Bundle 15.B (2026-05-18): freshness asymmetry check ────────────────

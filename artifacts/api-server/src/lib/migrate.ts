@@ -4790,6 +4790,15 @@ export async function runMigrations() {
       // So T-1h ≈ 1.0, T-12h ≈ 0.52, T-23h ≈ 0.04 (clamped to 0.25).
       // Operator can tighten the floor via this knob.
       { key: "ttk_kelly_floor", value: "0.25" },
+      // Bundle 16 (2026-05-18): Pinnacle line-movement direction.
+      // If pinnacle_implied drops by more than this in last 10 min,
+      // the gap is closing — demote. Tunable.
+      { key: "pinnacle_direction_drop_threshold_pp", value: "1.0" },
+      // Bundle 18 (2026-05-18): when model + Pinnacle agree direction
+      // vs Betfair, apply this multiplier (two-sharp confirmation).
+      // Default 1.10 (10% uplift). Capped at 1.0 in code if config is
+      // wrong, so safe ceiling.
+      { key: "inversion_model_agree_multiplier", value: "1.10" },
       { key: "high_edge_flag_threshold", value: "7.0" },
       { key: "kelly_multiplier_single_sharp", value: "0.5" },
       { key: "kelly_multiplier_two_sharp", value: "1.0" },
