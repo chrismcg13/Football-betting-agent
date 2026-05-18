@@ -133,21 +133,44 @@ function imputeMissingFeature(name: FeatureName): number {
 // safe (means[15] ?? 0 contributes 0 / 1 = 0 → no-op for the model).
 // Once a fresh 21-feature model trains via forceRetrain, the same
 // IDX arrays start contributing real weights for the new features.
+// Bundle FP-IDX (2026-05-18): extended IDX arrays for FP1+FP3+FP4
+// new features. Indices 21-25 are xG features (all 3 markets benefit
+// from goal-expectation signal). Indices 26-29 are FP3 (league_rank
+// + h2h depth — outcome benefits from rank, goals/BTTS benefit from
+// h2h_avg_goals + h2h_btts_rate). Indices 30-31 are FP4 transfer
+// churn (squad disruption affects all three markets equally).
+//
+// Previous behavior: IDX arrays capped at 0-20, so adding entries to
+// FEATURE_NAMES had no effect on the trained model (verified
+// 2026-05-18: feature_count stayed at 21 even after FP1/FP3/FP4 added
+// 11 entries to FEATURE_NAMES). featureImportances forEach in
+// forceRetrain only iterates IDX, so new features were invisible.
 const OUTCOME_IDX = [
   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
   15, 16, 17, 18, 19, 20,
+  21, 22, 23, 24, 25,   // xG: home/away_xg_for/against, xg_diff
+  26, 27,               // FP3: home/away_league_rank
+  28, 29,               // FP3: h2h_avg_goals, h2h_btts_rate
+  30, 31,               // FP4: home/away_transfer_churn_30d
 ] as const;
-// BTTS — drops league_position, h2h, elo (kept goal-related + new
-// features that plausibly affect goal markets: lineup/injuries + form).
+// BTTS — drops league_position, h2h_home_win_rate, elo (kept goal-related
+// + new features that plausibly affect goal markets: lineup/injuries,
+// form, xG, h2h goal depth, transfer churn).
 const BTTS_IDX = [
   0, 1, 2, 3, 4, 5, 8, 9, 12, 13, 14,
   15, 16, 17, 18, 19, 20,
+  21, 22, 23, 24, 25,   // xG (highly relevant for BTTS)
+  28, 29,               // FP3: h2h_avg_goals, h2h_btts_rate (goal-relevant)
+  30, 31,               // FP4: transfer churn (squad disruption)
 ] as const;
 // Over/Under — same shape as BTTS but with the OU rate features (10,11)
 // in place of BTTS rates (8,9).
 const OVER_UNDER_IDX = [
   0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14,
   15, 16, 17, 18, 19, 20,
+  21, 22, 23, 24, 25,   // xG (highly relevant for OU)
+  28, 29,               // FP3: h2h_avg_goals, h2h_btts_rate
+  30, 31,               // FP4: transfer churn
 ] as const;
 
 // Outcome class labels
