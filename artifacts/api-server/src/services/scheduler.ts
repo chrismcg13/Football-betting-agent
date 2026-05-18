@@ -3595,16 +3595,25 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("API-Football odds scheduler active — every 2 hours UTC (broad 7-day, with Pinnacle snapshot backfill)");
 
-  // Bundle 11.F (2026-05-18): fast-cadence API-Football Pinnacle refresh
-  // for upcoming-24h matches only. Pinnacle freshness for Bundle 11's
-  // 180s gate requires sub-3min ingestion cadence; the OddsPapi prefetch
-  // (15-min cron) used to cover this but has been silent since 2026-05-16.
-  // This 15-min api-football refresh provides a redundant Pinnacle channel
-  // for the trading window where it matters most. Budget impact: ~30-50
-  // upcoming matches × 96 ticks/day = 2880-4800 req/day, well inside the
-  // 75k/day API-Football quota (CLAUDE.md §H, reference_live_stake_unblockers).
-  cron.schedule("*/15 * * * *", () => {
-    logger.info("API-Football near-kickoff odds refresh triggered (24h window, 15-min cadence)");
+  // Bundle 11.F (2026-05-18) → Bundle 13 (2026-05-18): tightened cadence
+  // from */15 to */3 to satisfy the 180s Pinnacle freshness gate. Post-flip
+  // analysis showed every candidate failing inversion_skipped_no_fresh_pinnacle
+  // because the 15-min ingestion cadence produced data older than the 180s
+  // window for 80% of the time between ticks. */3 means upcoming-24h fixtures
+  // get refreshed every 3 minutes — snapshot_time stays within the 180s
+  // window continuously.
+  //
+  // Budget impact: ~30-50 upcoming-24h matches × 480 ticks/day
+  // = 14,400-24,000 req/day. Well inside the 75k/day API-Football quota
+  // (~20-32% utilisation, room for spike days). Single source — OddsPapi
+  // P1 stays at */15 as secondary/precision channel (its 100k/month budget
+  // can't sustain */3 — would exhaust in 3-4 days).
+  //
+  // The original 0 */2 broad 7-day refresh cron remains unchanged for
+  // farther-out matches and line-movement detection on long-horizon
+  // fixtures.
+  cron.schedule("*/3 * * * *", () => {
+    logger.info("API-Football near-kickoff odds refresh triggered (24h window, 3-min cadence)");
     void fetchAndStoreOddsForAllUpcoming({ maxHoursAhead: 24 })
       .then(async () => {
         const r = await backfillPinnacleSnapshotsFromAf();
@@ -3616,7 +3625,7 @@ export function startScheduler(): void {
         logger.error({ err }, "API-Football near-kickoff odds refresh failed");
       });
   }, { timezone: "UTC" });
-  logger.info("API-Football near-kickoff odds scheduler active — every 15 min UTC (upcoming-24h window, Bundle 11.F)");
+  logger.info("API-Football near-kickoff odds scheduler active — every 3 min UTC (upcoming-24h window, Bundle 13)");
 
   // API-Football: fetch team stats every 12 hours (~20 req)
   cron.schedule("0 */12 * * *", () => {
