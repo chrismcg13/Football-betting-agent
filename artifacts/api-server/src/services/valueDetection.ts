@@ -800,7 +800,7 @@ import { BANNED_MARKETS } from "./paperTrading";
 type PriceQuote = { backOdds: number; source: string };
 type FairValueSource = "oddspapi_pinnacle" | "api_football_real:Pinnacle" | "betfair_exchange";
 type ActionableSource = "betfair_exchange";
-type RejectReason = "no_actionable_source" | "no_fair_value_source";
+type RejectReason = "no_actionable_source" | "no_fair_value_source" | "no_pinnacle_anchor";
 type PricingResult =
   | {
       ok: true;
@@ -840,8 +840,21 @@ function selectPricingSources(
     }
   }
 
-  const fv = oddspapiPinnacle ?? afPinnacle ?? exchange;
-  if (!fv) return { ok: false, reason: "no_fair_value_source" };
+  // ── Bundle F2.A.2 (2026-05-18) ────────────────────────────────────────
+  // Per Chris locked architecture: Pinnacle IS the edge-finder anchor.
+  // Refuse to emit candidates that lack a Pinnacle source — both for
+  // live AND shadow. Pre-fix, when neither api_football_real:Pinnacle
+  // nor oddspapi_pinnacle was available, the function fell back to
+  // betfair_exchange as fair_value_source. That produced "edges" of
+  // model_p vs betfair_implied — meaningless under inversion because
+  // Betfair IS the action, not the sharp anchor. 391/476 shadows in
+  // last 24h had no Pinnacle anchor (82%) — pure ledger pollution
+  // that could never go live under F2.A's agreement gate.
+  //
+  // No Pinnacle source → no_pinnacle_anchor → no bet. Wait for the
+  // F2 tier polling + F1 event loop to capture a Pinnacle quote.
+  const fv = oddspapiPinnacle ?? afPinnacle;
+  if (!fv) return { ok: false, reason: "no_pinnacle_anchor" };
 
   if (!exchange) return { ok: false, reason: "no_actionable_source" };
 
