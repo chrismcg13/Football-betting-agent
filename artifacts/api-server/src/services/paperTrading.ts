@@ -1857,13 +1857,20 @@ export async function placePaperBet(
               inArray(oddsSnapshotsTable.selectionName, variants),
               or(
                 // Bundle F1-fix (2026-05-18): "oddspapi" is the BEST-BOOK
-                // aggregate (any bookmaker's best price), NOT Pinnacle.
-                // Pinnacle from OddsPapi is written as "oddspapi_pinnacle".
-                // Reading "oddspapi" here was silently treating soft-book
-                // odds as Pinnacle anchor (bug Chris flagged 2026-05-18).
+                // aggregate, NOT Pinnacle. Pinnacle from OddsPapi is
+                // "oddspapi_pinnacle".
+                // Bundle F2.A.4 (2026-05-18): TRUE-PINNACLE-ONLY. Removed
+                // "derived_from_match_odds" — synthetic AH derivations
+                // (Bundle 1U.2.1 Bet365 MO → Poisson) were being treated
+                // as real Pinnacle anchor under F2.A's agreement gate.
+                // Verified bet 26566 (match 5467 Away -0.75): stored
+                // pinn_odds=2.10 vs real Betfair 6.98 — 33pp gap proves
+                // synthetic. Per Chris 2026-05-18: "only true pinacle,
+                // not implied pinacle. If not covered on pinacle, can't
+                // be bet on." Missing real Pinnacle → null → demote to
+                // shadow per F2.A.3.
                 eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
                 eq(oddsSnapshotsTable.source, "oddspapi_pinnacle"),
-                eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
               ),
             ))
             .orderBy(desc(oddsSnapshotsTable.snapshotTime))
@@ -2873,9 +2880,14 @@ export async function placePaperBet(
           // (any bookmaker), not Pinnacle. Use "oddspapi_pinnacle" for the
           // OddsPapi-Pinnacle source. Bundle 11.D was silently using soft-
           // book odds as the Pinnacle live-verification anchor.
+          // Bundle F2.A.4 (2026-05-18): TRUE-PINNACLE-ONLY. Removed
+          // "derived_from_match_odds" — Bundle 1U.2.1 derives AH from
+          // Bet365 MO via Poisson and was being treated as real Pinnacle.
+          // Per Chris locked architecture: only true Pinnacle is the sharp
+          // anchor; if a scope has no real Pinnacle, candidate stays as
+          // shadow waiting for Pinnacle quote (per F2.A.3).
           eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
           eq(oddsSnapshotsTable.source, "oddspapi_pinnacle"),
-          eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
         ),
         sql`${oddsSnapshotsTable.snapshotTime} >= NOW() - INTERVAL '1 second' * ${pinnacleMaxAgeSeconds}`,
       ))
