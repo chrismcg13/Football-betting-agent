@@ -231,9 +231,15 @@ async function listMarketsForEvent(eventId: string): Promise<MarketCatalogue[]> 
     return cached as unknown as MarketCatalogue[];
   }
 
+  // Bundle F2.A.9 (2026-05-19): widened maxResults 50 → 200 to capture
+  // corners/cards/secondary markets that Betfair sorts below the top 50
+  // by their default priority. Premier League fixtures can have 80+
+  // markets (MO + AH + OU goals + corners + cards + booking points +
+  // first-half variants + correct score + ...). maxResults=200 keeps
+  // us well within Betfair's per-request 1000 cap.
   const markets = await betfairRequest<MarketCatalogue[]>("betting", "/listMarketCatalogue/", {
     filter: { eventIds: [eventId] },
-    maxResults: "50",
+    maxResults: "200",
     marketProjection: ["RUNNER_DESCRIPTION", "MARKET_DESCRIPTION"],
   });
 
