@@ -2901,6 +2901,70 @@ export async function placePaperBet(
     logger.warn({ err, matchId, marketType, selectionName }, "sharpAnchorFetch threw — Pinnacle-only fallback");
   }
 
+  // ── Bundle 12.E (2026-05-18): direct-Pinnacle source gate ─────────────
+  // Data analysis on bets since 2026-05-09 (Chris 2026-05-18 directive):
+  // direct_pinnacle source (fair_value AND actionable both ∈
+  // {api_football_real:Pinnacle, oddspapi_pinnacle}) is the ONLY source
+  // class with trustworthy implied probability. Live calibration gap on
+  // direct_pinnacle: -3.5pp (n=239, within sampling noise). Derived
+  // sources show massive calibration errors:
+  //   - pinn_fv_betfair_actionable AH gap: -27.4pp (n=549)
+  //   - betfair_only AH gap: -17.5pp (n=111)
+  // The mismatched-line / Betfair-derived implied probability is
+  // INFLATED relative to actual win rate — live-betting these would
+  // systematically lose (the n=25 / -80% ROI in §A.1's 10%+ edge bucket
+  // is almost certainly this source). Demote ALL non-direct-Pinnacle
+  // candidates to shadow when inversion pipeline is active.
+  const DIRECT_PINNACLE_SOURCES = new Set([
+    "api_football_real:Pinnacle",
+    "oddspapi_pinnacle",
+  ]);
+  const isDirectPinnacleSource =
+    fairValueSource != null &&
+    actionableSource != null &&
+    DIRECT_PINNACLE_SOURCES.has(fairValueSource) &&
+    DIRECT_PINNACLE_SOURCES.has(actionableSource);
+  if (!isShadowBet) {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if ((await isInversionPipelineEnabled()) && !isDirectPinnacleSource) {
+        const fullKellyStake = stake;
+        const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+        shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+        shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+        stake = 0;
+        isShadowBet = true;
+        await db.insert(complianceLogsTable).values({
+          actionType: "inversion_non_direct_pinnacle_demote",
+          details: {
+            matchId,
+            marketType,
+            selectionName,
+            fairValueSource: fairValueSource ?? null,
+            actionableSource: actionableSource ?? null,
+            backOdds,
+            modelProbability,
+            reason: "non_direct_pinnacle_source_routes_shadow",
+            shadowStake,
+          } as Record<string, unknown>,
+          timestamp: new Date(),
+        } as any);
+        await logShadowGateExemption(
+          "inversion_non_direct_pinnacle",
+          experimentTag ?? null,
+          `Non-direct-Pinnacle demote (Bundle 12.E): fv=${fairValueSource ?? "null"}, act=${actionableSource ?? "null"}`,
+          shadowStake,
+          universeTier,
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "Bundle 12.E direct-Pinnacle source check failed (non-blocking)",
+      );
+    }
+  }
+
   // ── Bundle 5.E + Bundle 10 + Bundle 11 (2026-05-17): inversion gate ─────
   // Evaluates the gate on every candidate that has fresh Pinnacle coverage.
   // ALWAYS logs the decision to compliance_logs (shadow telemetry). When

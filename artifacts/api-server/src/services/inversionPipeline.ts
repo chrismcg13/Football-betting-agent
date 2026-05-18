@@ -256,9 +256,17 @@ export async function getMarketTypeCalibration(
       | { mean_bias: string | number | null; model_se: string | number | null; n: string | number | null }
       | undefined;
     const n = row?.n != null ? Number(row.n) : 0;
+    // Bundle 12.A (2026-05-18): n threshold lowered from 30 to 10. Post-
+    // Bundle-3 (a209758) cutover the rolling view only contains live-
+    // track data, so reaching n=30 takes weeks per market_type. Memo §J
+    // and Chris's directive both want bias correction active on more
+    // markets sooner. n=10 is the floor for any signal at all; noisier
+    // than n=30 but better than the zero-bias default for non-AH markets.
+    // Operator-tunable via agent_config.inversion_bias_min_n if needed.
+    const MIN_N_FOR_CALIBRATION = 10;
     const value: MarketTypeCalibration = {
-      meanBias: row?.mean_bias != null && n >= 30 ? Number(row.mean_bias) : null,
-      modelSe: row?.model_se != null && n >= 30 ? Number(row.model_se) : null,
+      meanBias: row?.mean_bias != null && n >= MIN_N_FOR_CALIBRATION ? Number(row.mean_bias) : null,
+      modelSe: row?.model_se != null && n >= MIN_N_FOR_CALIBRATION ? Number(row.model_se) : null,
       n,
     };
     calibrationCache.set(marketType, { value, expiresAt: now + CALIBRATION_TTL_MS });

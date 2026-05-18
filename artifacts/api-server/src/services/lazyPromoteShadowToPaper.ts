@@ -355,6 +355,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
            pb.calculated_edge::numeric AS edge,
            pb.odds_at_placement::numeric AS odds,
            pb.universe_tier_at_placement AS universe_tier,
+           pb.fair_value_source AS fair_value_source,
+           pb.actionable_source AS actionable_source,
            m.league AS league
     FROM paper_bets pb JOIN matches m ON m.id = pb.match_id
     WHERE pb.bet_track = 'shadow'
@@ -383,6 +385,8 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     selection_canonical: string | null;
     score: string | number; edge: string | number; odds: string | number;
     universe_tier: string;
+    fair_value_source: string | null;
+    actionable_source: string | null;
     league: string | null;
   }>);
   result.pending_shadow_count = rows.length;
@@ -549,6 +553,41 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           // The shadow row keeps its £0 stake / shadow_stake notional and the
           // next lazy-promoter run can retry once the operator re-enables.
           result.skipped_kelly_below_min++;  // reuse counter for "not eligible for live"
+          continue;
+        }
+
+        // Bundle 12.E (2026-05-18): direct-Pinnacle source gate.
+        // Lazy-promote is forbidden when the shadow bet's stored
+        // fair_value_source or actionable_source is not a direct
+        // Pinnacle source. Data analysis (Chris 2026-05-18) showed
+        // non-direct sources mis-calibrate by -17 to -27pp on AH.
+        // Stays shadow forever for those bets; they're learning
+        // telemetry only.
+        const DIRECT_PINNACLE_SOURCES = new Set([
+          "api_football_real:Pinnacle",
+          "oddspapi_pinnacle",
+        ]);
+        const isDirectPinnacleSource =
+          r.fair_value_source != null &&
+          r.actionable_source != null &&
+          DIRECT_PINNACLE_SOURCES.has(r.fair_value_source) &&
+          DIRECT_PINNACLE_SOURCES.has(r.actionable_source);
+        if (!isDirectPinnacleSource) {
+          result.skipped_kelly_below_min++;  // reuse counter
+          await db.insert(complianceLogsTable).values({
+            actionType: "lazy_promote_non_direct_pinnacle",
+            details: {
+              betId: r.id,
+              matchId: r.match_id,
+              marketType: r.market_type,
+              selectionName: r.selection_name,
+              fairValueSource: r.fair_value_source,
+              actionableSource: r.actionable_source,
+              reason: "non_direct_pinnacle_source_stays_shadow",
+              source: "lazy_promote",
+            },
+            timestamp: new Date(),
+          } as any);
           continue;
         }
 
