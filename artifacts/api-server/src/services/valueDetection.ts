@@ -25,6 +25,12 @@ import {
   predictOutcome,
   predictBtts,
   predictOverUnder,
+  predictCorrectScore,
+  predictCorrectScoreAnyOther,
+  predictHalfTimeFullTime,
+  predictNextGoal,
+  predictCleanSheet,
+  predictWinToNil,
   predictDrawNoBet,
   predictTeamTotalGoals,
   predictAsianHandicap,
@@ -695,6 +701,77 @@ function getModelProbability(
     if (!Number.isFinite(line)) return null;
     return predictAsianTotalGoals(enriched, side, line);
   }
+
+  // ── Bundle F2.A.10 (2026-05-19): Poisson-derived predictors for new
+  // ── canonical Betfair markets so they can route LIVE (not just shadow).
+
+  // CORRECT_SCORE — Betfair runners are exact scores "0 - 0", "1 - 0",
+  // ... plus aggregate "Any Other Home Win" / "Any Other Away Win" /
+  // "Any Other Draw" for scores beyond Betfair's enumerated grid.
+  if (marketType === "CORRECT_SCORE") {
+    const exact = selectionName.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (exact) {
+      const h = parseInt(exact[1], 10);
+      const a = parseInt(exact[2], 10);
+      return predictCorrectScore(enriched, h, a, dcOpts);
+    }
+    const lower = selectionName.toLowerCase().trim();
+    if (lower.includes("any other") && lower.includes("home")) {
+      return predictCorrectScoreAnyOther(enriched, "home_win", 4, dcOpts);
+    }
+    if (lower.includes("any other") && lower.includes("away")) {
+      return predictCorrectScoreAnyOther(enriched, "away_win", 4, dcOpts);
+    }
+    if (lower.includes("any other") && lower.includes("draw")) {
+      return predictCorrectScoreAnyOther(enriched, "draw", 4, dcOpts);
+    }
+    return null;
+  }
+
+  // HALF_TIME_FULL_TIME — runners "Home/Home", "Home/Draw", ...
+  if (marketType === "HTFT" || marketType === "HALF_TIME_FULL_TIME") {
+    const m = selectionName.match(/^(Home|Draw|Away)\s*\/\s*(Home|Draw|Away)$/);
+    if (!m) return null;
+    return predictHalfTimeFullTime(
+      enriched,
+      m[1] as "Home" | "Draw" | "Away",
+      m[2] as "Home" | "Draw" | "Away",
+    );
+  }
+
+  // NEXT_GOAL — runners "Home" / "Away" / "NoGoal" (normalized in
+  // exchangeBookSweep.deriveSelectionName).
+  if (marketType === "NEXT_GOAL") {
+    if (selectionName === "Home" || selectionName === "Away" || selectionName === "NoGoal") {
+      return predictNextGoal(enriched, selectionName as "Home" | "Away" | "NoGoal");
+    }
+    return null;
+  }
+
+  // CLEAN_SHEET_HOME / CLEAN_SHEET_AWAY — runners "Yes" / "No".
+  if (marketType === "CLEAN_SHEET_HOME" || marketType === "CLEAN_SHEET_AWAY") {
+    const side = marketType === "CLEAN_SHEET_HOME" ? "home" : "away";
+    const cs = predictCleanSheet(enriched, side);
+    if (!cs) return null;
+    if (selectionName === "Yes") return cs.yes;
+    if (selectionName === "No") return cs.no;
+    return null;
+  }
+
+  // WIN_TO_NIL — runners "Yes" / "No" but the Betfair market itself is
+  // single (not per-team). We treat the selectionName.toLowerCase()
+  // hint as the side ("home wins to nil yes" etc.) when present; lacking
+  // that, defer to discovery — return null so this routes as shadow.
+  if (marketType === "WIN_TO_NIL") {
+    // Betfair's runner naming varies; commonly the runner names ARE the
+    // team names ("<HomeTeam> Win to Nil" / "<AwayTeam> Win to Nil")
+    // or a 4-runner Yes/No-per-team layout. Without runner name being
+    // resolved at deriveSelectionName time, we can't tell which side.
+    // First-pass: return null → falls to shadow until we observe real
+    // Betfair WIN_TO_NIL runners in odds_snapshots and refine the parser.
+    return null;
+  }
+
   return null;
 }
 

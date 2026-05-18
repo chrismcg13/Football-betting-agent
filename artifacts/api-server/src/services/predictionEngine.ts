@@ -1348,6 +1348,177 @@ export function predictAsianTotalGoals(
 // 60-bet paper-only flurry in April 2026 that did not graduate.
 // See [[feedback_subtract_before_restore]].
 
+// ===================== Bundle F2.A.10 (2026-05-19) Poisson predictors =====================
+// Per Chris directive: model needs to inform on new market types (CORRECT_SCORE,
+// HALF_TIME_FULL_TIME, NEXT_GOAL, CLEAN_SHEET, TO_WIN_TO_NIL) so they can go
+// live, not just shadow. All five derive from the same Poisson scoreline
+// matrix that powers AH + team totals. Uses existing home_goals_scored_avg /
+// away_goals_scored_avg features (xG fallback). No new features required.
+
+/**
+ * Predict probability of an exact (homeScore, awayScore). Returns null
+ * if lambdas unavailable. Caps the score lookup at the matrix max bucket
+ * — scores above 8 fold into the [8][*] / [*][8] tail.
+ */
+export function predictCorrectScore(
+  featureMap: Record<string, number>,
+  homeScore: number,
+  awayScore: number,
+  opts?: ScorelineMatrixOpts,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
+  if (homeScore < 0 || awayScore < 0 || !Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return null;
+  const matrix = scorelineMatrix(homeLambda, awayLambda, opts ?? {});
+  const maxIdx = matrix.length - 1;
+  const h = Math.min(homeScore, maxIdx);
+  const a = Math.min(awayScore, maxIdx);
+  return Math.max(0.001, Math.min(0.999, matrix[h]![a]!));
+}
+
+/**
+ * Predict probability of the "Any Other ..." aggregate CORRECT_SCORE
+ * runners. Betfair offers "Any Other Home Win" (sum of cells where
+ * homeScore > awayScore AND max(homeScore, awayScore) ≥ cutoff), same
+ * for away win and draw. cutoff is the smallest exact-score the
+ * runner list explicitly enumerates; remaining scores fold into "any
+ * other". Conservatively uses cutoff=4 (Betfair typically enumerates
+ * exact 0–3 scores).
+ */
+export function predictCorrectScoreAnyOther(
+  featureMap: Record<string, number>,
+  outcome: "home_win" | "away_win" | "draw",
+  cutoff = 4,
+  opts?: ScorelineMatrixOpts,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
+  const matrix = scorelineMatrix(homeLambda, awayLambda, opts ?? {});
+  const maxIdx = matrix.length - 1;
+  let p = 0;
+  for (let h = 0; h <= maxIdx; h++) {
+    for (let a = 0; a <= maxIdx; a++) {
+      const isOther = Math.max(h, a) >= cutoff;
+      if (!isOther) continue;
+      if (outcome === "home_win" && h > a) p += matrix[h]![a]!;
+      else if (outcome === "away_win" && a > h) p += matrix[h]![a]!;
+      else if (outcome === "draw" && h === a) p += matrix[h]![a]!;
+    }
+  }
+  return Math.max(0.001, Math.min(0.999, p));
+}
+
+/**
+ * Predict probability of an exact HT/FT outcome pair. Uses split
+ * Poisson — 1st-half lambda ≈ 45% of full-match lambda; 2nd-half
+ * lambda ≈ 55%. Half independence assumed (standard simplification).
+ */
+export function predictHalfTimeFullTime(
+  featureMap: Record<string, number>,
+  ht: "Home" | "Draw" | "Away",
+  ft: "Home" | "Draw" | "Away",
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
+  const halfShare = 0.45;
+  const lhHt = homeLambda * halfShare;
+  const laHt = awayLambda * halfShare;
+  const lh2 = homeLambda * (1 - halfShare);
+  const la2 = awayLambda * (1 - halfShare);
+  const mHt = scorelineMatrix(lhHt, laHt);
+  const m2 = scorelineMatrix(lh2, la2);
+  const maxG = mHt.length - 1;
+  const htClass = (h: number, a: number): "Home" | "Draw" | "Away" =>
+    h > a ? "Home" : h < a ? "Away" : "Draw";
+  let p = 0;
+  for (let h1 = 0; h1 <= maxG; h1++) {
+    for (let a1 = 0; a1 <= maxG; a1++) {
+      if (htClass(h1, a1) !== ht) continue;
+      const pHt = mHt[h1]![a1]!;
+      for (let h2 = 0; h2 <= maxG; h2++) {
+        for (let a2 = 0; a2 <= maxG; a2++) {
+          const ftH = Math.min(h1 + h2, maxG);
+          const ftA = Math.min(a1 + a2, maxG);
+          if (htClass(ftH, ftA) !== ft) continue;
+          p += pHt * m2[h2]![a2]!;
+        }
+      }
+    }
+  }
+  return Math.max(0.001, Math.min(0.999, p));
+}
+
+/**
+ * Predict probability of who scores the next goal in remaining time.
+ * Pre-match assumption: remaining time = full match (90 min). For
+ * in-play this would shift to remaining minutes — out of scope here.
+ *   P(home next) = (1 − P(no more)) × λ_home / (λ_home + λ_away)
+ *   P(no more)    = exp(−(λ_home + λ_away))
+ */
+export function predictNextGoal(
+  featureMap: Record<string, number>,
+  side: "Home" | "Away" | "NoGoal",
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
+  const total = homeLambda + awayLambda;
+  const pNoMore = Math.exp(-total);
+  if (side === "NoGoal") return Math.max(0.001, Math.min(0.999, pNoMore));
+  const pAnyMore = 1 - pNoMore;
+  if (side === "Home") return Math.max(0.001, Math.min(0.999, pAnyMore * (homeLambda / total)));
+  if (side === "Away") return Math.max(0.001, Math.min(0.999, pAnyMore * (awayLambda / total)));
+  return null;
+}
+
+/**
+ * Predict clean-sheet probability for a team.
+ *   CLEAN_SHEET home → P(away_score = 0) = exp(−λ_away)
+ *   CLEAN_SHEET away → P(home_score = 0) = exp(−λ_home)
+ * Note: this is INDEPENDENT clean-sheet (away scores zero) regardless
+ * of the home outcome. Distinct from WIN_TO_NIL which requires both.
+ */
+export function predictCleanSheet(
+  featureMap: Record<string, number>,
+  side: "home" | "away",
+): { yes: number; no: number } | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
+  const opposingLambda = side === "home" ? awayLambda : homeLambda;
+  const yes = Math.max(0.01, Math.min(0.99, Math.exp(-opposingLambda)));
+  return { yes, no: 1 - yes };
+}
+
+/**
+ * Predict win-to-nil probability for a team. Requires BOTH conditions:
+ *   - Team wins (scores more than the other team)
+ *   - Other team scores zero
+ * Computed by summing matrix cells where the conditions intersect.
+ */
+export function predictWinToNil(
+  featureMap: Record<string, number>,
+  side: "home" | "away",
+  opts?: ScorelineMatrixOpts,
+): { yes: number; no: number } | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
+  const m = scorelineMatrix(homeLambda, awayLambda, opts ?? {});
+  const maxG = m.length - 1;
+  let yes = 0;
+  if (side === "home") {
+    for (let h = 1; h <= maxG; h++) yes += m[h]![0]!;
+  } else {
+    for (let a = 1; a <= maxG; a++) yes += m[0]![a]!;
+  }
+  yes = Math.max(0.01, Math.min(0.99, yes));
+  return { yes, no: 1 - yes };
+}
+
 // ===================== Training sample builder from DB records =====================
 export interface DbTrainingSample {
   features: number[];
