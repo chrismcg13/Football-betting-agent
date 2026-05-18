@@ -2172,9 +2172,14 @@ export async function capturePreKickoffLineups(): Promise<{
   captured: number;
   keyPlayerMissing: number;
 }> {
+  // Bundle FP2.1 (2026-05-18): widened from 30-90min → 15-180min so we
+  // have more chances at the lineup publish window. _lineup_data feature
+  // blobs had 0 rows EVER pre-fix because most leagues publish lineups
+  // 15-45 min pre-kickoff and the prior window often missed it. Wider
+  // window = more polling attempts per fixture across the publish span.
   const now = new Date();
-  const in90min = new Date(now.getTime() + 90 * 60 * 1000);
-  const in30min = new Date(now.getTime() + 30 * 60 * 1000);
+  const in90min = new Date(now.getTime() + 180 * 60 * 1000); // outer bound
+  const in30min = new Date(now.getTime() + 15 * 60 * 1000);  // inner bound
 
   // X1 (2026-05-07): expanded scope to ALL Tier A/B/C upcoming matches in
   // T-30-90min window (was: only matches with pending bets). Required so
