@@ -1592,6 +1592,11 @@ export async function placePaperBet(
   // when the trading-cycle cache misses (allows Tier 1B qualification).
   let pinnacleOdds: number | null = options.pinnacleOdds ?? null;
   let pinnacleImplied: number | null = options.pinnacleImplied ?? null;
+  // Bundle 15.B (2026-05-18): track Pinnacle snapshot age for the
+  // asymmetry check. Betfair age is essentially 0 (relay call) at the
+  // time of capture; if Pinnacle age >> Betfair age, the gap likely
+  // reflects stale Pinnacle data not real mispricing.
+  let pinnacleSnapshotAgeSeconds: number | null = null;
   const score = opportunityScore ?? 65;
 
   const logReject = async (
@@ -2769,12 +2774,21 @@ export async function placePaperBet(
     if (freshOdds && freshOdds > 1.01) {
       pinnacleOdds = freshOdds;
       pinnacleImplied = 1 / freshOdds;
+      // Bundle 15.B: capture Pinnacle snapshot age in seconds for the
+      // freshness-asymmetry check below.
+      const snapTime = latestPin[0]?.snapshotTime
+        ? new Date(latestPin[0].snapshotTime as unknown as string).getTime()
+        : null;
+      pinnacleSnapshotAgeSeconds = snapTime != null
+        ? Math.max(0, (Date.now() - snapTime) / 1000)
+        : null;
     } else {
       // No fresh Pinnacle within window. Null out any stale cache value
       // the caller passed in. Downstream pre-gate check at ~line 2914 will
       // skip the inversion gate and route to shadow.
       pinnacleOdds = null;
       pinnacleImplied = null;
+      pinnacleSnapshotAgeSeconds = null;
     }
   } catch (err) {
     // On DB error, fail safe: null out to force shadow routing rather than
@@ -2840,6 +2854,61 @@ export async function placePaperBet(
     exchangeCaptureCounters.queue_position_samples.push(
       exchangeSnapshot.bestBack - backOdds,
     );
+  }
+
+  // ── Bundle 15.B (2026-05-18): freshness asymmetry check ────────────────
+  // Per Chris diagnostic #1: if Pinnacle snapshot is much staler than the
+  // Betfair price we're betting against, the "edge" likely reflects stale
+  // Pinnacle data not real mispricing. Betfair age is ~0s here
+  // (captureExchangeSnapshot is a live relay call). Demote when Pinnacle
+  // age > freshness_asymmetry_max_delta_seconds (default 90s).
+  if (
+    pinnacleSnapshotAgeSeconds != null &&
+    pinnacleImplied != null &&
+    !isShadowBet
+  ) {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if (await isInversionPipelineEnabled()) {
+        const deltaRaw = await getConfigValue("freshness_asymmetry_max_delta_seconds");
+        const maxDeltaSec =
+          deltaRaw != null && Number.isFinite(Number(deltaRaw))
+            ? Number(deltaRaw)
+            : 90;
+        if (pinnacleSnapshotAgeSeconds > maxDeltaSec) {
+          await db.insert(complianceLogsTable).values({
+            actionType: "inversion_freshness_asymmetry_demote",
+            details: {
+              matchId,
+              marketType,
+              selectionName,
+              pinnacleSnapshotAgeSeconds,
+              maxDeltaSec,
+              reason: "pinnacle_staler_than_betfair_beyond_max_delta",
+            } as Record<string, unknown>,
+            timestamp: new Date(),
+          } as any);
+          const fullKellyStake = stake;
+          const SHADOW_KELLY_FRACTION = await getShadowKellyFraction(matchId, marketType);
+          shadowStakeKellyFraction = SHADOW_KELLY_FRACTION;
+          shadowStake = Math.round(fullKellyStake * SHADOW_KELLY_FRACTION * 100) / 100;
+          stake = 0;
+          isShadowBet = true;
+          await logShadowGateExemption(
+            "inversion_freshness_asymmetry",
+            experimentTag ?? null,
+            `Pinnacle ${Math.round(pinnacleSnapshotAgeSeconds)}s stale vs Betfair ~0s (max delta ${maxDeltaSec}s)`,
+            shadowStake,
+            universeTier,
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "Bundle 15.B freshness-asymmetry check failed (non-blocking)",
+      );
+    }
   }
 
   // ── Bundle 15.A (2026-05-18): liquidity-at-price floor ───────────────────
