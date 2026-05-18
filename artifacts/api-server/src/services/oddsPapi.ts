@@ -2532,33 +2532,6 @@ const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   { marketType: "FIRST_HALF_OU_05",   selectionName: "Under 0.5" },
   { marketType: "FIRST_HALF_OU_15",   selectionName: "Over 1.5" },
   { marketType: "FIRST_HALF_OU_15",   selectionName: "Under 1.5" },
-  // ── Bundle F2.A.8 (2026-05-19): RESTORED corners + cards ────────────
-  // Per Chris directive: Pinnacle covers and Betfair Exchange offers
-  // these markets with liquidity. Earlier 2026-05-16 subtract was
-  // premature. Pulls common line buckets (corners 8.5-10.5 are highest
-  // volume; cards 3.5-5.5 highest volume). Lower / higher lines added
-  // for completeness — OddsPapi response includes whatever Pinnacle
-  // quotes; we extract what we recognise.
-  { marketType: "TOTAL_CORNERS_65",  selectionName: "Over 6.5 Corners" },
-  { marketType: "TOTAL_CORNERS_65",  selectionName: "Under 6.5 Corners" },
-  { marketType: "TOTAL_CORNERS_75",  selectionName: "Over 7.5 Corners" },
-  { marketType: "TOTAL_CORNERS_75",  selectionName: "Under 7.5 Corners" },
-  { marketType: "TOTAL_CORNERS_85",  selectionName: "Over 8.5 Corners" },
-  { marketType: "TOTAL_CORNERS_85",  selectionName: "Under 8.5 Corners" },
-  { marketType: "TOTAL_CORNERS_95",  selectionName: "Over 9.5 Corners" },
-  { marketType: "TOTAL_CORNERS_95",  selectionName: "Under 9.5 Corners" },
-  { marketType: "TOTAL_CORNERS_105", selectionName: "Over 10.5 Corners" },
-  { marketType: "TOTAL_CORNERS_105", selectionName: "Under 10.5 Corners" },
-  { marketType: "TOTAL_CORNERS_115", selectionName: "Over 11.5 Corners" },
-  { marketType: "TOTAL_CORNERS_115", selectionName: "Under 11.5 Corners" },
-  { marketType: "TOTAL_CARDS_25",    selectionName: "Over 2.5 Cards" },
-  { marketType: "TOTAL_CARDS_25",    selectionName: "Under 2.5 Cards" },
-  { marketType: "TOTAL_CARDS_35",    selectionName: "Over 3.5 Cards" },
-  { marketType: "TOTAL_CARDS_35",    selectionName: "Under 3.5 Cards" },
-  { marketType: "TOTAL_CARDS_45",    selectionName: "Over 4.5 Cards" },
-  { marketType: "TOTAL_CARDS_45",    selectionName: "Under 4.5 Cards" },
-  { marketType: "TOTAL_CARDS_55",    selectionName: "Over 5.5 Cards" },
-  { marketType: "TOTAL_CARDS_55",    selectionName: "Under 5.5 Cards" },
 ];
 
 // ── Bundle F2.0 (2026-05-18): actively-traded-markets cache ─────────────
