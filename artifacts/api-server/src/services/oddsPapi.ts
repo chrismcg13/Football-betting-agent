@@ -2655,11 +2655,22 @@ export async function prefetchAndStoreOddsPapiOdds(
   const matchIdsInScope = mappedRows.map((r) => r.matchId);
   const latestSnapshotMap = new Map<number, Date>();
   if (matchIdsInScope.length > 0) {
+    // Bundle 11.G (2026-05-18): Drizzle array-binding bug — `ANY(${arr})`
+    // expands as positional-parameter tuple, which Postgres rejects with
+    // "malformed array literal" (single element) or "cannot cast record to
+    // text[]" (multi-element). Same root cause as Bundle 4's
+    // resolveTier2Anchor fix at line ~3698. Replaces with sql.join + IN
+    // list. This bug was silently killing the entire kickoff-proximity
+    // prefetch run — every */15 cron tick since 2026-05-16 throwing here.
+    const matchIdList = sql.join(
+      matchIdsInScope.map((id) => sql`${id}`),
+      sql`, `,
+    );
     const latestRows = await db.execute(sql`
       SELECT match_id, MAX(snapshot_time) AS latest
       FROM odds_snapshots
       WHERE source IN ('oddspapi','oddspapi_pinnacle')
-        AND match_id = ANY(${matchIdsInScope})
+        AND match_id IN (${matchIdList})
       GROUP BY match_id
     `);
     for (const r of ((latestRows as { rows?: Array<{ match_id: number; latest: string }> }).rows ?? [])) {
