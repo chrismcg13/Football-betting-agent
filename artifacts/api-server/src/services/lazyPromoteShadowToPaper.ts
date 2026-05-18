@@ -892,6 +892,136 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
           );
         }
 
+        // ── Bundle 20 (2026-05-18): mirror direct-emission validation gates ──
+        // Apply 15.B (freshness asymmetry), 15.C (TTK Kelly), 16 (Pinnacle
+        // direction), 18 (model+Pinnacle agreement uplift) to the lazy
+        // promoter so live placements via this rail get the same discipline
+        // as direct emission. Bundle 15.A (liquidity-at-price) requires a
+        // relayGetLiquidity call — deferred (TODO).
+        let promoterStakeMultiplier = 1.0;
+        let promoterUpliftMultiplier = 1.0;
+        try {
+          const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+          if (await isInversionPipelineEnabled() && liveBetfairBack != null && liveBetfairBack > 1.01) {
+            // Pull current Pinnacle (with timestamp) + 5-15min-ago Pinnacle
+            // + match kickoff in parallel.
+            const [pinnFreshRes, pinnLookbackRes, matchKoRes] = await Promise.all([
+              db.execute(sql`
+                SELECT pinnacle_implied::float8 AS pi, captured_at
+                FROM pinnacle_odds_snapshots
+                WHERE match_id = ${r.match_id}
+                  AND market_type = ${r.market_type}
+                  AND selection_name = ${r.selection_name}
+                  AND bookmaker_slug = 'pinnacle'
+                ORDER BY captured_at DESC LIMIT 1
+              `) as unknown as Promise<{ rows?: Array<{ pi: number | null; captured_at: string }> }>,
+              db.execute(sql`
+                SELECT pinnacle_implied::float8 AS pi
+                FROM pinnacle_odds_snapshots
+                WHERE match_id = ${r.match_id}
+                  AND market_type = ${r.market_type}
+                  AND selection_name = ${r.selection_name}
+                  AND bookmaker_slug = 'pinnacle'
+                  AND captured_at < NOW() - INTERVAL '5 minutes'
+                  AND captured_at > NOW() - INTERVAL '15 minutes'
+                ORDER BY captured_at ASC LIMIT 1
+              `) as unknown as Promise<{ rows?: Array<{ pi: number | null }> }>,
+              db.execute(sql`SELECT kickoff_time FROM matches WHERE id = ${r.match_id} LIMIT 1`) as unknown as Promise<{ rows?: Array<{ kickoff_time: string | null }> }>,
+            ]);
+            const pinnImpliedNow = pinnFreshRes.rows?.[0]?.pi ?? null;
+            const pinnCapturedAt = pinnFreshRes.rows?.[0]?.captured_at;
+            const pinnAgeSec = pinnCapturedAt
+              ? Math.max(0, (Date.now() - new Date(pinnCapturedAt).getTime()) / 1000)
+              : null;
+            const pinnOlder = pinnLookbackRes.rows?.[0]?.pi ?? null;
+            const kickoffTime = matchKoRes.rows?.[0]?.kickoff_time;
+
+            // 15.B: freshness asymmetry — Pinnacle vs Betfair-which-is-~0s
+            if (pinnAgeSec != null) {
+              const deltaRaw = await getConfig("freshness_asymmetry_max_delta_seconds");
+              const maxDelta = deltaRaw != null && Number.isFinite(Number(deltaRaw)) ? Number(deltaRaw) : 90;
+              if (pinnAgeSec > maxDelta) {
+                await db.insert(complianceLogsTable).values({
+                  actionType: "lazy_promote_freshness_asymmetry",
+                  details: {
+                    betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                    selectionName: r.selection_name, pinnAgeSec, maxDelta,
+                    reason: "pinnacle_staler_than_betfair_beyond_max_delta",
+                  },
+                  timestamp: new Date(),
+                } as any);
+                result.skipped_edge_evaporated++;
+                continue;
+              }
+            }
+
+            // 16: Pinnacle line-movement direction
+            if (pinnImpliedNow != null && pinnOlder != null) {
+              const deltaPp = (pinnImpliedNow - pinnOlder) * 100;
+              const thresholdRaw = await getConfig("pinnacle_direction_drop_threshold_pp");
+              const threshold = thresholdRaw != null && Number.isFinite(Number(thresholdRaw)) ? Number(thresholdRaw) : 1.0;
+              if (deltaPp < -threshold) {
+                await db.insert(complianceLogsTable).values({
+                  actionType: "lazy_promote_pinnacle_direction_demote",
+                  details: {
+                    betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                    selectionName: r.selection_name,
+                    pinnImpliedNow, pinnOlder, deltaPp, threshold,
+                    reason: "pinnacle_drifting_toward_betfair",
+                  },
+                  timestamp: new Date(),
+                } as any);
+                result.skipped_edge_evaporated++;
+                continue;
+              }
+            }
+
+            // 15.C: TTK-weighted Kelly multiplier
+            if (kickoffTime) {
+              const hoursToKo = (new Date(kickoffTime).getTime() - Date.now()) / 3_600_000;
+              if (hoursToKo > 0) {
+                const floorRaw = await getConfig("ttk_kelly_floor");
+                const ttkFloor = floorRaw != null && Number.isFinite(Number(floorRaw)) ? Number(floorRaw) : 0.25;
+                const rawFactor = 1.0 - Math.max(0, hoursToKo - 1) / 23;
+                const ttkFactor = Math.max(ttkFloor, Math.min(1.0, rawFactor));
+                if (ttkFactor < 1.0) {
+                  promoterStakeMultiplier *= ttkFactor;
+                }
+              }
+            }
+
+            // 18: model + Pinnacle agreement uplift. Model_p derived from
+            // stored edge: model_p = 1/stored_odds + edge.
+            if (pinnImpliedNow != null) {
+              const backImplied = 1 / liveBetfairBack;
+              const storedEdge = Number(r.edge);
+              const modelP = Number.isFinite(storedEdge) && odds > 1.01
+                ? (1 / odds) + storedEdge
+                : null;
+              if (modelP != null && pinnImpliedNow > backImplied && modelP > backImplied) {
+                const upliftRaw = await getConfig("inversion_model_agree_multiplier");
+                const uplift =
+                  upliftRaw != null && Number.isFinite(Number(upliftRaw))
+                    ? Math.min(Math.max(Number(upliftRaw), 1.0), 1.25)
+                    : 1.10;
+                if (uplift > 1.0) {
+                  promoterUpliftMultiplier *= uplift;
+                }
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            { err: (err as Error)?.message ?? String(err), betId: r.id },
+            "Bundle 20 lazy-promoter gates failed (non-blocking)",
+          );
+        }
+        // Apply combined Bundle 20 stake adjustments (TTK × agreement uplift).
+        if (promoterStakeMultiplier !== 1.0 || promoterUpliftMultiplier !== 1.0) {
+          const combined = promoterStakeMultiplier * promoterUpliftMultiplier;
+          stake = Math.round(stake * combined * 100) / 100;
+        }
+
         const { placeLiveBetOnBetfair } = await import("./betfairLive");
         const promoteEdge = Number(r.edge);
         // Bundle 11.E (2026-05-17): use the LIVE Betfair best-back as the
