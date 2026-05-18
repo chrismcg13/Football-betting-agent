@@ -800,7 +800,7 @@ import { BANNED_MARKETS } from "./paperTrading";
 type PriceQuote = { backOdds: number; source: string };
 type FairValueSource = "oddspapi_pinnacle" | "api_football_real:Pinnacle" | "betfair_exchange";
 type ActionableSource = "betfair_exchange";
-type RejectReason = "no_actionable_source" | "no_fair_value_source" | "no_pinnacle_anchor";
+type RejectReason = "no_actionable_source" | "no_fair_value_source" | "no_pinnacle_anchor" | "no_pinnacle_coverage";
 type PricingResult =
   | {
       ok: true;
@@ -840,25 +840,31 @@ function selectPricingSources(
     }
   }
 
-  // ── Bundle F2.A.3 (2026-05-18) — demote, don't reject ─────────────────
-  // Allow Betfair fallback as fair_value when Pinnacle is absent, but
-  // flag the candidate as shadowOnly=true so it routes to shadow track.
-  // The lazy promoter (F1.1 reads fresh Pinnacle from odds_snapshots)
-  // re-evaluates these shadows on every tick + on every F1 queue event.
-  // When Pinnacle eventually quotes the scope, the agreement gate runs
-  // and the candidate can be promoted to live.
+  // ── Bundle F2.A.7 (2026-05-19) — strict-Pinnacle-coverage at emission ──
+  // Per Chris locked architecture 2026-05-19: "the model should only be
+  // choosing lines pinacle will quote for."
   //
-  // Rationale (Chris 2026-05-18): "if they don't have pinacle they
-  // should be demoted then picked up by lazy promoter instead of just
-  // rejecting and missing the opportunity." F2.A.2's reject path
-  // discarded ~80% of trading-cycle candidates that could have become
-  // live the moment Pinnacle quoted them.
-  const fv = oddspapiPinnacle ?? afPinnacle ?? exchange;
-  if (!fv) return { ok: false, reason: "no_fair_value_source" };
+  // Pinnacle covers leagues + selections it actually prices (e.g., ±0,
+  // ±0.5, ±1 AH lines on top leagues). It does NOT quote every quarter-
+  // line (±0.25, ±0.75, ±1.75 etc.) or every lower-tier league. Under
+  // strict-true-Pinnacle (F2.A.4), candidates on selections Pinnacle
+  // never quotes get stuck in shadow forever — wasted Neon storage and
+  // lazy-promoter cycles.
+  //
+  // F2.A.7 enforces "if Pinnacle hasn't quoted this exact (match ×
+  // market × selection), the model shouldn't emit a candidate for it."
+  // selectPricingSources is the natural enforcement point — if neither
+  // oddspapi_pinnacle nor api_football_real:Pinnacle has a row in the
+  // 6h lookback window for this group, REFUSE emission entirely.
+  //
+  // Supersedes F2.A.3 (which allowed Betfair fallback shadowOnly). The
+  // earlier "demote, don't reject" framing assumed Pinnacle would
+  // eventually quote the selection; reality is Pinnacle's coverage is
+  // FIXED — quarter-lines and minor markets are never quoted at all.
+  const fv = oddspapiPinnacle ?? afPinnacle;
+  if (!fv) return { ok: false, reason: "no_pinnacle_coverage" };
 
   if (!exchange) return { ok: false, reason: "no_actionable_source" };
-
-  const hasPinnacle = fv.source === "oddspapi_pinnacle" || fv.source === "api_football_real:Pinnacle";
 
   return {
     ok: true,
@@ -866,9 +872,7 @@ function selectPricingSources(
     actionableSource: "betfair_exchange",
     fairValueOdds: fv.backOdds,
     fairValueSource: fv.source as FairValueSource,
-    // shadowOnly when no Pinnacle anchor — bet emits to shadow track,
-    // lazy promoter retries with fresh Pinnacle on each cycle / F1 event.
-    shadowOnly: !hasPinnacle,
+    shadowOnly: false,
   };
 }
 
