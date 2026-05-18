@@ -472,14 +472,37 @@ export async function applyLevelTransition(): Promise<{
 }
 
 export async function getConsecutiveLiveLosses(): Promise<number> {
-  const recent = await db.execute(sql`
-    SELECT status FROM paper_bets
-    WHERE status IN ('won', 'lost')
-    AND live_tier = 'tier1'
-    AND betfair_bet_id IS NOT NULL
-    ORDER BY settled_at DESC
-    LIMIT 20
-  `);
+  // Bundle 13.D (2026-05-18): filter to bets settled AFTER cutover_completed_at.
+  // Pre-fix this counter included bulk-reconciled historical losses. When
+  // reconcileSettlements ran at 17:35 UTC and settled ~200 stuck-pending bets
+  // in one swing, the counter saw a run of legacy losses and tripped the
+  // halt spuriously. Filtering to post-cutover settled_at scopes the
+  // counter to the live-trading regime that the circuit breaker is
+  // meant to govern.
+  //
+  // Falls back to "no filter" if the config row is missing — preserves the
+  // halt behaviour for fresh installs / tests where cutover hasn't run.
+  const cutoverRaw = await getConfigValue("cutover_completed_at");
+  const cutoverTs = cutoverRaw && cutoverRaw.length > 0 ? new Date(cutoverRaw) : null;
+  const cutoverValid = cutoverTs != null && !Number.isNaN(cutoverTs.getTime());
+  const recent = cutoverValid
+    ? await db.execute(sql`
+        SELECT status FROM paper_bets
+        WHERE status IN ('won', 'lost')
+          AND live_tier = 'tier1'
+          AND betfair_bet_id IS NOT NULL
+          AND settled_at > ${cutoverTs!.toISOString()}
+        ORDER BY settled_at DESC
+        LIMIT 20
+      `)
+    : await db.execute(sql`
+        SELECT status FROM paper_bets
+        WHERE status IN ('won', 'lost')
+          AND live_tier = 'tier1'
+          AND betfair_bet_id IS NOT NULL
+        ORDER BY settled_at DESC
+        LIMIT 20
+      `);
 
   let streak = 0;
   for (const row of recent.rows as Record<string, unknown>[]) {
