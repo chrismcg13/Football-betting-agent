@@ -395,9 +395,32 @@ const TEAM_TOTAL_LINES: Record<string, string> = {
   "3.5": "_35",
 };
 
-// 2026-05-16 subtract bundle: CORNERS_LINES + CARDS_LINES maps deleted
-// alongside their downstream consumers in mapOddsToMarket. See
-// feedback_subtract_before_restore.
+// 2026-05-19 (Bundle F2.A.8): RESTORED CORNERS_LINES + CARDS_LINES
+// per Chris directive — Pinnacle covers these markets and Betfair
+// Exchange offers them with liquidity. The 2026-05-16 subtract was
+// premature: the justification "none had Betfair Exchange liquidity
+// probes" was about vps-relay coverage at the time, not Betfair's
+// actual offering. With cards/corners restored:
+//   - api-football pulls Pinnacle quotes when bookmaker returns them
+//   - oddsPapi PREFETCH_TARGETS extended (oddsPapi.ts) for parallel coverage
+//   - vps-relay needs Betfair polling for these market_types (SEPARATE
+//     codebase per CLAUDE.md §8 — flag this in deploy notes)
+const CORNERS_LINES: Record<string, string> = {
+  "6.5":  "TOTAL_CORNERS_65",
+  "7.5":  "TOTAL_CORNERS_75",
+  "8.5":  "TOTAL_CORNERS_85",
+  "9.5":  "TOTAL_CORNERS_95",
+  "10.5": "TOTAL_CORNERS_105",
+  "11.5": "TOTAL_CORNERS_115",
+  "12.5": "TOTAL_CORNERS_125",
+};
+const CARDS_LINES: Record<string, string> = {
+  "2.5": "TOTAL_CARDS_25",
+  "3.5": "TOTAL_CARDS_35",
+  "4.5": "TOTAL_CARDS_45",
+  "5.5": "TOTAL_CARDS_55",
+  "6.5": "TOTAL_CARDS_65",
+};
 
 function mapOddsToMarket(
   betName: string,
@@ -446,10 +469,30 @@ function mapOddsToMarket(
     }
   }
 
-  // 2026-05-16 subtract bundle: TOTAL_CARDS_* + TOTAL_CORNERS_* case branches
-  // removed. ~218k rows/day of API-Football writes to odds_snapshots
-  // eliminated. None of these markets had Betfair Exchange liquidity probes,
-  // none had non-paper bets ever placed.
+  // ── Bundle F2.A.8 (2026-05-19): RESTORED TOTAL_CORNERS_* + TOTAL_CARDS_*
+  // Per Chris directive: Pinnacle covers these and Betfair Exchange offers
+  // them with liquidity. Earlier 2026-05-16 subtract was premature.
+  //
+  // API-Football bet names vary; common patterns:
+  //   "Corners Over/Under", "Total Corners", "Corners Match"
+  //   "Total Cards", "Cards Over/Under", "Number of Cards"
+  // Values use "Over X.5" / "Under X.5" same as goals OU.
+  if (norm.includes("corner") && (norm.includes("over") || norm.includes("total") || norm.includes("under"))) {
+    const line = v.replace("Over", "").replace("Under", "").trim();
+    const marketSuffix = CORNERS_LINES[line];
+    if (marketSuffix) {
+      const sel = v.startsWith("Over") ? `Over ${line} Corners` : `Under ${line} Corners`;
+      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
+    }
+  }
+  if (norm.includes("card") && (norm.includes("over") || norm.includes("total") || norm.includes("under")) && !norm.includes("score")) {
+    const line = v.replace("Over", "").replace("Under", "").trim();
+    const marketSuffix = CARDS_LINES[line];
+    if (marketSuffix) {
+      const sel = v.startsWith("Over") ? `Over ${line} Cards` : `Under ${line} Cards`;
+      return { marketType: marketSuffix, selectionName: sel, backOdds: o };
+    }
+  }
 
   if (norm.includes("asian handicap")) {
     const line = v.replace("Home", "").replace("Away", "").trim();
