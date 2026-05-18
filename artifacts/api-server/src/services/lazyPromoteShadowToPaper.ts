@@ -492,40 +492,52 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
       if (r.league) {
         const adaptive = await computeAdaptiveKellyFactor(r.league, r.market_type, odds);
         if ("reason" in adaptive) {
-          if (adaptive.reason === "negative_kelly") {
-            result.skipped_adaptive_negative_kelly++;
-            await db.insert(complianceLogsTable).values({
-              actionType: "shadow_gate_exemption",
-              details: {
-                reason: "scope_eligible_but_negative_kelly",
-                betId: r.id, matchId: r.match_id, marketType: r.market_type,
-                league: r.league, backOdds: odds,
-                pHat: adaptive.pHat, pLo: adaptive.pLo,
-                fHat: adaptive.fHat, fLo: adaptive.fLo,
-                source: "lazy_promote",
-              },
-              timestamp: new Date(),
-            });
-            continue;
+          // Bundle 13.C (2026-05-18): under inversion strategy (R5),
+          // Wilson-LCB / negative-Kelly per-scope demotes are LEGACY gates
+          // — the inversion gate's 3-7pp band + Pinnacle-anchored fair
+          // value + direct-Pinnacle source IS the placement discipline.
+          // Diagnosis at 17:35 UTC showed 820 of 1226 lazy-promote
+          // candidates being blocked here despite having direct Pinnacle
+          // anchors. Bypass under inversion; keep the legacy demotes
+          // for pre-inversion paper mode. Multiplier defaults to 1.0
+          // so sizing isn't perturbed.
+          if (!inversionOn) {
+            if (adaptive.reason === "negative_kelly") {
+              result.skipped_adaptive_negative_kelly++;
+              await db.insert(complianceLogsTable).values({
+                actionType: "shadow_gate_exemption",
+                details: {
+                  reason: "scope_eligible_but_negative_kelly",
+                  betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                  league: r.league, backOdds: odds,
+                  pHat: adaptive.pHat, pLo: adaptive.pLo,
+                  fHat: adaptive.fHat, fLo: adaptive.fLo,
+                  source: "lazy_promote",
+                },
+                timestamp: new Date(),
+              });
+              continue;
+            }
+            if (adaptive.reason === "wilson_lcb_negative") {
+              result.skipped_adaptive_wilson_lcb_negative++;
+              await db.insert(complianceLogsTable).values({
+                actionType: "shadow_gate_exemption",
+                details: {
+                  reason: "scope_eligible_but_wilson_lcb_negative",
+                  betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                  league: r.league, backOdds: odds,
+                  pHat: adaptive.pHat, pLo: adaptive.pLo,
+                  fHat: adaptive.fHat, fLo: adaptive.fLo,
+                  source: "lazy_promote",
+                },
+                timestamp: new Date(),
+              });
+              continue;
+            }
           }
-          if (adaptive.reason === "wilson_lcb_negative") {
-            result.skipped_adaptive_wilson_lcb_negative++;
-            await db.insert(complianceLogsTable).values({
-              actionType: "shadow_gate_exemption",
-              details: {
-                reason: "scope_eligible_but_wilson_lcb_negative",
-                betId: r.id, matchId: r.match_id, marketType: r.market_type,
-                league: r.league, backOdds: odds,
-                pHat: adaptive.pHat, pLo: adaptive.pLo,
-                fHat: adaptive.fHat, fLo: adaptive.fLo,
-                source: "lazy_promote",
-              },
-              timestamp: new Date(),
-            });
-            continue;
-          }
-          // reason === "no_evidence": keep multiplier=1.0 (eligibility gate
-          // already accepted; trust the existing score-keyed fraction).
+          // reason === "no_evidence" OR (inversionOn AND any reason):
+          // keep multiplier=1.0. Inversion gate downstream is the
+          // active discipline.
         } else {
           adaptiveMultiplier = adaptive.factor;
           adaptiveAudit = {

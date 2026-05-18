@@ -767,16 +767,21 @@ const NEW_MARKET_TYPES = new Set(["TOTAL_CARDS_35", "TOTAL_CARDS_45", "TOTAL_COR
 // pipeline / structural correlation) — they stay until those reasons
 // are resolved.
 export const BANNED_MARKETS: ReadonlySet<string> = new Set([
-  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
-  "OVER_UNDER_25",
-  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
-  "OVER_UNDER_35",
-  // Quarantined 2026-04-20 pending pricing-pipeline fix — see CLV diagnostic
-  "FIRST_HALF_RESULT",
-  // Structurally correlated with MATCH_ODDS (1X2 with two of three
-  // outcomes bundled — same information, dependent settlement).
-  // Correlation dedup at the portfolio layer would also need
-  // generalising before this can flow.
+  // Bundle 13.C (2026-05-18): OVER_UNDER_25 / OVER_UNDER_35 /
+  // FIRST_HALF_RESULT removed from BANNED_MARKETS. The 2026-04-20
+  // pricing-pipeline quarantine reason was resolved by Bundle 3
+  // (a209758) which narrowed ActionableSource to betfair_exchange
+  // only — eliminating the inflated synthetic-odds writes that
+  // poisoned shadow ROI. Under the inversion strategy these markets
+  // are Pinnacle-covered and live-eligible by R5 ("all markets
+  // Betfair offers are eligible if Pinnacle covers them"). The
+  // Bundle 11/12 freshness + 3-7pp band + direct-Pinnacle source
+  // gates remain the active discipline.
+  //
+  // DOUBLE_CHANCE stays banned: structurally correlated with
+  // MATCH_ODDS (1X2 with two of three outcomes bundled — same
+  // information, dependent settlement). Correlation dedup at the
+  // portfolio layer needs to generalise before this can flow.
   "DOUBLE_CHANCE",
 ]);
 
