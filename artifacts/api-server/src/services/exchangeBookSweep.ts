@@ -53,6 +53,30 @@ const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   "TEAM_B_1",
   "TEAM_B_2",
   "TEAM_B_3",
+  // ── Bundle F2.A.9 (2026-05-19): corner + cards Betfair market types ───
+  // Per Chris directive: poll Betfair for cards, corners, all other
+  // markets Pinnacle covers. Common Betfair market type names per their
+  // documentation; the exact set per event varies. Discovery logger
+  // (below) surfaces any unknown variant Betfair returns so we can
+  // extend this set after first sightings.
+  "TOTAL_CORNERS",
+  "OVER_UNDER_85_CORNERS",
+  "OVER_UNDER_95_CORNERS",
+  "OVER_UNDER_105_CORNERS",
+  "OVER_UNDER_115_CORNERS",
+  "OVER_UNDER_125_CORNERS",
+  "TOTAL_CORNERS_OU",
+  "MATCH_CORNERS",
+  "ASIAN_CORNERS",
+  // Cards / booking points
+  "TOTAL_BOOKINGS",
+  "OVER_UNDER_BKD_PT_25",
+  "OVER_UNDER_BKD_PT_35",
+  "OVER_UNDER_BKD_PT_45",
+  "OVER_UNDER_BKD_PT_55",
+  "BOOKING_POINTS",
+  "TOTAL_CARDS",
+  "MATCH_CARDS",
 ]);
 
 function toInternalMarketType(bfMarketType: string): string {
@@ -72,6 +96,29 @@ function toInternalMarketType(bfMarketType: string): string {
     case "FIRST_HALF_GOALS_15": return "FIRST_HALF_OU_15";
     case "FIRST_HALF_GOALS_25": return "FIRST_HALF_OU_25";
     case "ALT_TOTAL_GOALS": return "ASIAN_TOTAL_GOALS";
+    // ── Bundle F2.A.9 (2026-05-19): corner + cards mappings ─────────────
+    // Multi-line markets (TOTAL_CORNERS, TOTAL_BOOKINGS, MATCH_CORNERS,
+    // MATCH_CARDS) map to a generic internal code. Runners carry the
+    // line as part of runnerName ("Over 8.5", "Over 9.5", etc.) and
+    // deriveSelectionName parses the specific line. Per-line Betfair
+    // markets (OVER_UNDER_85_CORNERS etc.) map to specific TOTAL_CORNERS_xx.
+    case "TOTAL_CORNERS": return "TOTAL_CORNERS_MULTI";
+    case "TOTAL_CORNERS_OU": return "TOTAL_CORNERS_MULTI";
+    case "MATCH_CORNERS": return "TOTAL_CORNERS_MULTI";
+    case "ASIAN_CORNERS": return "ASIAN_CORNERS";
+    case "OVER_UNDER_85_CORNERS": return "TOTAL_CORNERS_85";
+    case "OVER_UNDER_95_CORNERS": return "TOTAL_CORNERS_95";
+    case "OVER_UNDER_105_CORNERS": return "TOTAL_CORNERS_105";
+    case "OVER_UNDER_115_CORNERS": return "TOTAL_CORNERS_115";
+    case "OVER_UNDER_125_CORNERS": return "TOTAL_CORNERS_125";
+    case "TOTAL_BOOKINGS": return "TOTAL_BOOKINGS_MULTI";
+    case "TOTAL_CARDS": return "TOTAL_CARDS_MULTI";
+    case "MATCH_CARDS": return "TOTAL_CARDS_MULTI";
+    case "BOOKING_POINTS": return "TOTAL_BOOKINGS_MULTI";
+    case "OVER_UNDER_BKD_PT_25": return "TOTAL_CARDS_25";
+    case "OVER_UNDER_BKD_PT_35": return "TOTAL_CARDS_35";
+    case "OVER_UNDER_BKD_PT_45": return "TOTAL_CARDS_45";
+    case "OVER_UNDER_BKD_PT_55": return "TOTAL_CARDS_55";
     default: return bfMarketType; // OVER_UNDER_*, DRAW_NO_BET, ASIAN_HANDICAP map 1:1
   }
 }
@@ -119,6 +166,36 @@ function deriveSelectionName(
 
   if (bfMarketType.startsWith("OVER_UNDER_") || bfMarketType.startsWith("FIRST_HALF_GOALS_")) {
     if (lower.startsWith("over") || lower.startsWith("under")) return name;
+    return null;
+  }
+
+  // Bundle F2.A.9 (2026-05-19): corner + cards market runner parsers.
+  // Multi-line markets carry runners like "Over 8.5", "Under 9.5".
+  // Per-line markets carry "Over <line>" / "Under <line>" too.
+  // Selection names normalized to "Over X.5 Corners" / "Over X.5 Cards"
+  // to match internal naming used in apiFootball.ts mapping.
+  if (
+    bfMarketType === "TOTAL_CORNERS" || bfMarketType === "TOTAL_CORNERS_OU" ||
+    bfMarketType === "MATCH_CORNERS" || bfMarketType === "ASIAN_CORNERS" ||
+    bfMarketType.endsWith("_CORNERS")
+  ) {
+    const m = lower.match(/^(over|under)\s+(\d+(?:\.\d+)?)/);
+    if (m) {
+      const side = m[1] === "over" ? "Over" : "Under";
+      return `${side} ${m[2]} Corners`;
+    }
+    return null;
+  }
+  if (
+    bfMarketType === "TOTAL_BOOKINGS" || bfMarketType === "TOTAL_CARDS" ||
+    bfMarketType === "MATCH_CARDS" || bfMarketType === "BOOKING_POINTS" ||
+    bfMarketType.startsWith("OVER_UNDER_BKD_")
+  ) {
+    const m = lower.match(/^(over|under)\s+(\d+(?:\.\d+)?)/);
+    if (m) {
+      const side = m[1] === "over" ? "Over" : "Under";
+      return `${side} ${m[2]} Cards`;
+    }
     return null;
   }
 
@@ -219,7 +296,26 @@ export async function runExchangeBookSweep(
       apiCalls += 1;
       for (const cat of catalogue) {
         const bfMarketType = cat.description?.marketType;
-        if (!bfMarketType || !TARGET_BETFAIR_MARKET_TYPES.has(bfMarketType)) continue;
+        if (!bfMarketType) continue;
+        // Bundle F2.A.9 (2026-05-19) — discovery logger. If a corner-
+        // or card-related market type appears in the catalogue but is
+        // NOT in TARGET_BETFAIR_MARKET_TYPES, log it once so we can
+        // add it. Helps us learn Betfair's actual naming without
+        // running blind catalogue inspections.
+        if (!TARGET_BETFAIR_MARKET_TYPES.has(bfMarketType)) {
+          const upper = bfMarketType.toUpperCase();
+          if (
+            upper.includes("CORNER") || upper.includes("CARD") ||
+            upper.includes("BKD") || upper.includes("BOOKING") ||
+            upper.includes("CRNR")
+          ) {
+            logger.warn(
+              { bfMarketType, marketId: cat.marketId, eventId: match.betfairEventId, marketName: cat.marketName },
+              "Bundle F2.A.9 discovery: unmapped Betfair corner/card market type — consider adding to TARGET_BETFAIR_MARKET_TYPES",
+            );
+          }
+          continue;
+        }
         marketCtxByMarketId.set(cat.marketId, {
           match,
           bfMarketType,
