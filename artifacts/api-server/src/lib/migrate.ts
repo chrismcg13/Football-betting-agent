@@ -4799,6 +4799,12 @@ export async function runMigrations() {
       // Default 1.10 (10% uplift). Capped at 1.0 in code if config is
       // wrong, so safe ceiling.
       { key: "inversion_model_agree_multiplier", value: "1.10" },
+      // Bundle 13.D.2 (2026-05-18): halt counter windowing. Counts
+      // consecutive live losses only on bets placed+settled within
+      // these recent windows. Prevents bulk-reconciled historical bets
+      // from spuriously firing the 7-loss halt.
+      { key: "halt_counter_placed_hours", value: "24" },
+      { key: "halt_counter_settled_hours", value: "6" },
       { key: "high_edge_flag_threshold", value: "7.0" },
       { key: "kelly_multiplier_single_sharp", value: "0.5" },
       { key: "kelly_multiplier_two_sharp", value: "1.0" },

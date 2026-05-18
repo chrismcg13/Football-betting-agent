@@ -472,37 +472,45 @@ export async function applyLevelTransition(): Promise<{
 }
 
 export async function getConsecutiveLiveLosses(): Promise<number> {
-  // Bundle 13.D (2026-05-18): filter to bets settled AFTER cutover_completed_at.
-  // Pre-fix this counter included bulk-reconciled historical losses. When
-  // reconcileSettlements ran at 17:35 UTC and settled ~200 stuck-pending bets
-  // in one swing, the counter saw a run of legacy losses and tripped the
-  // halt spuriously. Filtering to post-cutover settled_at scopes the
-  // counter to the live-trading regime that the circuit breaker is
-  // meant to govern.
+  // Bundle 13.D.2 (2026-05-18): tighter halt-counter filter.
+  // Bundle 13.D used `settled_at > cutover_completed_at` (2026-05-09)
+  // which proved too loose — bulk-reconciled historical bets (placed
+  // pre-cutover but settled today via reconcileSettlements) still
+  // poison the counter because their settled_at is "today".
   //
-  // Falls back to "no filter" if the config row is missing — preserves the
-  // halt behaviour for fresh installs / tests where cutover hasn't run.
-  const cutoverRaw = await getConfigValue("cutover_completed_at");
-  const cutoverTs = cutoverRaw && cutoverRaw.length > 0 ? new Date(cutoverRaw) : null;
-  const cutoverValid = cutoverTs != null && !Number.isNaN(cutoverTs.getTime());
-  const recent = cutoverValid
-    ? await db.execute(sql`
-        SELECT status FROM paper_bets
-        WHERE status IN ('won', 'lost')
-          AND live_tier = 'tier1'
-          AND betfair_bet_id IS NOT NULL
-          AND settled_at > ${cutoverTs!.toISOString()}
-        ORDER BY settled_at DESC
-        LIMIT 20
-      `)
-    : await db.execute(sql`
-        SELECT status FROM paper_bets
-        WHERE status IN ('won', 'lost')
-          AND live_tier = 'tier1'
-          AND betfair_bet_id IS NOT NULL
-        ORDER BY settled_at DESC
-        LIMIT 20
-      `);
+  // True intent: count consecutive losses in the RECENT live-trading
+  // regime, not historical bulk-settles. New filter:
+  //   placed_at > NOW() - INTERVAL '24 hours'
+  //   AND settled_at > NOW() - INTERVAL '6 hours'
+  //
+  // Both windows must be recent. A bet placed 7 days ago and settled
+  // today (bulk reconcile) fails placed_at and is excluded. A bet
+  // placed AND settled today passes both — that's a real recent loss.
+  //
+  // The halt-counter window is configurable via
+  // agent_config.halt_counter_placed_hours (default 24) and
+  // agent_config.halt_counter_settled_hours (default 6). Operator can
+  // tighten to e.g. 12/3 if needed.
+  const placedHoursRaw = await getConfigValue("halt_counter_placed_hours");
+  const settledHoursRaw = await getConfigValue("halt_counter_settled_hours");
+  const placedHours =
+    placedHoursRaw != null && Number.isFinite(Number(placedHoursRaw)) && Number(placedHoursRaw) > 0
+      ? Number(placedHoursRaw)
+      : 24;
+  const settledHours =
+    settledHoursRaw != null && Number.isFinite(Number(settledHoursRaw)) && Number(settledHoursRaw) > 0
+      ? Number(settledHoursRaw)
+      : 6;
+  const recent = await db.execute(sql`
+    SELECT status FROM paper_bets
+    WHERE status IN ('won', 'lost')
+      AND live_tier = 'tier1'
+      AND betfair_bet_id IS NOT NULL
+      AND placed_at > NOW() - INTERVAL '1 hour' * ${placedHours}
+      AND settled_at > NOW() - INTERVAL '1 hour' * ${settledHours}
+    ORDER BY settled_at DESC
+    LIMIT 20
+  `);
 
   let streak = 0;
   for (const row of recent.rows as Record<string, unknown>[]) {
