@@ -6326,6 +6326,25 @@ router.post("/admin/set-bootstrap-priority", async (req, res) => {
   }
 });
 
+// Bundle FP-retrain (2026-05-18): force model retrain. Used when new
+// features land (FP1 xG, FP3 standings/h2h, FP4 transfers) and the
+// bootstrap featureMeans-length-mismatch guard didn't trigger
+// automatically. Returns the new model version + feature count.
+router.post("/admin/force-model-retrain", async (_req, res) => {
+  try {
+    const { forceRetrain } = await import("../services/predictionEngine");
+    const result = await forceRetrain();
+    if (!result) {
+      res.status(200).json({ ok: false, reason: "retrain returned null — insufficient settled bets" });
+      return;
+    }
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "Force model retrain failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 router.get("/admin/freshness-metrics", async (req, res) => {
   try {
     const daysRaw = req.query.days;

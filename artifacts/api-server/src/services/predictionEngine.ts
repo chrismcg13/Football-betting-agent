@@ -75,6 +75,20 @@ export const FEATURE_NAMES = [
   "home_xg_against_avg",
   "away_xg_against_avg",
   "xg_diff",
+  // Bundle FP3 (2026-05-18): wire team_standings + match_h2h depth.
+  // home/away_league_rank uses team_standings (348 rows). Normalize to
+  // /20 so range is [0.05, 1.0]; lower rank = better team (rank 1 → 0.05).
+  // h2h_avg_goals and h2h_btts_rate from match_h2h (703 rows) — depth
+  // beyond h2h_home_win_rate (already in FEATURE_NAMES).
+  "home_league_rank",
+  "away_league_rank",
+  "h2h_avg_goals",
+  "h2h_btts_rate",
+  // Bundle FP4 (2026-05-18): wire team_transfers (294,581 rows) recent
+  // squad churn. Higher = more roster disruption → chemistry risk.
+  // 30-day window catches WC squad changes + new-season activity.
+  "home_transfer_churn_30d",
+  "away_transfer_churn_30d",
 ] as const;
 
 type FeatureName = (typeof FEATURE_NAMES)[number];
@@ -92,6 +106,13 @@ function imputeMissingFeature(name: FeatureName): number {
   if (name === "home_xg_for_avg" || name === "away_xg_for_avg") return 1.3;
   if (name === "home_xg_against_avg" || name === "away_xg_against_avg") return 1.3;
   if (name === "xg_diff") return 0;
+  // Bundle FP3 defaults — mid-table position (rank 10 / 20 = 0.5), avg
+  // 2.5 goals per H2H, neutral BTTS rate of 50%.
+  if (name === "home_league_rank" || name === "away_league_rank") return 0.5;
+  if (name === "h2h_avg_goals") return 2.5;
+  if (name === "h2h_btts_rate") return 0.5;
+  // Bundle FP4 — 0 transfers in 30-day window as quiet-roster baseline.
+  if (name === "home_transfer_churn_30d" || name === "away_transfer_churn_30d") return 0;
   return 0;
 }
 

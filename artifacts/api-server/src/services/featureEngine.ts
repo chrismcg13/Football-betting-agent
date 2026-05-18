@@ -658,6 +658,90 @@ export async function computeFeaturesForMatch(
     await upsertFeature(matchId, "xg_diff", 0);
   }
 
+  // ── Bundle FP3 (2026-05-18): team_standings + match_h2h deeper features ──
+  // home/away_league_rank: rank from team_standings normalized to /20
+  // (lower rank = better team). Latest fetched_at row per team_name.
+  // h2h_avg_goals + h2h_btts_rate: from match_h2h keyed on match_id.
+  try {
+    const standings = await db.execute(sql`
+      WITH fx AS (
+        SELECT home_team, away_team FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        (
+          SELECT rank::int FROM team_standings
+          WHERE team_name = (SELECT home_team FROM fx)
+          ORDER BY fetched_at DESC LIMIT 1
+        ) AS home_rank,
+        (
+          SELECT rank::int FROM team_standings
+          WHERE team_name = (SELECT away_team FROM fx)
+          ORDER BY fetched_at DESC LIMIT 1
+        ) AS away_rank
+    `);
+    const s = ((standings as any).rows ?? [])[0] as
+      | { home_rank: number | null; away_rank: number | null } | undefined;
+    const normalize = (r: number | null | undefined): number => {
+      if (r == null || !Number.isFinite(r) || r <= 0) return 0.5;
+      return Math.max(0.05, Math.min(1.0, r / 20));
+    };
+    await upsertFeature(matchId, "home_league_rank", normalize(s?.home_rank));
+    await upsertFeature(matchId, "away_league_rank", normalize(s?.away_rank));
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP3 league_rank upsert failed — defaulting");
+    await upsertFeature(matchId, "home_league_rank", 0.5);
+    await upsertFeature(matchId, "away_league_rank", 0.5);
+  }
+  try {
+    const h2hRow = await db.execute(sql`
+      SELECT avg_total_goals::float8 AS avg_goals, btts_rate::float8 AS btts
+      FROM match_h2h
+      WHERE match_id = ${matchId}
+      ORDER BY captured_at DESC LIMIT 1
+    `);
+    const h = ((h2hRow as any).rows ?? [])[0] as
+      | { avg_goals: number | null; btts: number | null } | undefined;
+    await upsertFeature(matchId, "h2h_avg_goals",
+      h?.avg_goals != null && Number.isFinite(h.avg_goals) ? h.avg_goals : 2.5);
+    await upsertFeature(matchId, "h2h_btts_rate",
+      h?.btts != null && Number.isFinite(h.btts) ? h.btts : 0.5);
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP3 h2h depth upsert failed — defaulting");
+    await upsertFeature(matchId, "h2h_avg_goals", 2.5);
+    await upsertFeature(matchId, "h2h_btts_rate", 0.5);
+  }
+
+  // ── Bundle FP4 (2026-05-18): team_transfers 30-day squad-churn count ──
+  // Higher = more disruption / chemistry risk. Counts incoming transfers
+  // (team_in_name matches our team) in last 30 days. Caps at 20 to bound
+  // outliers.
+  try {
+    const tx = await db.execute(sql`
+      WITH fx AS (
+        SELECT home_team, away_team FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        (
+          SELECT COUNT(*)::int FROM team_transfers
+          WHERE team_in_name = (SELECT home_team FROM fx)
+            AND transfer_date >= NOW() - INTERVAL '30 days'
+        ) AS home_count,
+        (
+          SELECT COUNT(*)::int FROM team_transfers
+          WHERE team_in_name = (SELECT away_team FROM fx)
+            AND transfer_date >= NOW() - INTERVAL '30 days'
+        ) AS away_count
+    `);
+    const t = ((tx as any).rows ?? [])[0] as
+      | { home_count: number; away_count: number } | undefined;
+    await upsertFeature(matchId, "home_transfer_churn_30d", Math.min(20, t?.home_count ?? 0));
+    await upsertFeature(matchId, "away_transfer_churn_30d", Math.min(20, t?.away_count ?? 0));
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP4 transfer churn upsert failed — defaulting");
+    await upsertFeature(matchId, "home_transfer_churn_30d", 0);
+    await upsertFeature(matchId, "away_transfer_churn_30d", 0);
+  }
+
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
   if (lineupPublishMins !== null) {
     await upsertFeature(matchId, "lineup_publish_mins_pre_kickoff", lineupPublishMins);
@@ -1320,6 +1404,90 @@ async function computeFeaturesFromDb(
     await upsertFeature(matchId, "away_xg_for_avg", 1.3);
     await upsertFeature(matchId, "away_xg_against_avg", 1.3);
     await upsertFeature(matchId, "xg_diff", 0);
+  }
+
+  // ── Bundle FP3 (2026-05-18): team_standings + match_h2h deeper features ──
+  // home/away_league_rank: rank from team_standings normalized to /20
+  // (lower rank = better team). Latest fetched_at row per team_name.
+  // h2h_avg_goals + h2h_btts_rate: from match_h2h keyed on match_id.
+  try {
+    const standings = await db.execute(sql`
+      WITH fx AS (
+        SELECT home_team, away_team FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        (
+          SELECT rank::int FROM team_standings
+          WHERE team_name = (SELECT home_team FROM fx)
+          ORDER BY fetched_at DESC LIMIT 1
+        ) AS home_rank,
+        (
+          SELECT rank::int FROM team_standings
+          WHERE team_name = (SELECT away_team FROM fx)
+          ORDER BY fetched_at DESC LIMIT 1
+        ) AS away_rank
+    `);
+    const s = ((standings as any).rows ?? [])[0] as
+      | { home_rank: number | null; away_rank: number | null } | undefined;
+    const normalize = (r: number | null | undefined): number => {
+      if (r == null || !Number.isFinite(r) || r <= 0) return 0.5;
+      return Math.max(0.05, Math.min(1.0, r / 20));
+    };
+    await upsertFeature(matchId, "home_league_rank", normalize(s?.home_rank));
+    await upsertFeature(matchId, "away_league_rank", normalize(s?.away_rank));
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP3 league_rank upsert failed — defaulting");
+    await upsertFeature(matchId, "home_league_rank", 0.5);
+    await upsertFeature(matchId, "away_league_rank", 0.5);
+  }
+  try {
+    const h2hRow = await db.execute(sql`
+      SELECT avg_total_goals::float8 AS avg_goals, btts_rate::float8 AS btts
+      FROM match_h2h
+      WHERE match_id = ${matchId}
+      ORDER BY captured_at DESC LIMIT 1
+    `);
+    const h = ((h2hRow as any).rows ?? [])[0] as
+      | { avg_goals: number | null; btts: number | null } | undefined;
+    await upsertFeature(matchId, "h2h_avg_goals",
+      h?.avg_goals != null && Number.isFinite(h.avg_goals) ? h.avg_goals : 2.5);
+    await upsertFeature(matchId, "h2h_btts_rate",
+      h?.btts != null && Number.isFinite(h.btts) ? h.btts : 0.5);
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP3 h2h depth upsert failed — defaulting");
+    await upsertFeature(matchId, "h2h_avg_goals", 2.5);
+    await upsertFeature(matchId, "h2h_btts_rate", 0.5);
+  }
+
+  // ── Bundle FP4 (2026-05-18): team_transfers 30-day squad-churn count ──
+  // Higher = more disruption / chemistry risk. Counts incoming transfers
+  // (team_in_name matches our team) in last 30 days. Caps at 20 to bound
+  // outliers.
+  try {
+    const tx = await db.execute(sql`
+      WITH fx AS (
+        SELECT home_team, away_team FROM matches WHERE id = ${matchId}
+      )
+      SELECT
+        (
+          SELECT COUNT(*)::int FROM team_transfers
+          WHERE team_in_name = (SELECT home_team FROM fx)
+            AND transfer_date >= NOW() - INTERVAL '30 days'
+        ) AS home_count,
+        (
+          SELECT COUNT(*)::int FROM team_transfers
+          WHERE team_in_name = (SELECT away_team FROM fx)
+            AND transfer_date >= NOW() - INTERVAL '30 days'
+        ) AS away_count
+    `);
+    const t = ((tx as any).rows ?? [])[0] as
+      | { home_count: number; away_count: number } | undefined;
+    await upsertFeature(matchId, "home_transfer_churn_30d", Math.min(20, t?.home_count ?? 0));
+    await upsertFeature(matchId, "away_transfer_churn_30d", Math.min(20, t?.away_count ?? 0));
+  } catch (err) {
+    logger.debug({ err, matchId }, "Bundle FP4 transfer churn upsert failed — defaulting");
+    await upsertFeature(matchId, "home_transfer_churn_30d", 0);
+    await upsertFeature(matchId, "away_transfer_churn_30d", 0);
   }
 
   // Sub-phase 7.6: conditional lineup-publish-timing (only if captured).
