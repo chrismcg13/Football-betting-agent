@@ -2534,6 +2534,61 @@ const PREFETCH_TARGETS: Array<{ marketType: string; selectionName: string }> = [
   { marketType: "FIRST_HALF_OU_15",   selectionName: "Under 1.5" },
 ];
 
+// ── Bundle F2.0 (2026-05-18): actively-traded-markets cache ─────────────
+// Reads market_types where any (league × market_type) scope qualifies_live
+// OR the __market_type_aggregate__ row qualifies_live. 5-min TTL so a
+// recompute of analysis_signal_strength propagates promptly.
+//
+// Used to gate adaptive AH + BTTS follow-up calls — if the market_type
+// has zero evidence of profitable scopes, we don't spend budget filling
+// extra calls. The MO base call still returns whatever the API includes
+// for free, so discovery isn't blocked.
+interface ActiveMarketsCache {
+  set: Set<string>;
+  expiresAt: number;
+}
+let activeMarketsCache: ActiveMarketsCache | null = null;
+const ACTIVE_MARKETS_TTL_MS = 5 * 60 * 1000;
+
+export async function getActivelyTradedMarkets(): Promise<Set<string>> {
+  const now = Date.now();
+  if (activeMarketsCache && activeMarketsCache.expiresAt > now) {
+    return activeMarketsCache.set;
+  }
+  const set = new Set<string>();
+  try {
+    const rows = await db.execute(sql`
+      SELECT DISTINCT market_type
+      FROM analysis_signal_strength
+      WHERE qualifies_live = true
+        AND market_type IS NOT NULL
+    `) as unknown as { rows?: Array<{ market_type: string }> };
+    for (const r of rows.rows ?? []) {
+      if (r.market_type) set.add(r.market_type);
+    }
+  } catch (err) {
+    logger.warn({ err }, "F2.0: failed to read analysis_signal_strength — defaulting to fire-all");
+    // Fail safe: empty set means trim says "no qualifying markets" which
+    // would skip ALL follow-ups. That's overly aggressive. Instead, return
+    // the legacy set (AH + BTTS) so behaviour matches pre-F2.0 on error.
+    set.add("ASIAN_HANDICAP");
+    set.add("BTTS");
+  }
+  activeMarketsCache = { set, expiresAt: now + ACTIVE_MARKETS_TTL_MS };
+  return set;
+}
+
+export async function isF2MarketTrimEnabled(): Promise<boolean> {
+  try {
+    const { getConfigValue } = await import("./paperTrading");
+    const raw = await getConfigValue("f2_oddspapi_market_trim_enabled");
+    if (raw == null) return true; // default ON
+    return String(raw).toLowerCase().trim() !== "false";
+  } catch {
+    return true;
+  }
+}
+
 export async function prefetchAndStoreOddsPapiOdds(
   earliestKickoff: Date,
   latestKickoff: Date,
@@ -2690,6 +2745,8 @@ export async function prefetchAndStoreOddsPapiOdds(
   let cadenceSkipped = 0;
   let ahFollowupFired = 0;
   let bttsFollowupFired = 0;
+  let ahTrimSkipped = 0;
+  let bttsTrimSkipped = 0;
 
   for (let i = 0; i < mappedRows.length; i++) {
     const row = mappedRows[i];
@@ -2813,7 +2870,19 @@ export async function prefetchAndStoreOddsPapiOdds(
     const ahPinnacleHits = countPinnacleHitsFor((mt) => mt === "ASIAN_HANDICAP");
     const bttsPinnacleHits = countPinnacleHitsFor((mt) => mt === "BTTS");
 
-    if (ahPinnacleHits === 0 && (await canMakeOddspapiRequest(1, "P1"))) {
+    // ── Bundle F2.0 (2026-05-18): markets-per-fixture trim ────────────
+    // Skip adaptive follow-up calls for market_types that have ZERO
+    // qualifying scopes in analysis_signal_strength (per-scope or
+    // aggregate). The MO base call already gives us free discovery
+    // coverage when the API decides to include the market; we just stop
+    // PAYING for extra fills on markets we don't actually trade.
+    // Operator override via f2_oddspapi_market_trim_enabled.
+    const trimEnabled = await isF2MarketTrimEnabled();
+    const tradedMarkets = trimEnabled ? await getActivelyTradedMarkets() : null;
+    const ahShouldFire = !trimEnabled || tradedMarkets!.has("ASIAN_HANDICAP");
+    const bttsShouldFire = !trimEnabled || tradedMarkets!.has("BTTS");
+
+    if (ahPinnacleHits === 0 && ahShouldFire && (await canMakeOddspapiRequest(1, "P1"))) {
       await new Promise((r) => setTimeout(r, 2400));
       const ahRaw = await fetchOddsPapi<RawOddsResponse>(
         "/odds",
@@ -2828,9 +2897,11 @@ export async function prefetchAndStoreOddsPapiOdds(
           ahFollowupFired++;
         }
       }
+    } else if (ahPinnacleHits === 0 && !ahShouldFire) {
+      ahTrimSkipped++;
     }
 
-    if (bttsPinnacleHits === 0 && (await canMakeOddspapiRequest(1, "P1"))) {
+    if (bttsPinnacleHits === 0 && bttsShouldFire && (await canMakeOddspapiRequest(1, "P1"))) {
       await new Promise((r) => setTimeout(r, 2400));
       const bttsRaw = await fetchOddsPapi<RawOddsResponse>(
         "/odds",
@@ -2845,6 +2916,8 @@ export async function prefetchAndStoreOddsPapiOdds(
           bttsFollowupFired++;
         }
       }
+    } else if (bttsPinnacleHits === 0 && !bttsShouldFire) {
+      bttsTrimSkipped++;
     }
 
     // ── Build flat matchCache: selectionName → OddspapiValidation ──
@@ -2955,8 +3028,10 @@ export async function prefetchAndStoreOddsPapiOdds(
       cadenceSkipped,
       ahFollowupFired,
       bttsFollowupFired,
+      ahTrimSkipped,
+      bttsTrimSkipped,
     },
-    "OddsPapi pre-fetch complete (Bundle 1S cadence + adaptive AH/BTTS)",
+    "OddsPapi pre-fetch complete (Bundle 1S cadence + adaptive AH/BTTS + F2.0 trim)",
   );
   return cache;
 }

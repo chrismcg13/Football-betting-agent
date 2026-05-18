@@ -4813,6 +4813,12 @@ export async function runMigrations() {
       { key: "pinnacle_max_age_seconds_3to4pp", value: "90" },
       { key: "pinnacle_max_age_seconds_4to5pp", value: "120" },
       { key: "pinnacle_max_age_seconds_5plus", value: "180" },
+      // Bundle F2.0 (2026-05-18): OddsPapi adaptive market-trim. When
+      // true, skip AH/BTTS follow-up fetches for market_types with zero
+      // qualifying scopes in analysis_signal_strength. MO base call
+      // continues (free discovery via API's bundled response). Operator
+      // can flip to "false" to restore legacy behaviour (fire all).
+      { key: "f2_oddspapi_market_trim_enabled", value: "true" },
       // Bundle 13.D.2 (2026-05-18): halt counter windowing. Counts
       // consecutive live losses only on bets placed+settled within
       // these recent windows. Prevents bulk-reconciled historical bets
