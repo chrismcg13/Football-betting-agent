@@ -2426,6 +2426,53 @@ export async function placePaperBet(
     );
   }
 
+  // ── Bundle 15.C (2026-05-18): TTK-weighted Kelly factor ──────────────────
+  // Per Chris diagnostic #3: "a 7% gap 4 hours out is much weaker evidence
+  // than 7% at T-30 minutes." Pinnacle lines tighten as kickoff approaches
+  // and sharp money has had time to act. Gaps further out are noisier.
+  // Multiply Kelly by a TTK decay factor: ~1.0 inside T-1h, taper linearly
+  // to a floor (default 0.25) at T-24h. Floor configurable via
+  // agent_config.ttk_kelly_floor.
+  if (!isShadowBet && stake > 0) {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      if (await isInversionPipelineEnabled()) {
+        const koRows = await db
+          .select({ kickoffTime: matchesTable.kickoffTime })
+          .from(matchesTable)
+          .where(eq(matchesTable.id, matchId))
+          .limit(1);
+        const ko = koRows[0]?.kickoffTime;
+        if (ko) {
+          const hoursToKo = (new Date(ko).getTime() - Date.now()) / 3_600_000;
+          if (hoursToKo > 0) {
+            const floorRaw = await getConfigValue("ttk_kelly_floor");
+            const ttkFloor =
+              floorRaw != null && Number.isFinite(Number(floorRaw))
+                ? Number(floorRaw)
+                : 0.25;
+            // Linear taper: 1.0 at T-1h, ttkFloor at T-24h+.
+            const rawFactor = 1.0 - Math.max(0, hoursToKo - 1) / 23;
+            const ttkFactor = Math.max(ttkFloor, Math.min(1.0, rawFactor));
+            if (ttkFactor < 1.0) {
+              const before = stake;
+              stake = Math.round(stake * ttkFactor * 100) / 100;
+              logger.info(
+                { matchId, marketType, hoursToKo, ttkFactor, before, after: stake },
+                "Bundle 15.C TTK Kelly multiplier applied",
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? String(err), matchId, marketType, selectionName },
+        "Bundle 15.C TTK weighting failed (non-blocking)",
+      );
+    }
+  }
+
   // Phase 5d.2 (Task 13 wire-in, 2026-05-11): portfolio correlation
   // shrinkage. Treats this new candidate plus any already-pending bets
   // on the same fixture as a basket and shrinks each leg's fraction by
