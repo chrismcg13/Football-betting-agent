@@ -2178,21 +2178,31 @@ export async function placePaperBet(
   let maxStakePct = liveLimits
     ? liveLimits.config.maxSingleBetPct
     : Number((await getConfigValue("max_stake_pct")) ?? "0.02");
-  // ── Bundle 5.D (2026-05-17, gated, NOT shipped) ──────────────────────────
-  // When agent_config.inversion_pipeline_enabled = 'true', the 0.02 absolute
-  // single-bet cap (and its 0.025-0.035 live-mode risk-level equivalent) is
-  // bypassed — Kelly fractioning + correlation 1/√k shrinkage + portfolio
-  // fixture cap + open-exposure ceiling are the binding controls. The cap
-  // was the conservative pre-inversion default for an over-confident model;
-  // post-inversion, edge sizing comes from Pinnacle directly (memo §A, §J)
-  // and the 0.02 cap is a duplicative throttle on top of Kelly itself.
-  // SAFETY: defaults OFF. Bundle 5 enable sequence must be: (i) confirm
-  // inversion gate stable in shadow for n>=200; (ii) operator flips the
-  // agent_config flag; (iii) cap bypass activates atomically.
+  // ── Bundle 5.D bypass — now gated on F2.A burn-in completion (2026-05-18) ──
+  // The Bundle 5.D bypass lifted the 0.02 single-bet cap to 1.0 under
+  // inversion mode on the premise that Kelly fractioning + correlation
+  // 1/√k + portfolio fixture cap were sufficient binding controls.
+  //
+  // F2.A (2026-05-18) expanded the live universe from ~52 proven scopes
+  // to 800+ Pinnacle-covered leagues — many with NO historical calibration.
+  // Adaptive Kelly factor shrinks n<30 scopes via Wilson lower bound, but
+  // can't fully protect against systematic model bias on entirely new
+  // scopes. Re-imposing the 0.02 cap during burn-in is the money guardrail.
+  //
+  // Bypass activates when operator flips f2a_burnin_complete=true after
+  // v_model_calibration_by_scope_daily shows positive stake-weighted CLV
+  // on n>=200 settled F2.A bets.
   try {
     const { isInversionPipelineEnabled } = await import("./inversionPipeline");
     if (await isInversionPipelineEnabled()) {
-      maxStakePct = 1.0; // no absolute cap; Kelly self-limits per memo §7
+      const burninCompleteRaw = await getConfigValue("f2a_burnin_complete");
+      const burninComplete =
+        burninCompleteRaw != null &&
+        String(burninCompleteRaw).toLowerCase().trim() === "true";
+      if (burninComplete) {
+        maxStakePct = 1.0; // no absolute cap; Kelly self-limits per memo §7
+      }
+      // else: retain 0.02 (or operator-configured max_stake_pct) during burn-in
     }
   } catch (err) {
     logger.warn(

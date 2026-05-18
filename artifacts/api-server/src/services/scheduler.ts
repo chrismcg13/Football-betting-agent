@@ -3688,6 +3688,50 @@ export function startScheduler(): void {
   makeTierCron("*/30 * * * *",  "bootstrap",   "bootstrap");
   logger.info("Bundle F2.A: tier-aware polling crons active (Tier 1 every 5m, Tier 2 every 30m, Tier 3 every 1h, Tier 4 every 6h, Bootstrap every 30m)");
 
+  // ── Bundle F1 (2026-05-18): event-driven placement queue drain ──────────
+  // Every 30s, drain unprocessed Pinnacle-write events inside the 180s
+  // freshness window and run the lazy promoter's full gate chain on the
+  // matched (match × market × selection) scopes. Decouples placement from
+  // the 5-min lazy cron — a Pinnacle write triggers re-evaluation within
+  // ~30s, keeping the 180s freshness ceiling honored for marginal-edge
+  // bets. Pre-F1 the lazy cron's 5-min cadence missed ~99% of fresh-
+  // Pinnacle windows (Pinnacle writes ~every 2h on most scopes).
+  let f1DrainRunning = false;
+  cron.schedule("*/30 * * * * *", () => {
+    if (f1DrainRunning) return; // silent skip — 30s cadence is high-frequency
+    f1DrainRunning = true;
+    void (async () => {
+      try {
+        const { getConfigValue } = await import("./paperTrading");
+        const { drainPlacementQueue } = await import("./placementEvent");
+        const { runLazyPromoteShadowToPaper } = await import("./lazyPromoteShadowToPaper");
+        const freshnessRaw = await getConfigValue("pinnacle_max_age_seconds");
+        const dedupeRaw = await getConfigValue("f1_dedupe_window_seconds");
+        const freshness = freshnessRaw != null && Number.isFinite(Number(freshnessRaw)) ? Number(freshnessRaw) : 180;
+        const dedupe = dedupeRaw != null && Number.isFinite(Number(dedupeRaw)) ? Number(dedupeRaw) : 180;
+        const scopes = await drainPlacementQueue({
+          freshnessWindowSeconds: freshness,
+          dedupeWindowSeconds: dedupe,
+          maxRows: 500,
+        });
+        if (scopes.length === 0) return;
+        logger.info({ scopeCount: scopes.length }, "Bundle F1: draining placement queue");
+        const result = await runLazyPromoteShadowToPaper({ scopeAllowlist: scopes });
+        if (result.promoted > 0 || result.skipped_edge_evaporated > 0) {
+          logger.info(
+            { promoted: result.promoted, skipped: result.skipped_edge_evaporated, scopeCount: scopes.length },
+            "Bundle F1: drain cycle complete",
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, "Bundle F1 drain cycle failed");
+      } finally {
+        f1DrainRunning = false;
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Bundle F1: placement_evaluation_queue drain cron active — every 30s UTC");
+
   // ── Bundle F2.A (2026-05-18): calibration tripwire daily audit ──────────
   // Reads model_calibration view, logs alert when global stake-weighted
   // CLV trips below threshold on n >= min_n. AUDIT ONLY — no auto-pause

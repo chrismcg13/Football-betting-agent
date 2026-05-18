@@ -4913,6 +4913,63 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F0: v_freshness_placement_per_write_daily view ready");
 
+    // ── Bundle F1 (2026-05-18): placement_evaluation_queue ────────────────
+    // Event-driven placement evaluator. Pinnacle writers (apiFootball,
+    // oddsPapi) insert one row per (match × market × selection) write.
+    // The 30-second drain cron picks unprocessed rows within the 180s
+    // freshness window and runs the lazy-promoter agreement gate on the
+    // matching pending shadow bet. Bypasses the 5-min lazy cron latency
+    // so a fresh Pinnacle quote triggers re-evaluation within ~30s,
+    // preserving the 180s freshness ceiling for marginal-edge bets.
+    //
+    // Dedupe rule (Chris 2026-05-18): skip if any LIVE placement on the
+    // (match, market, selection) within 180s of the queue row's
+    // captured_at. Allow re-evaluation on new Pinnacle writes within
+    // the window so direction-reversal signals (Bundle 16 / 16.B) can
+    // fire on second-look.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS placement_evaluation_queue (
+        id BIGSERIAL PRIMARY KEY,
+        match_id BIGINT NOT NULL,
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        source TEXT NOT NULL,
+        captured_at TIMESTAMPTZ NOT NULL,
+        enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        processed_at TIMESTAMPTZ,
+        outcome TEXT,
+        bet_id BIGINT
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_peq_unprocessed
+        ON placement_evaluation_queue (processed_at, captured_at)
+        WHERE processed_at IS NULL
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_peq_scope_captured
+        ON placement_evaluation_queue (match_id, market_type, selection_name, captured_at DESC)
+    `);
+    logger.info("Bundle F1: placement_evaluation_queue table + indexes ready");
+
+    // F1 + burn-in: seed config keys
+    const f1Seeds: Array<{ key: string; value: string }> = [
+      // F1 drain cadence — operator-tunable
+      { key: "f1_drain_seconds", value: "30" },
+      // F1 dedupe window — must match pinnacle_max_age_seconds; if you
+      // change one, change the other.
+      { key: "f1_dedupe_window_seconds", value: "180" },
+      // F2.A burn-in flag — when false, max_stake_pct (0.02) cap stays
+      // active under inversion mode. Flip to true once
+      // v_model_calibration_by_scope_daily shows positive stake-weighted
+      // CLV on n>=200 settled F2.A bets.
+      { key: "f2a_burnin_complete", value: "false" },
+    ];
+    for (const row of f1Seeds) {
+      await db.insert(agentConfigTable).values(row).onConflictDoNothing({ target: agentConfigTable.key });
+    }
+    logger.info({ count: f1Seeds.length }, "Bundle F1: config keys seeded");
+
     // ── Bundle F2.A (2026-05-18): bootstrap_priority on competition_config ────
     // Operator override for the polling system — flag a competition for
     // accelerated discovery cadence (e.g., new WC, women's expansion).

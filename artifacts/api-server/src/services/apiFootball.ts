@@ -1195,6 +1195,25 @@ export async function fetchAndStoreOddsForFixture(
         });
         storedCount++;
 
+        // Bundle F1 (2026-05-18): event-driven placement queue. Pinnacle
+        // writes get fan-out into placement_evaluation_queue for the
+        // 30-second drain cron to pick up. Non-blocking — failure to
+        // enqueue doesn't stop the writer.
+        if (bookmakerName === "Pinnacle") {
+          void (async () => {
+            try {
+              const { enqueuePinnacleWrite } = await import("./placementEvent");
+              await enqueuePinnacleWrite({
+                matchId,
+                marketType: mapped.marketType,
+                selectionName: mapped.selectionName,
+                source: "api_football_real:Pinnacle",
+                capturedAt: snapshotTime,
+              });
+            } catch { /* non-blocking */ }
+          })();
+        }
+
         // Track line movement for best-available bookmaker (Bet365 or first found)
         if (kickoffTime && (bookmakerName === "Bet365" || bookmakerName === "Pinnacle" || bookmakerName === "1xBet")) {
           void detectAndLogLineMovement(matchId, mapped.marketType, mapped.selectionName, bookmakerName, mapped.backOdds, kickoffTime);

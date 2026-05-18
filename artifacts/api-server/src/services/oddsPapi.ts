@@ -3003,6 +3003,21 @@ export async function prefetchAndStoreOddsPapiOdds(
           snapshotTime: now,
           source: "oddspapi_pinnacle",
         });
+
+        // Bundle F1 (2026-05-18): event-driven placement queue.
+        // Non-blocking enqueue for the 30-second drain cron.
+        void (async () => {
+          try {
+            const { enqueuePinnacleWrite } = await import("./placementEvent");
+            await enqueuePinnacleWrite({
+              matchId,
+              marketType: marketTypeForSnapshot,
+              selectionName: selName,
+              source: "oddspapi_pinnacle",
+              capturedAt: now,
+            });
+          } catch { /* non-blocking */ }
+        })();
       }
     }
 

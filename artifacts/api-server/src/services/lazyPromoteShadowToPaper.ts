@@ -251,7 +251,17 @@ export interface LazyPromoteResult {
   errors: number;
 }
 
-export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> {
+/**
+ * Bundle F1 (2026-05-18): optional scopeAllowlist restricts the pending-shadow
+ * scan to a specific set of (matchId, marketType, selectionName) tuples.
+ * Used by the F1 placement-event evaluator to evaluate ONLY the scopes
+ * that just received a fresh Pinnacle write. When omitted, full scan
+ * (legacy behavior).
+ */
+export type LazyPromoteOpts = {
+  scopeAllowlist?: ReadonlyArray<{ matchId: number; marketType: string; selectionName: string }>;
+};
+export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promise<LazyPromoteResult> {
   const result: LazyPromoteResult = {
     evaluated_at: new Date().toISOString(),
     pending_shadow_count: 0,
@@ -402,10 +412,19 @@ export async function runLazyPromoteShadowToPaper(): Promise<LazyPromoteResult> 
     actionable_source: string | null;
     league: string | null;
   }>);
-  result.pending_shadow_count = rows.length;
-  if (rows.length === 0) return result;
+  // Bundle F1 (2026-05-18): if scopeAllowlist provided, filter to those
+  // scopes only. F1 evaluator calls with one or more recently-Pinnacle-
+  // updated scopes for targeted evaluation within the 180s window.
+  let filteredRows = rows;
+  if (opts?.scopeAllowlist && opts.scopeAllowlist.length > 0) {
+    const key = (mId: number, mt: string, sn: string) => `${mId}|${mt}|${sn}`;
+    const allowed = new Set(opts.scopeAllowlist.map((s) => key(s.matchId, s.marketType, s.selectionName)));
+    filteredRows = rows.filter((r) => allowed.has(key(r.match_id, r.market_type, r.selection_name)));
+  }
+  result.pending_shadow_count = filteredRows.length;
+  if (filteredRows.length === 0) return result;
 
-  for (const r of rows) {
+  for (const r of filteredRows) {
     try {
       // 2026-05-12: drop the strict/relaxed conditional. The strict variant
       // (30-min exact-selection-name snapshot) structurally cannot lazy-
