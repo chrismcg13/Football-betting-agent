@@ -1856,8 +1856,13 @@ export async function placePaperBet(
               eq(oddsSnapshotsTable.marketType, marketType),
               inArray(oddsSnapshotsTable.selectionName, variants),
               or(
+                // Bundle F1-fix (2026-05-18): "oddspapi" is the BEST-BOOK
+                // aggregate (any bookmaker's best price), NOT Pinnacle.
+                // Pinnacle from OddsPapi is written as "oddspapi_pinnacle".
+                // Reading "oddspapi" here was silently treating soft-book
+                // odds as Pinnacle anchor (bug Chris flagged 2026-05-18).
                 eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
-                eq(oddsSnapshotsTable.source, "oddspapi"),
+                eq(oddsSnapshotsTable.source, "oddspapi_pinnacle"),
                 eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
               ),
             ))
@@ -2864,8 +2869,12 @@ export async function placePaperBet(
         eq(oddsSnapshotsTable.marketType, marketType),
         inArray(oddsSnapshotsTable.selectionName, variants),
         or(
+          // Bundle F1-fix (2026-05-18): "oddspapi" is best-book aggregate
+          // (any bookmaker), not Pinnacle. Use "oddspapi_pinnacle" for the
+          // OddsPapi-Pinnacle source. Bundle 11.D was silently using soft-
+          // book odds as the Pinnacle live-verification anchor.
           eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
-          eq(oddsSnapshotsTable.source, "oddspapi"),
+          eq(oddsSnapshotsTable.source, "oddspapi_pinnacle"),
           eq(oddsSnapshotsTable.source, "derived_from_match_odds"),
         ),
         sql`${oddsSnapshotsTable.snapshotTime} >= NOW() - INTERVAL '1 second' * ${pinnacleMaxAgeSeconds}`,
@@ -2993,8 +3002,11 @@ export async function placePaperBet(
             eq(oddsSnapshotsTable.marketType, marketType),
             inArray(oddsSnapshotsTable.selectionName, variants),
             or(
+              // Bundle F1-fix (2026-05-18): drop "oddspapi" — that's the
+              // best-book aggregate, not Pinnacle data. Pinnacle is
+              // "oddspapi_pinnacle". Bundle 16 direction-detect was
+              // diluting Pinnacle line movements with soft-book noise.
               eq(oddsSnapshotsTable.source, "api_football_real:Pinnacle"),
-              eq(oddsSnapshotsTable.source, "oddspapi"),
               eq(oddsSnapshotsTable.source, "oddspapi_pinnacle"),
             ),
             sql`${oddsSnapshotsTable.snapshotTime} < NOW() - INTERVAL '5 minutes'`,

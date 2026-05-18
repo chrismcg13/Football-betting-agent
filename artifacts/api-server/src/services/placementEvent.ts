@@ -46,7 +46,10 @@ export async function enqueuePinnacleWrite(event: PinnacleWriteEvent): Promise<v
       VALUES (${event.matchId}, ${event.marketType}, ${event.selectionName}, ${event.source}, ${event.capturedAt})
     `);
   } catch (err) {
-    logger.debug({ err, event }, "Bundle F1 enqueue failed (non-blocking)");
+    // Elevated from debug → warn 2026-05-18 so silent enqueue failures
+    // surface in production logs (per Chris feedback after 0-row queue
+    // observed despite 1,445 Pinnacle writes in 30 min post-deploy).
+    logger.warn({ err: (err as Error)?.message ?? String(err), event }, "Bundle F1 enqueue failed");
   }
 }
 

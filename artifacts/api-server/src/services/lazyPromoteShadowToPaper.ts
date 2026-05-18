@@ -724,19 +724,29 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
             pinnMaxAgeRaw != null && Number.isFinite(Number(pinnMaxAgeRaw)) ? Number(pinnMaxAgeRaw) : 180;
           const bfMaxAgeSec =
             bfMaxAgeRaw != null && Number.isFinite(Number(bfMaxAgeRaw)) ? Number(bfMaxAgeRaw) : 180;
-          // Fetch fresh Pinnacle anchor + fresh Betfair best-back in
-          // parallel so we always evaluate against current prices.
+          // ── Bundle F1.1 (2026-05-18): fresh-Pinnacle query fix ──────────
+          // Previous read used pinnacle_odds_snapshots which only carries
+          // STRUCTURED-PHASE rows (identification, closing, t60/30/15/5,
+          // pre_kickoff). The continuous mid-window Pinnacle stream from
+          // api-football lands in odds_snapshots with source =
+          // 'api_football_real:Pinnacle', NOT in pinnacle_odds_snapshots.
+          //
+          // Between identification and the t60 phase, pinnacle_odds_snapshots
+          // could be hours stale → 180s freshness filter excluded most
+          // candidates. Now reading from odds_snapshots directly with
+          // source-name filter for actual fresh Pinnacle anchor.
           const [pinnRow, bfRow] = await Promise.all([
             db.execute(sql`
-              SELECT pinnacle_implied::float8 AS pinn_implied,
-                     captured_at
-              FROM pinnacle_odds_snapshots
+              SELECT (1.0 / back_odds::float8)::float8 AS pinn_implied,
+                     snapshot_time AS captured_at
+              FROM odds_snapshots
               WHERE match_id = ${r.match_id}
                 AND market_type = ${r.market_type}
                 AND selection_name = ${r.selection_name}
-                AND bookmaker_slug = 'pinnacle'
-                AND captured_at >= NOW() - INTERVAL '1 second' * ${pinnMaxAgeSec}
-              ORDER BY captured_at DESC
+                AND source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+                AND back_odds > 1.01
+                AND snapshot_time >= NOW() - INTERVAL '1 second' * ${pinnMaxAgeSec}
+              ORDER BY snapshot_time DESC
               LIMIT 1
             `) as unknown as Promise<{ rows?: Array<{ pinn_implied: number | null; captured_at: string | null }> }>,
             db.execute(sql`
@@ -931,26 +941,33 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
           if (await isInversionPipelineEnabled() && liveBetfairBack != null && liveBetfairBack > 1.01) {
             // Pull current Pinnacle (with timestamp) + 5-15min-ago Pinnacle
             // + match kickoff in parallel.
+            // Bundle F1.1 (2026-05-18): same fix as the freshness query
+            // upstream — read fresh + lookback Pinnacle from odds_snapshots
+            // (continuous stream) not pinnacle_odds_snapshots (structured
+            // phases only). The latter is stale between identification
+            // and t60, missing the live Pinnacle quotes.
             const [pinnFreshRes, pinnLookbackRes, matchKoRes] = await Promise.all([
               db.execute(sql`
-                SELECT pinnacle_implied::float8 AS pi, captured_at
-                FROM pinnacle_odds_snapshots
+                SELECT (1.0 / back_odds::float8)::float8 AS pi, snapshot_time AS captured_at
+                FROM odds_snapshots
                 WHERE match_id = ${r.match_id}
                   AND market_type = ${r.market_type}
                   AND selection_name = ${r.selection_name}
-                  AND bookmaker_slug = 'pinnacle'
-                ORDER BY captured_at DESC LIMIT 1
+                  AND source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+                  AND back_odds > 1.01
+                ORDER BY snapshot_time DESC LIMIT 1
               `) as unknown as Promise<{ rows?: Array<{ pi: number | null; captured_at: string }> }>,
               db.execute(sql`
-                SELECT pinnacle_implied::float8 AS pi
-                FROM pinnacle_odds_snapshots
+                SELECT (1.0 / back_odds::float8)::float8 AS pi
+                FROM odds_snapshots
                 WHERE match_id = ${r.match_id}
                   AND market_type = ${r.market_type}
                   AND selection_name = ${r.selection_name}
-                  AND bookmaker_slug = 'pinnacle'
-                  AND captured_at < NOW() - INTERVAL '5 minutes'
-                  AND captured_at > NOW() - INTERVAL '15 minutes'
-                ORDER BY captured_at ASC LIMIT 1
+                  AND source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+                  AND back_odds > 1.01
+                  AND snapshot_time < NOW() - INTERVAL '5 minutes'
+                  AND snapshot_time > NOW() - INTERVAL '15 minutes'
+                ORDER BY snapshot_time ASC LIMIT 1
               `) as unknown as Promise<{ rows?: Array<{ pi: number | null }> }>,
               db.execute(sql`SELECT kickoff_time FROM matches WHERE id = ${r.match_id} LIMIT 1`) as unknown as Promise<{ rows?: Array<{ kickoff_time: string | null }> }>,
             ]);

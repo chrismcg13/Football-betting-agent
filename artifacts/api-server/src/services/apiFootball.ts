@@ -1198,7 +1198,8 @@ export async function fetchAndStoreOddsForFixture(
         // Bundle F1 (2026-05-18): event-driven placement queue. Pinnacle
         // writes get fan-out into placement_evaluation_queue for the
         // 30-second drain cron to pick up. Non-blocking — failure to
-        // enqueue doesn't stop the writer.
+        // enqueue doesn't stop the writer, but errors are now logged
+        // at warn level so silent breakage surfaces.
         if (bookmakerName === "Pinnacle") {
           void (async () => {
             try {
@@ -1210,7 +1211,9 @@ export async function fetchAndStoreOddsForFixture(
                 source: "api_football_real:Pinnacle",
                 capturedAt: snapshotTime,
               });
-            } catch { /* non-blocking */ }
+            } catch (err) {
+              logger.warn({ err: (err as Error)?.message ?? String(err), matchId, marketType: mapped.marketType }, "Bundle F1 apiFootball enqueue dynamic-import failed");
+            }
           })();
         }
 
