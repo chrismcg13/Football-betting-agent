@@ -6291,6 +6291,20 @@ router.post("/admin/fit-half-fractions", async (_req, res) => {
 // Bundle F2.B.I (2026-05-19): trigger niche-league Betfair discovery on
 // demand. Same code path as the 6h cron — useful after adding a new
 // league or to verify the negative-cache behavior without waiting.
+// Bundle F2.B.N (2026-05-19): fit per-league NegBin dispersion k for
+// corners + cards. Operator-triggered for v1; promote to scheduled cron
+// once cadence stable.
+router.post("/admin/fit-dispersion-k", async (_req, res) => {
+  try {
+    const { runDispersionKFit } = await import("../services/dispersionKFit");
+    const result = await runDispersionKFit();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "Dispersion k fit failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 router.post("/admin/run-niche-league-discovery", async (_req, res) => {
   try {
     const { runNicheLeagueDiscovery } = await import("../services/betfairMarketDiscovery");

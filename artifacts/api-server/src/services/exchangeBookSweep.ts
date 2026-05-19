@@ -574,6 +574,20 @@ export async function runExchangeBookSweep(
           // If no line matched (e.g., "Push" / unfamiliar runner) leave as
           // MULTI — downstream consumers will skip, no edge lost.
         }
+        // Bundle F2.B.O (2026-05-19): split TOTAL_BOOKINGS_MULTI into
+        // per-line TOTAL_BOOKING_POINTS_X using the integer points line
+        // from "Over 35 BookingPoints" runner names. Aligns with the
+        // Bundle O predictor's emission market_type (TOTAL_BOOKING_POINTS_35
+        // etc.). Same split pattern as A.2.1 for corners.
+        if (writeMarketType === "TOTAL_BOOKINGS_MULTI") {
+          const m = selectionName.match(/^(?:Over|Under)\s+(\d+(?:\.\d+)?)/);
+          if (m) {
+            const line = parseFloat(m[1]!);
+            if (Number.isFinite(line)) {
+              writeMarketType = `TOTAL_BOOKING_POINTS_${Math.round(line)}`;
+            }
+          }
+        }
 
         try {
           await db.insert(oddsSnapshotsTable).values({

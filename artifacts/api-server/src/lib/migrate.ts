@@ -5257,6 +5257,29 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.K: v_predictor_consistency view ready");
 
+    // ── Bundle F2.B.N (2026-05-19): per-league dispersion k ──
+    // One row per (league, family) where family ∈ {corners, cards}.
+    // Replaces hardcoded CORNERS_K_GLOBAL / CARDS_K_GLOBAL with
+    // Bayesian-shrunk MoM fits.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS league_dispersion_k (
+        id SERIAL PRIMARY KEY,
+        league TEXT NOT NULL,
+        family TEXT NOT NULL,
+        n_matches INTEGER NOT NULL,
+        mean NUMERIC(8,3),
+        variance NUMERIC(10,3),
+        k_mle NUMERIC(8,3),
+        k_posterior NUMERIC(8,3) NOT NULL,
+        fit_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS league_dispersion_k_unique
+        ON league_dispersion_k (league, family)
+    `);
+    logger.info("Bundle F2.B.N: league_dispersion_k table ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

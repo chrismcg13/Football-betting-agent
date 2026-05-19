@@ -1390,6 +1390,13 @@ export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   // market with no settlement push (integer handicaps only). exchangeBook
   // Sweep catalogue requests it per F2.A.9.2.
   "EUROPEAN_HANDICAP",
+  // Bundle F2.B.O (2026-05-19): TOTAL_BOOKING_POINTS — Betfair's native
+  // cards market (yellow=10, red=25). Settlement bridge deferred —
+  // shadow-only emission until ResolveContext carries yellow/red split.
+  "TOTAL_BOOKING_POINTS_25",
+  "TOTAL_BOOKING_POINTS_35",
+  "TOTAL_BOOKING_POINTS_45",
+  "TOTAL_BOOKING_POINTS_55",
 ]);
 
 // 2026-05-16 subtract bundle: TOTAL_CORNERS_* entirely subtracted; this

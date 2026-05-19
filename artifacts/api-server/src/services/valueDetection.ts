@@ -37,6 +37,7 @@ import {
   predictAsianTotalGoals,
   predictTotalCorners,
   predictTotalCards,
+  predictTotalBookingPoints,
   predictHalfTimeMatchOdds,
   predictSecondHalfMatchOdds,
   predictEuropeanHandicap,
@@ -64,6 +65,11 @@ export interface ValueBet {
   // active for the (league × market) at emission time.
   rawModelProbability: number;
   calibrationBucketId: number | null;
+  // Bundle F2.B.H (2026-05-19): version of the calibration bucket active
+  // at the moment this candidate was emitted. Pins paper_bets to its
+  // placement-time bucket state so updateBucketFromSettledBet doesn't
+  // retroactively change Kelly attribution on sibling pending bets.
+  calibrationBucketVersionAtPlacement: number | null;
   impliedProbability: number;
   edge: number;
   backOdds: number;
@@ -616,7 +622,8 @@ function getModelProbability(
     const suffix = marketType.split("_").pop()!;
     const line = parseInt(suffix, 10) / 10; // "85" → 8.5
     if (!Number.isFinite(line)) return null;
-    const tc = predictTotalCorners(enriched, line);
+    const kCorners = enriched["_league_k_corners"];
+    const tc = predictTotalCorners(enriched, line, kCorners);
     if (!tc) return null;
     if (selectionName.startsWith("Over")) return tc.over;
     if (selectionName.startsWith("Under")) return tc.under;
@@ -672,10 +679,33 @@ function getModelProbability(
     const suffix = marketType.split("_").pop()!;
     const line = parseInt(suffix, 10) / 10; // "35" → 3.5
     if (!Number.isFinite(line)) return null;
-    const tc = predictTotalCards(enriched, line);
+    const kCards = enriched["_league_k_cards"];
+    const tc = predictTotalCards(enriched, line, kCards);
     if (!tc) return null;
     if (selectionName.startsWith("Over")) return tc.over;
     if (selectionName.startsWith("Under")) return tc.under;
+    return null;
+  }
+  // Bundle F2.B.O (2026-05-19): TOTAL_BOOKING_POINTS_X — Betfair native
+  // cards market (yellow=10pts, red=25pts). Predictor approximates booking
+  // points as NegBin on (10*lambda_yellow + 25*lambda_red). Lines from
+  // suffix: 25, 35, 45, 55 booking points. Per-league k via same dispersion
+  // fit as TOTAL_CARDS (cards family). Settlement bridge (ResolveContext
+  // extension to carry yellow/red split) deferred — v1 shadow-only.
+  if (
+    marketType === "TOTAL_BOOKING_POINTS_25" ||
+    marketType === "TOTAL_BOOKING_POINTS_35" ||
+    marketType === "TOTAL_BOOKING_POINTS_45" ||
+    marketType === "TOTAL_BOOKING_POINTS_55"
+  ) {
+    const suffix = marketType.split("_").pop()!;
+    const line = parseInt(suffix, 10); // "35" → 35 booking points
+    if (!Number.isFinite(line)) return null;
+    const kCards = enriched["_league_k_cards"];
+    const tbp = predictTotalBookingPoints(enriched, line, kCards);
+    if (!tbp) return null;
+    if (selectionName.startsWith("Over")) return tbp.over;
+    if (selectionName.startsWith("Under")) return tbp.under;
     return null;
   }
   // Over/Under 0.5 goals
@@ -1560,6 +1590,12 @@ export async function detectValueBets(options?: {
     // feature names. Sync DB read on first call per cache window.
     const { getHalfFractionForLeague } = await import("./halfFractionFit");
     featureMap["_league_ht_fraction"] = await getHalfFractionForLeague(match.league);
+    // Bundle F2.B.N (2026-05-19): per-league NegBin k for corners + cards
+    // predictors. Same key-injection pattern as ht_fraction. 5-min cached
+    // reads; fallback to global prior for unfitted leagues.
+    const { getDispersionKForLeague } = await import("./dispersionKFit");
+    featureMap["_league_k_corners"] = await getDispersionKForLeague(match.league, "corners");
+    featureMap["_league_k_cards"] = await getDispersionKForLeague(match.league, "cards");
 
     // Phase 1a (2026-05-14): load Dixon-Coles correction context once
     // per match. Resolves (rho, copulaKind, gender) and consults

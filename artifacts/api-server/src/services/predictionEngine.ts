@@ -1713,6 +1713,10 @@ function negBinCdf(mean: number, kDisp: number, line: number): number {
 export function predictTotalCorners(
   featureMap: Record<string, number>,
   line: number,
+  // Bundle F2.B.N (2026-05-19): per-league dispersion override.
+  // Caller threads k from league_dispersion_k posterior; falls back to
+  // CORNERS_K_GLOBAL when null (caller hasn't fetched / league not fitted).
+  kOverride?: number | null,
 ): { over: number; under: number } | null {
   const homeCornersAvg = featureMap["home_corners_avg"];
   const awayCornersAvg = featureMap["away_corners_avg"];
@@ -1728,7 +1732,11 @@ export function predictTotalCorners(
   }
   const lambda = homeCornersAvg + awayCornersAvg;
   if (lambda <= 0) return null;
-  const under = negBinCdf(lambda, CORNERS_K_GLOBAL, line);
+  const k =
+    kOverride != null && Number.isFinite(kOverride) && kOverride > 0
+      ? kOverride
+      : CORNERS_K_GLOBAL;
+  const under = negBinCdf(lambda, k, line);
   const overRaw = 1 - under;
   return {
     over: Math.max(0.01, Math.min(0.99, overRaw)),
@@ -1769,6 +1777,8 @@ const RED_CARD_PRIOR = 0.1;
 export function predictTotalCards(
   featureMap: Record<string, number>,
   line: number,
+  // Bundle F2.B.N (2026-05-19): per-league dispersion override.
+  kOverride?: number | null,
 ): { over: number; under: number } | null {
   const homeYellow = featureMap["home_yellow_cards_avg"];
   const awayYellow = featureMap["away_yellow_cards_avg"];
@@ -1784,7 +1794,60 @@ export function predictTotalCards(
   }
   const lambda = homeYellow + awayYellow + RED_CARD_PRIOR;
   if (lambda <= 0) return null;
-  const under = negBinCdf(lambda, CARDS_K_GLOBAL, line);
+  const k =
+    kOverride != null && Number.isFinite(kOverride) && kOverride > 0
+      ? kOverride
+      : CARDS_K_GLOBAL;
+  const under = negBinCdf(lambda, k, line);
+  const overRaw = 1 - under;
+  return {
+    over: Math.max(0.01, Math.min(0.99, overRaw)),
+    under: Math.max(0.01, Math.min(0.99, under)),
+  };
+}
+
+// ===================== Bundle F2.B.O (2026-05-19) Booking Points =====================
+//
+// Betfair represents cards as TOTAL_BOOKING_POINTS (yellow=10, red=25).
+// Lines typically 25 / 35 / 45 / 55 booking points (3.5 to 5.5 yellow-
+// equivalents). Compound Poisson / NegBin on the points scale —
+// approximated as scaled card count.
+//
+// Mean booking points: 10 × λ_yellow + 25 × λ_red. Without separate
+// per-team red rate, fold the global RED_CARD_PRIOR (0.1 reds/match)
+// to estimate red contribution. Empirically this lands ~0-3pp off true
+// mean for top leagues — refinement (per-team red rate) is a follow-up.
+
+export function predictTotalBookingPoints(
+  featureMap: Record<string, number>,
+  line: number,
+  kOverride?: number | null,
+): { over: number; under: number } | null {
+  const homeYellow = featureMap["home_yellow_cards_avg"];
+  const awayYellow = featureMap["away_yellow_cards_avg"];
+  if (
+    homeYellow == null ||
+    awayYellow == null ||
+    !Number.isFinite(homeYellow) ||
+    !Number.isFinite(awayYellow) ||
+    homeYellow < 0 ||
+    awayYellow < 0
+  ) {
+    return null;
+  }
+  const lambdaYellow = homeYellow + awayYellow;
+  const lambdaRed = RED_CARD_PRIOR;
+  const meanPoints = 10 * lambdaYellow + 25 * lambdaRed;
+  if (meanPoints <= 0) return null;
+  const k =
+    kOverride != null && Number.isFinite(kOverride) && kOverride > 0
+      ? kOverride
+      : CARDS_K_GLOBAL;
+  // Approx: model booking_points as NegBin on the points scale. The
+  // discrete points are coarse (multiples of 5/10/15) but for OVER/UNDER
+  // at half-point lines (25, 35, 45...) the CDF approximation is
+  // acceptable. negBinCdf naturally floors to int — adequate for v1.
+  const under = negBinCdf(meanPoints, k, line);
   const overRaw = 1 - under;
   return {
     over: Math.max(0.01, Math.min(0.99, overRaw)),

@@ -197,10 +197,48 @@ export async function calibrate(
     return { calibrated: rawProb, bucketId: bucket.bucketId, bucketVersion: bucket.version };
   }
 
-  const calibrated = interpolateIsotonic(rawProb, bucket.params);
-  // Defensive clamp.
-  const clamped = Math.max(0, Math.min(1, calibrated));
-  return { calibrated: clamped, bucketId: bucket.bucketId, bucketVersion: bucket.version };
+  const isotonicCalibrated = interpolateIsotonic(rawProb, bucket.params);
+  // Defensive clamp on the isotonic output.
+  const isotonicClamped = Math.max(0, Math.min(1, isotonicCalibrated));
+
+  // ── Bundle F2.B.H.2 (2026-05-19): posterior shrinkage ──
+  // Use the Beta-Binomial posterior accumulated by updateBucketFromSettled
+  // Bet to shrink the isotonic-calibrated value toward the empirical
+  // win-rate. Avoids the "AH n=1774 bootstrap_lo95 = -0.23" pattern
+  // where isotonic says one thing but realised outcomes consistently
+  // diverge — posterior pulls the calibrated value toward what we
+  // actually observe.
+  //
+  // Formula: shrunk = (k_iso × isotonic + n_obs × posterior_p) / (k_iso + n_obs)
+  //   k_iso  = pseudo-count for the isotonic prior (50 by default —
+  //            roughly equal weight at n_obs=50, isotonic-dominated below,
+  //            posterior-dominated above)
+  //   n_obs  = posterior_alpha + posterior_beta − 2 (subtract the Beta(1,1)
+  //            initial prior — n_obs counts only observed bets)
+  //   posterior_p = posterior_alpha / (posterior_alpha + posterior_beta)
+  //
+  // Effects:
+  //   - At n_obs=0 (no settled bets yet) → shrunk = isotonic (dormant)
+  //   - At n_obs=50 → 50/50 blend
+  //   - At n_obs=500 → 91% posterior weight
+  //   - posterior_p only meaningful for buckets whose bets cluster around
+  //     a similar probability band — orthogonal to per-odds-band variation
+  //     which is a future refinement
+  const ISOTONIC_PSEUDO_COUNT = 50;
+  const nObserved = Math.max(
+    0,
+    bucket.posteriorAlpha + bucket.posteriorBeta - 2,
+  );
+  let finalCalibrated = isotonicClamped;
+  if (nObserved > 0 && bucket.posteriorAlpha + bucket.posteriorBeta > 0) {
+    const posteriorP = bucket.posteriorAlpha / (bucket.posteriorAlpha + bucket.posteriorBeta);
+    finalCalibrated =
+      (ISOTONIC_PSEUDO_COUNT * isotonicClamped + nObserved * posteriorP) /
+      (ISOTONIC_PSEUDO_COUNT + nObserved);
+  }
+  const finalClamped = Math.max(0, Math.min(1, finalCalibrated));
+
+  return { calibrated: finalClamped, bucketId: bucket.bucketId, bucketVersion: bucket.version };
 }
 
 // ── Bundle F2.B.H (2026-05-19): Beta-Binomial posterior updater ─────────

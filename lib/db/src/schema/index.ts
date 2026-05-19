@@ -50,3 +50,4 @@ export * from "./modelLayerEnabled";
 export * from "./teamFormScrape";
 export * from "./pinnacleLineMovement";
 export * from "./leagueHalfFractions";
+export * from "./leagueDispersionK";
