@@ -515,9 +515,21 @@ function mapOddsToMarket(
   // covers selection" gate. NEXT_GOAL excluded — pre-match agent does
   // not place in-play bets.
 
-  // CORRECT_SCORE — bet name "Exact Score" / "Correct Score"
+  // CORRECT_SCORE — bet name "Exact Score" / "Correct Score" (FULL TIME only).
   // Values come as "1:0", "2:1", "0:0", etc. or "1-0", "2-1".
-  if (norm.includes("correct score") || norm.includes("exact score")) {
+  // F2.A.11.1 (2026-05-19) bugfix: exclude halftime variants
+  // ("Correct Score 1st Half", "Exact Score Halftime", "Halftime Correct
+  // Score") — they share the same selection format and were being
+  // conflated into CORRECT_SCORE, producing dual rows with different
+  // odds per scoreline per match. No HALF_TIME_SCORE predictor exists,
+  // so these are dropped (avoid ingesting dead weight).
+  const isHalftimeCS =
+    norm.includes("1st half") ||
+    norm.includes("first half") ||
+    norm.includes("half time") ||
+    norm.includes("halftime") ||
+    norm.includes("ht ");
+  if (!isHalftimeCS && (norm.includes("correct score") || norm.includes("exact score"))) {
     const m = v.match(/^(\d+)\s*[:\-]\s*(\d+)$/);
     if (m) {
       const sel = `${m[1]} - ${m[2]}`; // normalise to Betfair format
