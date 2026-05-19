@@ -117,7 +117,7 @@ Other rules:
 - **Betfair Exchange minimum = £2** — bets sized below £2 demote to shadow with reason `kelly_below_min_stake`.
 - **`max_stake_pct = 0.02`** absolute cap per bet. Money guardrail; needs operator approval to change.
 - **`portfolio_fixture_cap = 0.05`** correlation cap per fixture across a basket.
-- **No daily-loss caps, no bankroll floors** — kill switch + 7-loss halt are the only operator guardrails (`risk guardrails: strip exposure caps + bankroll floors`, 2026-05-12).
+- **No daily-loss caps, no bankroll floors** — kill switch is the only operator guardrail (7-loss halt removed 2026-05-19 — Kelly is self-throttling, daily/weekly drawdown limits remain in force).
 
 ## 8 — Architecture
 

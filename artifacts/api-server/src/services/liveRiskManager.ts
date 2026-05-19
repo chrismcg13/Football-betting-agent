@@ -548,21 +548,14 @@ export async function checkLiveCircuitBreakers(): Promise<LiveCircuitBreakerResu
     }
   }
 
-  // 2026-05-12: single loss-streak guard. The prior three-tier escalation
-  // (3-loss 1hr pause / 5-loss 6hr pause / 8-loss halt) was over-engineered —
-  // bad-luck streaks of 3-5 fire on noise, not model-broken signal. Kelly
-  // growth theory says the only legitimate exit is "model has gone bad",
-  // which 7 consecutive losses captures cleanly. Daily/weekly drawdown
-  // limits remain in force as the other dimension of model-broken detection.
-  const consecutiveLosses = await getConsecutiveLiveLosses();
-  if (consecutiveLosses >= 7) {
-    return {
-      triggered: true,
-      action: "halt",
-      reason: `CRITICAL: ${consecutiveLosses} consecutive live losses — manual restart required`,
-      autoResumeAt: null,
-    };
-  }
+  // 2026-05-19: 7-consecutive-loss halt removed (operator-approved).
+  // Kelly is self-throttling — stake size scales with bankroll, so
+  // a model-broken regime mechanically shrinks position size as PnL
+  // erodes. Daily/weekly drawdown limits remain in force as the other
+  // dimension of model-broken detection; the streak halt was a redundant
+  // belt-and-braces that fired on noise (P(7 consecutive losses at
+  // p=0.50) = 0.78%, which a bankroll of 14k+ bets will hit ~110×
+  // per year by chance alone).
 
   // 2026-05-12: absolute-cash floor decommissioned. Kelly is self-throttling
   // (stakes shrink with bankroll); the £2 Betfair minimum is the natural ruin
