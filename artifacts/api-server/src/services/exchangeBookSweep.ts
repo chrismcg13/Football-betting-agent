@@ -85,6 +85,18 @@ const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   "TO_WIN_TO_NIL",             // team wins without conceding
   "CLEAN_SHEET_TEAM_A",        // team A keeps clean sheet
   "CLEAN_SHEET_TEAM_B",        // team B keeps clean sheet
+  // ── Bundle F2.B.AUDIT-FIX (2026-05-19): ACTUAL Betfair Exchange codes ──
+  // Discovery cron observation: corners + cards markets on Exchange are
+  // returned under _CORNR / _CARDS suffix codes — NOT the docs aliases
+  // TOTAL_CORNERS / TOTAL_BOOKING_POINTS. Without these in the target set
+  // the sweep filters them out even when the catalogue returns them.
+  "OVER_UNDER_25_CORNR", "OVER_UNDER_35_CORNR", "OVER_UNDER_45_CORNR",
+  "OVER_UNDER_55_CORNR", "OVER_UNDER_65_CORNR", "OVER_UNDER_75_CORNR",
+  "OVER_UNDER_85_CORNR", "OVER_UNDER_95_CORNR", "OVER_UNDER_105_CORNR",
+  "OVER_UNDER_115_CORNR", "OVER_UNDER_125_CORNR",
+  "OVER_UNDER_25_CARDS", "OVER_UNDER_35_CARDS", "OVER_UNDER_45_CARDS",
+  "OVER_UNDER_55_CARDS",
+  "CORNER_ODDS",
 ]);
 
 function toInternalMarketType(bfMarketType: string): string {
@@ -130,6 +142,25 @@ function toInternalMarketType(bfMarketType: string): string {
     case "TO_WIN_TO_NIL":         return "WIN_TO_NIL";
     case "CLEAN_SHEET_TEAM_A":    return "CLEAN_SHEET_HOME";
     case "CLEAN_SHEET_TEAM_B":    return "CLEAN_SHEET_AWAY";
+    // Bundle F2.B.AUDIT-FIX (2026-05-19): map ACTUAL Exchange codes to
+    // our internal line-suffixed market types so Pinnacle (which uses
+    // TOTAL_CORNERS_85) and Betfair join by market_type at value detection.
+    case "OVER_UNDER_25_CORNR":   return "TOTAL_CORNERS_25";
+    case "OVER_UNDER_35_CORNR":   return "TOTAL_CORNERS_35";
+    case "OVER_UNDER_45_CORNR":   return "TOTAL_CORNERS_45";
+    case "OVER_UNDER_55_CORNR":   return "TOTAL_CORNERS_55";
+    case "OVER_UNDER_65_CORNR":   return "TOTAL_CORNERS_65";
+    case "OVER_UNDER_75_CORNR":   return "TOTAL_CORNERS_75";
+    case "OVER_UNDER_85_CORNR":   return "TOTAL_CORNERS_85";
+    case "OVER_UNDER_95_CORNR":   return "TOTAL_CORNERS_95";
+    case "OVER_UNDER_105_CORNR":  return "TOTAL_CORNERS_105";
+    case "OVER_UNDER_115_CORNR":  return "TOTAL_CORNERS_115";
+    case "OVER_UNDER_125_CORNR":  return "TOTAL_CORNERS_125";
+    case "OVER_UNDER_25_CARDS":   return "TOTAL_CARDS_25";
+    case "OVER_UNDER_35_CARDS":   return "TOTAL_CARDS_35";
+    case "OVER_UNDER_45_CARDS":   return "TOTAL_CARDS_45";
+    case "OVER_UNDER_55_CARDS":   return "TOTAL_CARDS_55";
+    case "CORNER_ODDS":           return "MATCH_CORNERS_2WAY";
     default: return bfMarketType; // OVER_UNDER_*, DRAW_NO_BET, ASIAN_HANDICAP map 1:1
   }
 }
@@ -172,6 +203,40 @@ function deriveSelectionName(
     if (lower === awayTeam.toLowerCase()) return "Away";
     if (runner.sortPriority === 1) return "Home";
     if (runner.sortPriority === 2) return "Away";
+    return null;
+  }
+
+  // Bundle F2.B.AUDIT-FIX (2026-05-19): _CORNR / _CARDS variants of
+  // OVER_UNDER_* must be handled BEFORE the generic catch-all below so
+  // the selection name matches Pinnacle's storage ("Over 8.5 Corners",
+  // "Over 3.5 Cards"). Without this normalisation Betfair writes
+  // "Over 8.5" and selectPricingSources fails to join Pinnacle +
+  // Betfair sides on the same market_type → no_actionable_source skip.
+  if (bfMarketType.endsWith("_CORNR")) {
+    const m = lower.match(/^(over|under)\s+(\d+(?:\.\d+)?)/);
+    if (m) {
+      const side = m[1] === "over" ? "Over" : "Under";
+      return `${side} ${m[2]} Corners`;
+    }
+    return null;
+  }
+  if (bfMarketType.endsWith("_CARDS")) {
+    const m = lower.match(/^(over|under)\s+(\d+(?:\.\d+)?)/);
+    if (m) {
+      const side = m[1] === "over" ? "Over" : "Under";
+      return `${side} ${m[2]} Cards`;
+    }
+    return null;
+  }
+  if (bfMarketType === "CORNER_ODDS") {
+    // 3-way match corners: runner is team name (or "The Draw") — mirror
+    // MATCH_CORNERS handler.
+    if (lower === "the draw" || lower === "draw") return "Draw";
+    if (lower === homeTeam.toLowerCase()) return "Home";
+    if (lower === awayTeam.toLowerCase()) return "Away";
+    if (runner.sortPriority === 1) return "Home";
+    if (runner.sortPriority === 2) return "Away";
+    if (runner.sortPriority === 3) return "Draw";
     return null;
   }
 

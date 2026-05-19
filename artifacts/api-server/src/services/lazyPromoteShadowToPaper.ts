@@ -911,7 +911,13 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
               AND market_type = ${r.market_type}
               AND selection_name = ${r.selection_name}
               AND source = 'betfair_exchange'
-              AND snapshot_time >= NOW() - INTERVAL '10 minutes'
+              -- Bundle F2.B.AUDIT-FIX (2026-05-19): widened from 10 min to
+              -- 15 min so the 10-min main sweep cadence isn't a tail miss
+              -- (sweep + 1m lag = ~11min stale right before next tick;
+              -- caused 9,601 stale_or_absent_betfair skips/h pre-fix).
+              -- Bundle A.2's 1m near-sweep + 5m mid-sweep still serve <4h
+              -- matches well within 15min staleness.
+              AND snapshot_time >= NOW() - INTERVAL '15 minutes'
             ORDER BY snapshot_time DESC
             LIMIT 1
           `)) as unknown as { rows?: Array<{ back_odds: number | null }> };

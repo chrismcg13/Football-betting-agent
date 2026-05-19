@@ -47,6 +47,19 @@ export const MARKET_TYPES = [
   "TO_SCORE_IN_BOTH_HALVES",
   "TO_WIN_TO_NIL",
   "CLEAN_SHEET_TEAM_A", "CLEAN_SHEET_TEAM_B",
+  // Bundle F2.B.AUDIT-FIX (2026-05-19): the ACTUAL Betfair Exchange API
+  // codes for corners + cards markets (verified via betfair_market_discovery
+  // cron observations 2026-05-17/18/19). The docs codes above are aliases
+  // that the Exchange API does NOT return on listMarketCatalogue. The
+  // _CORNR suffix indicates corners-by-line; _CARDS indicates cards-by-
+  // line; CORNER_ODDS is the 3-way match-corners-difference market.
+  "OVER_UNDER_25_CORNR", "OVER_UNDER_35_CORNR", "OVER_UNDER_45_CORNR",
+  "OVER_UNDER_55_CORNR", "OVER_UNDER_65_CORNR", "OVER_UNDER_75_CORNR",
+  "OVER_UNDER_85_CORNR", "OVER_UNDER_95_CORNR", "OVER_UNDER_105_CORNR",
+  "OVER_UNDER_115_CORNR", "OVER_UNDER_125_CORNR",
+  "OVER_UNDER_25_CARDS", "OVER_UNDER_35_CARDS", "OVER_UNDER_45_CARDS",
+  "OVER_UNDER_55_CARDS",
+  "CORNER_ODDS",
 ] as const;
 
 export type MarketType = (typeof MARKET_TYPES)[number];
