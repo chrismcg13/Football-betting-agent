@@ -174,9 +174,14 @@ export async function mapBetfairEventsToFixtures(
   // fixtures whose league has has_betfair_exchange=TRUE (high-confidence
   // target — we know the league trades on Betfair, so the af_ placeholder
   // is a fuzzy-match miss, not a genuinely-unlisted event).
+  // Bundle F2.B.AUDIT-FIX-4 (2026-05-19): the column was renamed to
+  // has_betfair_coverage in Bundle I (2026-05-19). The old name
+  // 'has_betfair_exchange' doesn't exist — query returned empty Set →
+  // Pass 2 permissive recovery silently no-op'd → 502 matches at 72-168h
+  // stayed AF-only with no Betfair mapping. Found by audit 2026-05-19.
   const tradeableRows = await db.execute(sql`
     SELECT name FROM competition_config
-    GROUP BY name HAVING BOOL_OR(has_betfair_exchange = TRUE)
+    GROUP BY name HAVING BOOL_OR(has_betfair_coverage = TRUE)
   `);
   const tradeableLeagues = new Set<string>(
     (((tradeableRows as any).rows ?? (tradeableRows as any) ?? []) as Array<{ name: string }>)

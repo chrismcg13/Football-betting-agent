@@ -3606,14 +3606,19 @@ export function startScheduler(): void {
     }, { timezone: "UTC" });
     logger.info("Exchange book sweep NEAR scheduler active — every 1 minute (1h window)");
 
-    // Mid (5m / 4h window): catches the 1-4h TTK bucket where Bundle A's
-    // freshness gate is 120-240s. 5-min polling keeps best-back inside
-    // window. Avoids duplicate work — overlap with the wide sweep is
-    // dedupe-tolerated (odds_snapshots ROW INSERT, no PK collision).
+    // Mid (5m / 24h window): catches every match inside 24h kickoff
+    // (and TTK-bucketed freshness curve binding at 240s-360s for the
+    // 4-24h bucket per Bundle A). Originally 4h window per Bundle A.2
+    // sizing; Bundle F2.B.AUDIT-FIX-4 (2026-05-19) widened to 24h after
+    // audit observed 0/33 leagues had Betfair fresh in 15min for
+    // upcoming 48h matches — main 10min/168h sweep alone left 4-24h
+    // matches with worst-case 12-13min staleness, right on the edge of
+    // the lazy-promoter 15min Betfair window. Mid sweep duration scales
+    // ~6x (6s -> ~37s) — still well inside 5-min cron cadence.
     cron.schedule("*/5 * * * *", () => {
-      void safeRunExchangeBookSweepWith(exchangeBookSweepMidLock, "exchange_book_sweep_mid", { hoursAhead: 4 });
+      void safeRunExchangeBookSweepWith(exchangeBookSweepMidLock, "exchange_book_sweep_mid", { hoursAhead: 24 });
     }, { timezone: "UTC" });
-    logger.info("Exchange book sweep MID scheduler active — every 5 minutes (4h window)");
+    logger.info("Exchange book sweep MID scheduler active — every 5 minutes (24h window)");
 
     // Startup warmup: run one sweep ~30s after boot so the first population
     // doesn't have to wait the full 10-minute cron interval.
