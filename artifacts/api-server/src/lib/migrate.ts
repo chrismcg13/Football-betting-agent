@@ -5299,6 +5299,25 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.AUDIT-FIX-3: lifted max_hours_to_kickoff default 24h -> 72h");
 
+    // ── Bundle F2.B.AUDIT-FIX-5 (2026-05-19): widen inversion band 7pp → 9pp ──
+    // Controlled experiment with auto-snap-back: monitored by
+    // runInversionBandMonitor every 30 min. Snaps back to 7 if stake-
+    // weighted ROI on 7-9pp settled bets is negative once n≥200 OR
+    // 14 days elapsed since widening, whichever first. Operator
+    // controls further widening to 12 after this experiment passes.
+    await db.execute(sql`
+      UPDATE agent_config
+         SET value = '9.0'
+       WHERE key = 'inversion_live_max_edge_pp'
+         AND value = '7.0'
+    `);
+    await db.execute(sql`
+      INSERT INTO agent_config (key, value)
+      VALUES ('inversion_band_widening_started_at', NOW()::text)
+      ON CONFLICT (key) DO NOTHING
+    `);
+    logger.info("Bundle F2.B.AUDIT-FIX-5: inversion band widened 7pp -> 9pp (auto-snap-back monitor active)");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

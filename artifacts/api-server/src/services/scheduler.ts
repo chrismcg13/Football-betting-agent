@@ -2506,6 +2506,25 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Lazy shadow→paper promoter active — every 5 min UTC");
 
+  // Bundle F2.B.AUDIT-FIX-5 (2026-05-19): inversion band widening monitor.
+  // Every 30 min, re-evaluates whether the 7-9pp widening is performing.
+  // Auto-snaps cap back to 7pp if stake-weighted ROI < 0 after n≥200 or
+  // 14 days. Idempotent — subsequent ticks no-op once snap-back has fired.
+  cron.schedule("*/30 * * * *", () => {
+    void (async () => {
+      try {
+        const { runInversionBandMonitor } = await import("./inversionBandMonitor");
+        const r = await runInversionBandMonitor();
+        if (r.action !== "noop" || r.settled_in_band > 0) {
+          logger.info(r, "Inversion band monitor evaluated");
+        }
+      } catch (err) {
+        logger.error({ err }, "Inversion band monitor failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Inversion band monitor active — every 30 min UTC");
+
   // Bundle F2.B.J (2026-05-19): per-predictor circuit breaker. Every
   // 30 min, computes wilson_lo95 on rolling-100 settled bets per
   // market_type; if below breakeven minus the edge-scaled shortfall

@@ -6294,6 +6294,20 @@ router.post("/admin/fit-half-fractions", async (_req, res) => {
 // Bundle F2.B.N (2026-05-19): fit per-league NegBin dispersion k for
 // corners + cards. Operator-triggered for v1; promote to scheduled cron
 // once cadence stable.
+// Bundle F2.B.AUDIT-FIX-5 (2026-05-19): run the inversion-band monitor
+// on demand. Useful for operator-triggered evaluation without waiting
+// for the 30-min cron tick.
+router.post("/admin/run-inversion-band-monitor", async (_req, res) => {
+  try {
+    const { runInversionBandMonitor } = await import("../services/inversionBandMonitor");
+    const result = await runInversionBandMonitor();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "Inversion band monitor failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 router.post("/admin/fit-dispersion-k", async (_req, res) => {
   try {
     const { runDispersionKFit } = await import("../services/dispersionKFit");
