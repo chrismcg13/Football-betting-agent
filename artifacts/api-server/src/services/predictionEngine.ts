@@ -1452,6 +1452,30 @@ export function predictHalfTimeFullTime(
   return Math.max(0.001, Math.min(0.999, p));
 }
 
+// F2.A.17 (2026-05-19): HALF_TIME_SCORE. Same scoreline-matrix substrate
+// as CORRECT_SCORE but evaluated at HT lambdas (full-match λ × halfShare).
+// Betfair runners are "0 - 0", "1 - 0", etc. 60 bf matches/24h were
+// emitting zero bets because no predictor branch existed. Uses
+// _league_ht_fraction when featureEngine populates it; falls back to
+// 0.45 (global prior) when league hasn't been fit yet.
+export function predictHalfTimeScore(
+  featureMap: Record<string, number>,
+  homeGoalsHt: number,
+  awayGoalsHt: number,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
+  const halfShare = featureMap["_league_ht_fraction"] ?? 0.45;
+  const lhHt = homeLambda * halfShare;
+  const laHt = awayLambda * halfShare;
+  const mHt = scorelineMatrix(lhHt, laHt);
+  const maxG = mHt.length - 1;
+  if (homeGoalsHt < 0 || awayGoalsHt < 0 || homeGoalsHt > maxG || awayGoalsHt > maxG) return null;
+  const p = mHt[homeGoalsHt]?.[awayGoalsHt] ?? 0;
+  return Math.max(0.001, Math.min(0.999, p));
+}
+
 // predictNextGoal removed 2026-05-19 — in-play market, excluded from
 // pre-match agent per operator. Predictor mathematically valid but
 // unreachable; removing to keep the surface area honest.

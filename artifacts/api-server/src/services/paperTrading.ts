@@ -1380,6 +1380,37 @@ export async function placePaperBet(
   // threshold). That path is unchanged.
   let isShadowBet = placementTrack === "shadow";
 
+  // F2.A.17 (2026-05-19): per-market shadow-only force-list. Distinct from
+  // market_type_paused_list (which skips emission entirely). Shadow-only
+  // means: emit the bet for learning, but never promote to live regardless
+  // of scope eligibility. Use case: a market type that has proven negative
+  // ROI under prior calibration but where new features (corners/cards/HT
+  // data) might rehabilitate it — we want continued data collection
+  // without capital exposure.
+  //
+  // Storage: agent_config.market_type_shadow_only_list (CSV, mirroring
+  // market_type_paused_list shape). Operator-set, operator-unset.
+  //
+  // Initial population: BTTS (after May 19 auto-pause confirmed -47% live
+  // ROI; the new feature set warrants a shadow-only re-test before any
+  // capital flows).
+  if (!isShadowBet) {
+    const shadowOnlyRaw = (await getConfigValue("market_type_shadow_only_list")) ?? "";
+    const shadowOnlySet = new Set(
+      shadowOnlyRaw.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean),
+    );
+    if (shadowOnlySet.has(marketType.toUpperCase())) {
+      await logShadowGateExemption(
+        "market_type_shadow_only_list",
+        experimentTag ?? null,
+        `Market type ${marketType} is on operator shadow-only list — emit for learning but no live promotion regardless of scope eligibility`,
+        null,
+        universeTier,
+      );
+      isShadowBet = true;
+    }
+  }
+
   // 2026-05-11 (Task 7 — back-to-theory plan): AH-only live exception removed.
   // Live eligibility is now governed entirely by v_live_eligibility_candidates
   // (Wilson lower-95 on win-rate AND/OR t-stat on CLV at n>=30). Any market

@@ -62,7 +62,13 @@ The `shrunk_roi > 0.20` path was **dropped 2026-05-13** (commit `4e94db1`) — 0
 
 AND the specific (league × market_type) is NOT **three-signal disproven**: `n ≥ 30 AND roi < 0 AND clv_t_stat < 0`. The carve-out mirrors the three-gate logic in reverse — one bad signal isn't enough, three independent bad signals are.
 
-**Currently qualifying market_types (snapshot 2026-05-13):** ASIAN_HANDICAP (n=6224), OVER_UNDER_15 (n=60). Everything else is shadow-only.
+**Currently qualifying market_types (snapshot 2026-05-19, F2.A.17 audit):** `v_live_eligibility_market_types` is **empty** — no market type clears the aggregate three-gate on clean substrate. Per-scope qualifiers: 6 (league × ASIAN_HANDICAP) pairs, all on CLV t-stat only (V.League 1, Primera B Chile, Bundesliga, Primera División Bolivia, MLS Next Pro, Ligue 1). None clear the 50% Wilson lower bound.
+
+The 2026-05-13 snapshot (AH n=6224, OU_15 n=60) was contaminated by synthetic-anchor leak. Bundle 0 quarantine cleaned the substrate; the cleaned aggregate AH row shows WR 40.5%, Wilson lo95 38.2%, bootstrap_lo95_roi -24.1%. The system is correctly demoting most AH bets to shadow until anchor audit (F2.A.18) localises and fixes the contamination mechanism.
+
+**Per-market operational state (operator-set, change via `/api/admin/set-config`):**
+- `market_type_paused_list` — emission completely blocked. Currently includes BTTS (auto-paused by per-market circuit breaker 2026-05-19, -47% live ROI on n=8) and **ASIAN_HANDICAP** (manual pause 2026-05-19 pending F2.A.18 anchor audit).
+- `market_type_shadow_only_list` — emit for learning, never promote to live regardless of scope eligibility. Currently includes BTTS while new corners/cards/HT feature set rehabilitation tests run (F2.A.17, 2026-05-19).
 
 Other live-routing requirements (unchanged):
 - **Edge / opportunity score** above per-scope floors (emission-stage gates in `valueDetection.ts`)

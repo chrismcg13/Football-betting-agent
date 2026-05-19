@@ -28,6 +28,7 @@ import {
   predictCorrectScore,
   predictCorrectScoreAnyOther,
   predictHalfTimeFullTime,
+  predictHalfTimeScore,
   // predictNextGoal removed 2026-05-19 — in-play, not pre-match-eligible
   predictCleanSheet,
   predictWinToNil,
@@ -354,9 +355,26 @@ const DERIVED_MARKETS = new Set(["FIRST_HALF_RESULT"]);
 // families were instrumented to root-cause why they emitted no bets. Root
 // cause: zero liquidity probes + zero placed bets ever + not in edge
 // thesis. All 15 markets subtracted in the 2026-05-16 subtract bundle.
-// DIAGNOSTIC_TARGET_MARKETS retained as an empty set — the helpers below
-// become no-ops in steady state. Future diagnostic needs can re-populate.
-const DIAGNOSTIC_TARGET_MARKETS: ReadonlySet<string> = new Set<string>();
+// F2.A.17 (2026-05-19): re-populated with the 8 silent-emission market
+// families identified in the Bundle D/E/F/G/O audit. Per-cycle rejection
+// counters now publish per-reason breakdown so future investigations
+// don't require code archaeology. Set is small — overhead is one Set
+// membership check per (market_type, selection) on the hot path.
+const DIAGNOSTIC_TARGET_MARKETS: ReadonlySet<string> = new Set<string>([
+  "TOTAL_CORNERS_65", "TOTAL_CORNERS_75", "TOTAL_CORNERS_85",
+  "TOTAL_CORNERS_95", "TOTAL_CORNERS_105", "TOTAL_CORNERS_115",
+  "TOTAL_CARDS_25", "TOTAL_CARDS_35", "TOTAL_CARDS_45",
+  "TOTAL_CARDS_55", "TOTAL_CARDS_65",
+  "TOTAL_BOOKING_POINTS_25", "TOTAL_BOOKING_POINTS_35",
+  "TOTAL_BOOKING_POINTS_45", "TOTAL_BOOKING_POINTS_55",
+  "MATCH_CORNERS_2WAY", "FIRST_HALF_CORNERS_MULTI",
+  "FIRST_HALF_RESULT", "SECOND_HALF_RESULT",
+  "HTFT", "HALF_TIME_FULL_TIME", "HALF_TIME_SCORE",
+  "CORRECT_SCORE",
+  "CLEAN_SHEET_HOME", "CLEAN_SHEET_AWAY",
+  "WIN_TO_NIL_HOME", "WIN_TO_NIL_AWAY", "WIN_TO_NIL",
+  "EUROPEAN_HANDICAP",
+]);
 
 function computeOpportunityScore(params: {
   edge: number;
@@ -849,6 +867,45 @@ function getModelProbability(
     return null;
   }
 
+  // F2.A.17 (2026-05-19): HALF_TIME_SCORE — exact HT score, "0 - 0",
+  // "1 - 0" etc. Uses scoreline matrix at HT lambdas (full λ × halfShare).
+  // 60 bf matches/24h have this market with zero emissions because no
+  // predictor branch existed.
+  if (marketType === "HALF_TIME_SCORE") {
+    const exact = selectionName.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (exact) {
+      const h = parseInt(exact[1], 10);
+      const a = parseInt(exact[2], 10);
+      return predictHalfTimeScore(enriched, h, a);
+    }
+    // "Any Other Home Win / Away Win / Draw" aggregates handled like CS
+    const lower = selectionName.toLowerCase().trim();
+    if (lower.includes("any other")) {
+      // Sum tail mass beyond enumerated grid (h or a > 3) using full matrix
+      const homeLambda = enriched["home_goals_scored_avg"] ?? enriched["home_xg_proxy"];
+      const awayLambda = enriched["away_goals_scored_avg"] ?? enriched["away_xg_proxy"];
+      if (homeLambda == null || awayLambda == null) return null;
+      const halfShare = enriched["_league_ht_fraction"] ?? 0.45;
+      // Approximate via predictHalfTimeScore over tail cells
+      let tail = 0;
+      const wantHome = lower.includes("home");
+      const wantAway = lower.includes("away");
+      const wantDraw = lower.includes("draw");
+      for (let h = 0; h <= 6; h++) {
+        for (let a = 0; a <= 6; a++) {
+          if (h <= 3 && a <= 3) continue; // already enumerated grid
+          if (wantHome && h <= a) continue;
+          if (wantAway && a <= h) continue;
+          if (wantDraw && h !== a) continue;
+          const p = predictHalfTimeScore(enriched, h, a);
+          if (p != null) tail += p;
+        }
+      }
+      return Math.max(0.001, Math.min(0.999, tail));
+    }
+    return null;
+  }
+
   // HALF_TIME_FULL_TIME — runners "Home/Home", "Home/Draw", ...
   if (marketType === "HTFT" || marketType === "HALF_TIME_FULL_TIME") {
     const m = selectionName.match(/^(Home|Draw|Away)\s*\/\s*(Home|Draw|Away)$/);
@@ -1251,7 +1308,10 @@ export async function detectValueBets(options?: {
   const COVERAGE_GATED_MARKETS = new Set<string>([
     "TEAM_TOTAL_HOME_05", "TEAM_TOTAL_HOME_15", "TEAM_TOTAL_HOME_25",
     "TEAM_TOTAL_AWAY_05", "TEAM_TOTAL_AWAY_15", "TEAM_TOTAL_AWAY_25",
-    "FIRST_HALF_RESULT",
+    // F2.A.17 (2026-05-19): FIRST_HALF_RESULT removed from gate. Stale
+    // entry from 2026-05-08 when coverage was 0; current bf coverage
+    // is 86 matches/24h (Bundle F's predictor was re-added but this
+    // gate kept silently dropping emissions).
     "FIRST_HALF_OU_05", "FIRST_HALF_OU_15", "FIRST_HALF_OU_25",
     "OVER_UNDER_05", "OVER_UNDER_45", "OVER_UNDER_55",
     "OVER_UNDER_65", "OVER_UNDER_75", "OVER_UNDER_85",
