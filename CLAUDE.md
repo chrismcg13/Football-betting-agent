@@ -62,7 +62,31 @@ The `shrunk_roi > 0.20` path was **dropped 2026-05-13** (commit `4e94db1`) — 0
 
 AND the specific (league × market_type) is NOT **three-signal disproven**: `n ≥ 30 AND roi < 0 AND clv_t_stat < 0`. The carve-out mirrors the three-gate logic in reverse — one bad signal isn't enough, three independent bad signals are.
 
-**Currently qualifying market_types (snapshot 2026-05-19, F2.A.17 audit):** `v_live_eligibility_market_types` is **empty** — no market type clears the aggregate three-gate on clean substrate. Per-scope qualifiers: 6 (league × ASIAN_HANDICAP) pairs, all on CLV t-stat only (V.League 1, Primera B Chile, Bundesliga, Primera División Bolivia, MLS Next Pro, Ligue 1). None clear the 50% Wilson lower bound.
+### ARCHITECTURAL DECISION 2026-05-20 (F2.A.25 + F2.A.26)
+
+**Live placement does NOT consult scope-level historical evidence as a gate.** The eligibility views (`v_live_eligibility_candidates`, `v_live_eligibility_market_types`) continue to be computed for analytical reporting but do not gate placement under `inversion_pipeline_enabled = true` (currently TRUE).
+
+This is an explicit commitment, not an emergent state. As of 2026-05-20, the gates that DO control live placement are:
+
+1. **Pinnacle anchor freshness** (TTK-aware, F2.A.23 — emission stage)
+2. **Post-slip edge in 3–9pp band against Pinnacle** (F2.A.25 — emission stage)
+3. **Model+Pinnacle direction agreement** (implicit: `calculated_edge > 0`)
+4. **Kill switch ON** (`live_placement_enabled`)
+5. **Not in `market_type_paused_list`** (operator override)
+6. **Not in `market_type_shadow_only_list`** (operator override)
+7. **2% per-bet stake cap** + £2 Betfair minimum
+
+Portfolio-level defences that REPLACE the eligibility view's role:
+
+- **Per-market circuit breaker** (`runPerMarketCircuitBreaker`, every 30min): auto-pauses any `market_type` whose rolling-100 Wilson lo95 win-rate falls below `breakeven − max(3pp, avg_edge × 1.5)`.
+- **Three-signal CLV-vs-realized disproof** (F2.A.26): auto-pauses any `market_type` where CLV t-stat > 2.0 but realized ROI < −3% on n ≥ 30. Catches anchor-contamination drift directly.
+- **n-tiered Kelly sizing** (F2.A.26): under inversion_direct, scope with n_settled < 10 sizes at 0.25× Kelly; n < 50 at 0.50×; n ≥ 50 at full. Replaces the dropped adaptive Kelly factor with a coarse evidence-proportional discount.
+
+**What this trades off:** the system no longer requires positive Wilson/CLV history before placing live capital on a scope. New scopes can enter live placement immediately upon meeting per-bet quality controls. The asymmetry that the adaptive Kelly factor enforced (size down on thin-evidence scopes) is preserved coarsely via the n-tiered multiplier; the disproof check ensures CLV-vs-realized divergence still triggers automatic protection.
+
+---
+
+**Currently qualifying market_types (snapshot 2026-05-19, F2.A.17 audit):** `v_live_eligibility_market_types` is **empty** — no market type clears the aggregate three-gate on clean substrate. Per-scope qualifiers: 6 (league × ASIAN_HANDICAP) pairs, all on CLV t-stat only (V.League 1, Primera B Chile, Bundesliga, Primera División Bolivia, MLS Next Pro, Ligue 1). None clear the 50% Wilson lower bound. **Per the ADR above, these views are analytical-only and do not gate placement.**
 
 The 2026-05-13 snapshot (AH n=6224, OU_15 n=60) was contaminated by synthetic-anchor leak. Bundle 0 quarantine cleaned the substrate; the cleaned aggregate AH row shows WR 40.5%, Wilson lo95 38.2%, bootstrap_lo95_roi -24.1%. The system is correctly demoting most AH bets to shadow until anchor audit (F2.A.18) localises and fixes the contamination mechanism.
 

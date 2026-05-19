@@ -115,6 +115,78 @@ export async function runPerMarketCircuitBreaker(): Promise<CircuitBreakerResult
   const newlyPaused: string[] = [];
   const stillFiring: string[] = [];
 
+  // F2.A.26 (2026-05-20): three-signal CLV-vs-realized disproof, relocated
+  // from the now-bypassed v_live_eligibility view. Catches the failure
+  // mode the anchor-contamination diagnostic exposed: CLV looks good
+  // (we're beating Pinnacle close in expectation) but realized Wilson ROI
+  // is negative. Indicates anchor measurement is broken, not edge real.
+  //
+  // Trigger: n >= 30 AND CLV t-stat > 2.0 AND Wilson lo95 ROI < -0.03.
+  // Same threshold semantics as the deprecated eligibility view's
+  // disproof carve-out, applied here so removing the view doesn't lose
+  // the defence.
+  const disproofRowsQ = await db.execute(sql`
+    WITH ranked AS (
+      SELECT
+        market_type,
+        status,
+        odds_at_placement::float8 AS odds,
+        stake::float8 AS stake,
+        net_pnl::float8 AS pnl,
+        clv_pct::float8 AS clv,
+        ROW_NUMBER() OVER (PARTITION BY market_type ORDER BY settled_at DESC NULLS LAST) AS rn
+      FROM paper_bets
+      WHERE status IN ('won','lost')
+        AND deleted_at IS NULL
+        AND settled_at IS NOT NULL
+        AND settled_at >= NOW() - INTERVAL '90 days'
+        AND clv_pct IS NOT NULL
+    )
+    SELECT
+      market_type,
+      COUNT(*)::int AS n,
+      COUNT(*) FILTER (WHERE status = 'won')::int AS wins,
+      AVG(clv)::float8 AS avg_clv,
+      STDDEV_SAMP(clv)::float8 AS sd_clv,
+      SUM(pnl)::float8 / NULLIF(SUM(stake), 0)::float8 AS roi
+    FROM ranked
+    WHERE rn <= 100
+    GROUP BY market_type
+    HAVING COUNT(*) >= 30
+  `);
+  type DisproofRow = { market_type: string; n: number; wins: number; avg_clv: number; sd_clv: number | null; roi: number | null };
+  const disproofStats = (((disproofRowsQ as any).rows ?? []) as DisproofRow[]);
+  for (const d of disproofStats) {
+    if (alreadyPaused.has(d.market_type.toUpperCase())) continue;
+    const sd = d.sd_clv ?? 0;
+    const tStat = sd > 0 ? (d.avg_clv * Math.sqrt(d.n)) / sd : 0;
+    const wilsonLoRoi = wilsonLo95(d.wins, d.n) - 0.5; // approx ROI lower bound proxy
+    const roi = d.roi ?? 0;
+    // Three-signal disproof: CLV positive but realized strongly negative.
+    if (tStat > 2.0 && roi < -0.03 && wilsonLoRoi < 0) {
+      newlyPaused.push(d.market_type);
+      alreadyPaused.add(d.market_type.toUpperCase());
+      void db.insert(complianceLogsTable).values({
+        actionType: "market_type_auto_paused",
+        details: {
+          market_type: d.market_type,
+          n: d.n,
+          clv_t_stat: tStat,
+          avg_clv: d.avg_clv,
+          realized_roi: roi,
+          wilson_lo_roi_proxy: wilsonLoRoi,
+          reason: "three_signal_clv_realized_disproof",
+          source: "per_market_circuit_breaker",
+        },
+        timestamp: new Date(),
+      });
+      logger.warn(
+        { marketType: d.market_type, n: d.n, tStat, roi },
+        "Three-signal disproof: CLV positive but realized negative — auto-pausing",
+      );
+    }
+  }
+
   for (const s of stats) {
     if (alreadyPaused.has(s.market_type.toUpperCase())) {
       stillFiring.push(s.market_type);

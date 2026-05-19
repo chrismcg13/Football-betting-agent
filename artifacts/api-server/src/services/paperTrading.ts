@@ -2538,6 +2538,55 @@ export async function placePaperBet(
     );
   }
 
+  // F2.A.26 (2026-05-20): n-tiered Kelly multiplier — coarse replacement
+  // for the adaptive Kelly factor under inversion_direct. The adaptive
+  // factor (f_lo/f̂) is skipped under inversion (no historical Wilson-
+  // LCB to compute), so without this every qualifying inversion bet
+  // would size at the same fraction regardless of scope evidence depth.
+  // Per operator decision 2026-05-20: preserve variance discipline by
+  // discounting unfamiliar scopes.
+  //
+  // Bands:
+  //   scope n_settled < 10  → factor 0.25 (minimum-stake territory)
+  //   scope n_settled < 50  → factor 0.50 (half-Kelly)
+  //   scope n_settled >= 50 → factor 1.00 (full opp-score Kelly)
+  //
+  // n_settled = count of settled bets (any track) for (league, market_type)
+  // over last 90 days. Cheap rolling count; cached via the standard 60s
+  // agentConfigCached path would be premature optimisation here.
+  if (!isShadowBet && livePathTag === "inversion_direct" && scopeLeague != null) {
+    try {
+      const nRow = await db.execute(sql`
+        SELECT COUNT(*)::int AS n_settled
+        FROM paper_bets pb
+        JOIN matches m ON m.id = pb.match_id
+        WHERE m.league = ${scopeLeague}
+          AND pb.market_type = ${marketType}
+          AND pb.status IN ('won','lost')
+          AND pb.deleted_at IS NULL
+          AND pb.settled_at >= NOW() - INTERVAL '90 days'
+      `);
+      const nSettled = ((nRow as { rows?: Array<{ n_settled: number }> }).rows?.[0]?.n_settled) ?? 0;
+      const nTieredFactor = nSettled >= 50 ? 1.0 : nSettled >= 10 ? 0.5 : 0.25;
+      if (nTieredFactor < 1.0) {
+        const originalStake = stake;
+        stake = Math.round(stake * nTieredFactor * 100) / 100;
+        logger.info(
+          {
+            matchId, marketType, scopeLeague, nSettled,
+            nTieredFactor, originalStake, reducedStake: stake,
+          },
+          "F2.A.26: n-tiered Kelly multiplier applied (inversion_direct path)",
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err, matchId, marketType, scopeLeague },
+        "F2.A.26: n-tiered Kelly lookup failed — defaulting to full Kelly (no scope haircut)",
+      );
+    }
+  }
+
   // ── Bundle 18 (2026-05-18): model + Pinnacle agreement upside ──────────
   // Per Chris diagnostic #6: "If your own model also says Betfair is
   // mispriced in the same direction as Pinnacle, you have two sharp
