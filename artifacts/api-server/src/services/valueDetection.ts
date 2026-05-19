@@ -2081,7 +2081,45 @@ export async function detectValueBets(options?: {
       // Production-track bets respect the cold-market cooldown (capital-risk
       // gate). Shadow-track bypasses — that's how the model relearns whether
       // a chronically-losing segment has recovered.
-      const productionAllowed = meetsProduction && !isColdSegment;
+      const productionAllowedBase = meetsProduction && !isColdSegment;
+
+      // F2.A.25 (2026-05-19): post-slip 3-9pp band check at EMISSION.
+      // Mirrors the lazy promoter's band gate (lazyPromoteShadowToPaper.ts
+      // line ~810) so bets are born production-track iff they would also
+      // pass at promotion. Avoids the round-trip of born-shadow → lazy-
+      // promote → live for bets that meet criteria immediately.
+      //
+      // Computes: post-slip edge against Pinnacle fair value.
+      //   expectedFill   = bf_back * (1 - slip)
+      //   pinn_implied   = 1 / pinn_fair_odds
+      //   post_slip_edge = (expectedFill * pinn_implied - 1) * 100
+      //
+      // If outside [3pp, 9pp] band, demote to shadow track. The bet still
+      // emits (learning data) but won't deploy capital. Same band config
+      // as lazy promoter: min_net_edge_pp + inversion_live_max_edge_pp.
+      const SLIP_DEFAULT = 0.015;
+      const pinnImpliedAtEmission = fairValueOdds > 1.01 ? 1 / fairValueOdds : null;
+      const postSlipEdgePpAtEmission = pinnImpliedAtEmission != null
+        ? (actionablePrice * (1 - SLIP_DEFAULT) * pinnImpliedAtEmission - 1) * 100
+        : null;
+      const minEdgePpAtEmission = Number(cfg.min_net_edge_pp ?? "3.0");
+      const maxEdgePpAtEmission = Number(cfg.inversion_live_max_edge_pp ?? "9.0");
+      const bandOk =
+        postSlipEdgePpAtEmission != null &&
+        postSlipEdgePpAtEmission >= minEdgePpAtEmission &&
+        postSlipEdgePpAtEmission <= maxEdgePpAtEmission;
+      const productionAllowed = productionAllowedBase && bandOk;
+      if (productionAllowedBase && !bandOk) {
+        recordDiagnosticReject(
+          oddsRow.marketType,
+          postSlipEdgePpAtEmission == null
+            ? "no_pinn_for_emission_band_check"
+            : postSlipEdgePpAtEmission < minEdgePpAtEmission
+              ? `below_${minEdgePpAtEmission}pp_at_emission`
+              : `above_${maxEdgePpAtEmission}pp_at_emission`,
+        );
+      }
+
       const placementTrack: "production" | "shadow" | null = productionAllowed
         ? "production"
         : meetsShadow

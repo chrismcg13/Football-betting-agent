@@ -1437,11 +1437,60 @@ export async function placePaperBet(
   //                   market_type, but three independent bad signals are.
   // PASS_IF (a OR b). Failure demotes to shadow; the bet still records so
   // the per-scope sample keeps accumulating.
-  let livePathTag: "per_scope" | "market_type_aggregate" | null = null;
+  let livePathTag: "per_scope" | "market_type_aggregate" | "inversion_direct" | null = null;
   // Resolved league name lifted to outer scope so the adaptive-Kelly step
   // downstream can reuse it without a second matches lookup.
   let scopeLeague: string | null = null;
-  if (!isShadowBet) {
+
+  // F2.A.25 (2026-05-19): under inversion_pipeline_enabled, BYPASS the
+  // v_live_eligibility historical-evidence gate entirely. The eligibility
+  // view was decorative under inversion — the lazy promoter's SQL filter
+  // at line ~392 already had `inversionOn::boolean = true OR scope_in_view`,
+  // making the scope check non-functional for promoted bets. At the
+  // EMISSION stage (here), demoting to shadow on scope-fail forced a
+  // shadow→lazy-promote round-trip for every bet, which is the wrong
+  // architecture under inversion: a fresh-anchor + agreement + band bet
+  // should be born LIVE directly, not detoured through shadow.
+  //
+  // Architecture per user 2026-05-19:
+  //   "I want a model that looks for pinnacle sharp edge 3-7pp, validates
+  //    with the data feature model 32 features, then if it aligns with
+  //    pinnacle and the pinnacle edge is fresh place the bet. There should
+  //    be no gates on CLV or settled bets or past performance."
+  //
+  // Under inversion, the active gates are:
+  //   1. Pinnacle anchor fresh (F2.A.23 — gated at valueDetection.ts emission)
+  //   2. 3-9pp post-slip band (F2.A.25 — gated at valueDetection.ts emission)
+  //   3. Model+Pinnacle direction agreement (implicit in positive calculated_edge)
+  //   4. Kill switch ON (live_placement_enabled)
+  //   5. Not in market_type_paused_list (operator override)
+  //   6. Not in market_type_shadow_only_list (operator override)
+  // Adaptive Kelly skipped under inversion_direct — no historical scope
+  // evidence to anchor f_lo/f̂ ratio; sizing uses kellyFractionForScore
+  // (opp_score-keyed) as the active fraction.
+  const inversionOnForGate = await (async (): Promise<boolean> => {
+    try {
+      const { isInversionPipelineEnabled } = await import("./inversionPipeline");
+      return await isInversionPipelineEnabled();
+    } catch {
+      return false;
+    }
+  })();
+  if (!isShadowBet && inversionOnForGate) {
+    // Resolve league for downstream adaptive-Kelly reuse without the scope check.
+    try {
+      const matchLeague = await db
+        .select({ league: matchesTable.league })
+        .from(matchesTable)
+        .where(eq(matchesTable.id, matchId))
+        .limit(1);
+      scopeLeague = matchLeague[0]?.league ?? null;
+    } catch {
+      scopeLeague = null;
+    }
+    livePathTag = "inversion_direct";
+  }
+  if (!isShadowBet && !inversionOnForGate) {
     try {
       const matchLeague = await db
         .select({ league: matchesTable.league })
@@ -1529,7 +1578,12 @@ export async function placePaperBet(
   // surfaces model-calibration drift independent of eligibility shifts.
   let adaptiveKellyMultiplier = 1.0;
   let adaptiveFactorAudit: AdaptiveKellyResult | null = null;
-  if (!isShadowBet && livePathTag != null && scopeLeague != null) {
+  // F2.A.25: skip adaptive Kelly under inversion_direct. The factor reads
+  // analysis_signal_strength for Wilson-LCB / Kelly-LCB ratio — no
+  // historical-evidence scope under inversion, so no f̂/f_lo to compute.
+  // kellyFractionForScore (opp_score-keyed 0.125-0.5) becomes the active
+  // base fraction. Per-bet 2% cap and Betfair £2 minimum still apply.
+  if (!isShadowBet && livePathTag != null && livePathTag !== "inversion_direct" && scopeLeague != null) {
     const adaptive = await computeAdaptiveKellyFactor(scopeLeague, marketType, backOdds);
     if ("reason" in adaptive) {
       if (adaptive.reason === "negative_kelly") {
