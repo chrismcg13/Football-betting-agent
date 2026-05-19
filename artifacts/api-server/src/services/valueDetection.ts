@@ -1784,6 +1784,30 @@ export async function detectValueBets(options?: {
         if (pricing.reason === "no_actionable_source") {
           pricingRejectNoBetfairExchange++; // legacy counter — repurposed
           recordDiagnosticReject(marketType, "no_actionable_source");
+          // F2.A.28 (2026-05-20): when Pinnacle is present but Betfair is
+          // stale/absent for this (match, market), trigger an on-demand
+          // Betfair sweep. Mirrors the F2.A.24 lazy-promoter fix. Without
+          // this, corners/cards/HT markets that have Pinnacle coverage
+          // but limited Betfair polling never get an actionable price —
+          // emission rejects with no_actionable_source forever. Fire-and-
+          // forget; next cycle (5min) sees the new snapshot.
+          //
+          // Bounded by isCachedAsUnavailable (6h negative cache) inside
+          // sweepEventOnDemand itself. Match must have betfair_event_id.
+          const matchBfEventId = (match as { betfairEventId?: string | null }).betfairEventId;
+          if (matchBfEventId && /^[0-9]+$/.test(matchBfEventId)) {
+            void (async () => {
+              try {
+                const { sweepEventOnDemand } = await import("./exchangeBookSweep");
+                await sweepEventOnDemand(match.id, matchBfEventId);
+              } catch (err) {
+                logger.debug(
+                  { err, matchId: match.id, marketType },
+                  "F2.A.28: emission on-demand sweep failed (non-blocking)",
+                );
+              }
+            })();
+          }
         } else {
           // F2.A.23: distinguish "no Pinnacle ever" from "Pinnacle stale
           // after freshness filter" so the diagnostic counter shows
