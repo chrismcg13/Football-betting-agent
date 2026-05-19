@@ -270,6 +270,41 @@ const COMPLEMENTARY_RULES: ComplementaryRule[] = [
     market2: "TOTAL_CARDS_55", sel2Includes: "Over",
     thesis: "derby pattern — low goals but high cards",
   },
+  // ─── F2.A.20: BTTS-specific tactical pairs ─────────────────────────────
+  // BTTS Yes thesis = open-game / two-attack-vulnerabilities. Naturally
+  // correlates with corner volume (sustained two-way attacking) and
+  // sometimes with cards (open games have more transitions = more fouls).
+  // BTTS No thesis = one-side-shut-out / disciplined defending. Often
+  // pairs with low corners (less sustained pressure) and the dominant
+  // side winning.
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "TOTAL_CORNERS_95", sel2Includes: "Over",
+    thesis: "BTTS Yes + corners Over — open two-way attacking game",
+  },
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "TOTAL_CORNERS_105", sel2Includes: "Over",
+    thesis: "BTTS Yes + corners Over — open two-way attacking game",
+  },
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "TOTAL_CORNERS_85", sel2Includes: "Under",
+    thesis: "BTTS No + corners Under — disciplined low-tempo game",
+  },
+  // BTTS No + Possession-dominance favourite winning — the favourite
+  // keeps a clean sheet. Same thesis expressed as MO Home + CS Yes,
+  // but BTTS No is the lower-vig wrapper that captures it.
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "MATCH_ODDS", sel2Includes: "Home",
+    thesis: "BTTS No + MO Home — home dominance with clean sheet upside",
+  },
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "MATCH_ODDS", sel2Includes: "Away",
+    thesis: "BTTS No + MO Away — away dominance with clean sheet upside",
+  },
 ];
 
 interface ConflictingRule {
@@ -464,6 +499,53 @@ const CORRELATED_PAIRS: CorrelatedPair[] = [
     market1: "EUROPEAN_HANDICAP", sel1Includes: "Away -",
     market2: "MATCH_ODDS", sel2Includes: "Away",
     reason: "EH Away -N is a strict subset of MO Away — dominated",
+  },
+  // ─── F2.A.20: BTTS deterministic relationships ─────────────────────────
+  // BTTS Yes ⇔ (home_score ≥ 1 AND away_score ≥ 1).
+  // TT_HOME_05 Over = home_score ≥ 1; TT_AWAY_05 Over = away_score ≥ 1.
+  // So BTTS Yes equals the conjunction. Pair-wise these are *partially*
+  // dominated — backing BTTS Yes plus either TT_OVER is paying vig twice
+  // on a strongly-overlapping proposition. Keep higher-scored only.
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "TEAM_TOTAL_HOME_05", sel2Includes: "Over",
+    reason: "BTTS Yes requires home ≥ 1 — TT_HOME_05 Over is implied",
+  },
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "TEAM_TOTAL_AWAY_05", sel2Includes: "Over",
+    reason: "BTTS Yes requires away ≥ 1 — TT_AWAY_05 Over is implied",
+  },
+  // BTTS No ⇔ (home_score = 0 OR away_score = 0). CLEAN_SHEET_HOME Yes
+  // (away = 0) implies BTTS No; same for CS_AWAY (home = 0). Backing
+  // both is paying vig twice.
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "CLEAN_SHEET_HOME", sel2Includes: "Yes",
+    reason: "CS_HOME Yes implies BTTS No (away scored 0) — dominated",
+  },
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "CLEAN_SHEET_AWAY", sel2Includes: "Yes",
+    reason: "CS_AWAY Yes implies BTTS No (home scored 0) — dominated",
+  },
+  // BTTS No + WTN Yes also dominated (WTN requires opp = 0).
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "WIN_TO_NIL_HOME", sel2Includes: "Yes",
+    reason: "WTN_HOME Yes implies BTTS No (away scored 0) — dominated",
+  },
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "WIN_TO_NIL_AWAY", sel2Includes: "Yes",
+    reason: "WTN_AWAY Yes implies BTTS No (home scored 0) — dominated",
+  },
+  // OU_15 Under = total ≤ 1 ⇒ one side at most 1 goal but the OTHER side
+  // must be 0 ⇒ BTTS No is implied. Keep higher-scored.
+  {
+    market1: "BTTS", sel1Includes: "No",
+    market2: "OVER_UNDER_15", sel2Includes: "Under",
+    reason: "OU_15 Under (≤1 goal) implies one side at 0 ⇒ BTTS No — dominated",
   },
 ];
 

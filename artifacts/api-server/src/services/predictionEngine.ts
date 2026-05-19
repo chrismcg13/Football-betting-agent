@@ -89,6 +89,13 @@ export const FEATURE_NAMES = [
   // 30-day window catches WC squad changes + new-season activity.
   "home_transfer_churn_30d",
   "away_transfer_churn_30d",
+  // F2.A.20 deferred to F2.A.21 — BTTS-targeted features to add:
+  //   home/away_clean_sheet_rate, home/away_failed_to_score_rate,
+  //   xg_btts_implied. Holding until featureEngine.ts populates them;
+  //   adding to FEATURE_NAMES without population forces a wasted model
+  //   retrain on constant defaults. Ship as a single coordinated PR
+  //   (featureEngine compute + FEATURE_NAMES extend + imputation
+  //   defaults) so the retrain captures actual signal first time.
 ] as const;
 
 type FeatureName = (typeof FEATURE_NAMES)[number];
