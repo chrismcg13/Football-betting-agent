@@ -101,6 +101,19 @@ const SHARP_FAIR_VALUE_SOURCES = ["oddspapi_pinnacle", "api_football_real:Pinnac
 // cross-book vig differential, not sharp-anchor CLV.
 const SYNTHETIC_CLV_SOURCES = ["bet365_mo_derived_ah"];
 
+// Module-scope pre-built SQL fragments. Reused by both runBundleBAnalytics
+// (Step-1 segment_stats INSERT) and runMarketTypeAggregatePass (Step-4 raw
+// query). Drizzle's sql template can't expand JS arrays as ANY() — must
+// use sql.join + IN. See feedback_drizzle_array_binding_bug (bitten 3x prior).
+const sharpFvList = sql.join(
+  SHARP_FAIR_VALUE_SOURCES.map((s) => sql`${s}`),
+  sql`, `,
+);
+const syntheticClvList = sql.join(
+  SYNTHETIC_CLV_SOURCES.map((s) => sql`${s}`),
+  sql`, `,
+);
+
 async function getAnalysisStartDate(): Promise<string> {
   const rows = await db
     .select({ value: agentConfigTable.value })
@@ -153,18 +166,6 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
   const analysisStart = await getAnalysisStartDate();
 
   logger.info({ analysisStart, computedAt }, "Bundle B analytics starting");
-
-  // Bundle F2.B.0: pre-build IN-list SQL fragments. Drizzle's sql template
-  // can't expand JS arrays as ANY() — must use sql.join + IN. See
-  // feedback_drizzle_array_binding_bug (bitten 3x prior).
-  const sharpFvList = sql.join(
-    SHARP_FAIR_VALUE_SOURCES.map((s) => sql`${s}`),
-    sql`, `,
-  );
-  const syntheticClvList = sql.join(
-    SYNTHETIC_CLV_SOURCES.map((s) => sql`${s}`),
-    sql`, `,
-  );
 
   // Step 1: segment-level stats. One row per (league, market_type, bet_track)
   // with n >= 1 settled bet. PnL/stake column resolved per-rail at compute
