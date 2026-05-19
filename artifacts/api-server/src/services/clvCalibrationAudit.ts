@@ -25,6 +25,14 @@ const SHARP_CLV_SOURCES = [
   // edge-validation pool. Without this entry, matchbook-anchored bets were
   // being excluded from clvCalibrationAudit regressions.
   "matchbook",
+  // Bundle F2.B.J (2026-05-19): sharp-consensus closing-line anchor for
+  // markets where no direct Pinnacle quote exists (CLEAN_SHEET / WIN_TO_NIL /
+  // HTFT / SECOND_HALF_RESULT / EUROPEAN_HANDICAP). Requires ≥3 broker
+  // sources median-aggregated in resolveSharpConsensus — pragmatically
+  // pulls from Tier-2 sharps plus reliable soft books (Bet365/Unibet) to
+  // get coverage on the markets that need it most. Included in this
+  // allow-list so the CLV signal feeds edge-validation regressions.
+  "sharp_consensus",
 ];
 
 // Bundle 1C.1 (2026-05-16): CLV-vs-ROI calibration regression.

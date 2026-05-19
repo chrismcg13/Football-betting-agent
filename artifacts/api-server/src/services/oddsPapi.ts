@@ -3811,6 +3811,91 @@ async function resolveTier3BetfairAnchor(args: {
   };
 }
 
+// ── Bundle F2.B.J (2026-05-19): sharp-consensus closing-line anchor ──
+//
+// Use case: markets with NO direct Pinnacle quote (CLEAN_SHEET / WIN_TO_NIL /
+// HTFT / SECOND_HALF_RESULT / EUROPEAN_HANDICAP per audit 2026-05-19).
+// Currently these fall through Tier-1 + Tier-2 (which is sharp-only and
+// rarely populated for these markets) to Tier-3 single-source fallback.
+// Tier-3 is excluded from SHARP_CLV_SOURCES so the CLV signal is lost.
+//
+// Consensus rule: require ≥3 distinct broker sources (sharp Tier-2 +
+// reliable soft books) with non-stale (≤6h) snapshots, median the implied
+// probabilities, convert back to consensus odds. Tag clv_source =
+// 'sharp_consensus' with consensus_quality = source count. Add to
+// SHARP_CLV_SOURCES so the resulting CLV feeds edge-validation.
+//
+// Median (not mean) for outlier robustness — one stale bookmaker drift
+// shouldn't skew the close.
+
+const SHARP_CONSENSUS_POOL: ReadonlyArray<string> = [
+  // Tier-2 sharps (mostly empty without paid subscriptions, but kept first)
+  "matchbook",
+  "oddspapi_smarkets",
+  "oddspapi_matchbook",
+  "oddspapi_sbo",
+  "oddspapi_sbobet",
+  "oddspapi_ibcbet",
+  // Soft books with high coverage on new markets — included so consensus
+  // actually fires on CLEAN_SHEET / HTFT / etc. Plan's strict "sharp-only"
+  // wording was Smarkets/Matchbook/SBO; pragmatic widening for coverage.
+  "api_football_real:Bet365",
+  "api_football_real:Unibet",
+  "oddspapi_bet365",
+];
+
+const SHARP_CONSENSUS_MIN_SOURCES = 3;
+
+async function resolveSharpConsensus(args: {
+  matchId: number;
+  marketType: string;
+  selectionName: string;
+}): Promise<{ odds: number; source: string; quality: number } | null> {
+  const sourceList = sql.join(
+    SHARP_CONSENSUS_POOL.map((s) => sql`${s}`),
+    sql`, `,
+  );
+  const rows = await db.execute(sql`
+    SELECT source, back_odds::float8 AS odds, snapshot_time
+    FROM odds_snapshots
+    WHERE match_id = ${args.matchId}
+      AND market_type = ${args.marketType}
+      AND selection_name = ${args.selectionName}
+      AND source IN (${sourceList})
+      AND back_odds::numeric > 1.01
+      AND snapshot_time > NOW() - INTERVAL '6 hours'
+    ORDER BY snapshot_time DESC
+    LIMIT 50
+  `);
+  const list = (((rows as any).rows ?? []) as Array<{
+    source: string; odds: number; snapshot_time: string;
+  }>);
+  if (list.length === 0) return null;
+
+  // Latest snapshot per source. ORDER BY snapshot_time DESC above ensures
+  // first occurrence per source is the freshest.
+  const latestPerSource = new Map<string, number>();
+  for (const r of list) {
+    if (!latestPerSource.has(r.source)) latestPerSource.set(r.source, r.odds);
+  }
+
+  if (latestPerSource.size < SHARP_CONSENSUS_MIN_SOURCES) return null;
+
+  const implieds = [...latestPerSource.values()]
+    .map((o) => 1 / o)
+    .sort((a, b) => a - b);
+  const mid = implieds.length / 2;
+  const medianImplied = implieds.length % 2 === 1
+    ? implieds[Math.floor(mid)]!
+    : (implieds[mid - 1]! + implieds[mid]!) / 2;
+  const consensusOdds = 1 / medianImplied;
+  return {
+    odds: consensusOdds,
+    source: "sharp_consensus",
+    quality: latestPerSource.size,
+  };
+}
+
 async function resolveTier2Anchor(args: {
   matchId: number;
   marketType: string;
@@ -4088,6 +4173,10 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
         let clvSourceTier: number | null = null;
         let closingOdds: number | null = null;
         let dataQuality: string | null = null;
+        // Bundle F2.B.J (2026-05-19): number of broker sources used in
+        // sharp_consensus aggregation. Null on Tier-1 Pinnacle / Tier-2
+        // single-source / Tier-3 paths.
+        let consensusQualityFromJ: number | null = null;
 
         if (resolved.odds && resolved.source) {
           closingOdds = resolved.odds;
@@ -4109,6 +4198,28 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
             clvSourceTier = 2;
             dataQuality = "tier_2_sharp_anchor";
           } else {
+            // Bundle F2.B.J (2026-05-19): sharp-consensus fallback for
+            // markets without Pinnacle. Requires ≥3 broker sources;
+            // median-of-implieds → consensus odds. Tagged
+            // 'sharp_consensus' + consensus_quality=N for forensic
+            // tracking. Added to SHARP_CLV_SOURCES so the resulting
+            // CLV measurement counts in edge validation.
+            const consensus = await resolveSharpConsensus({
+              matchId,
+              marketType,
+              selectionName: bet.selectionName,
+            });
+            if (consensus) {
+              closingOdds = consensus.odds;
+              clvSourceTag = consensus.source;
+              clvSourceTier = 2;
+              dataQuality = `sharp_consensus_n${consensus.quality}`;
+              consensusQualityFromJ = consensus.quality;
+            }
+          }
+          // Tier-3 fallback (Bundle 1T.3) — only if neither Tier-2 nor
+          // Bundle J consensus resolved.
+          if (closingOdds == null) {
             // Bundle 1T.3 (2026-05-16): Tier-3 last-resort Betfair Exchange
             // fallback. Ensures every shadow bet has SOME CLV anchor (per
             // operator directive "every shadow bet needs SOME CLV"). Wider
@@ -4204,6 +4315,12 @@ export async function fetchAndStoreClosingLineForPendingBets(): Promise<{
             clvSource: clvSourceTag,
             clvDataQuality: dataQuality,
             clvSourceTier: clvSourceTier as any,
+            // Bundle F2.B.J: populate consensus_quality only on sharp_consensus
+            // hits — other clv paths leave it as-is so existing synthetic_clv
+            // populations remain readable independently.
+            ...(consensusQualityFromJ != null
+              ? { consensusQuality: consensusQualityFromJ }
+              : {}),
           } as any)
           .where(eq(paperBetsTable.id, bet.id));
 
