@@ -38,6 +38,7 @@ import {
   predictTotalCorners,
   predictTotalCards,
   predictTotalBookingPoints,
+  predictMatchCorners,
   predictHalfTimeMatchOdds,
   predictSecondHalfMatchOdds,
   predictEuropeanHandicap,
@@ -685,6 +686,16 @@ function getModelProbability(
     if (selectionName.startsWith("Over")) return tc.over;
     if (selectionName.startsWith("Under")) return tc.under;
     return null;
+  }
+  // Bundle F2.B.P (2026-05-19): MATCH_CORNERS_2WAY — 3-way corner-
+  // difference (Home/Draw/Away). Settlement uses matches.home_corners_full
+  // / away_corners_full (populated by apiFootball.fetchMatchStatsForSettlement
+  // post-Bundle-P). Predictor uses additive independence; per-team
+  // xCorners split is the same follow-up that gates TOTAL_CORNERS upgrade.
+  if (marketType === "MATCH_CORNERS_2WAY") {
+    if (selectionName !== "Home" && selectionName !== "Draw" && selectionName !== "Away") return null;
+    const kCorners = enriched["_league_k_corners"];
+    return predictMatchCorners(enriched, selectionName, 0, kCorners);
   }
   // Bundle F2.B.O (2026-05-19): TOTAL_BOOKING_POINTS_X — Betfair native
   // cards market (yellow=10pts, red=25pts). Predictor approximates booking

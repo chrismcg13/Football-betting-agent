@@ -1756,7 +1756,7 @@ function getStat(stats: ApiFixtureStats["statistics"], type: string): number {
 
 export async function fetchMatchStatsForSettlement(
   fixtureId: number,
-): Promise<{ totalCorners: number; totalCards: number } | null> {
+): Promise<{ totalCorners: number; totalCards: number; homeCorners: number; awayCorners: number } | null> {
   const result = await fetchApiFootball<ApiFixtureStats[]>("/fixtures/statistics", {
     fixture: fixtureId,
   }, { priority: true });
@@ -1765,16 +1765,18 @@ export async function fetchMatchStatsForSettlement(
   const [homeStats, awayStats] = result;
   if (!homeStats || !awayStats) return null;
 
-  const totalCorners =
-    getStat(homeStats.statistics, "Corner Kicks") +
-    getStat(awayStats.statistics, "Corner Kicks");
+  // Bundle F2.B.P (2026-05-19): return per-team corner counts alongside
+  // total so MATCH_CORNERS_2WAY settlement can resolve from matches table.
+  const homeCorners = getStat(homeStats.statistics, "Corner Kicks");
+  const awayCorners = getStat(awayStats.statistics, "Corner Kicks");
+  const totalCorners = homeCorners + awayCorners;
   const totalCards =
     getStat(homeStats.statistics, "Yellow Cards") +
     getStat(awayStats.statistics, "Yellow Cards") +
     getStat(homeStats.statistics, "Red Cards") +
     getStat(awayStats.statistics, "Red Cards");
 
-  return { totalCorners, totalCards };
+  return { totalCorners, totalCards, homeCorners, awayCorners };
 }
 
 export async function fetchAndStoreFixtureStats(

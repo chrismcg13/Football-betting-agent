@@ -1397,6 +1397,10 @@ export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   "TOTAL_BOOKING_POINTS_35",
   "TOTAL_BOOKING_POINTS_45",
   "TOTAL_BOOKING_POINTS_55",
+  // Bundle F2.B.P (2026-05-19): MATCH_CORNERS_2WAY — Betfair native
+  // 3-way corner-difference market. Settlement wired via matches per-team
+  // corners + new MATCH_CORNERS_2WAY resolver.
+  "MATCH_CORNERS_2WAY",
 ]);
 
 // 2026-05-16 subtract bundle: TOTAL_CORNERS_* entirely subtracted; this

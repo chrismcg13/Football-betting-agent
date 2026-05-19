@@ -4497,6 +4497,9 @@ function determineBetWon(
     totalCards: number | null;
     homeScoreHt?: number | null;
     awayScoreHt?: number | null;
+    // Bundle F2.B.P (2026-05-19): per-team corners for MATCH_CORNERS_2WAY.
+    homeCornersFull?: number | null;
+    awayCornersFull?: number | null;
   } | null,
 ): boolean | "void" | null {
   // Return semantics:
@@ -4516,6 +4519,8 @@ function determineBetWon(
       totalCards: matchStats?.totalCards ?? null,
       homeScoreHt: matchStats?.homeScoreHt ?? null,
       awayScoreHt: matchStats?.awayScoreHt ?? null,
+      homeCornersFull: matchStats?.homeCornersFull ?? null,
+      awayCornersFull: matchStats?.awayCornersFull ?? null,
     });
   }
 
@@ -4858,6 +4863,8 @@ async function _settleBetsInner(): Promise<SettlementResult> {
         totalCards: match.totalCards ?? null,
         homeScoreHt: match.homeScoreHt ?? null,
         awayScoreHt: match.awayScoreHt ?? null,
+        homeCornersFull: match.homeCornersFull ?? null,
+        awayCornersFull: match.awayCornersFull ?? null,
       },
     );
 
@@ -5289,6 +5296,9 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
               apiFixtureId: fixtureId,
               totalCorners: stats.totalCorners,
               totalCards: stats.totalCards,
+              // Bundle F2.B.P: per-team for MATCH_CORNERS_2WAY settlement.
+              homeCornersFull: stats.homeCorners,
+              awayCornersFull: stats.awayCorners,
             })
             .where(eq(matchesTable.id, dbMatch.id));
 
@@ -5332,6 +5342,8 @@ export async function backfillCornersCardsStats(): Promise<{ matchesUpdated: num
         totalCards: match.totalCards ?? null,
         homeScoreHt: match.homeScoreHt ?? null,
         awayScoreHt: match.awayScoreHt ?? null,
+        homeCornersFull: match.homeCornersFull ?? null,
+        awayCornersFull: match.awayCornersFull ?? null,
       },
     );
 

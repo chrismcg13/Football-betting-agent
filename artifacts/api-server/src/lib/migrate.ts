@@ -5280,6 +5280,14 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.N: league_dispersion_k table ready");
 
+    // ── Bundle F2.B.P (2026-05-19): per-team final corners for MATCH_CORNERS settlement ──
+    await db.execute(sql`
+      ALTER TABLE matches
+        ADD COLUMN IF NOT EXISTS home_corners_full INTEGER,
+        ADD COLUMN IF NOT EXISTS away_corners_full INTEGER
+    `);
+    logger.info("Bundle F2.B.P: matches per-team corner columns ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

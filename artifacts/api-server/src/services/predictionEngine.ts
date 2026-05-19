@@ -1806,6 +1806,118 @@ export function predictTotalCards(
   };
 }
 
+// ===================== Bundle F2.B.P (2026-05-19) MATCH_CORNERS (3-way) =====================
+//
+// 3-way corners-difference market: Home (more home corners) / Draw (equal)
+// / Away (more away corners). Optional integer handicap on home corners.
+// Independent-Poisson approximation: P(h_corners) × P(a_corners) over
+// the 2D matrix; sum cells matching each outcome.
+//
+// Per-team for/against split not yet wired (featureEngine only has
+// home_corners_avg = corners taken by home). v1 uses additive
+// independence on home_corners_avg + away_corners_avg with k = per-league
+// corners dispersion. Refinement to xCorners-style for/against is the
+// same follow-up that gates the TOTAL_CORNERS xCorners upgrade.
+
+function _negBinPmfArray(mean: number, k: number, maxN: number): number[] {
+  const arr = new Array(maxN + 1).fill(0);
+  for (let i = 0; i <= maxN; i += 1) {
+    arr[i] = negBinPmf(i, mean, k);
+  }
+  return arr;
+}
+
+export function predictMatchCorners(
+  featureMap: Record<string, number>,
+  side: "Home" | "Draw" | "Away",
+  handicap = 0,
+  kOverride?: number | null,
+): number | null {
+  const homeCornersAvg = featureMap["home_corners_avg"];
+  const awayCornersAvg = featureMap["away_corners_avg"];
+  if (
+    homeCornersAvg == null ||
+    awayCornersAvg == null ||
+    !Number.isFinite(homeCornersAvg) ||
+    !Number.isFinite(awayCornersAvg) ||
+    homeCornersAvg < 0 ||
+    awayCornersAvg < 0
+  ) {
+    return null;
+  }
+  const k =
+    kOverride != null && Number.isFinite(kOverride) && kOverride > 0
+      ? kOverride
+      : CORNERS_K_GLOBAL;
+  if (!Number.isFinite(handicap) || handicap !== Math.trunc(handicap)) return null;
+  const MAX_N = 20;
+  const homePmf = _negBinPmfArray(homeCornersAvg, k, MAX_N);
+  const awayPmf = _negBinPmfArray(awayCornersAvg, k, MAX_N);
+  let p = 0;
+  for (let h = 0; h <= MAX_N; h += 1) {
+    for (let a = 0; a <= MAX_N; a += 1) {
+      const adjustedHome = h + handicap;
+      if (side === "Home" && adjustedHome > a) p += homePmf[h]! * awayPmf[a]!;
+      else if (side === "Draw" && adjustedHome === a) p += homePmf[h]! * awayPmf[a]!;
+      else if (side === "Away" && adjustedHome < a) p += homePmf[h]! * awayPmf[a]!;
+    }
+  }
+  return Math.max(0.01, Math.min(0.99, p));
+}
+
+// ===================== Bundle F2.B.Q (2026-05-19) FIRST_HALF_CORNERS =====================
+//
+// Predictor only — NO emission until HT corner data is ingested. The
+// api-football /fixtures/statistics endpoint returns full-match stats
+// only; per-half corner counts require /fixtures/events parsing
+// (corner events filtered to time.elapsed <= 45). That ingestion is
+// a separate deferred task. Emitting FIRST_HALF_CORNERS bets without
+// HT corner settlement data would force-settle as losses after the
+// 72h retry timeout — strictly worse than not emitting.
+//
+// Function is exported for callers when settlement data exists; also
+// callable for backtesting against scrape-sourced HT corner data.
+// Uses same lambda × 0.43 split as Bundle F's HT goals — corners are
+// empirically slightly less front-loaded than goals.
+//
+// Per-league HT-corner-fraction fit is a follow-up of the per-league
+// HT-fraction fit already done for goals (Bundle F's halfFractionFit
+// could extend with a 'corners' family using a future
+// matches.home_corners_ht / away_corners_ht).
+
+const CORNERS_HT_FRACTION = 0.43;
+
+export function predictFirstHalfCorners(
+  featureMap: Record<string, number>,
+  line: number,
+  kOverride?: number | null,
+): { over: number; under: number } | null {
+  const homeCornersAvg = featureMap["home_corners_avg"];
+  const awayCornersAvg = featureMap["away_corners_avg"];
+  if (
+    homeCornersAvg == null ||
+    awayCornersAvg == null ||
+    !Number.isFinite(homeCornersAvg) ||
+    !Number.isFinite(awayCornersAvg) ||
+    homeCornersAvg < 0 ||
+    awayCornersAvg < 0
+  ) {
+    return null;
+  }
+  const lambda = (homeCornersAvg + awayCornersAvg) * CORNERS_HT_FRACTION;
+  if (lambda <= 0) return null;
+  const k =
+    kOverride != null && Number.isFinite(kOverride) && kOverride > 0
+      ? kOverride
+      : CORNERS_K_GLOBAL;
+  const under = negBinCdf(lambda, k, line);
+  const overRaw = 1 - under;
+  return {
+    over: Math.max(0.01, Math.min(0.99, overRaw)),
+    under: Math.max(0.01, Math.min(0.99, under)),
+  };
+}
+
 // ===================== Bundle F2.B.O (2026-05-19) Booking Points =====================
 //
 // Betfair represents cards as TOTAL_BOOKING_POINTS (yellow=10, red=25).

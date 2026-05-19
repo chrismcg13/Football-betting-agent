@@ -31,6 +31,12 @@ export interface ResolveContext {
   totalCards: number | null;
   homeScoreHt: number | null;
   awayScoreHt: number | null;
+  // Bundle F2.B.P (2026-05-19): per-team final corners for MATCH_CORNERS
+  // _2WAY settlement. Populated from matches.home_corners_full /
+  // away_corners_full when caller pre-loads them; NULL otherwise (resolver
+  // returns null in that case).
+  homeCornersFull: number | null;
+  awayCornersFull: number | null;
 }
 
 /**
@@ -319,6 +325,25 @@ export const MARKET_TYPES: Record<string, MarketType> = {
       const total = ctx.homeScoreHt + ctx.awayScoreHt;
       if (selection.startsWith("Over")) return total > 1.5;
       if (selection.startsWith("Under")) return total < 1.5;
+      return null;
+    },
+  },
+
+  // Bundle F2.B.P (2026-05-19): MATCH_CORNERS_2WAY — 3-way corner-difference
+  // market on Betfair. Selection names "Home" / "Draw" / "Away" map to:
+  //   Home: home_corners > away_corners
+  //   Draw: home_corners == away_corners
+  //   Away: home_corners < away_corners
+  // Requires per-team corners in ResolveContext (homeCornersFull /
+  // awayCornersFull) — populated by Bundle F2.B.P apiFootball update.
+  MATCH_CORNERS_2WAY: {
+    id: "MATCH_CORNERS_2WAY",
+    resolveFrom: "final_with_stats",
+    resolve: (selection, ctx) => {
+      if (ctx.homeCornersFull == null || ctx.awayCornersFull == null) return null;
+      if (selection === "Home") return ctx.homeCornersFull > ctx.awayCornersFull;
+      if (selection === "Draw") return ctx.homeCornersFull === ctx.awayCornersFull;
+      if (selection === "Away") return ctx.awayCornersFull > ctx.homeCornersFull;
       return null;
     },
   },

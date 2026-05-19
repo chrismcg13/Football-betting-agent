@@ -24,6 +24,12 @@ export const matchesTable = pgTable("matches", {
   apiFixtureId: integer("api_fixture_id"),
   totalCorners: integer("total_corners"),
   totalCards: integer("total_cards"),
+  // Bundle F2.B.P (2026-05-19): per-team final corner counts. Populated
+  // by apiFootball.fetchMatchStatsForSettlement alongside totalCorners.
+  // Required for MATCH_CORNERS_2WAY settlement (home_corners vs
+  // away_corners comparison after handicap). NULL on legacy rows.
+  homeCornersFull: integer("home_corners_full"),
+  awayCornersFull: integer("away_corners_full"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
