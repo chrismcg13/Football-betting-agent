@@ -187,6 +187,89 @@ const COMPLEMENTARY_RULES: ComplementaryRule[] = [
     market2: "TOTAL_CARDS_35", sel2Includes: "Under",
     thesis: "low-tempo cautious game (goals + cards same direction)",
   },
+  // ─── F2.A.19: tactical-archetype correlations ──────────────────────────
+  // Theory-based pairs the model should recognise as expressing one
+  // underlying thesis rather than two independent edges. Each gets the
+  // tempo haircut (default 0.85) — keeps both bets but right-sizes
+  // combined exposure per Kelly theory (sqrt(1-rho) discount).
+  //
+  // POSSESSION DOMINANCE — favourite home pressing all-game produces
+  // both wins AND corner volume (sustained attacking phases).
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Home",
+    market2: "TOTAL_CORNERS_105", sel2Includes: "Over",
+    thesis: "home possession dominance produces corner volume",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Home",
+    market2: "TOTAL_CORNERS_115", sel2Includes: "Over",
+    thesis: "home possession dominance produces corner volume",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Home",
+    market2: "TEAM_TOTAL_HOME_15", sel2Includes: "Over",
+    thesis: "home dominance expressed via own-team scoring",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Home",
+    market2: "TEAM_TOTAL_AWAY_05", sel2Includes: "Under",
+    thesis: "home dominance shutting out away attack",
+  },
+  // Mirror for away dominance
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Away",
+    market2: "TEAM_TOTAL_AWAY_15", sel2Includes: "Over",
+    thesis: "away dominance expressed via own-team scoring",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Away",
+    market2: "TEAM_TOTAL_HOME_05", sel2Includes: "Under",
+    thesis: "away dominance shutting out home attack",
+  },
+  // COUNTER-ATTACKING THESIS — underdog wins via efficiency, not
+  // sustained pressure. Means: away win + lower total + lower corners.
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Away",
+    market2: "OVER_UNDER_25", sel2Includes: "Under",
+    thesis: "counter-attacking away win on limited chances",
+  },
+  {
+    market1: "MATCH_ODDS", sel1Includes: "Away",
+    market2: "TOTAL_CORNERS_85", sel2Includes: "Under",
+    thesis: "counter-attacking thesis — away wins without sustained pressure",
+  },
+  // DEFENSIVE GRIND — Under goals + one clean sheet implies the
+  // proposition "low-scoring game, opposite side shut out".
+  {
+    market1: "OVER_UNDER_15", sel1Includes: "Under",
+    market2: "CLEAN_SHEET_HOME", sel2Includes: "Yes",
+    thesis: "low-scoring grind with home clean sheet",
+  },
+  {
+    market1: "OVER_UNDER_15", sel1Includes: "Under",
+    market2: "CLEAN_SHEET_AWAY", sel2Includes: "Yes",
+    thesis: "low-scoring grind with away clean sheet",
+  },
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Under",
+    market2: "CLEAN_SHEET_HOME", sel2Includes: "Yes",
+    thesis: "defensive grind with home clean sheet",
+  },
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Under",
+    market2: "CLEAN_SHEET_AWAY", sel2Includes: "Yes",
+    thesis: "defensive grind with away clean sheet",
+  },
+  // DERBY / HIGH-INTENSITY — defensive (low goals) but heated (high
+  // cards). Classic "anti-tempo" inversion. Cards alone don't move
+  // with goals here — the haircut is theory-correct but small (0.9
+  // via the default fallback rather than tempo's 0.85 since the
+  // correlation is mild + inverse on goals/cards).
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Under",
+    market2: "TOTAL_CARDS_55", sel2Includes: "Over",
+    thesis: "derby pattern — low goals but high cards",
+  },
 ];
 
 interface ConflictingRule {
@@ -202,6 +285,38 @@ const CONFLICTING_RULES: ConflictingRule[] = [
   { market1: "OVER_UNDER_35", sel1Includes: "Over", market2: "OVER_UNDER_35", sel2Includes: "Under" },
   { market1: "BTTS", sel1Includes: "Yes", market2: "OVER_UNDER_15", sel2Includes: "Under" },
   { market1: "BTTS", sel1Includes: "Yes", market2: "BTTS", sel2Includes: "No" },
+  // F2.A.19 — Clean Sheet / Win to Nil literal conflicts.
+  // CS Home Yes means away scored 0; BTTS Yes requires away >= 1.
+  { market1: "CLEAN_SHEET_HOME", sel1Includes: "Yes", market2: "BTTS", sel2Includes: "Yes" },
+  { market1: "CLEAN_SHEET_AWAY", sel1Includes: "Yes", market2: "BTTS", sel2Includes: "Yes" },
+  // WTN Yes requires opponent at 0 — same conflict as CS Yes + BTTS Yes
+  { market1: "WIN_TO_NIL_HOME", sel1Includes: "Yes", market2: "BTTS", sel2Includes: "Yes" },
+  { market1: "WIN_TO_NIL_AWAY", sel1Includes: "Yes", market2: "BTTS", sel2Includes: "Yes" },
+  // WTN Home Yes ⇒ Home wins — incompatible with MO Away or MO Draw
+  { market1: "WIN_TO_NIL_HOME", sel1Includes: "Yes", market2: "MATCH_ODDS", sel2Includes: "Away" },
+  { market1: "WIN_TO_NIL_HOME", sel1Includes: "Yes", market2: "MATCH_ODDS", sel2Includes: "Draw" },
+  { market1: "WIN_TO_NIL_AWAY", sel1Includes: "Yes", market2: "MATCH_ODDS", sel2Includes: "Home" },
+  { market1: "WIN_TO_NIL_AWAY", sel1Includes: "Yes", market2: "MATCH_ODDS", sel2Includes: "Draw" },
+  // CS Home Yes ⇒ away team total = 0 ⇒ incompatible with TT_AWAY_05 Over
+  { market1: "CLEAN_SHEET_HOME", sel1Includes: "Yes", market2: "TEAM_TOTAL_AWAY_05", sel2Includes: "Over" },
+  { market1: "CLEAN_SHEET_AWAY", sel1Includes: "Yes", market2: "TEAM_TOTAL_HOME_05", sel2Includes: "Over" },
+  // Same-line OU for new card / corner / booking lines (Over/Under cancel)
+  { market1: "TOTAL_CARDS_25", sel1Includes: "Over", market2: "TOTAL_CARDS_25", sel2Includes: "Under" },
+  { market1: "TOTAL_CARDS_35", sel1Includes: "Over", market2: "TOTAL_CARDS_35", sel2Includes: "Under" },
+  { market1: "TOTAL_CARDS_45", sel1Includes: "Over", market2: "TOTAL_CARDS_45", sel2Includes: "Under" },
+  { market1: "TOTAL_CARDS_55", sel1Includes: "Over", market2: "TOTAL_CARDS_55", sel2Includes: "Under" },
+  { market1: "TOTAL_CARDS_65", sel1Includes: "Over", market2: "TOTAL_CARDS_65", sel2Includes: "Under" },
+  { market1: "TOTAL_CORNERS_65", sel1Includes: "Over", market2: "TOTAL_CORNERS_65", sel2Includes: "Under" },
+  { market1: "TOTAL_CORNERS_75", sel1Includes: "Over", market2: "TOTAL_CORNERS_75", sel2Includes: "Under" },
+  { market1: "TOTAL_CORNERS_85", sel1Includes: "Over", market2: "TOTAL_CORNERS_85", sel2Includes: "Under" },
+  { market1: "TOTAL_CORNERS_95", sel1Includes: "Over", market2: "TOTAL_CORNERS_95", sel2Includes: "Under" },
+  { market1: "TOTAL_CORNERS_105", sel1Includes: "Over", market2: "TOTAL_CORNERS_105", sel2Includes: "Under" },
+  { market1: "TOTAL_CORNERS_115", sel1Includes: "Over", market2: "TOTAL_CORNERS_115", sel2Includes: "Under" },
+  { market1: "TOTAL_CORNERS_125", sel1Includes: "Over", market2: "TOTAL_CORNERS_125", sel2Includes: "Under" },
+  { market1: "TOTAL_BOOKING_POINTS_25", sel1Includes: "Over", market2: "TOTAL_BOOKING_POINTS_25", sel2Includes: "Under" },
+  { market1: "TOTAL_BOOKING_POINTS_35", sel1Includes: "Over", market2: "TOTAL_BOOKING_POINTS_35", sel2Includes: "Under" },
+  { market1: "TOTAL_BOOKING_POINTS_45", sel1Includes: "Over", market2: "TOTAL_BOOKING_POINTS_45", sel2Includes: "Under" },
+  { market1: "TOTAL_BOOKING_POINTS_55", sel1Includes: "Over", market2: "TOTAL_BOOKING_POINTS_55", sel2Includes: "Under" },
 ];
 
 // Cross-market correlation pairs — if both present on same match, keep higher-scored only

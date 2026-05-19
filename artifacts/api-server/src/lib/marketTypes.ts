@@ -37,6 +37,16 @@ export interface ResolveContext {
   // returns null in that case).
   homeCornersFull: number | null;
   awayCornersFull: number | null;
+  // F2.A.19 (2026-05-19): per-team card breakdown for TOTAL_BOOKING_POINTS_X
+  // (yellows=10pts, reds=25pts). Populated from api-football fixtureStats
+  // when available; resolver falls back to totalCards*10 approximation when
+  // null. HT corners for FIRST_HALF_CORNERS_MULTI settlement (Bundle Q).
+  homeYellowCards?: number | null;
+  awayYellowCards?: number | null;
+  homeRedCards?: number | null;
+  awayRedCards?: number | null;
+  homeCornersHt?: number | null;
+  awayCornersHt?: number | null;
 }
 
 /**
@@ -282,17 +292,21 @@ export const MARKET_TYPES: Record<string, MarketType> = {
   TEAM_TOTAL_AWAY_25: { id: "TEAM_TOTAL_AWAY_25", resolveFrom: "final_score", resolve: teamTotal("AWAY", 2.5) },
   TEAM_TOTAL_AWAY_35: { id: "TEAM_TOTAL_AWAY_35", resolveFrom: "final_score", resolve: teamTotal("AWAY", 3.5) },
 
-  // Stats-based
+  // Stats-based — F2.A.19: extended to 6.5 and 12.5 lines (Pinnacle data
+  // confirmed flowing for both; predictor extended in valueDetection.ts).
+  TOTAL_CORNERS_65: { id: "TOTAL_CORNERS_65", resolveFrom: "final_with_stats", resolve: totalCorners(6.5) },
   TOTAL_CORNERS_75: { id: "TOTAL_CORNERS_75", resolveFrom: "final_with_stats", resolve: totalCorners(7.5) },
   TOTAL_CORNERS_85: { id: "TOTAL_CORNERS_85", resolveFrom: "final_with_stats", resolve: totalCorners(8.5) },
   TOTAL_CORNERS_95: { id: "TOTAL_CORNERS_95", resolveFrom: "final_with_stats", resolve: totalCorners(9.5) },
   TOTAL_CORNERS_105: { id: "TOTAL_CORNERS_105", resolveFrom: "final_with_stats", resolve: totalCorners(10.5) },
   TOTAL_CORNERS_115: { id: "TOTAL_CORNERS_115", resolveFrom: "final_with_stats", resolve: totalCorners(11.5) },
+  TOTAL_CORNERS_125: { id: "TOTAL_CORNERS_125", resolveFrom: "final_with_stats", resolve: totalCorners(12.5) },
 
   TOTAL_CARDS_25: { id: "TOTAL_CARDS_25", resolveFrom: "final_with_stats", resolve: totalCards(2.5) },
   TOTAL_CARDS_35: { id: "TOTAL_CARDS_35", resolveFrom: "final_with_stats", resolve: totalCards(3.5) },
   TOTAL_CARDS_45: { id: "TOTAL_CARDS_45", resolveFrom: "final_with_stats", resolve: totalCards(4.5) },
   TOTAL_CARDS_55: { id: "TOTAL_CARDS_55", resolveFrom: "final_with_stats", resolve: totalCards(5.5) },
+  TOTAL_CARDS_65: { id: "TOTAL_CARDS_65", resolveFrom: "final_with_stats", resolve: totalCards(6.5) },
 
   // Halftime
   FIRST_HALF_RESULT: {
@@ -481,7 +495,145 @@ export const MARKET_TYPES: Record<string, MarketType> = {
       return null;
     },
   },
+
+  // F2.A.19 (2026-05-19): HALF_TIME_SCORE settles on HT scores exactly.
+  // Matches predictHalfTimeScore in predictionEngine.ts (F2.A.17). Same
+  // selection grammar as CORRECT_SCORE: "h - a" exact or "Any Other
+  // <Home|Away|Draw>" tail beyond enumerated grid.
+  HALF_TIME_SCORE: {
+    id: "HALF_TIME_SCORE",
+    resolveFrom: "halftime",
+    resolve: (selection, ctx) => {
+      if (ctx.homeScoreHt == null || ctx.awayScoreHt == null) return null;
+      const exact = selection.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (exact) {
+        const h = parseInt(exact[1]!, 10);
+        const a = parseInt(exact[2]!, 10);
+        if (!Number.isFinite(h) || !Number.isFinite(a)) return null;
+        return ctx.homeScoreHt === h && ctx.awayScoreHt === a;
+      }
+      const lower = selection.toLowerCase().trim();
+      if (!lower.includes("any other")) return null;
+      const maxGoal = Math.max(ctx.homeScoreHt, ctx.awayScoreHt);
+      if (maxGoal < 4) return false;
+      if (lower.includes("home")) return ctx.homeScoreHt > ctx.awayScoreHt;
+      if (lower.includes("away")) return ctx.awayScoreHt > ctx.homeScoreHt;
+      if (lower.includes("draw")) return ctx.homeScoreHt === ctx.awayScoreHt;
+      return null;
+    },
+  },
+
+  // F2.A.19: WIN_TO_NIL_HOME — Home wins AND away scores zero.
+  // Predictor (predictWinToNil) already implemented; emission was
+  // returning null due to runner-naming uncertainty (line ~887 of
+  // valueDetection.ts). Now safe to register once emission unblocks.
+  WIN_TO_NIL_HOME: {
+    id: "WIN_TO_NIL_HOME",
+    resolveFrom: "final_score",
+    resolve: (selection, ctx) => {
+      const yes = ctx.homeScore > ctx.awayScore && ctx.awayScore === 0;
+      if (selection === "Yes") return yes;
+      if (selection === "No") return !yes;
+      return null;
+    },
+  },
+
+  WIN_TO_NIL_AWAY: {
+    id: "WIN_TO_NIL_AWAY",
+    resolveFrom: "final_score",
+    resolve: (selection, ctx) => {
+      const yes = ctx.awayScore > ctx.homeScore && ctx.homeScore === 0;
+      if (selection === "Yes") return yes;
+      if (selection === "No") return !yes;
+      return null;
+    },
+  },
+
+  // F2.A.19: TOTAL_BOOKING_POINTS_X — Betfair native lines on weighted
+  // card count (yellows=10, reds=25). Predictor (Bundle O) ships
+  // predictTotalBookingPoints; resolver was the gap. Uses
+  // ctx.homeYellowCards / homeRedCards / awayYellowCards / awayRedCards
+  // from final_with_stats; falls back to total_cards * 10 (yellow-only)
+  // when red breakdown unavailable — explicit approximation for legacy
+  // settlements with no red column.
+  TOTAL_BOOKING_POINTS_25: {
+    id: "TOTAL_BOOKING_POINTS_25",
+    resolveFrom: "final_with_stats",
+    resolve: bookingPoints(25),
+  },
+  TOTAL_BOOKING_POINTS_35: {
+    id: "TOTAL_BOOKING_POINTS_35",
+    resolveFrom: "final_with_stats",
+    resolve: bookingPoints(35),
+  },
+  TOTAL_BOOKING_POINTS_45: {
+    id: "TOTAL_BOOKING_POINTS_45",
+    resolveFrom: "final_with_stats",
+    resolve: bookingPoints(45),
+  },
+  TOTAL_BOOKING_POINTS_55: {
+    id: "TOTAL_BOOKING_POINTS_55",
+    resolveFrom: "final_with_stats",
+    resolve: bookingPoints(55),
+  },
+
+  // F2.A.19: FIRST_HALF_CORNERS_MULTI — Bundle Q line splits, settled
+  // from HT corners (homeCornersHt + awayCornersHt). Predictor exists;
+  // resolver was the gap. Suffix-encoded line parsed at settlement time
+  // since the multi-line market type doesn't carry the line in the name.
+  // Settlement reads selection name "Over 4.5" / "Under 4.5" etc.
+  FIRST_HALF_CORNERS_MULTI: {
+    id: "FIRST_HALF_CORNERS_MULTI",
+    resolveFrom: "final_with_stats",
+    resolve: (selection, ctx) => {
+      if (ctx.homeCornersHt == null || ctx.awayCornersHt == null) return null;
+      const m = selection.match(/^(Over|Under)\s+(\d+(?:\.\d+)?)$/i);
+      if (!m) return null;
+      const line = parseFloat(m[2]!);
+      if (!Number.isFinite(line)) return null;
+      const total = ctx.homeCornersHt + ctx.awayCornersHt;
+      if (m[1]!.toLowerCase() === "over") return total > line;
+      return total < line;
+    },
+  },
+
+  // F2.A.19: FIRST_HALF_OU_25 (FHR_OU_05 and _15 already existed; _25
+  // was the missing third line predictor emits against).
+  FIRST_HALF_OU_25: {
+    id: "FIRST_HALF_OU_25",
+    resolveFrom: "halftime",
+    resolve: (selection, ctx) => {
+      if (ctx.homeScoreHt == null || ctx.awayScoreHt == null) return null;
+      const total = ctx.homeScoreHt + ctx.awayScoreHt;
+      if (selection.startsWith("Over")) return total > 2.5;
+      if (selection.startsWith("Under")) return total < 2.5;
+      return null;
+    },
+  },
 };
+
+// F2.A.19: booking_points = 10 * yellows + 25 * reds. Resolver factory
+// shared across all TOTAL_BOOKING_POINTS_X lines.
+function bookingPoints(line: number) {
+  return (selection: string, ctx: ResolveContext): boolean | null => {
+    if (ctx.homeYellowCards == null || ctx.awayYellowCards == null) {
+      // Fall back to total_cards * 10 if yellow-only column unavailable
+      // (legacy settlements with no breakdown). Loses red-card mass but
+      // preferable to forever-pending.
+      if (ctx.totalCards == null) return null;
+      const approx = ctx.totalCards * 10;
+      if (selection.startsWith("Over")) return approx > line;
+      if (selection.startsWith("Under")) return approx < line;
+      return null;
+    }
+    const yellows = ctx.homeYellowCards + ctx.awayYellowCards;
+    const reds = (ctx.homeRedCards ?? 0) + (ctx.awayRedCards ?? 0);
+    const points = 10 * yellows + 25 * reds;
+    if (selection.startsWith("Over")) return points > line;
+    if (selection.startsWith("Under")) return points < line;
+    return null;
+  };
+}
 
 /**
  * Resolve a bet outcome. Returns true (won), false (lost), or null

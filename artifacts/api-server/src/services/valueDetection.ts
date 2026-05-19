@@ -632,11 +632,15 @@ function getModelProbability(
   // (xCorners "for/against" split deferred). All 5 lines route through
   // predictTotalCorners; line parsed from suffix.
   if (
+    // F2.A.19: extended to _65 (309 matches/14d Pinnacle) and _125
+    // (258 matches/14d, Unibet only — still emit, fair_value falls back)
+    marketType === "TOTAL_CORNERS_65" ||
     marketType === "TOTAL_CORNERS_75" ||
     marketType === "TOTAL_CORNERS_85" ||
     marketType === "TOTAL_CORNERS_95" ||
     marketType === "TOTAL_CORNERS_105" ||
-    marketType === "TOTAL_CORNERS_115"
+    marketType === "TOTAL_CORNERS_115" ||
+    marketType === "TOTAL_CORNERS_125"
   ) {
     const suffix = marketType.split("_").pop()!;
     const line = parseInt(suffix, 10) / 10; // "85" → 8.5
@@ -690,10 +694,12 @@ function getModelProbability(
     return predictEuropeanHandicap(enriched, side, handicap, dcOpts);
   }
   if (
+    // F2.A.19: extended to _65 (12 matches/14d Pinnacle confirmed)
     marketType === "TOTAL_CARDS_25" ||
     marketType === "TOTAL_CARDS_35" ||
     marketType === "TOTAL_CARDS_45" ||
-    marketType === "TOTAL_CARDS_55"
+    marketType === "TOTAL_CARDS_55" ||
+    marketType === "TOTAL_CARDS_65"
   ) {
     const suffix = marketType.split("_").pop()!;
     const line = parseInt(suffix, 10) / 10; // "35" → 3.5
@@ -941,6 +947,24 @@ function getModelProbability(
     // resolved at deriveSelectionName time, we can't tell which side.
     // First-pass: return null → falls to shadow until we observe real
     // Betfair WIN_TO_NIL runners in odds_snapshots and refine the parser.
+    return null;
+  }
+
+  // F2.A.19 (2026-05-19): WIN_TO_NIL_HOME / _AWAY — Betfair-typed Yes/No.
+  // Predictor (predictWinToNil) returns the WTN probability for that side.
+  // Resolver in marketTypes.ts F2.A.19 settles on (side wins AND opp = 0).
+  if (marketType === "WIN_TO_NIL_HOME") {
+    const wtn = predictWinToNil(enriched, "home");
+    if (wtn == null) return null;
+    if (selectionName === "Yes") return wtn;
+    if (selectionName === "No") return 1 - wtn;
+    return null;
+  }
+  if (marketType === "WIN_TO_NIL_AWAY") {
+    const wtn = predictWinToNil(enriched, "away");
+    if (wtn == null) return null;
+    if (selectionName === "Yes") return wtn;
+    if (selectionName === "No") return 1 - wtn;
     return null;
   }
 
