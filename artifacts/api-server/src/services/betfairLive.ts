@@ -1320,6 +1320,13 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   // catalogue inspection. Settlement and prediction work without exchange
   // capture (paper_mode shadow bets settle from final score directly).
   ASIAN_TOTAL_GOALS: "ALT_TOTAL_GOALS",
+  // Bundle F2.B.C (2026-05-19): Betfair codes for F2.A.10 predictor outputs.
+  // CORRECT_SCORE already mapped above; add the half/clean-sheet group so
+  // capture + reconcile can join Betfair settlement rows to internal bets.
+  HTFT: "HALF_TIME_FULL_TIME",
+  HALF_TIME_FULL_TIME: "HALF_TIME_FULL_TIME",
+  CLEAN_SHEET_HOME: "CLEAN_SHEET_TEAM_A",
+  CLEAN_SHEET_AWAY: "CLEAN_SHEET_TEAM_B",
 };
 
 // Sub-phase 4.B (2026-05-08): set of internal market types whose Betfair code

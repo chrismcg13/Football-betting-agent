@@ -322,6 +322,96 @@ export const MARKET_TYPES: Record<string, MarketType> = {
       return null;
     },
   },
+
+  // Bundle F2.B.C (2026-05-19): register resolvers for the F2.A.10 Poisson
+  // predictors (CORRECT_SCORE / HTFT / CLEAN_SHEET) so emitted bets can
+  // actually settle. Without entries here, determineBetWon falls through
+  // to null and bets accumulate pending. WIN_TO_NIL omitted: predictor
+  // returns null at emission (runner-naming unresolved), so no bets land
+  // in paper_bets — nothing to settle yet.
+  CORRECT_SCORE: {
+    id: "CORRECT_SCORE",
+    resolveFrom: "final_score",
+    resolve: (selection, ctx) => {
+      const exact = selection.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (exact) {
+        const h = parseInt(exact[1]!, 10);
+        const a = parseInt(exact[2]!, 10);
+        if (!Number.isFinite(h) || !Number.isFinite(a)) return null;
+        return ctx.homeScore === h && ctx.awayScore === a;
+      }
+      // Any Other Home/Away/Draw — Betfair aggregates scores ≥ 4 goals.
+      // Matches predictCorrectScoreAnyOther cutoff=4 in valueDetection.ts.
+      const lower = selection.toLowerCase().trim();
+      if (!lower.includes("any other")) return null;
+      const maxGoal = Math.max(ctx.homeScore, ctx.awayScore);
+      if (maxGoal < 4) return false;
+      if (lower.includes("home")) return ctx.homeScore > ctx.awayScore;
+      if (lower.includes("away")) return ctx.awayScore > ctx.homeScore;
+      if (lower.includes("draw")) return ctx.homeScore === ctx.awayScore;
+      return null;
+    },
+  },
+
+  HTFT: {
+    id: "HTFT",
+    resolveFrom: "halftime",
+    resolve: (selection, ctx) => {
+      if (ctx.homeScoreHt == null || ctx.awayScoreHt == null) return null;
+      const m = selection.match(/^(Home|Draw|Away)\s*\/\s*(Home|Draw|Away)$/);
+      if (!m) return null;
+      const htClass = (h: number, a: number): "Home" | "Draw" | "Away" =>
+        h > a ? "Home" : h < a ? "Away" : "Draw";
+      return (
+        htClass(ctx.homeScoreHt, ctx.awayScoreHt) === m[1] &&
+        htClass(ctx.homeScore, ctx.awayScore) === m[2]
+      );
+    },
+  },
+
+  // Alias so bets written under either canonical name settle identically.
+  // valueDetection.ts treats marketType === "HTFT" || === "HALF_TIME_FULL_TIME"
+  // as the same Poisson predictor; same on settlement.
+  HALF_TIME_FULL_TIME: {
+    id: "HALF_TIME_FULL_TIME",
+    resolveFrom: "halftime",
+    resolve: (selection, ctx) => {
+      if (ctx.homeScoreHt == null || ctx.awayScoreHt == null) return null;
+      const m = selection.match(/^(Home|Draw|Away)\s*\/\s*(Home|Draw|Away)$/);
+      if (!m) return null;
+      const htClass = (h: number, a: number): "Home" | "Draw" | "Away" =>
+        h > a ? "Home" : h < a ? "Away" : "Draw";
+      return (
+        htClass(ctx.homeScoreHt, ctx.awayScoreHt) === m[1] &&
+        htClass(ctx.homeScore, ctx.awayScore) === m[2]
+      );
+    },
+  },
+
+  // CLEAN_SHEET_HOME — Home keeps a clean sheet iff awayScore == 0.
+  // Mirrors predictCleanSheet(side='home') which returns P(away_score = 0).
+  CLEAN_SHEET_HOME: {
+    id: "CLEAN_SHEET_HOME",
+    resolveFrom: "final_score",
+    resolve: (selection, ctx) => {
+      const yes = ctx.awayScore === 0;
+      if (selection === "Yes") return yes;
+      if (selection === "No") return !yes;
+      return null;
+    },
+  },
+
+  // CLEAN_SHEET_AWAY — Away keeps a clean sheet iff homeScore == 0.
+  CLEAN_SHEET_AWAY: {
+    id: "CLEAN_SHEET_AWAY",
+    resolveFrom: "final_score",
+    resolve: (selection, ctx) => {
+      const yes = ctx.homeScore === 0;
+      if (selection === "Yes") return yes;
+      if (selection === "No") return !yes;
+      return null;
+    },
+  },
 };
 
 /**
