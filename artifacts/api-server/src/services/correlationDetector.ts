@@ -305,6 +305,79 @@ const COMPLEMENTARY_RULES: ComplementaryRule[] = [
     market2: "MATCH_ODDS", sel2Includes: "Away",
     thesis: "BTTS No + MO Away — away dominance with clean sheet upside",
   },
+  // ─── F2.A.22: WTN / CS / BTTS / OU cross-market thesis chains ──────────
+  // Theory: a dominant favourite winning to nil expresses one joint
+  // thesis across MULTIPLE markets. The model should size these as
+  // EXPRESSIONS OF ONE EDGE rather than independent picks. Same applies
+  // to defensive-grind under-thesis pairs.
+  //
+  // POSSESSION-DOMINANCE + DEFENSIVE SOLIDITY:
+  {
+    market1: "CLEAN_SHEET_HOME", sel1Includes: "Yes",
+    market2: "MATCH_ODDS", sel2Includes: "Home",
+    thesis: "home possession dominance with defensive solidity (CS + win)",
+  },
+  {
+    market1: "CLEAN_SHEET_AWAY", sel1Includes: "Yes",
+    market2: "MATCH_ODDS", sel2Includes: "Away",
+    thesis: "away dominance with defensive solidity (CS + win)",
+  },
+  {
+    market1: "CLEAN_SHEET_HOME", sel1Includes: "Yes",
+    market2: "OVER_UNDER_25", sel2Includes: "Under",
+    thesis: "low-scoring grind with home clean sheet",
+  },
+  {
+    market1: "CLEAN_SHEET_AWAY", sel1Includes: "Yes",
+    market2: "OVER_UNDER_25", sel2Includes: "Under",
+    thesis: "low-scoring grind with away clean sheet",
+  },
+  // EXPANDED LOW-SCORING-DEFENSIVE THESIS — OU Under 1.5/2.5 with BTTS No
+  // (already shipped) is the same family; add corner-low correlate:
+  {
+    market1: "CLEAN_SHEET_HOME", sel1Includes: "Yes",
+    market2: "TOTAL_CORNERS_85", sel2Includes: "Under",
+    thesis: "home shuts down — low away pressure, low corners",
+  },
+  {
+    market1: "CLEAN_SHEET_AWAY", sel1Includes: "Yes",
+    market2: "TOTAL_CORNERS_85", sel2Includes: "Under",
+    thesis: "away shuts down — low home pressure, low corners",
+  },
+  // OPEN-GAME / TWO-ATTACK-VULNERABILITIES THESIS:
+  // BTTS Yes + OU Over (existing 2.5 / 3.5 cases shipped) — now extend to
+  // include team-totals + corner-volume same direction. Common thesis is
+  // "both teams will score = both teams have vulnerability = high goal
+  // total likely = many corners likely". Sizing must reflect.
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "TEAM_TOTAL_HOME_15", sel2Includes: "Over",
+    thesis: "both score thesis with home scoring multiple",
+  },
+  {
+    market1: "BTTS", sel1Includes: "Yes",
+    market2: "TEAM_TOTAL_AWAY_15", sel2Includes: "Over",
+    thesis: "both score thesis with away scoring multiple",
+  },
+  // EARLY-GOAL THESIS (HT to FT chain):
+  // FHR Over 0.5 (goal in first half) + Over 2.5 FT — early goal opens
+  // the game. FHR Over 1.5 + Over 3.5 FT — even stronger correlation.
+  {
+    market1: "FIRST_HALF_OU_05", sel1Includes: "Over",
+    market2: "OVER_UNDER_25", sel2Includes: "Over",
+    thesis: "early-goal opens the game — FH+FT Over correlate",
+  },
+  {
+    market1: "FIRST_HALF_OU_15", sel1Includes: "Over",
+    market2: "OVER_UNDER_35", sel2Includes: "Over",
+    thesis: "high-tempo open game — FH and FT Over both stretch",
+  },
+  // NO-GOAL FIRST HALF + UNDER FT (defensive grind continues):
+  {
+    market1: "FIRST_HALF_OU_05", sel1Includes: "Under",
+    market2: "OVER_UNDER_15", sel2Includes: "Under",
+    thesis: "scoreless first half + low-scoring total — defensive thesis",
+  },
 ];
 
 interface ConflictingRule {
@@ -546,6 +619,116 @@ const CORRELATED_PAIRS: CorrelatedPair[] = [
     market1: "BTTS", sel1Includes: "No",
     market2: "OVER_UNDER_15", sel2Includes: "Under",
     reason: "OU_15 Under (≤1 goal) implies one side at 0 ⇒ BTTS No — dominated",
+  },
+  // ─── F2.A.22: WIN_TO_NIL strict-subset chains ──────────────────────────
+  // WTN_HOME Yes ⇔ (Home wins AND Away = 0). It is the STRICT subset of:
+  //   1. MO Home (every WTN_HOME Yes is a Home win, but not vice versa)
+  //   2. CLEAN_SHEET_HOME Yes (CS allows draws 0-0; WTN doesn't)
+  //   3. BTTS No (WTN requires opp=0 = BTTS No always)
+  // Backing WTN + any of these = paying vig twice. Drop weaker (lower opp
+  // score). Mirror for WTN_AWAY.
+  {
+    market1: "WIN_TO_NIL_HOME", sel1Includes: "Yes",
+    market2: "MATCH_ODDS", sel2Includes: "Home",
+    reason: "WTN_HOME Yes is strict subset of MO Home — dominated",
+  },
+  {
+    market1: "WIN_TO_NIL_HOME", sel1Includes: "Yes",
+    market2: "CLEAN_SHEET_HOME", sel2Includes: "Yes",
+    reason: "WTN_HOME Yes is strict subset of CLEAN_SHEET_HOME Yes — dominated",
+  },
+  {
+    market1: "WIN_TO_NIL_HOME", sel1Includes: "Yes",
+    market2: "BTTS", sel2Includes: "No",
+    reason: "WTN_HOME Yes is strict subset of BTTS No — dominated",
+  },
+  {
+    market1: "WIN_TO_NIL_AWAY", sel1Includes: "Yes",
+    market2: "MATCH_ODDS", sel2Includes: "Away",
+    reason: "WTN_AWAY Yes is strict subset of MO Away — dominated",
+  },
+  {
+    market1: "WIN_TO_NIL_AWAY", sel1Includes: "Yes",
+    market2: "CLEAN_SHEET_AWAY", sel2Includes: "Yes",
+    reason: "WTN_AWAY Yes is strict subset of CLEAN_SHEET_AWAY Yes — dominated",
+  },
+  {
+    market1: "WIN_TO_NIL_AWAY", sel1Includes: "Yes",
+    market2: "BTTS", sel2Includes: "No",
+    reason: "WTN_AWAY Yes is strict subset of BTTS No — dominated",
+  },
+  // ─── F2.A.22: HTFT exact-pair subset chains ────────────────────────────
+  // HTFT "X/Y" is a STRICT subset of (FHR X) AND of (MO Y). Backing both
+  // is paying vig twice on partial implications.
+  {
+    market1: "HTFT", sel1Includes: "Home/Home",
+    market2: "MATCH_ODDS", sel2Includes: "Home",
+    reason: "HTFT Home/Home implies MO Home — dominated",
+  },
+  {
+    market1: "HTFT", sel1Includes: "Away/Away",
+    market2: "MATCH_ODDS", sel2Includes: "Away",
+    reason: "HTFT Away/Away implies MO Away — dominated",
+  },
+  {
+    market1: "HTFT", sel1Includes: "Draw/Draw",
+    market2: "MATCH_ODDS", sel2Includes: "Draw",
+    reason: "HTFT Draw/Draw implies MO Draw — dominated",
+  },
+  {
+    market1: "HTFT", sel1Includes: "Home/Home",
+    market2: "FIRST_HALF_RESULT", sel2Includes: "Home",
+    reason: "HTFT Home/Home implies FHR Home — dominated",
+  },
+  {
+    market1: "HTFT", sel1Includes: "Away/Away",
+    market2: "FIRST_HALF_RESULT", sel2Includes: "Away",
+    reason: "HTFT Away/Away implies FHR Away — dominated",
+  },
+  // ─── F2.A.22: CORRECT_SCORE specific-cell subset chains ────────────────
+  // Exact CS cells deterministically imply many other markets. Backing
+  // CS "0 - 0" with Under 0.5 (existing rule) + BTTS No + CS_HOME Yes +
+  // CS_AWAY Yes is FOUR bets on one event. Add the missing implications.
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "0 - 0",
+    market2: "BTTS", sel2Includes: "No",
+    reason: "CS 0-0 implies BTTS No — dominated",
+  },
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "0 - 0",
+    market2: "CLEAN_SHEET_HOME", sel2Includes: "Yes",
+    reason: "CS 0-0 implies CLEAN_SHEET_HOME Yes — dominated",
+  },
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "0 - 0",
+    market2: "CLEAN_SHEET_AWAY", sel2Includes: "Yes",
+    reason: "CS 0-0 implies CLEAN_SHEET_AWAY Yes — dominated",
+  },
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "0 - 0",
+    market2: "MATCH_ODDS", sel2Includes: "Draw",
+    reason: "CS 0-0 implies MO Draw — dominated",
+  },
+  // CS 1-0: Home wins to nil, low total
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "1 - 0",
+    market2: "WIN_TO_NIL_HOME", sel2Includes: "Yes",
+    reason: "CS 1-0 implies WTN_HOME Yes — dominated",
+  },
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "1 - 0",
+    market2: "MATCH_ODDS", sel2Includes: "Home",
+    reason: "CS 1-0 implies MO Home — dominated",
+  },
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "0 - 1",
+    market2: "WIN_TO_NIL_AWAY", sel2Includes: "Yes",
+    reason: "CS 0-1 implies WTN_AWAY Yes — dominated",
+  },
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "0 - 1",
+    market2: "MATCH_ODDS", sel2Includes: "Away",
+    reason: "CS 0-1 implies MO Away — dominated",
   },
 ];
 
