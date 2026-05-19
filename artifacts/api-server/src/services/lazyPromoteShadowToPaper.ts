@@ -790,11 +790,23 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
             // Bounded by 6h on-demand cache + isCachedAsUnavailable gate
             // upstream. Throttled inherently by the lazy-promote loop
             // iteration speed (~10ms/candidate).
-            if (m.betfair_event_id) {
+            // F2.A.29 (2026-05-20): guard against af_-prefixed pseudo IDs.
+            // F2.A.24 originally only checked truthiness, but matches table
+            // contains betfair_event_id values like 'af_1545237' (AF-derived
+            // placeholders pending Betfair confirmation). Passing those to
+            // sweepEventOnDemand → findEventIdByTeamNames → undefined.replace
+            // crash. Each cycle's 837 pending shadows generated hundreds of
+            // error logs per minute, flooding pm2 and triggering the crash
+            // loop (restart count: 8505).
+            //
+            // Real Betfair event IDs are pure numeric strings. Skip any
+            // non-numeric variant.
+            const bfId = m.betfair_event_id;
+            if (bfId && /^[0-9]+$/.test(bfId)) {
               void (async () => {
                 try {
                   const { sweepEventOnDemand } = await import("./exchangeBookSweep");
-                  await sweepEventOnDemand(r.match_id, m.betfair_event_id!);
+                  await sweepEventOnDemand(r.match_id, bfId);
                 } catch (sweepErr) {
                   logger.debug(
                     { sweepErr, betId: r.id, matchId: r.match_id },
