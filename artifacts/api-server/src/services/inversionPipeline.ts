@@ -201,9 +201,78 @@ export async function isInversionPipelineEnabled(): Promise<boolean> {
  * — these cuts ARE educated guesses. Recalibrate after Bundle 17 / F0
  * accumulates more (edge × age) cells.
  */
+// Bundle F2.B.A (2026-05-19): TTK-aware Pinnacle freshness curve.
+//
+// Single-180s gate rejected 9,905 bets/24h far from kickoff while being
+// too loose <30 min from kickoff (last 24h: zero bets placed in the <1h
+// "gold zone"). Pinnacle moves slowly 24h+ out (mostly injury news);
+// rapidly inside 1h (sharp money + lineups). One number can't both fit.
+//
+// Curve below maps (hoursToKickoff, edgeBandPp) → max snapshot age. The
+// columns scale edge-asymmetrically: small edges (<3pp) demand tighter
+// freshness because they evaporate fast; large edges (≥5pp) tolerate
+// looser windows because real edge survives normal price drift.
+//
+// hoursToKickoff < 0.25 (15min) → returns 0, which naturally blocks the
+// downstream SQL (`snapshot_time >= NOW() - 0 seconds`). That's the
+// Pinnacle closing-line surge window — Pinnacle is at peak efficiency
+// AND our edge measurement collides with the actual move.
+//
+// Backward-compat: callers that pass only edge (hoursToKickoff omitted)
+// fall through to the legacy edge-band reads. The lazy promoter passes
+// both; the existing 3to4pp/4to5pp/5plus config keys remain meaningful
+// for the legacy path.
+interface FreshnessRow {
+  /** Bucket applies when hoursToKickoff < maxHrs (sorted ascending). */
+  maxHrs: number;
+  /** Seconds when edge is unknown / null. */
+  base: number;
+  /** Seconds when edge < 3pp. */
+  e3: number;
+  /** Seconds when 3pp <= edge < 5pp. */
+  e35: number;
+  /** Seconds when edge >= 5pp. */
+  e5: number;
+}
+
+export const FRESHNESS_CURVE: ReadonlyArray<FreshnessRow> = [
+  { maxHrs: 0.25,     base: 0,    e3: 0,    e35: 0,    e5: 0   }, // <15m: BLOCK
+  { maxHrs: 0.5,      base: 60,   e3: 45,   e35: 60,   e5: 90  }, // 15–30m
+  { maxHrs: 1,        base: 90,   e3: 60,   e35: 90,   e5: 120 }, // 30–60m
+  { maxHrs: 2,        base: 180,  e3: 120,  e35: 180,  e5: 240 }, // 1–2h
+  { maxHrs: 4,        base: 240,  e3: 180,  e35: 240,  e5: 360 }, // 2–4h
+  { maxHrs: 8,        base: 360,  e3: 240,  e35: 360,  e5: 720 }, // 4–8h
+  { maxHrs: 24,       base: 600,  e3: 360,  e35: 600,  e5: 1200 }, // 8–24h
+  { maxHrs: Infinity, base: 900,  e3: 600,  e35: 900,  e5: 1800 }, // 24h+
+];
+
+function pickBucket(hoursToKickoff: number): FreshnessRow {
+  for (const row of FRESHNESS_CURVE) {
+    if (hoursToKickoff < row.maxHrs) return row;
+  }
+  return FRESHNESS_CURVE[FRESHNESS_CURVE.length - 1]!;
+}
+
+function pickEdgeColumn(row: FreshnessRow, postSlipEdgePp: number | null): number {
+  if (postSlipEdgePp == null || !Number.isFinite(postSlipEdgePp)) return row.base;
+  if (postSlipEdgePp >= 5) return row.e5;
+  if (postSlipEdgePp >= 3) return row.e35;
+  return row.e3;
+}
+
 export async function effectivePinnacleMaxAgeSeconds(
   postSlipEdgePp: number | null,
+  hoursToKickoff?: number | null,
 ): Promise<number> {
+  // TTK-aware curve (Bundle F2.B.A). Used when caller knows hoursToKickoff.
+  // Returns 0 in the <15min bucket — natural block (no snapshot satisfies
+  // `age <= 0` so downstream "no fresh Pinnacle" fallback fires).
+  if (hoursToKickoff != null && Number.isFinite(hoursToKickoff)) {
+    return pickEdgeColumn(pickBucket(hoursToKickoff), postSlipEdgePp);
+  }
+
+  // Legacy edge-only path — preserved for callers without TTK context.
+  // Config keys retain operator override capability for the legacy bands.
   const read = async (key: string, fallback: number): Promise<number> => {
     const raw = await getConfigValue(key);
     const n = raw != null ? Number(raw) : NaN;

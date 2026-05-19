@@ -379,7 +379,8 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
            pb.universe_tier_at_placement AS universe_tier,
            pb.fair_value_source AS fair_value_source,
            pb.actionable_source AS actionable_source,
-           m.league AS league
+           m.league AS league,
+           m.kickoff_time AS kickoff_time
     FROM paper_bets pb JOIN matches m ON m.id = pb.match_id
     WHERE pb.bet_track = 'shadow'
       AND pb.status = 'pending'
@@ -411,6 +412,7 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
     fair_value_source: string | null;
     actionable_source: string | null;
     league: string | null;
+    kickoff_time: string | Date | null;
   }>);
   // Bundle F1 (2026-05-18): if scopeAllowlist provided, filter to those
   // scopes only. F1 evaluator calls with one or more recently-Pinnacle-
@@ -718,10 +720,17 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
         // matched (stored odds had drifted past current market).
         let liveBetfairBack: number | null = null;
         try {
-          const pinnMaxAgeRaw = await getConfig("pinnacle_max_age_seconds");
+          // Bundle F2.B.A (2026-05-19): TTK-aware Pinnacle freshness for
+          // the pre-edge query. Edge isn't known yet (we need a fresh
+          // Pinnacle quote to compute it), so pass null edge — curve uses
+          // the base column per TTK bucket. Same curve, edge re-applied
+          // later at the F4-band check.
+          const hoursToKickoffPre = r.kickoff_time
+            ? (new Date(r.kickoff_time).getTime() - Date.now()) / 3_600_000
+            : null;
+          const { effectivePinnacleMaxAgeSeconds } = await import("./inversionPipeline");
+          const pinnMaxAgeSec = await effectivePinnacleMaxAgeSeconds(null, hoursToKickoffPre);
           const bfMaxAgeRaw = await getConfig("betfair_odds_max_age_seconds");
-          const pinnMaxAgeSec =
-            pinnMaxAgeRaw != null && Number.isFinite(Number(pinnMaxAgeRaw)) ? Number(pinnMaxAgeRaw) : 180;
           const bfMaxAgeSec =
             bfMaxAgeRaw != null && Number.isFinite(Number(bfMaxAgeRaw)) ? Number(bfMaxAgeRaw) : 180;
           // ── Bundle F1.1 (2026-05-18): fresh-Pinnacle query fix ──────────
@@ -823,10 +832,19 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
               continue;
             }
             // ── Bundle F4 (2026-05-18): edge-asymmetric freshness ──────
-            // Marginal-edge bets demand tighter Pinnacle freshness.
+            // Bundle F2.B.A (2026-05-19): now TTK-aware. Pass hours-to-
+            // kickoff so the curve picks the right bucket (tighter inside
+            // 1h, looser at 24h+). Lazy promoter has both edge and
+            // kickoff_time on the candidate row, so we get the full curve.
             if (pinnAgeSecAtEval != null) {
               const { effectivePinnacleMaxAgeSeconds } = await import("./inversionPipeline");
-              const ceilingSec = await effectivePinnacleMaxAgeSeconds(postSlipEdgePp);
+              const hoursToKickoff = r.kickoff_time
+                ? (new Date(r.kickoff_time).getTime() - Date.now()) / 3_600_000
+                : null;
+              const ceilingSec = await effectivePinnacleMaxAgeSeconds(
+                postSlipEdgePp,
+                hoursToKickoff,
+              );
               if (pinnAgeSecAtEval > ceilingSec) {
                 result.skipped_edge_evaporated++;
                 await db.insert(complianceLogsTable).values({
@@ -839,6 +857,7 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
                     postSlipEdgePp,
                     pinnAgeSecAtEval,
                     ceilingSec,
+                    hoursToKickoff,
                     reason: "f4_edge_banded_freshness_exceeded",
                     source: "lazy_promote",
                   },

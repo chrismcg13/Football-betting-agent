@@ -2857,9 +2857,30 @@ export async function placePaperBet(
   // gate saw stale data. Now the DB is the single source of truth for
   // "what does the system know about Pinnacle right now."
   try {
-    const maxAgeRaw = await getConfigValue("pinnacle_max_age_seconds");
-    const pinnacleMaxAgeSeconds =
-      maxAgeRaw != null && Number.isFinite(Number(maxAgeRaw)) ? Number(maxAgeRaw) : 180;
+    // Bundle F2.B.A (2026-05-19): TTK-aware Pinnacle freshness curve.
+    // Pre-gate verification doesn't have edge yet (runs before edge calc),
+    // so passes null edge. The curve's base column applies: 600s far out,
+    // 60s near kickoff, 0s (block) inside 15min. Query kickoffTime inline
+    // — small cost (PK lookup on matches).
+    let hoursToKickoff: number | null = null;
+    try {
+      const koRows = await db
+        .select({ kickoffTime: matchesTable.kickoffTime })
+        .from(matchesTable)
+        .where(eq(matchesTable.id, matchId))
+        .limit(1);
+      const ko = koRows[0]?.kickoffTime;
+      if (ko) {
+        hoursToKickoff = (new Date(ko).getTime() - Date.now()) / 3_600_000;
+      }
+    } catch {
+      hoursToKickoff = null; // fall through to edge-only legacy path
+    }
+    const { effectivePinnacleMaxAgeSeconds } = await import("./inversionPipeline");
+    const pinnacleMaxAgeSeconds = await effectivePinnacleMaxAgeSeconds(null, hoursToKickoff);
+    // pinnacleMaxAgeSeconds = 0 (curve block in <15min bucket) means the SQL
+    // query below filters everything out -> falls through to the "no fresh
+    // Pinnacle" branch -> shadow rail. Correct semantic.
     const variants = Array.from(new Set([
       selectionName,
       selectionName.endsWith(" Goals") ? selectionName.replace(/ Goals$/, "") : `${selectionName} Goals`,
