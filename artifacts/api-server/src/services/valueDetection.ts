@@ -1632,8 +1632,11 @@ export async function detectValueBets(options?: {
       // (match.league, marketType) — falls back to market-type-global, then
       // to passthrough if no bucket exists. Bucket id stored on the bet for
       // audit + future recalibration analysis.
-      const { calibrated: modelProb, bucketId: calibrationBucketId } =
-        await calibrate(rawModelProb, match.league ?? null, marketType);
+      const {
+        calibrated: modelProb,
+        bucketId: calibrationBucketId,
+        bucketVersion: calibrationBucketVersionAtPlacement,
+      } = await calibrate(rawModelProb, match.league ?? null, marketType);
 
       selectionsEvaluated++;
 
@@ -1886,6 +1889,7 @@ export async function detectValueBets(options?: {
           modelProbability: modelProb,
           rawModelProbability: rawModelProb,
           calibrationBucketId,
+          calibrationBucketVersionAtPlacement,
           impliedProbability: impliedProb,
           edge,
           backOdds,

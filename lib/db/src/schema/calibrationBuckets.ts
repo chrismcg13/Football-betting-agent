@@ -32,6 +32,17 @@ export const calibrationBucketsTable = pgTable("calibration_buckets", {
   brierOut: numeric("brier_out", { precision: 10, scale: 6 }),
   eceOut: numeric("ece_out", { precision: 10, scale: 6 }),
   active: boolean("active").notNull().default(true),
+  // Bundle F2.B.H (2026-05-19): Beta-Binomial continuous-update columns.
+  // Each settled bet increments alpha (win) or beta (loss); posterior
+  // win-rate = alpha / (alpha + beta). Version bumps on each update so
+  // pending bets stay pinned to the version active at placement (avoids
+  // self-referential feedback — a settled bet's outcome can't retroactively
+  // adjust the Kelly fraction on a sibling bet placed at the same time).
+  version: integer("version").notNull().default(0),
+  posteriorAlpha: numeric("posterior_alpha", { precision: 12, scale: 2 }).notNull().default("1"),
+  posteriorBeta: numeric("posterior_beta", { precision: 12, scale: 2 }).notNull().default("1"),
+  lastSettledBetId: integer("last_settled_bet_id"),
+  lastUpdatedAt: timestamp("last_updated_at", { withTimezone: true }),
 });
 
 export type CalibrationBucket = typeof calibrationBucketsTable.$inferSelect;

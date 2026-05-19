@@ -1534,6 +1534,9 @@ export async function runTradingCycle(options?: {
       // Task 12 (2026-05-11): pre-calibration prob + bucket id for audit.
       rawModelProbability: number;
       calibrationBucketId: number | null;
+      // Bundle F2.B.H (2026-05-19): bucket version at placement-time
+      // (version-pinned to avoid retroactive Kelly shifts on settlement).
+      calibrationBucketVersionAtPlacement: number | null;
     }
 
     const betOrders: BetOrder[] = [];
@@ -1715,6 +1718,7 @@ export async function runTradingCycle(options?: {
         // calibration_bucket_id even though the calibration was applied.
         rawModelProbability: candidate.rawModelProbability,
         calibrationBucketId: candidate.calibrationBucketId,
+        calibrationBucketVersionAtPlacement: candidate.calibrationBucketVersionAtPlacement,
         // Phase 2.B.2: tier carried through to placePaperBet for the
         // shadow-stake branch.
         universeTier: candidate.universeTier ?? null,
@@ -1950,6 +1954,7 @@ export async function runTradingCycle(options?: {
           // backreference for audit.
           rawModelProbability: order.rawModelProbability,
           calibrationBucketId: order.calibrationBucketId,
+          calibrationBucketVersionAtPlacement: order.calibrationBucketVersionAtPlacement,
         },
       );
 

@@ -1251,6 +1251,10 @@ export interface PaperBetOptions {
   // to placePaperBet) carries the post-calibration value.
   rawModelProbability?: number | null;
   calibrationBucketId?: number | null;
+  // Bundle F2.B.H (2026-05-19): bucket version at placement time. Pins
+  // this bet to the version-specific posterior so settlement-time updates
+  // don't retroactively shift its Kelly attribution.
+  calibrationBucketVersionAtPlacement?: number | null;
 }
 
 export async function placePaperBet(
@@ -1288,6 +1292,7 @@ export async function placePaperBet(
     placementTrack = null,
     rawModelProbability = null,
     calibrationBucketId = null,
+    calibrationBucketVersionAtPlacement = null,
   } = options;
 
   // ── Block B (2026-05-14) — parameter-free Bayesian shrinkage ───────────────
@@ -3650,6 +3655,7 @@ export async function placePaperBet(
         rawModelProbability:
           rawModelProbability != null ? String(rawModelProbability) : null,
         calibrationBucketId: calibrationBucketId ?? null,
+        calibrationBucketVersionAtPlacement: calibrationBucketVersionAtPlacement ?? null,
         betfairImpliedProbability: String(impliedProbability),
         calculatedEdge: String(edge),
         opportunityScore: String(score),
@@ -4766,6 +4772,10 @@ async function _settleBetsInner(): Promise<SettlementResult> {
   let won = 0;
   let lost = 0;
   let totalPnl = 0;
+  // Bundle F2.B.H (2026-05-19): bet IDs settled in this run; passed to
+  // updateBucketFromSettledBet after applyBatchPnl so Beta-Binomial
+  // posteriors stay current with the latest settlement batch.
+  const settledBetIds: number[] = [];
   let paperPendingRetry = 0;
   let paperTimeoutLoss = 0;
   let paperAbandonmentVoid = 0;
@@ -5086,6 +5096,7 @@ async function _settleBetsInner(): Promise<SettlementResult> {
     else if (!isVoid) lost++;
     totalPnl += settlementPnl;
     settled++;
+    if (!isVoid) settledBetIds.push(bet.id);
 
     logger.info(
       {
@@ -5152,6 +5163,24 @@ async function _settleBetsInner(): Promise<SettlementResult> {
       won,
       lost,
     });
+
+    // Bundle F2.B.H (2026-05-19): increment calibration-bucket posteriors
+    // for buckets touched by this settlement batch. Bumps version on
+    // affected buckets + invalidates the 5-min cache so the next
+    // calibrate() call sees the updated posterior. Pending bets keep
+    // their placement-time version (paper_bets.calibration_bucket_version_at
+    // _placement) — no retroactive Kelly adjustment.
+    if (settledBetIds.length > 0) {
+      try {
+        const { updateBucketFromSettledBet } = await import("./calibration");
+        const r = await updateBucketFromSettledBet(settledBetIds);
+        if (r.buckets_updated > 0) {
+          logger.info(r, "Calibration buckets posterior updated from settlement batch");
+        }
+      } catch (err) {
+        logger.warn({ err, betCount: settledBetIds.length }, "updateBucketFromSettledBet failed — non-fatal");
+      }
+    }
 
     const totalSettledResult = await db
       .select({ count: sql<number>`count(*)::int` })

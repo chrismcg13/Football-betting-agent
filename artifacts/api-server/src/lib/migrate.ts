@@ -5170,6 +5170,25 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.F: league_half_fractions table ready");
 
+    // ── Bundle F2.B.H (2026-05-19): Beta-Binomial continuous calibration ──
+    // Adds posterior counters + version pin so the calibration substrate
+    // updates on every settled bet (not just weekly via fit_calibration.py)
+    // without retroactively changing Kelly attribution on bets already
+    // placed under the prior version.
+    await db.execute(sql`
+      ALTER TABLE calibration_buckets
+        ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS posterior_alpha NUMERIC(12,2) NOT NULL DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS posterior_beta NUMERIC(12,2) NOT NULL DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS last_settled_bet_id INTEGER,
+        ADD COLUMN IF NOT EXISTS last_updated_at TIMESTAMPTZ
+    `);
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS calibration_bucket_version_at_placement INTEGER
+    `);
+    logger.info("Bundle F2.B.H: calibration_buckets posterior + version columns ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

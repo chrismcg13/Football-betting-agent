@@ -88,6 +88,13 @@ export const paperBetsTable = pgTable("paper_bets", {
   // SHARP_CLV_SOURCES allow-list, which excludes betfair_exchange).
   closingPinnacleOdds: numeric("closing_pinnacle_odds", { precision: 10, scale: 4 }),
   clvPct: numeric("clv_pct", { precision: 8, scale: 4 }),
+  // Bundle F2.B.H (2026-05-19): version of the calibration bucket active
+  // at placement time. Updates to the bucket (Beta-Binomial posterior
+  // increments on settled bets) bump the version; this column pins the
+  // bet to its placement-time state so settlement does NOT retroactively
+  // change Kelly attribution. NULL on bets placed before the column
+  // existed or where no calibration bucket applied.
+  calibrationBucketVersionAtPlacement: integer("calibration_bucket_version_at_placement"),
   // Bundle F2.B.B.2 (2026-05-19): velocity-derived early CLV estimate.
   // Pinned from a stable pinnacle_line_movement window (max_abs_delta_pp
   // < 0.3pp AND n_snapshots >= TTK-bucket floor) inside the <30m TTK
