@@ -5063,6 +5063,17 @@ router.post("/admin/run-near-cycle", async (_req, res) => {
   }
 });
 
+router.post("/admin/sync-pinnacle-coverage", async (_req, res) => {
+  try {
+    const { runPinnacleCoverageUpdateNow } = await import("../services/scheduler");
+    const result = await runPinnacleCoverageUpdateNow();
+    res.json({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "sync-pinnacle-coverage failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/rescue-pinnacle-mapping", async (req, res) => {
   try {
     const dryRun = String(req.query["dryRun"] ?? req.body?.dryRun ?? "false") === "true";

@@ -895,9 +895,32 @@ export async function updatePinnacleOddsFromActualMappings(): Promise<{
     }
   }
 
+  // F2.A.12 (2026-05-19): competition_config is the table the rest of the
+  // system reads (lazyPromoter ranking, oddspapi prefetch prioritisation,
+  // analysis_signal_strength views). discovered_leagues was being written but
+  // never read for has_pinnacle_odds — leaving the flag stuck at false for
+  // ~17 leagues actively ingesting Pinnacle (Liga MX, Israel Premier, etc.).
+  let competitionConfigUpdated = 0;
+  for (const name of leagueNames) {
+    const result = await db
+      .update(competitionConfigTable)
+      .set({ hasPinnacleOdds: true })
+      .where(and(eq(competitionConfigTable.name, name), eq(competitionConfigTable.hasPinnacleOdds, false)));
+
+    if ((result.rowCount ?? 0) > 0) {
+      competitionConfigUpdated++;
+      logger.info({ league: name }, "competition_config: hasPinnacleOdds=true from actual ingestion");
+    }
+  }
+
   logger.info(
-    { afPinnacle: leaguesWithAfPinnacle.length, oddsPapiMapped: leaguesWithOddsPapiMapping.length, newlyUpdated: updated },
+    {
+      afPinnacle: leaguesWithAfPinnacle.length,
+      oddsPapiMapped: leaguesWithOddsPapiMapping.length,
+      discoveredLeaguesUpdated: updated,
+      competitionConfigUpdated,
+    },
     "Pinnacle coverage sync complete",
   );
-  return { updated, leaguesWithPinnacle: leagueNames };
+  return { updated: updated + competitionConfigUpdated, leaguesWithPinnacle: leagueNames };
 }
