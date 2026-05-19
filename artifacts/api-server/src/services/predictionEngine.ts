@@ -1350,10 +1350,11 @@ export function predictAsianTotalGoals(
 
 // ===================== Bundle F2.A.10 (2026-05-19) Poisson predictors =====================
 // Per Chris directive: model needs to inform on new market types (CORRECT_SCORE,
-// HALF_TIME_FULL_TIME, NEXT_GOAL, CLEAN_SHEET, TO_WIN_TO_NIL) so they can go
-// live, not just shadow. All five derive from the same Poisson scoreline
-// matrix that powers AH + team totals. Uses existing home_goals_scored_avg /
-// away_goals_scored_avg features (xG fallback). No new features required.
+// HALF_TIME_FULL_TIME, CLEAN_SHEET, TO_WIN_TO_NIL) so they can go live, not
+// just shadow. Derives from the same Poisson scoreline matrix that powers AH
+// + team totals. Uses existing home_goals_scored_avg / away_goals_scored_avg
+// features (xG fallback). No new features required. NEXT_GOAL removed
+// 2026-05-19 — pre-match agent does not place in-play bets.
 
 /**
  * Predict probability of an exact (homeScore, awayScore). Returns null
@@ -1451,28 +1452,9 @@ export function predictHalfTimeFullTime(
   return Math.max(0.001, Math.min(0.999, p));
 }
 
-/**
- * Predict probability of who scores the next goal in remaining time.
- * Pre-match assumption: remaining time = full match (90 min). For
- * in-play this would shift to remaining minutes — out of scope here.
- *   P(home next) = (1 − P(no more)) × λ_home / (λ_home + λ_away)
- *   P(no more)    = exp(−(λ_home + λ_away))
- */
-export function predictNextGoal(
-  featureMap: Record<string, number>,
-  side: "Home" | "Away" | "NoGoal",
-): number | null {
-  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
-  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
-  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) return null;
-  const total = homeLambda + awayLambda;
-  const pNoMore = Math.exp(-total);
-  if (side === "NoGoal") return Math.max(0.001, Math.min(0.999, pNoMore));
-  const pAnyMore = 1 - pNoMore;
-  if (side === "Home") return Math.max(0.001, Math.min(0.999, pAnyMore * (homeLambda / total)));
-  if (side === "Away") return Math.max(0.001, Math.min(0.999, pAnyMore * (awayLambda / total)));
-  return null;
-}
+// predictNextGoal removed 2026-05-19 — in-play market, excluded from
+// pre-match agent per operator. Predictor mathematically valid but
+// unreachable; removing to keep the surface area honest.
 
 /**
  * Predict clean-sheet probability for a team.

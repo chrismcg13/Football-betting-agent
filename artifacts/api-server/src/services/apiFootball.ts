@@ -507,6 +507,77 @@ function mapOddsToMarket(
     if (v === "Away") return { marketType: "DRAW_NO_BET", selectionName: "Away", backOdds: o };
   }
 
+  // ── Bundle F2.A.11 (2026-05-19): CORRECT_SCORE / HTFT / CLEAN_SHEET ──
+  // F2.A.10 added model predictors for these; F2.A.11 unblocks the
+  // Pinnacle data flow by parsing API-Football bet names for them.
+  // Without this, Pinnacle quotes for these markets get dropped at
+  // ingestion and emissions can never satisfy F2.A.7's "Pinnacle
+  // covers selection" gate. NEXT_GOAL excluded — pre-match agent does
+  // not place in-play bets.
+
+  // CORRECT_SCORE — bet name "Exact Score" / "Correct Score"
+  // Values come as "1:0", "2:1", "0:0", etc. or "1-0", "2-1".
+  if (norm.includes("correct score") || norm.includes("exact score")) {
+    const m = v.match(/^(\d+)\s*[:\-]\s*(\d+)$/);
+    if (m) {
+      const sel = `${m[1]} - ${m[2]}`; // normalise to Betfair format
+      return { marketType: "CORRECT_SCORE", selectionName: sel, backOdds: o };
+    }
+  }
+
+  // HALF_TIME_FULL_TIME — bet name "HT/FT" / "Half Time/Full Time" /
+  //   "Halftime/Fulltime" / "HT FT Double"
+  // Values: "Home/Home", "Home/Draw", "Home/Away", ..., or short codes
+  //   "1/1", "1/X", "1/2", "X/1", "X/X", "X/2", "2/1", "2/X", "2/2"
+  if (
+    norm.includes("ht/ft") ||
+    (norm.includes("half time") && norm.includes("full time")) ||
+    norm.includes("halftime/fulltime") || norm.includes("ht ft")
+  ) {
+    const map = (token: string): "Home" | "Draw" | "Away" | null => {
+      const t = token.trim().toLowerCase();
+      if (t === "home" || t === "1") return "Home";
+      if (t === "draw" || t === "x") return "Draw";
+      if (t === "away" || t === "2") return "Away";
+      return null;
+    };
+    const m = v.match(/^([A-Za-z0-9]+)\s*[\/\-]\s*([A-Za-z0-9]+)$/);
+    if (m) {
+      const ht = map(m[1]);
+      const ft = map(m[2]);
+      if (ht && ft) {
+        return {
+          marketType: "HTFT",
+          selectionName: `${ht}/${ft}`,
+          backOdds: o,
+        };
+      }
+    }
+  }
+
+  // NEXT_GOAL excluded — pre-match agent does not place in-play bets
+  // (per operator 2026-05-19). Predictor in predictionEngine.ts and
+  // dispatch in valueDetection.ts removed in companion edit.
+
+  // CLEAN_SHEET — bet names "Clean Sheet - Home" / "Home Clean Sheet" /
+  //   "Team to keep clean sheet (Home)" / similar. Values "Yes" / "No".
+  if (norm.includes("clean sheet")) {
+    const isHome = norm.includes("home") || norm.includes("team a");
+    const isAway = norm.includes("away") || norm.includes("team b");
+    const sel = v === "Yes" || v.toLowerCase() === "yes" ? "Yes"
+              : v === "No" || v.toLowerCase() === "no" ? "No"
+              : null;
+    if (sel) {
+      if (isHome) return { marketType: "CLEAN_SHEET_HOME", selectionName: sel, backOdds: o };
+      if (isAway) return { marketType: "CLEAN_SHEET_AWAY", selectionName: sel, backOdds: o };
+    }
+  }
+
+  // WIN_TO_NIL deferred — predictor exists but no valueDetection dispatch
+  // wired (F2.A.10 covered the other four). Adding ingestion without a
+  // downstream consumer fails the no-dead-weight rule. Revisit once the
+  // dispatch + market mapping in exchangeBookSweep land.
+
   // 2026-05-16 subtract bundle: WIN_TO_NIL_HOME/AWAY + GOALS_ODD_EVEN case
   // branches removed.
 

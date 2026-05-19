@@ -80,7 +80,7 @@ const TARGET_BETFAIR_MARKET_TYPES = new Set<string>([
   // markets per Chris's docs paste — exclude all player props.
   "CORRECT_SCORE",             // full-time exact scoreline
   "HALF_TIME_SCORE",           // half-time exact scoreline
-  "NEXT_GOAL",                 // who scores next (Home/Away/No more goals)
+  // NEXT_GOAL excluded 2026-05-19 — pre-match agent does not place in-play bets.
   "TO_SCORE_IN_BOTH_HALVES",   // team scores in both halves (per team)
   "TO_WIN_TO_NIL",             // team wins without conceding
   "CLEAN_SHEET_TEAM_A",        // team A keeps clean sheet
@@ -125,7 +125,7 @@ function toInternalMarketType(bfMarketType: string): string {
     case "HALF_TIME_FULL_TIME":   return "HTFT";
     case "CORRECT_SCORE":         return "CORRECT_SCORE";
     case "HALF_TIME_SCORE":       return "HALF_TIME_SCORE";
-    case "NEXT_GOAL":             return "NEXT_GOAL";
+    // NEXT_GOAL case removed 2026-05-19 — in-play market, excluded.
     case "TO_SCORE_IN_BOTH_HALVES": return "BOTH_HALVES_TEAM_SCORE";
     case "TO_WIN_TO_NIL":         return "WIN_TO_NIL";
     case "CLEAN_SHEET_TEAM_A":    return "CLEAN_SHEET_HOME";
@@ -250,15 +250,7 @@ function deriveSelectionName(
     // Runners are scores like "0 - 0", "1 - 0", "Any Other Home Win" etc.
     return name;
   }
-  if (bfMarketType === "NEXT_GOAL") {
-    if (lower === homeTeam.toLowerCase()) return "Home";
-    if (lower === awayTeam.toLowerCase()) return "Away";
-    if (lower.includes("no goal") || lower === "no more goals") return "NoGoal";
-    if (runner.sortPriority === 1) return "Home";
-    if (runner.sortPriority === 2) return "Away";
-    if (runner.sortPriority === 3) return "NoGoal";
-    return null;
-  }
+  // NEXT_GOAL runner-derivation removed 2026-05-19 — in-play market, excluded.
   if (bfMarketType === "TO_SCORE_IN_BOTH_HALVES") {
     if (lower === "yes") return "Yes";
     if (lower === "no") return "No";

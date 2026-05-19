@@ -28,7 +28,7 @@ import {
   predictCorrectScore,
   predictCorrectScoreAnyOther,
   predictHalfTimeFullTime,
-  predictNextGoal,
+  // predictNextGoal removed 2026-05-19 — in-play, not pre-match-eligible
   predictCleanSheet,
   predictWinToNil,
   predictDrawNoBet,
@@ -739,14 +739,8 @@ function getModelProbability(
     );
   }
 
-  // NEXT_GOAL — runners "Home" / "Away" / "NoGoal" (normalized in
-  // exchangeBookSweep.deriveSelectionName).
-  if (marketType === "NEXT_GOAL") {
-    if (selectionName === "Home" || selectionName === "Away" || selectionName === "NoGoal") {
-      return predictNextGoal(enriched, selectionName as "Home" | "Away" | "NoGoal");
-    }
-    return null;
-  }
+  // NEXT_GOAL dispatch removed 2026-05-19 — in-play market, excluded from
+  // pre-match agent per operator.
 
   // CLEAN_SHEET_HOME / CLEAN_SHEET_AWAY — runners "Yes" / "No".
   if (marketType === "CLEAN_SHEET_HOME" || marketType === "CLEAN_SHEET_AWAY") {
