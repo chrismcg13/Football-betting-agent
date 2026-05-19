@@ -343,6 +343,19 @@ export const TIER3_LEAGUE_IDS: number[] = [
   38,   // WCQ - OFC
   530,  // CONCACAF Nations League
 
+  // F2.A.12.1 (2026-05-19): newer-season AF IDs for leagues whose CC entry
+  // had become stale. Existing entries kept (older seasons may still settle).
+  329,  // Estonia Meistriliiga (current season — paired with stale 382)
+  164,  // Iceland Úrvalsdeild (current — paired with stale 377)
+  671,  // Iceland Úrvalsdeild Women
+  274,  // Indonesia Liga 1
+  257,  // USA US Open Cup
+  525,  // UEFA Champions League Women
+  549,  // Sweden Damallsvenskan (current — paired with stale 793)
+  76,   // Brazil Brasileirão Série D
+  96,   // Portugal Taça de Portugal
+  230,  // Mexico Liga MX — already in TIER2, re-listed for completeness audit
+
   // Women's — expanded
   790,  // Brasileiro Women (Brazil)
   772,  // Championship Women (England 2nd)
