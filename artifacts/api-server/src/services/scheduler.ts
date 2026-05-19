@@ -154,6 +154,12 @@ import { registerLock } from "../lib/lockManager";
 const ingestionLock = registerLock("ingestion_run", { staleAfterMs: 150 * 60 * 1000 });
 const featureLock = registerLock("feature_run", { staleAfterMs: 20 * 60 * 1000 });
 const exchangeBookSweepLock = registerLock("exchange_book_sweep", { staleAfterMs: 20 * 60 * 1000 });
+// Bundle F2.B.A.2 (2026-05-19): TTK-aware Betfair sweep cadence. Separate
+// locks per window so the near-kickoff sweep (1m) doesn't block on the
+// broad 168h sweep (10m) running concurrently. Tighter staleness on the
+// near lock because that cron fires much more often.
+const exchangeBookSweepNearLock = registerLock("exchange_book_sweep_near", { staleAfterMs: 3 * 60 * 1000 });
+const exchangeBookSweepMidLock = registerLock("exchange_book_sweep_mid", { staleAfterMs: 10 * 60 * 1000 });
 
 let tradingCycleRunning = false;
 let tradingCycleAcquiredAt: number | null = null;
@@ -214,6 +220,35 @@ async function safeRunFeatures(): Promise<void> {
 // venue-anchored pricing picker has live exchange data to consume. Runs
 // unconditionally whenever Betfair credentials are configured — NOT gated on
 // agent_config.data_source.
+
+// Bundle F2.B.A.2: parameterised sweep wrapper used by the new near (1m/1h)
+// and mid (5m/4h) cadence crons. Same try/lock/track/markRun shape as the
+// pre-existing safeRunExchangeBookSweep — separate lock + telemetry key
+// per cadence so they can run independently without colliding.
+async function safeRunExchangeBookSweepWith(
+  lockKey: typeof exchangeBookSweepLock,
+  markName: string,
+  opts?: { hoursAhead?: number },
+): Promise<void> {
+  const r = await lockKey.withLock(async () => {
+    markStart(markName);
+    try {
+      await trackCronExecution(markName, async () => {
+        const result = await runExchangeBookSweep(opts);
+        return result.snapshotsWritten;
+      });
+      markRun(markName, "success");
+    } catch (err) {
+      logger.error({ err, hoursAhead: opts?.hoursAhead }, `${markName} failed`);
+      markRun(markName, "error");
+      throw err;
+    }
+  });
+  if (r.skipped) {
+    logger.info({ reason: r.reason, heldMs: r.heldMs, hoursAhead: opts?.hoursAhead }, `${markName} skipped — lock held`);
+    markRun(markName, "skipped");
+  }
+}
 
 async function safeRunExchangeBookSweep(opts?: { hoursAhead?: number }): Promise<void> {
   const r = await exchangeBookSweepLock.withLock(async () => {
@@ -3527,6 +3562,30 @@ export function startScheduler(): void {
     // surface any rate-limit issue in logs.
     cron.schedule("*/10 * * * *", () => { void safeRunExchangeBookSweep({ hoursAhead: 168 }); }, { timezone: "UTC" });
     logger.info("Exchange book sweep scheduler active — every 10 minutes (168h window — 2026-05-10)");
+
+    // Bundle F2.B.A.2 (2026-05-19): TTK-aware Betfair sweep cadence.
+    // The flat 10min/168h sweep was producing 21,492 stale_or_absent_betfair
+    // skips per 2h on the lazy promoter — near-kickoff matches had Betfair
+    // snapshots up to 10 min stale, well beyond Bundle A's 60-90s freshness
+    // gate for the <1h TTK bucket. Two extra crons with tighter cadence
+    // matching the Pinnacle freshness curve windows.
+    //
+    // Near (1m / 1h window): catches the <1h TTK bucket where Bundle A's
+    // freshness gate is 45-90s. With 1-min polling Betfair best-back stays
+    // <120s stale, well inside the gate.
+    cron.schedule("* * * * *", () => {
+      void safeRunExchangeBookSweepWith(exchangeBookSweepNearLock, "exchange_book_sweep_near", { hoursAhead: 1 });
+    }, { timezone: "UTC" });
+    logger.info("Exchange book sweep NEAR scheduler active — every 1 minute (1h window)");
+
+    // Mid (5m / 4h window): catches the 1-4h TTK bucket where Bundle A's
+    // freshness gate is 120-240s. 5-min polling keeps best-back inside
+    // window. Avoids duplicate work — overlap with the wide sweep is
+    // dedupe-tolerated (odds_snapshots ROW INSERT, no PK collision).
+    cron.schedule("*/5 * * * *", () => {
+      void safeRunExchangeBookSweepWith(exchangeBookSweepMidLock, "exchange_book_sweep_mid", { hoursAhead: 4 });
+    }, { timezone: "UTC" });
+    logger.info("Exchange book sweep MID scheduler active — every 5 minutes (4h window)");
 
     // Startup warmup: run one sweep ~30s after boot so the first population
     // doesn't have to wait the full 10-minute cron interval.

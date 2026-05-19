@@ -10,14 +10,43 @@ const SOCCER_EVENT_TYPE_ID = "1";
 const MAX_RPS = 5;
 const REQUEST_INTERVAL_MS = Math.ceil(1000 / MAX_RPS);
 
+// Bundle F2.B.A.2 (2026-05-19): widened catalogue request to match
+// TARGET_BETFAIR_MARKET_TYPES in exchangeBookSweep.ts. Prior list was 7
+// market types — corners/cards/EH/half markets were filter-allowed but
+// NEVER REQUESTED from listMarketCatalogue, so the sweep pipeline was a
+// no-op for those families. F2.A.9.2 added them to the filter but not
+// here. Net effect: zero Betfair coverage for new-market predictors
+// (verified 2026-05-19: 0/119 upcoming matches had Betfair corner
+// snapshots despite Pinnacle quoting them for ~622 matches/week).
+//
+// Cost: catalogue payload per event grows ~3-4× but listMarketBook
+// chunking (40/call) still resolves in 1 chunk per typical event.
+// Betfair's 60-req/min rate limit unaffected.
 export const MARKET_TYPES = [
   "MATCH_ODDS",
-  "OVER_UNDER_25",
-  "OVER_UNDER_15",
-  "OVER_UNDER_35",
+  "OVER_UNDER_05", "OVER_UNDER_15", "OVER_UNDER_25", "OVER_UNDER_35",
+  "OVER_UNDER_45", "OVER_UNDER_55", "OVER_UNDER_65", "OVER_UNDER_75",
+  "OVER_UNDER_85",
   "BOTH_TEAMS_TO_SCORE",
   "CORRECT_SCORE",
   "ASIAN_HANDICAP",
+  "ALT_TOTAL_GOALS",
+  "DRAW_NO_BET",
+  "HALF_TIME",
+  "FIRST_HALF_GOALS_05", "FIRST_HALF_GOALS_15", "FIRST_HALF_GOALS_25",
+  "TEAM_A_1", "TEAM_A_2", "TEAM_A_3",
+  "TEAM_B_1", "TEAM_B_2", "TEAM_B_3",
+  // Bundle F2.B.A.2 additions — unblocks D/E/F/G new-market live graduation:
+  "TOTAL_CORNERS", "OVER_UNDER_CORNERS", "MATCH_CORNERS", "FIRST_HALF_CORNERS",
+  "TOTAL_BOOKING_POINTS", "OVER_UNDER_BOOKING_POINTS",
+  "HALF_TIME_MATCH_ODDS", "SECOND_HALF_MATCH_ODDS",
+  "HALF_TIME_FULL_TIME",
+  "TEAM_A_TOTAL_GOALS", "TEAM_B_TOTAL_GOALS",
+  "EUROPEAN_HANDICAP", "HANDICAP",
+  "HALF_TIME_SCORE",
+  "TO_SCORE_IN_BOTH_HALVES",
+  "TO_WIN_TO_NIL",
+  "CLEAN_SHEET_TEAM_A", "CLEAN_SHEET_TEAM_B",
 ] as const;
 
 export type MarketType = (typeof MARKET_TYPES)[number];
