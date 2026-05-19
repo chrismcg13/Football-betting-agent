@@ -2450,6 +2450,60 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Gate monitor scheduler active — daily 04:00 UTC");
 
+  // F2.A.12.5 (2026-05-19): daily aggressive league-coverage drain. Fires
+  // the full mega-chain (promote → ingest → reverse-map → event-map → niche-
+  // discovery → pinnacle-sync) at 04:30 UTC — pre-EU-morning low-activity
+  // window. Idempotent: each step no-ops on already-promoted state.
+  //
+  // Replaces the 6-day passive drain via the 6h niche-discovery tick. Manual
+  // verification 2026-05-19 showed one mega-chain run flipped 4 of 22 user-
+  // priority leagues from bf=false to bf=true in 3 min (Estonia Meistriliiga,
+  // Iceland Úrvalsdeild, Sweden Damallsvenskan, US Open Cup) plus Cyprus +
+  // Iceland 1. Deild + Finland Ykkösliiga + 12 niche leagues. Daily cadence
+  // captures the seasonal-gap leagues as they activate (Liga MX Apertura
+  // July, Copa América June 11, MLS Leagues Cup August, etc.).
+  cron.schedule("30 4 * * *", () => {
+    logger.info("Daily league-coverage mega-chain triggered (04:30 UTC)");
+    void (async () => {
+      const startedAt = Date.now();
+      try {
+        // Step 1: pinnacle coverage sync (cheap, primes downstream)
+        const sync = await runPinnacleCoverageUpdateNow();
+        // Step 2: fixture ingestion for active discovered_leagues
+        const ingest = await runIngestDiscoveredFixturesNow();
+        // Step 3: Betfair reverse-mapping (competitions ↔ AF leagues)
+        const { manualTriggerBetfairReverseMapping } = await import("./betfairFirstUniverse");
+        const reverse = await manualTriggerBetfairReverseMapping();
+        // Step 3.5: event-id propagation to matches
+        const { mapBetfairEventsToFixtures } = await import("./betfairEventMapping");
+        const eventMap = await mapBetfairEventsToFixtures(168);
+        // Step 4: confirm Betfair coverage on candidates with mapped events
+        const { runNicheLeagueDiscovery } = await import("./betfairMarketDiscovery");
+        const niche = await runNicheLeagueDiscovery();
+        // Step 5: re-sync (in case step 4 just unlocked new leagues with Pinnacle data)
+        const finalSync = await runPinnacleCoverageUpdateNow();
+
+        logger.info(
+          {
+            durationMs: Date.now() - startedAt,
+            preSync: sync.updated,
+            ingestFixturesUpdated: ingest.fixturesUpdated,
+            reverseWritesApplied: reverse.writesApplied,
+            eventsMatched: eventMap.fixturesMatched,
+            eventsUpdated: eventMap.fixturesUpdated,
+            nicheEvaluated: niche.leagues_evaluated,
+            nicheNewlyCovered: niche.newly_covered.length,
+            postSync: finalSync.updated,
+          },
+          "Daily league-coverage mega-chain complete",
+        );
+      } catch (err) {
+        logger.error({ err, durationMs: Date.now() - startedAt }, "Daily league-coverage mega-chain failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Daily league-coverage mega-chain scheduler active — 04:30 UTC");
+
   // Phase 3 A4 (2026-05-08): post-flip operational jobs. Both run every
   // 15 min. Pre-flip (live_mode_active != 'true') they short-circuit as
   // no-ops, so no harm in scheduling them now — they'll start working
