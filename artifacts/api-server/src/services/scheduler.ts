@@ -2506,6 +2506,29 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Lazy shadow→paper promoter active — every 5 min UTC");
 
+  // Bundle F2.B.J (2026-05-19): per-predictor circuit breaker. Every
+  // 30 min, computes wilson_lo95 on rolling-100 settled bets per
+  // market_type; if below breakeven minus the edge-scaled shortfall
+  // band (max(3pp, avg_edge * 1.5)), auto-pause emission via
+  // agent_config.market_type_paused_list. Operator-only unpause after
+  // root-cause investigation. Dormant per market until n>=50 settled
+  // bets accumulate — inert for newly-launched Bundles D/E/F/G at first,
+  // becomes load-bearing as volume builds.
+  cron.schedule("*/30 * * * *", () => {
+    void (async () => {
+      try {
+        const { runPerMarketCircuitBreaker } = await import("./perMarketCircuitBreaker");
+        const r = await runPerMarketCircuitBreaker();
+        if (r.markets_paused_now.length > 0 || r.markets_evaluated > 0) {
+          logger.info(r, "Per-market circuit breaker evaluated");
+        }
+      } catch (err) {
+        logger.error({ err }, "Per-market circuit breaker failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Per-market circuit breaker active — every 30 min UTC");
+
   // Bundle F2.B.B (2026-05-19): Pinnacle line-movement velocity tracker.
   // Every 2 min, computes Δimplied_pp/Δhr over a TTK-bucketed window per
   // (match × market × selection) with a pending paper_bet inside 8h. Writes

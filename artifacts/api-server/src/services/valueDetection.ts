@@ -1039,6 +1039,13 @@ export async function detectValueBets(options?: {
   const cfg = await getAgentConfigCached();
   maybeLogCacheStats();
 
+  // Bundle F2.B.J (2026-05-19): load circuit-breaker pause list once
+  // per run. Hot-path lookup against the Set is O(1); the underlying
+  // agent_config read is 60s-cached so the cost amortises across all
+  // candidates in this evaluation cycle.
+  const { getPausedMarketTypes } = await import("./perMarketCircuitBreaker");
+  const pausedMarketTypes = await getPausedMarketTypes();
+
   // Option A (2026-05-15): when enabled, predictAH and predictTT use
   // opponent-aware lambdas via inverse-Poisson projection from the LR
   // outcomeModel. Default OFF — operator enables via:
@@ -1598,6 +1605,15 @@ export async function detectValueBets(options?: {
       // track (Tier A) keeps the bans untouched.
       if (BANNED_MARKETS.has(marketType) && !isExperimentTrack) {
         recordDiagnosticReject(marketType, "banned_market_production_track");
+        continue;
+      }
+
+      // Bundle F2.B.J (2026-05-19): per-market circuit-breaker pause.
+      // Auto-paused when wilson_lo95 on rolling-100 settled bets falls
+      // below breakeven - max(3pp, avg_edge * 1.5). Operator-only
+      // unpause. Catches D/E/F/G new-market predictor drift at n>=50.
+      if (pausedMarketTypes.has(marketType.toUpperCase())) {
+        recordDiagnosticReject(marketType, "market_type_circuit_breaker_paused");
         continue;
       }
 
