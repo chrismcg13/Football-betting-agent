@@ -63,6 +63,44 @@ const MT_AGG_LEAGUE_SENTINEL = "__market_type_aggregate__";
 const BOOTSTRAP_ITERATIONS = 10_000;
 const BOOTSTRAP_LOWER_PERCENTILE = 0.025;
 
+// Bundle F2.B.0 (2026-05-19): synthetic-anchor quarantine.
+//
+// Pre-F2.A.7 (cutover 2026-05-19), selectPricingSources fell back to Betfair
+// Exchange as the fair-value anchor when Pinnacle wasn't covered for the
+// (match × market × selection). That meant calculated_edge was the gap
+// between the model and the exchange's own implied probability — NOT model
+// vs sharp anchor. Bets emitted on that basis pollute the aggregate
+// statistics two ways:
+//   1. ROI gates: shadow PnL was computed against odds the model "found
+//      edge on" against Betfair's vig, not against sharp expectation.
+//      Survives into bootstrap_lo95_roi negatively.
+//   2. CLV gates: the closing-line writer later resolves a Pinnacle quote
+//      for these bets, producing CLV that compares Betfair-placement-odds
+//      to Pinnacle-close. That cross-book CLV is not edge measurement —
+//      it's vig differential. Surfaces as avg_clv inflated to 32-169pp on
+//      AH (Neon audit 2026-05-19).
+//
+// Audit (last 90d AH): 3,487 contaminated bets — 1,548 with clv_source=
+// 'pinnacle', 1,211 null, 636 betfair_exchange, 76 bet365_mo_derived_ah
+// (the F2.A.10/F2.A.11 synthetic-AH path). Excluding them recovers the
+// AH aggregate's true edge profile.
+//
+// The filter is content-based (not timestamp-based) — defense in depth
+// against any future regression that reintroduces a non-sharp fair_value_
+// source. Live pipeline is already clean post-F2.A.7; the filter just
+// guarantees the aggregator never trusts an upstream anchor regression.
+//
+// fair_value_source allow-list: only direct Pinnacle quotes count as sharp
+// anchors at emission time. tier2 sharp books (Smarkets, Matchbook) are
+// reserved for CLOSING-line capture, not placement-time anchoring.
+const SHARP_FAIR_VALUE_SOURCES = ["oddspapi_pinnacle", "api_football_real:Pinnacle"];
+
+// CLV sources that came from a synthetic derivation (Bet365 MO → Poisson
+// AH). Closing-line writer correctly tags them distinctly, but they MUST
+// be excluded from the CLV t-stat / avg_clv computation — they encode
+// cross-book vig differential, not sharp-anchor CLV.
+const SYNTHETIC_CLV_SOURCES = ["bet365_mo_derived_ah"];
+
 async function getAnalysisStartDate(): Promise<string> {
   const rows = await db
     .select({ value: agentConfigTable.value })
@@ -116,6 +154,18 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
 
   logger.info({ analysisStart, computedAt }, "Bundle B analytics starting");
 
+  // Bundle F2.B.0: pre-build IN-list SQL fragments. Drizzle's sql template
+  // can't expand JS arrays as ANY() — must use sql.join + IN. See
+  // feedback_drizzle_array_binding_bug (bitten 3x prior).
+  const sharpFvList = sql.join(
+    SHARP_FAIR_VALUE_SOURCES.map((s) => sql`${s}`),
+    sql`, `,
+  );
+  const syntheticClvList = sql.join(
+    SYNTHETIC_CLV_SOURCES.map((s) => sql`${s}`),
+    sql`, `,
+  );
+
   // Step 1: segment-level stats. One row per (league, market_type, bet_track)
   // with n >= 1 settled bet. PnL/stake column resolved per-rail at compute
   // time so shadow uses shadow_*, live/paper uses net/settlement.
@@ -142,12 +192,25 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
       -- Matchbook + Betfair-SP weighted consensus (sharpConsensus.ts) is now
       -- a valid fallback. Per the back-to-theory plan Task 11, this is the
       -- "synthetic sharp consensus" closing-line anchor for non-Pinnacle scopes.
-      AVG(COALESCE(pb.clv_pct, pb.synthetic_clv_pct))::numeric      AS avg_clv,
-      STDDEV(COALESCE(pb.clv_pct, pb.synthetic_clv_pct))::numeric   AS sd_clv,
-      COUNT(*) FILTER (WHERE pb.clv_pct IS NOT NULL OR pb.synthetic_clv_pct IS NOT NULL)::int AS clv_n,
+      -- Bundle F2.B.0: NULL the CLV for synthetic-anchor rows so they
+      -- don't contribute to avg_clv / sd_clv / clv_n. They stay in the
+      -- bet population (n, w, stake, pnl) — ROI gates remain trustworthy
+      -- because shadow PnL is computed from real outcomes.
+      AVG(CASE WHEN pb.clv_source IN (${syntheticClvList}) THEN NULL
+               ELSE COALESCE(pb.clv_pct, pb.synthetic_clv_pct) END)::numeric      AS avg_clv,
+      STDDEV(CASE WHEN pb.clv_source IN (${syntheticClvList}) THEN NULL
+                  ELSE COALESCE(pb.clv_pct, pb.synthetic_clv_pct) END)::numeric   AS sd_clv,
+      COUNT(*) FILTER (
+        WHERE COALESCE(pb.clv_source, '') NOT IN (${syntheticClvList})
+          AND (pb.clv_pct IS NOT NULL OR pb.synthetic_clv_pct IS NOT NULL)
+      )::int AS clv_n,
       -- 2026-05-15: Tier-1 (Pinnacle) anchor count for conditional CLV gate.
       -- Scope is "Pinnacle-anchored" iff tier1_n / n >= TIER1_COVERAGE_THRESHOLD.
-      COUNT(*) FILTER (WHERE pb.clv_source_tier = 1)::int          AS tier1_n
+      -- Bundle F2.B.0: tier1_n also excludes synthetic-anchor rows.
+      COUNT(*) FILTER (
+        WHERE pb.clv_source_tier = 1
+          AND COALESCE(pb.clv_source, '') NOT IN (${syntheticClvList})
+      )::int          AS tier1_n
     FROM paper_bets pb
     LEFT JOIN matches m ON pb.match_id = m.id
     WHERE pb.placed_at >= ${analysisStart}::date
@@ -160,6 +223,14 @@ export async function runBundleBAnalytics(): Promise<BundleBResult> {
       -- wins) which dominates the per-market priors CTE below and
       -- inflates shrunk_roi for low-n shadow segments. Drop them.
       AND pb.bet_track IN ('live', 'shadow')
+      -- Bundle F2.B.0 (synthetic-anchor quarantine): exclude bets emitted
+      -- against a non-sharp fair_value_source. See header constant comment.
+      -- Defense in depth: F2.A.7 already prevents this going forward; the
+      -- filter guarantees any future regression doesn't pollute the
+      -- aggregate. NULL fair_value_source preserved (pre-fair-value-tracking
+      -- legacy data — small population, no clean way to retag).
+      AND (pb.fair_value_source IS NULL
+           OR pb.fair_value_source IN (${sharpFvList}))
       -- 2026-05-15: analysis_exclusion_rules. Filters out rows from
       -- (market_type, bet_track) pairs that have an uncleared exclusion
       -- rule AND were placed before the rule's cutover. Hard cutover:
@@ -349,8 +420,13 @@ async function runMarketTypeAggregatePass(
       CASE WHEN pb.bet_track = 'shadow'
            THEN COALESCE(pb.shadow_pnl, 0)
            ELSE COALESCE(pb.net_pnl, pb.settlement_pnl, 0) END        AS pnl,
-      COALESCE(pb.clv_pct, pb.synthetic_clv_pct)                      AS clv,
-      (pb.clv_source_tier = 1)                                        AS is_tier1
+      -- Bundle F2.B.0: NULL the CLV for synthetic-anchor rows so they
+      -- drop out of the CLV t-stat / mean computation while still
+      -- contributing to ROI (PnL is real outcome, not anchor-derived).
+      CASE WHEN pb.clv_source IN (${syntheticClvList}) THEN NULL
+           ELSE COALESCE(pb.clv_pct, pb.synthetic_clv_pct) END        AS clv,
+      (pb.clv_source_tier = 1
+        AND COALESCE(pb.clv_source, '') NOT IN (${syntheticClvList}))           AS is_tier1
     FROM paper_bets pb
     WHERE pb.placed_at >= ${analysisStart}::date
       AND pb.deleted_at IS NULL
@@ -367,6 +443,10 @@ async function runMarketTypeAggregatePass(
           AND r.cleared_at IS NULL
           AND pb.placed_at < r.exclude_placed_before
       )
+      -- Bundle F2.B.0 (synthetic-anchor quarantine): exclude bets emitted
+      -- against a non-sharp fair_value_source. Mirrors the Step-1 filter.
+      AND (pb.fair_value_source IS NULL
+           OR pb.fair_value_source IN (${sharpFvList}))
   `);
   const rows = ((raw as unknown) as {
     rows?: Array<{
