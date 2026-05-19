@@ -5168,15 +5168,18 @@ router.post("/admin/force-promote-pinnacle-leagues", async (req, res) => {
 // Betfair coverage can land NOW instead of in 6 days.
 //
 // Sequence:
-//   1. force-promote-pinnacle-leagues (optional `forceIds` body)
-//   2. ingestFixturesForDiscoveredLeagues — fills matches for newly-active
-//   3. runBetfairReverseMapping — Betfair competitions ↔ AF leagues (this
-//      is what propagates betfair_event_id onto matches, unblocking the
-//      niche-discovery candidate gate at line ~199 of
-//      betfairMarketDiscovery.ts)
-//   4. runNicheLeagueDiscovery — confirms has_betfair_coverage flips
-//   5. runPinnacleCoverageUpdateNow — flips has_pinnacle_odds in CC for
-//      any league that just started ingesting Pinnacle
+//   1.   force-promote-pinnacle-leagues (optional `forceIds` body)
+//   2.   ingestFixturesForDiscoveredLeagues — fills matches for newly-active
+//   3.   runBetfairReverseMapping — Betfair competitions ↔ AF leagues
+//        (writes competition_config.betfair_competition_id)
+//   3.5. mapBetfairEventsToFixtures(168h) — per-fixture Betfair event_id
+//        lookup. Populates matches.betfair_event_id which is the gate at
+//        line ~199 of betfairMarketDiscovery.ts. Added F2.A.12.4 after a
+//        first dry-run showed step 4 = 0 candidates — the 5-min cron tick
+//        for this mapping hadn't run between steps 3 and 4.
+//   4.   runNicheLeagueDiscovery — confirms has_betfair_coverage flips
+//   5.   runPinnacleCoverageUpdateNow — flips has_pinnacle_odds in CC for
+//        any league that just started ingesting Pinnacle
 //
 // Total api-football cost ~200 requests (well under 75k/day).
 // Betfair cost ~1 listCompetitions + ~50-200 listMarketsByEventId.
@@ -5242,6 +5245,27 @@ router.post("/admin/accelerate-league-coverage", async (req, res) => {
       writesApplied: reverseResult.writesApplied,
       aliasHits: reverseResult.aliasHits,
       durationMs: reverseResult.durationMs,
+    };
+
+    // F2.A.12.4: Step 3.5 — propagate Betfair event_id onto matches.
+    // Step 3 wrote competition_config.betfair_competition_id but the
+    // niche-discovery gate (line ~199 of betfairMarketDiscovery.ts)
+    // reads matches.betfair_event_id. That's populated per-fixture by
+    // mapBetfairEventsToFixtures via Betfair listEvents — runs on a 5min
+    // cron normally; here we fire it inline so step 4 has candidates to
+    // evaluate immediately rather than waiting for the next tick.
+    // Horizon 168h (7 days) — matches the niche-discovery gate's lookahead.
+    const { mapBetfairEventsToFixtures } = await import("../services/betfairEventMapping");
+    const eventMap = await mapBetfairEventsToFixtures(168);
+    result.step3_5_event_mapping = {
+      competitionsFetched: eventMap.competitionsFetched,
+      eventsFetched: eventMap.eventsFetched,
+      fixturesScanned: eventMap.fixturesScanned,
+      fixturesMatched: eventMap.fixturesMatched,
+      fixturesUpdated: eventMap.fixturesUpdated,
+      fixturesAlreadyMapped: eventMap.fixturesAlreadyMapped,
+      fixturesUnmatched: eventMap.fixturesUnmatched,
+      durationMs: eventMap.durationMs,
     };
 
     // Step 4: confirm Betfair market coverage on candidates with betfair_event_id
