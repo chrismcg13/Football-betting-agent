@@ -5089,29 +5089,39 @@ router.post("/admin/sync-pinnacle-coverage", async (_req, res) => {
 //     them next cron tick)
 //   - competition_config.has_pinnacle_odds = true (so oddspapi prefetch +
 //     lazyPromoter ranking prioritises them)
-router.post("/admin/force-promote-pinnacle-leagues", async (_req, res) => {
+router.post("/admin/force-promote-pinnacle-leagues", async (req, res) => {
   try {
-    const universe = await db.execute(sql`
-      SELECT DISTINCT cc.api_football_id, cc.name, cc.country
-      FROM competition_config cc
-      WHERE cc.api_football_id IS NOT NULL
-        AND cc.api_football_id < 900000
-        AND (
-          cc.has_pinnacle_odds = TRUE
-          OR EXISTS (
-            SELECT 1 FROM odds_snapshots os
-            JOIN matches m ON m.id = os.match_id
-            WHERE m.league = cc.name AND os.source ILIKE '%pinnacle%'
-            LIMIT 1
-          )
-          OR EXISTS (
-            SELECT 1 FROM oddspapi_fixture_map ofm
-            JOIN matches m ON m.id = ofm.match_id
-            WHERE m.league = cc.name
-            LIMIT 1
-          )
-        )
-    `);
+    const explicitIds = Array.isArray(req.body?.ids)
+      ? (req.body.ids as unknown[]).filter((x): x is number => typeof x === "number")
+      : [];
+
+    const universe = explicitIds.length > 0
+      ? await db.execute(sql`
+          SELECT DISTINCT cc.api_football_id, cc.name, cc.country
+          FROM competition_config cc
+          WHERE cc.api_football_id IN (${sql.join(explicitIds.map((id) => sql`${id}`), sql`, `)})
+        `)
+      : await db.execute(sql`
+          SELECT DISTINCT cc.api_football_id, cc.name, cc.country
+          FROM competition_config cc
+          WHERE cc.api_football_id IS NOT NULL
+            AND cc.api_football_id < 900000
+            AND (
+              cc.has_pinnacle_odds = TRUE
+              OR EXISTS (
+                SELECT 1 FROM odds_snapshots os
+                JOIN matches m ON m.id = os.match_id
+                WHERE m.league = cc.name AND os.source ILIKE '%pinnacle%'
+                LIMIT 1
+              )
+              OR EXISTS (
+                SELECT 1 FROM oddspapi_fixture_map ofm
+                JOIN matches m ON m.id = ofm.match_id
+                WHERE m.league = cc.name
+                LIMIT 1
+              )
+            )
+        `);
 
     type UniverseRow = { api_football_id: number; name: string; country: string };
     const rows = (universe as { rows?: UniverseRow[] }).rows ?? [];
@@ -5150,6 +5160,114 @@ router.post("/admin/force-promote-pinnacle-leagues", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "force-promote-pinnacle-leagues failed");
     res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
+// F2.A.12.3 (2026-05-19): single-curl mega-chain. Bypasses the 6h niche-
+// discovery cron tick — runs everything back-to-back in one request so
+// Betfair coverage can land NOW instead of in 6 days.
+//
+// Sequence:
+//   1. force-promote-pinnacle-leagues (optional `forceIds` body)
+//   2. ingestFixturesForDiscoveredLeagues — fills matches for newly-active
+//   3. runBetfairReverseMapping — Betfair competitions ↔ AF leagues (this
+//      is what propagates betfair_event_id onto matches, unblocking the
+//      niche-discovery candidate gate at line ~199 of
+//      betfairMarketDiscovery.ts)
+//   4. runNicheLeagueDiscovery — confirms has_betfair_coverage flips
+//   5. runPinnacleCoverageUpdateNow — flips has_pinnacle_odds in CC for
+//      any league that just started ingesting Pinnacle
+//
+// Total api-football cost ~200 requests (well under 75k/day).
+// Betfair cost ~1 listCompetitions + ~50-200 listMarketsByEventId.
+router.post("/admin/accelerate-league-coverage", async (req, res) => {
+  const startedAt = Date.now();
+  const forceIds = Array.isArray(req.body?.forceIds)
+    ? (req.body.forceIds as unknown[]).filter((x): x is number => typeof x === "number")
+    : [];
+
+  const result: Record<string, unknown> = { startedAt: new Date(startedAt).toISOString() };
+
+  try {
+    // Step 1: force-promote (explicit IDs if provided, else universe)
+    const universe = forceIds.length > 0
+      ? await db.execute(sql`
+          SELECT cc.api_football_id, cc.name, cc.country
+          FROM competition_config cc
+          WHERE cc.api_football_id IN (${sql.join(forceIds.map((id) => sql`${id}`), sql`, `)})
+        `)
+      : await db.execute(sql`
+          SELECT DISTINCT cc.api_football_id, cc.name, cc.country
+          FROM competition_config cc
+          WHERE cc.api_football_id IS NOT NULL AND cc.api_football_id < 900000
+            AND cc.has_pinnacle_odds = TRUE
+        `);
+
+    const rows = (universe as { rows?: Array<{ api_football_id: number }> }).rows ?? [];
+    const ids = rows.map((r) => r.api_football_id);
+
+    if (ids.length > 0) {
+      const idList = sql.join(ids.map((id) => sql`${id}`), sql`, `);
+      const ccR = await db.execute(sql`
+        UPDATE competition_config SET has_pinnacle_odds = TRUE
+        WHERE api_football_id IN (${idList}) AND has_pinnacle_odds = FALSE
+      `);
+      const dlR = await db.execute(sql`
+        UPDATE discovered_leagues
+        SET status = 'active', has_api_football_odds = TRUE,
+            has_pinnacle_odds = TRUE, last_checked = NOW()
+        WHERE league_id IN (${idList})
+          AND (status <> 'active' OR has_api_football_odds = FALSE OR has_pinnacle_odds = FALSE)
+      `);
+      result.step1_promote = {
+        targets: ids.length,
+        ccUpdated: (ccR as { rowCount?: number }).rowCount ?? 0,
+        dlUpdated: (dlR as { rowCount?: number }).rowCount ?? 0,
+      };
+    } else {
+      result.step1_promote = { targets: 0, skipped: true };
+    }
+
+    // Step 2: ingest fixtures so the niche-discovery gate has betfair_event_id
+    const { runIngestDiscoveredFixturesNow } = await import("../services/scheduler");
+    result.step2_ingest = await runIngestDiscoveredFixturesNow();
+
+    // Step 3: full reverse-mapping (Betfair competitions ↔ AF leagues).
+    // This is what propagates Betfair coverage to new leagues.
+    const { manualTriggerBetfairReverseMapping } = await import("../services/betfairFirstUniverse");
+    const reverseResult = await manualTriggerBetfairReverseMapping();
+    result.step3_reverse_mapping = {
+      betfairCompetitionsFetched: reverseResult.betfairCompetitionsFetched,
+      afUniverseSize: reverseResult.afUniverseSize,
+      writesApplied: reverseResult.writesApplied,
+      aliasHits: reverseResult.aliasHits,
+      durationMs: reverseResult.durationMs,
+    };
+
+    // Step 4: confirm Betfair market coverage on candidates with betfair_event_id
+    const { runNicheLeagueDiscovery } = await import("../services/betfairMarketDiscovery");
+    const niche = await runNicheLeagueDiscovery();
+    result.step4_niche_discovery = {
+      evaluated: niche.leagues_evaluated,
+      newlyCovered: niche.newly_covered.length,
+      failedAgain: niche.failed_again.length,
+      newlyCoveredSample: niche.newly_covered.slice(0, 30),
+    };
+
+    // Step 5: sync Pinnacle flag from actual ingestion
+    const { runPinnacleCoverageUpdateNow } = await import("../services/scheduler");
+    result.step5_pinnacle_sync = await runPinnacleCoverageUpdateNow();
+
+    result.totalDurationMs = Date.now() - startedAt;
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err, partialResult: result }, "accelerate-league-coverage failed");
+    res.status(500).json({
+      success: false,
+      message: String(err),
+      partialResult: result,
+      failedAtMs: Date.now() - startedAt,
+    });
   }
 });
 
