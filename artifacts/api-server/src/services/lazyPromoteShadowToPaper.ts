@@ -1127,7 +1127,179 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
             "Bundle 20 lazy-promoter gates failed (non-blocking)",
           );
         }
-        // Apply combined Bundle 20 stake adjustments (TTK × agreement uplift).
+
+        // ── Bundle F2.B.B.2 (2026-05-19): velocity × lineup-shock gate ──
+        // Reads pinnacle_line_movement (Bundle B.1 producer) for the
+        // latest velocity classification + lineup-publication recency
+        // from features._lineup_data MIN(computed_at). Applies the
+        // 5-cell decision matrix from the master plan:
+        //
+        //   velocity              | shock | action
+        //   ----------------------+-------+------------------------------
+        //   rising (converging)   | no    | +10% Kelly uplift (capped)
+        //   rising (converging)   | yes   | no action (public news, not sharp)
+        //   falling (walking_away)| no    | skip placement (demote)
+        //   falling (walking_away)| yes   | skip placement (90s pause; news settling)
+        //   stable / null         | *     | no effect
+        //
+        // For BACK bets (all our placements): Pinnacle implied prob
+        // RISING for selection = closing odds shortened = our placement
+        // odds were better than close = positive CLV = converging_with_us.
+        // (Direction interpretation comment in pinnacleLineMovement.ts
+        // service header was misstated; producer rows are unaffected, only
+        // the consumer reads matter.)
+        //
+        // Also pins early_clv_estimate from stable windows inside <30m TTK,
+        // strictly for promotion-gate audit (NEVER for settlement-grade
+        // CLV per the two-CLV-columns design).
+        let movementSkipReason: string | null = null;
+        try {
+          const movRes = (await db.execute(sql`
+            SELECT direction, is_stable, n_snapshots,
+                   velocity_implied_pp_per_hour::float8 AS velocity,
+                   max_abs_delta_pp::float8 AS max_delta,
+                   window_seconds
+            FROM pinnacle_line_movement
+            WHERE match_id = ${r.match_id}
+              AND market_type = ${r.market_type}
+              AND selection_name = ${r.selection_name}
+              AND computed_at >= NOW() - INTERVAL '10 minutes'
+            ORDER BY window_end DESC
+            LIMIT 1
+          `)) as unknown as {
+            rows?: Array<{
+              direction: string | null;
+              is_stable: boolean | null;
+              n_snapshots: number | null;
+              velocity: number | null;
+              max_delta: number | null;
+              window_seconds: number | null;
+            }>;
+          };
+          const mov = movRes.rows?.[0];
+
+          // Lineup-shock signal: features._lineup_data MIN(computed_at)
+          // is the first time we captured a lineup for this match.
+          // Within 15 min of that = public news event, sharp-money
+          // signals are confounded.
+          const shockRes = (await db.execute(sql`
+            SELECT (MIN(computed_at) >= NOW() - INTERVAL '15 minutes') AS shock_in_window
+            FROM features
+            WHERE match_id = ${r.match_id}
+              AND feature_name = '_lineup_data'
+          `)) as unknown as { rows?: Array<{ shock_in_window: boolean | null }> };
+          const lineupShockInWindow = shockRes.rows?.[0]?.shock_in_window === true;
+
+          if (mov && mov.direction) {
+            const direction = mov.direction;
+            // Apply decision matrix.
+            if (direction === "rising" && !lineupShockInWindow) {
+              // Sharp money agrees → +10% Kelly fraction (capped at 1.25
+              // combined with existing uplifts, matching Bundle 20 ceiling).
+              const upliftRaw = await getConfig("velocity_converging_uplift_multiplier");
+              const uplift =
+                upliftRaw != null && Number.isFinite(Number(upliftRaw))
+                  ? Math.min(Math.max(Number(upliftRaw), 1.0), 1.25)
+                  : 1.10;
+              if (uplift > 1.0) {
+                promoterUpliftMultiplier = Math.min(
+                  promoterUpliftMultiplier * uplift,
+                  1.25,
+                );
+              }
+              await db.insert(complianceLogsTable).values({
+                actionType: "lazy_promote_velocity_converging_uplift",
+                details: {
+                  betId: r.id, matchId: r.match_id, marketType: r.market_type,
+                  selectionName: r.selection_name,
+                  velocityPpPerHour: mov.velocity, nSnapshots: mov.n_snapshots,
+                  windowSeconds: mov.window_seconds, uplift,
+                  reason: "rising_no_lineup_shock_sharp_money_agrees",
+                },
+                timestamp: new Date(),
+              } as any);
+            } else if (direction === "falling" && !lineupShockInWindow) {
+              // Sharp disagreement, no news to explain it → demote.
+              movementSkipReason = "walking_away_no_lineup_shock";
+            } else if (direction === "falling" && lineupShockInWindow) {
+              // News-driven move; let edge re-stabilize. Skip THIS tick;
+              // next 5-min lazy-promoter pass re-evaluates with fresh data.
+              movementSkipReason = "walking_away_lineup_shock_pause";
+            }
+            // rising + shock → no action (public news, not sharp signal).
+            // stable / null direction → no effect.
+          }
+
+          // Pin early_clv_estimate from stable windows inside <30m TTK.
+          // PROMOTION-GATE-ONLY metric — never feeds settlement CLV.
+          // Use current Pinnacle implied (pinnImpliedNow from Bundle 20
+          // block above) as the early closing-line anchor.
+          const hoursToKoNow = r.kickoff_time
+            ? (new Date(r.kickoff_time).getTime() - Date.now()) / 3_600_000
+            : null;
+          if (
+            mov &&
+            mov.is_stable === true &&
+            hoursToKoNow != null &&
+            hoursToKoNow < 0.5 &&
+            mov.window_seconds === 300 // <30m TTK bucket
+          ) {
+            // Best-effort: pull current Pinnacle implied separately (cheap
+            // — same query Bundle 20 already runs). Falls back gracefully
+            // if absent.
+            const currentPinnRes = (await db.execute(sql`
+              SELECT (1.0 / back_odds::float8)::float8 AS pi
+              FROM odds_snapshots
+              WHERE match_id = ${r.match_id}
+                AND market_type = ${r.market_type}
+                AND selection_name = ${r.selection_name}
+                AND source IN ('api_football_real:Pinnacle','oddspapi_pinnacle')
+                AND back_odds > 1.01
+              ORDER BY snapshot_time DESC LIMIT 1
+            `)) as unknown as { rows?: Array<{ pi: number | null }> };
+            const currentPi = currentPinnRes.rows?.[0]?.pi;
+            if (currentPi != null && currentPi > 0 && Number(r.odds) > 1.01) {
+              const earlyClosingOdds = 1 / currentPi;
+              const earlyClvPct =
+                ((Number(r.odds) - earlyClosingOdds) / earlyClosingOdds) * 100;
+              void db.execute(sql`
+                UPDATE paper_bets
+                   SET early_clv_estimate = ${earlyClvPct},
+                       early_clv_estimate_quality = 'stable_window'
+                 WHERE id = ${r.id}
+              `);
+            }
+          } else if (mov && mov.is_stable === false) {
+            void db.execute(sql`
+              UPDATE paper_bets
+                 SET early_clv_estimate_quality = 'unstable'
+               WHERE id = ${r.id} AND early_clv_estimate IS NULL
+            `);
+          }
+        } catch (err) {
+          logger.warn(
+            { err: (err as Error)?.message ?? String(err), betId: r.id },
+            "Bundle F2.B.B.2 velocity/lineup gate failed (non-blocking)",
+          );
+        }
+
+        if (movementSkipReason) {
+          await db.insert(complianceLogsTable).values({
+            actionType: "lazy_promote_velocity_walking_away",
+            details: {
+              betId: r.id, matchId: r.match_id, marketType: r.market_type,
+              selectionName: r.selection_name,
+              reason: movementSkipReason,
+              source: "lazy_promote_bundle_b2",
+            },
+            timestamp: new Date(),
+          } as any);
+          result.skipped_edge_evaporated++;
+          continue;
+        }
+
+        // Apply combined Bundle 20 stake adjustments (TTK × agreement uplift
+        // × Bundle F2.B.B.2 velocity-converging uplift).
         if (promoterStakeMultiplier !== 1.0 || promoterUpliftMultiplier !== 1.0) {
           const combined = promoterStakeMultiplier * promoterUpliftMultiplier;
           stake = Math.round(stake * combined * 100) / 100;

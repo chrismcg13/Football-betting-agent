@@ -88,6 +88,18 @@ export const paperBetsTable = pgTable("paper_bets", {
   // SHARP_CLV_SOURCES allow-list, which excludes betfair_exchange).
   closingPinnacleOdds: numeric("closing_pinnacle_odds", { precision: 10, scale: 4 }),
   clvPct: numeric("clv_pct", { precision: 8, scale: 4 }),
+  // Bundle F2.B.B.2 (2026-05-19): velocity-derived early CLV estimate.
+  // Pinned from a stable pinnacle_line_movement window (max_abs_delta_pp
+  // < 0.3pp AND n_snapshots >= TTK-bucket floor) inside the <30m TTK
+  // bucket. STRICTLY used for promotion-gate decisions in the lazy
+  // promoter — NEVER for settlement-grade CLV (that stays clv_pct
+  // anchored to the actual closing snapshot, see the two-CLV-columns
+  // design in the master plan). Separating prevents the velocity tracker
+  // from being a feedback loop into eligibility / Kelly attribution.
+  earlyClvEstimate: numeric("early_clv_estimate", { precision: 8, scale: 4 }),
+  // 'stable_window' = pinned from a stable velocity window; 'unstable'
+  // = window saw too much drift; NULL = no velocity row available.
+  earlyClvEstimateQuality: text("early_clv_estimate_quality"),
   // Bundle 1B.2 (2026-05-16): Club Elo fair-line CLV benchmark for European
   // fixtures where both teams in club_elo_snapshots. Independent third source
   // alongside Pinnacle (tier 1) and Smarkets (tier 2 — Bundle 1B.1 next).

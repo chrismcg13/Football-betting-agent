@@ -5138,6 +5138,18 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.B: pinnacle_line_movement table ready");
 
+    // ── Bundle F2.B.B.2 (2026-05-19): velocity-derived early CLV estimate ──
+    // Two columns on paper_bets. Populated by the lazy promoter when a
+    // stable pinnacle_line_movement window exists for the bet's selection
+    // inside the <30m TTK bucket. Strictly promotion-gate-only; settlement-
+    // grade CLV stays clv_pct anchored to the actual closing snapshot.
+    await db.execute(sql`
+      ALTER TABLE paper_bets
+        ADD COLUMN IF NOT EXISTS early_clv_estimate NUMERIC(8,4),
+        ADD COLUMN IF NOT EXISTS early_clv_estimate_quality TEXT
+    `);
+    logger.info("Bundle F2.B.B.2: paper_bets early_clv_estimate columns ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
