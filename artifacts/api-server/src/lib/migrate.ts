@@ -5288,6 +5288,17 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.P: matches per-team corner columns ready");
 
+    // ── Bundle F2.B.AUDIT-FIX-3 (2026-05-19): lift redundant 24h cap ──
+    // Only update if the existing value IS the old default (24). Operator
+    // overrides preserved.
+    await db.execute(sql`
+      UPDATE agent_config
+         SET value = '72'
+       WHERE key = 'live_placement_max_hours_to_kickoff'
+         AND value = '24'
+    `);
+    logger.info("Bundle F2.B.AUDIT-FIX-3: lifted max_hours_to_kickoff default 24h -> 72h");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

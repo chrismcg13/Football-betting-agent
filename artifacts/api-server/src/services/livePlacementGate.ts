@@ -100,8 +100,25 @@ async function getDisabledLeagues(): Promise<Set<string>> {
 // Bundle 1L FIX 1 (2026-05-16): live-placement window cap. The Bundle 1L
 // timing-bucket audit showed bets placed within 24h of kickoff realise
 // +41% ROI; bets placed 24-48h out realise -8%; 48h+ progressively worse
-// (-19% to -24%). Default 24h cap; operator-overridable via
-// agent_config.live_placement_max_hours_to_kickoff.
+// (-19% to -24%). Default originally 24h cap.
+//
+// Bundle F2.B.AUDIT-FIX-3 (2026-05-19): lifted default 24h → 72h. The
+// 24h cap is REDUNDANT with Bundle A's TTK-graded Pinnacle freshness
+// curve (effectivePinnacleMaxAgeSeconds in inversionPipeline.ts), which
+// is the designed source-of-truth for time-based gating. Bundle A's
+// ≥24h bucket allows 900s/1800s freshness depending on edge band; any
+// match where Pinnacle is stale beyond that is naturally rejected.
+//
+// The 24h hard cap was overriding the freshness curve and blocking
+// the 34/50 (68%) of vetoed pending shadows whose kickoff is 24-72h
+// out — observed in audit 2026-05-19 stale-Betfair forensic. The
+// 1L-FIX-1 timing observation (24-48h ROI -8%) was on pre-Bundle-H.2
+// calibration drift; H.2's posterior shrinkage is the proper fix for
+// that, not a static kickoff cap.
+//
+// 72h chosen as "where Pinnacle coverage thins" (~50% of 48h upcoming
+// matches had Pinnacle anchors as of the audit). Operator can tighten
+// or further loosen via agent_config.live_placement_max_hours_to_kickoff.
 async function getMaxHoursToKickoff(): Promise<number> {
   const now = Date.now();
   if (cachedMaxHoursToKickoff && now - cachedMaxHoursToKickoff.fetchedAt < FLAG_CACHE_TTL_MS) {
@@ -110,8 +127,8 @@ async function getMaxHoursToKickoff(): Promise<number> {
   const rows = (await db.execute(sql`
     SELECT value FROM agent_config WHERE key = 'live_placement_max_hours_to_kickoff' LIMIT 1
   `)) as unknown as { rows: Array<{ value: string }> };
-  const parsed = Number(rows.rows[0]?.value ?? "24");
-  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
+  const parsed = Number(rows.rows[0]?.value ?? "72");
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : 72;
   cachedMaxHoursToKickoff = { value, fetchedAt: now };
   return value;
 }
