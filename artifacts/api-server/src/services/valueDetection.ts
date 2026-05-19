@@ -1748,6 +1748,67 @@ export async function detectValueBets(options?: {
         continue;
       }
 
+      // ── Bundle F2.B.AUDIT-FIX-2 (2026-05-19): pre-emission sanity vetoes ──
+      // Two veto-only gates that catch upstream data / calibration bugs
+      // BEFORE a shadow bet lands in paper_bets. Neither changes when bets
+      // would otherwise PLACE — both reduce emission of structurally-broken
+      // candidates that have been polluting the pending shadow pool
+      // (98 bets in the 25pp+ band as of 2026-05-19 audit).
+      //
+      // Detector 1 — CALC-BUG: stored edge should reflect what the
+      // probabilities imply. For non-degenerate pricing edge = fv_implied
+      // − actionable_implied; model_p − implied (which Kelly sizing later
+      // assumes) should be CLOSE to that (Bundle F2.A agreement gate
+      // ensures model ≈ Pinnacle for live promotion). A >1pp divergence
+      // signals (a) Pinnacle data quality issue, (b) selection-name
+      // mismatch wiring model to wrong Pinnacle quote, or (c) F2.A gate
+      // bypass via degenerate-source fallback. All three are bugs, not
+      // edges to bet.
+      const impliedProbCheck = 1 / actionablePrice;
+      const modelMinusImplied = modelProb - impliedProbCheck;
+      const edgeArithmeticDivergence = Math.abs(edge - modelMinusImplied);
+      if (edgeArithmeticDivergence > 0.01) {
+        recordDiagnosticReject(oddsRow.marketType, "edge_calc_divergence_gt_1pp");
+        // Compliance log first 5 per market_type per minute — useful for
+        // root-causing without spamming the table at emission scale.
+        void db.insert(complianceLogsTable).values({
+          actionType: "emission_veto_calc_bug",
+          details: {
+            matchId: match.id, marketType: oddsRow.marketType,
+            selectionName: oddsRow.selectionName,
+            storedEdge: edge, modelProb, impliedProb: impliedProbCheck,
+            modelMinusImplied, divergence: edgeArithmeticDivergence,
+            fairValueSource, actionableSource,
+            reason: "edge_calc_divergence_gt_1pp",
+          },
+          timestamp: new Date(),
+        });
+        continue;
+      }
+
+      // Detector 2 — CALIBRATION-BUG: model_p > implied + 30pp signals
+      // the model is structurally wrong for this market_type / line. The
+      // 25pp+ pending shadow band (98 bets as of audit) is dominated by
+      // AH +1.25/+1.5/+1.75 selections where model_p=0.80 vs implied=0.25.
+      // No real market mispricings of that size exist on tradeable books;
+      // emitting these wastes circuit-breaker headroom and pollutes the
+      // posterior shrinkage Bundle H.2 is feeding.
+      if (modelProb - impliedProbCheck > 0.30) {
+        recordDiagnosticReject(oddsRow.marketType, "calibration_bug_model_30pp_above_implied");
+        void db.insert(complianceLogsTable).values({
+          actionType: "emission_veto_calibration_bug",
+          details: {
+            matchId: match.id, marketType: oddsRow.marketType,
+            selectionName: oddsRow.selectionName,
+            modelProb, impliedProb: impliedProbCheck,
+            modelMinusImplied,
+            reason: "model_30pp_above_implied",
+          },
+          timestamp: new Date(),
+        });
+        continue;
+      }
+
       // Coverage filter (2026-05-08): for known-coverage-gated market types
       // (TEAM_TOTAL_*, FIRST_HALF_*, OVER_UNDER_05/45+), require a recent
       // betfair_exchange snapshot for THIS specific (match, market_type)

@@ -1806,6 +1806,33 @@ export function predictTotalCards(
   };
 }
 
+// ===================== Bundle F2.B.AUDIT-FIX-2 (2026-05-19) AH↔MO consistency =====================
+//
+// Cross-market predictor sanity check. Both predictAsianHandicap("Home -0.5")
+// and predictOutcome("Home") derive from the SAME Poisson scoreline matrix
+// using the SAME lambdas (home_goals_scored_avg + xg_proxy). They should
+// be MATHEMATICALLY IDENTICAL — AH "Home -0.5" wins iff home_score > away_score
+// (no integer score equals a half-line) which is exactly MO Home.
+//
+// Disagreement signals a numerical / wiring bug (matrix-edge NaN, wrong
+// lambda passed, AH parser drift). Hysteresis: enter veto state at >2pp,
+// exit only when <1.5pp (per Bundle K master plan). Stateless at the
+// predictor layer — consumer (valueDetection) interprets the bool and
+// applies its own hysteresis if it wants to track state across runs.
+//
+// For v1, just return the disagreement magnitude; valueDetection decides.
+
+export function ahMoConsistencyDisagreementPp(
+  featureMap: Record<string, number>,
+): number | null {
+  const ahHomeMinus05 = predictAsianHandicap(featureMap, "Home -0.5");
+  const moHome = predictOutcome(featureMap);
+  if (ahHomeMinus05 == null || moHome == null) return null;
+  // ahHomeMinus05 is P(home wins) under -0.5 handicap = P(home_score > away_score)
+  // moHome.home is also P(home_score > away_score). Should match exactly.
+  return Math.abs((ahHomeMinus05 - moHome.home)) * 100;
+}
+
 // ===================== Bundle F2.B.P (2026-05-19) MATCH_CORNERS (3-way) =====================
 //
 // 3-way corners-difference market: Home (more home corners) / Draw (equal)
