@@ -2466,6 +2466,29 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Lazy shadow→paper promoter active — every 5 min UTC");
 
+  // Bundle F2.B.B (2026-05-19): Pinnacle line-movement velocity tracker.
+  // Every 2 min, computes Δimplied_pp/Δhr over a TTK-bucketed window per
+  // (match × market × selection) with a pending paper_bet inside 8h. Writes
+  // to pinnacle_line_movement; lazy promoter (Bundle B.2) will consume
+  // direction + is_stable to gate promotion (converging_with_us vs
+  // walking_away). Self-rate-limited: row count bounded by pending bet
+  // count, UPSERT keyed on 2-min-rounded window_end so duplicate ticks
+  // are no-ops.
+  cron.schedule("*/2 * * * *", () => {
+    void (async () => {
+      try {
+        const { runPinnacleVelocityComputation } = await import("./pinnacleLineMovement");
+        const r = await runPinnacleVelocityComputation();
+        if (r.rows_written > 0) {
+          logger.info(r, "Pinnacle velocity computation evaluated");
+        }
+      } catch (err) {
+        logger.error({ err }, "Pinnacle velocity computation failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Pinnacle velocity tracker active — every 2 min UTC");
+
   // ── Bundle 7.0 (2026-05-17): Stage 0 watch-priority scoring (every 5 min)
   // For every (fixture × market_type) active in the next 7 days, compute
   // watch_priority_score (MAX of weighted base components + non-negative

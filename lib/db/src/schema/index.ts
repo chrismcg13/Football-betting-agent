@@ -48,3 +48,4 @@ export * from "./teamAliases";
 export * from "./scorelineCorrelation";
 export * from "./modelLayerEnabled";
 export * from "./teamFormScrape";
+export * from "./pinnacleLineMovement";

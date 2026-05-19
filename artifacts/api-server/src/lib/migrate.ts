@@ -5102,6 +5102,42 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F0: v_freshness_clv_by_age_band_daily view ready");
 
+    // ── Bundle F2.B.B (2026-05-19): Pinnacle line-movement velocity tracker ──
+    // One row per (match, market, selection, window_seconds, window_end).
+    // window_end is rounded to the cron tick so UPSERTs collide and don't
+    // duplicate. Lazy promoter consumes via direction + is_stable; Bundle
+    // B.2 will use stable windows to pin early_clv_estimate on paper_bets.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS pinnacle_line_movement (
+        id SERIAL PRIMARY KEY,
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        market_type TEXT NOT NULL,
+        selection_name TEXT NOT NULL,
+        window_seconds INTEGER NOT NULL,
+        window_end TIMESTAMPTZ NOT NULL,
+        n_snapshots INTEGER NOT NULL,
+        velocity_implied_pp_per_hour NUMERIC(8,3),
+        max_abs_delta_pp NUMERIC(8,3),
+        last_snapshot_age_s INTEGER,
+        direction TEXT,
+        is_stable BOOLEAN NOT NULL DEFAULT FALSE,
+        computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS pinn_lm_unique
+        ON pinnacle_line_movement
+        (match_id, market_type, selection_name, window_seconds, window_end)
+    `);
+    // Read-side helper index: lazy promoter looks up by (match, market,
+    // selection) ordered by window_end DESC to get the latest classification.
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS pinn_lm_lookup
+        ON pinnacle_line_movement
+        (match_id, market_type, selection_name, window_end DESC)
+    `);
+    logger.info("Bundle F2.B.B: pinnacle_line_movement table ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");
