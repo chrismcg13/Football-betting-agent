@@ -1334,6 +1334,9 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   // (internal → Betfair) for live placement once a market graduates.
   FIRST_HALF_RESULT: "HALF_TIME_MATCH_ODDS",
   SECOND_HALF_RESULT: "SECOND_HALF_MATCH_ODDS",
+  // Bundle F2.B.G (2026-05-19): 3-way European Handicap. Betfair's
+  // native code is EUROPEAN_HANDICAP; catalogue requested per F2.A.9.2.
+  EUROPEAN_HANDICAP: "EUROPEAN_HANDICAP",
 };
 
 // Sub-phase 4.B (2026-05-08): set of internal market types whose Betfair code
@@ -1383,6 +1386,10 @@ export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   // scores (SECOND_HALF_RESULT) — both available in matches table.
   "FIRST_HALF_RESULT",
   "SECOND_HALF_RESULT",
+  // Bundle F2.B.G (2026-05-19): 3-way European Handicap. Native Betfair
+  // market with no settlement push (integer handicaps only). exchangeBook
+  // Sweep catalogue requests it per F2.A.9.2.
+  "EUROPEAN_HANDICAP",
 ]);
 
 // 2026-05-16 subtract bundle: TOTAL_CORNERS_* entirely subtracted; this

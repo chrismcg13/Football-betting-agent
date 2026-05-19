@@ -1585,6 +1585,57 @@ export function predictSecondHalfMatchOdds(
   return Math.max(0.01, Math.min(0.99, p));
 }
 
+// ===================== Bundle F2.B.G (2026-05-19) European Handicap (3-way) =====================
+//
+// EUROPEAN_HANDICAP: integer handicap applied to home team; settles 3-way
+// (Home wins after handicap / handicapped Draw / Away wins after handicap).
+// Distinct from ASIAN_HANDICAP which uses quarter/half lines and 2-way
+// settles (push on whole-line ties). Distinct from MATCH_ODDS which has
+// no handicap.
+//
+// Selection naming: "Home -1", "Draw -1", "Away -1" — handicap embedded.
+// All three selections share the same handicap (the favorite gets -N).
+//
+// Predictor sums scoreline-matrix cells matching each outcome under the
+// handicap. Same Poisson substrate as predictAsianHandicap / predictOutcome
+// — no new feature dependencies.
+
+/**
+ * Predict EUROPEAN_HANDICAP outcome probability. Returns null when lambdas
+ * unavailable. Handicap is applied to home team (positive = home gets
+ * goals added; negative = home gets goals deducted).
+ *
+ * Examples (handicap = -1):
+ *   "Home -1": P(home_score - 1 > away_score), i.e. P(home wins by 2+)
+ *   "Draw -1": P(home_score - 1 == away_score), i.e. P(home wins by 1)
+ *   "Away -1": P(home_score - 1 < away_score), i.e. P(draw or away wins)
+ */
+export function predictEuropeanHandicap(
+  featureMap: Record<string, number>,
+  side: "Home" | "Draw" | "Away",
+  handicap: number,
+  opts?: ScorelineMatrixOpts,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) {
+    return null;
+  }
+  if (!Number.isFinite(handicap)) return null;
+  const m = scorelineMatrix(homeLambda, awayLambda, opts ?? {});
+  const maxG = m.length - 1;
+  let p = 0;
+  for (let h = 0; h <= maxG; h += 1) {
+    for (let a = 0; a <= maxG; a += 1) {
+      const adjustedHome = h + handicap;
+      if (side === "Home" && adjustedHome > a) p += m[h]![a]!;
+      else if (side === "Draw" && adjustedHome === a) p += m[h]![a]!;
+      else if (side === "Away" && adjustedHome < a) p += m[h]![a]!;
+    }
+  }
+  return Math.max(0.01, Math.min(0.99, p));
+}
+
 // ===================== Bundle F2.B.D (2026-05-19) NegBin corners =====================
 //
 // Corners are overdispersed (variance > mean). Poisson here would mis-price

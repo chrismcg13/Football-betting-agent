@@ -39,6 +39,7 @@ import {
   predictTotalCards,
   predictHalfTimeMatchOdds,
   predictSecondHalfMatchOdds,
+  predictEuropeanHandicap,
   getModelVersion,
   // 2026-05-16 subtract bundle: predictCards, predictCorners, predictWinToNil,
   // predictOddEven, predictHtFt, predictBttsHalf, predictSecondHalfResult
@@ -648,6 +649,19 @@ function getModelProbability(
       return predictSecondHalfMatchOdds(enriched, selectionName, htFrac);
     }
     return null;
+  }
+  // Bundle F2.B.G (2026-05-19): EUROPEAN_HANDICAP. Selection format
+  // "<Home|Draw|Away> <handicap>" (e.g. "Home -1"). Integer handicaps
+  // only — fractional handicaps belong to ASIAN_HANDICAP. Same Poisson
+  // substrate as predictAsianHandicap; 3-way settlement via the
+  // EUROPEAN_HANDICAP resolver in marketTypes.ts.
+  if (marketType === "EUROPEAN_HANDICAP") {
+    const parts = selectionName.split(" ");
+    const side = parts[0];
+    const handicap = parseFloat(parts[1] ?? "0");
+    if (!Number.isFinite(handicap) || handicap !== Math.trunc(handicap)) return null;
+    if (side !== "Home" && side !== "Draw" && side !== "Away") return null;
+    return predictEuropeanHandicap(enriched, side, handicap, dcOpts);
   }
   if (
     marketType === "TOTAL_CARDS_25" ||

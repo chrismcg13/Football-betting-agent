@@ -323,6 +323,32 @@ export const MARKET_TYPES: Record<string, MarketType> = {
     },
   },
 
+  // Bundle F2.B.G (2026-05-19): EUROPEAN_HANDICAP 3-way settlement.
+  // Integer handicap applied to home team; 3 outcomes (Home / Draw /
+  // Away) under the handicapped score. Selection format matches the
+  // predictor in valueDetection: "<Home|Draw|Away> <handicap>"
+  // (e.g. "Home -1", "Draw +2", "Away -2"). No push — every match
+  // resolves to exactly one of the three sides.
+  EUROPEAN_HANDICAP: {
+    id: "EUROPEAN_HANDICAP",
+    resolveFrom: "final_score",
+    resolve: (selection, ctx) => {
+      const parts = selection.split(" ");
+      const side = parts[0];
+      const handicap = parseFloat(parts[1] ?? "0");
+      if (!Number.isFinite(handicap)) return null;
+      // Only integer handicaps are valid EH lines (½ / ¼ go to AH).
+      // Reject fractional handicaps defensively rather than silently
+      // mis-settling — caller bug.
+      if (handicap !== Math.trunc(handicap)) return null;
+      const adjustedHome = ctx.homeScore + handicap;
+      if (side === "Home") return adjustedHome > ctx.awayScore;
+      if (side === "Draw") return adjustedHome === ctx.awayScore;
+      if (side === "Away") return adjustedHome < ctx.awayScore;
+      return null;
+    },
+  },
+
   // Bundle F2.B.F (2026-05-19): SECOND_HALF_RESULT settles from second-half
   // goals only (FT - HT). FIRST_HALF_RESULT already exists above and serves
   // the HALF_TIME_MATCH_ODDS market on the placement side. Selection format
