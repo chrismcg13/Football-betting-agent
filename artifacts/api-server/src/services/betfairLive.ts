@@ -1327,6 +1327,13 @@ export const MARKET_TYPE_MAP: Record<string, string> = {
   HALF_TIME_FULL_TIME: "HALF_TIME_FULL_TIME",
   CLEAN_SHEET_HOME: "CLEAN_SHEET_TEAM_A",
   CLEAN_SHEET_AWAY: "CLEAN_SHEET_TEAM_B",
+  // Bundle F2.B.F (2026-05-19): half-specific 1X2. Betfair exposes
+  // either HALF_TIME (older code) or HALF_TIME_MATCH_ODDS / SECOND_HALF
+  // _MATCH_ODDS as live market types. exchangeBookSweep already requests
+  // both in its catalogue filter; this map is the reverse direction
+  // (internal → Betfair) for live placement once a market graduates.
+  FIRST_HALF_RESULT: "HALF_TIME_MATCH_ODDS",
+  SECOND_HALF_RESULT: "SECOND_HALF_MATCH_ODDS",
 };
 
 // Sub-phase 4.B (2026-05-08): set of internal market types whose Betfair code
@@ -1370,6 +1377,12 @@ export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   "TOTAL_CARDS_35",
   "TOTAL_CARDS_45",
   "TOTAL_CARDS_55",
+  // Bundle F2.B.F (2026-05-19): half-specific 1X2. Betfair has both
+  // as native markets (catalogue filter requests them per F2.A.9.2).
+  // Settlement uses HT scores only (FIRST_HALF_RESULT) and FT-HT
+  // scores (SECOND_HALF_RESULT) — both available in matches table.
+  "FIRST_HALF_RESULT",
+  "SECOND_HALF_RESULT",
 ]);
 
 // 2026-05-16 subtract bundle: TOTAL_CORNERS_* entirely subtracted; this

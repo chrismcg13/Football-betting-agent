@@ -6272,6 +6272,22 @@ router.post("/admin/run-bundle-b", async (_req, res) => {
   }
 });
 
+// Bundle F2.B.F (2026-05-19): fit per-league HT goal fraction. Refresh
+// league_half_fractions from the rolling 12-month window. Operator-
+// triggered for v1; once stable cadence emerges, promote to a scheduled
+// cron. Cache invalidates on completion so predictors pick up new values
+// on the next call (5-min TTL otherwise).
+router.post("/admin/fit-half-fractions", async (_req, res) => {
+  try {
+    const { runHalfFractionFit } = await import("../services/halfFractionFit");
+    const result = await runHalfFractionFit();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "Half-fraction fit failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // 2026-05-11: manual trigger for the drawdown-targeted Kelly Monte-Carlo
 // (Task 17). Same code path as the daily 03:15 UTC cron, just run on
 // demand. Use after changing `drawdown_target_p1_pct` so the lookup

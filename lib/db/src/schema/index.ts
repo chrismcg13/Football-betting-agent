@@ -49,3 +49,4 @@ export * from "./scorelineCorrelation";
 export * from "./modelLayerEnabled";
 export * from "./teamFormScrape";
 export * from "./pinnacleLineMovement";
+export * from "./leagueHalfFractions";

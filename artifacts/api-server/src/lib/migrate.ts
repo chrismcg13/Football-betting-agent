@@ -5150,6 +5150,26 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.B.2: paper_bets early_clv_estimate columns ready");
 
+    // ── Bundle F2.B.F (2026-05-19): per-league HT goal fraction ──
+    // One row per league. ht_fraction_posterior is the Bayesian-shrunk
+    // value used by predictHalfTimeMatchOdds / predictSecondHalfMatchOdds.
+    // Refit on demand via POST /api/admin/fit-half-fractions.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS league_half_fractions (
+        id SERIAL PRIMARY KEY,
+        league TEXT NOT NULL,
+        n_matches INTEGER NOT NULL,
+        ht_fraction_mle NUMERIC(6,4),
+        ht_fraction_posterior NUMERIC(6,4) NOT NULL,
+        fit_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS league_half_fractions_unique
+        ON league_half_fractions (league)
+    `);
+    logger.info("Bundle F2.B.F: league_half_fractions table ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

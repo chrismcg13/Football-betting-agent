@@ -323,6 +323,24 @@ export const MARKET_TYPES: Record<string, MarketType> = {
     },
   },
 
+  // Bundle F2.B.F (2026-05-19): SECOND_HALF_RESULT settles from second-half
+  // goals only (FT - HT). FIRST_HALF_RESULT already exists above and serves
+  // the HALF_TIME_MATCH_ODDS market on the placement side. Selection format
+  // matches MATCH_ODDS / FIRST_HALF_RESULT for consistency.
+  SECOND_HALF_RESULT: {
+    id: "SECOND_HALF_RESULT",
+    resolveFrom: "halftime",
+    resolve: (selection, ctx) => {
+      if (ctx.homeScoreHt == null || ctx.awayScoreHt == null) return null;
+      const home2H = ctx.homeScore - ctx.homeScoreHt;
+      const away2H = ctx.awayScore - ctx.awayScoreHt;
+      if (selection === "Home") return home2H > away2H;
+      if (selection === "Draw") return home2H === away2H;
+      if (selection === "Away") return away2H > home2H;
+      return null;
+    },
+  },
+
   // Bundle F2.B.C (2026-05-19): register resolvers for the F2.A.10 Poisson
   // predictors (CORRECT_SCORE / HTFT / CLEAN_SHEET) so emitted bets can
   // actually settle. Without entries here, determineBetWon falls through

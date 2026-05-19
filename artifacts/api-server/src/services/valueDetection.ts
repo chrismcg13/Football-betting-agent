@@ -37,6 +37,8 @@ import {
   predictAsianTotalGoals,
   predictTotalCorners,
   predictTotalCards,
+  predictHalfTimeMatchOdds,
+  predictSecondHalfMatchOdds,
   getModelVersion,
   // 2026-05-16 subtract bundle: predictCards, predictCorners, predictWinToNil,
   // predictOddEven, predictHtFt, predictBttsHalf, predictSecondHalfResult
@@ -627,6 +629,26 @@ function getModelProbability(
   // as TOTAL_BOOKING_POINTS (yellow=10, red=25); a TOTAL_CARDS ->
   // TOTAL_BOOKING_POINTS settlement bridge is a follow-up (current
   // bundle ships shadow-only learning).
+  // Bundle F2.B.F (2026-05-19): FIRST_HALF_RESULT + SECOND_HALF_RESULT
+  // half-specific 1X2 (settles on HT scores only / on FT-HT scores
+  // respectively, distinct from HTFT which prices the pair). Splits
+  // full-match xGoals using per-league HT fraction from featureMap
+  // (injected upstream from league_half_fractions). Falls back to
+  // global 0.45 when league hasn't been fitted yet.
+  if (marketType === "FIRST_HALF_RESULT") {
+    const htFrac = enriched["_league_ht_fraction"];
+    if (selectionName === "Home" || selectionName === "Draw" || selectionName === "Away") {
+      return predictHalfTimeMatchOdds(enriched, selectionName, htFrac);
+    }
+    return null;
+  }
+  if (marketType === "SECOND_HALF_RESULT") {
+    const htFrac = enriched["_league_ht_fraction"];
+    if (selectionName === "Home" || selectionName === "Draw" || selectionName === "Away") {
+      return predictSecondHalfMatchOdds(enriched, selectionName, htFrac);
+    }
+    return null;
+  }
   if (
     marketType === "TOTAL_CARDS_25" ||
     marketType === "TOTAL_CARDS_35" ||
@@ -1509,6 +1531,14 @@ export async function detectValueBets(options?: {
     for (const f of publicFeatures) {
       featureMap[f.featureName] = Number(f.featureValue);
     }
+    // Bundle F2.B.F (2026-05-19): inject per-league HT fraction so
+    // predictHalfTimeMatchOdds / predictSecondHalfMatchOdds can split
+    // xGoals between halves more accurately than the hardcoded 0.45.
+    // Uses a 5-min cached posterior; falls back to 0.45 for unfitted
+    // leagues. Underscore-prefixed key avoids collision with public
+    // feature names. Sync DB read on first call per cache window.
+    const { getHalfFractionForLeague } = await import("./halfFractionFit");
+    featureMap["_league_ht_fraction"] = await getHalfFractionForLeague(match.league);
 
     // Phase 1a (2026-05-14): load Dixon-Coles correction context once
     // per match. Resolves (rho, copulaKind, gender) and consults

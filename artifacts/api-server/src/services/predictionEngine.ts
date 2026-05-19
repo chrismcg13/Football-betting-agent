@@ -1501,6 +1501,90 @@ export function predictWinToNil(
   return { yes, no: 1 - yes };
 }
 
+// ===================== Bundle F2.B.F (2026-05-19) HT/SH match-odds =====================
+//
+// HALF_TIME_MATCH_ODDS settles on HT scores only; SECOND_HALF_MATCH_ODDS
+// settles on (FT - HT) scores. Distinct from HTFT (which prices the
+// pair). Same Poisson-on-half-lambda machinery as predictHalfTimeFullTime
+// but returns a single-half marginal instead of the joint.
+//
+// htFraction is per-league (Bundle F2.B.F shrinkage fit); caller passes
+// it in so the predictor stays pure. Falls back to global 0.45 when
+// caller passes null — keeps the function callable without league
+// context for backtests etc.
+//
+// Independent-halves assumption: same as predictHalfTimeFullTime. Real
+// matches have second-half effects (chasing, time-wasting, fitness)
+// that violate independence, but Pinnacle's own HT/SH lines are priced
+// off the same simplification — we don't pay an edge penalty for it.
+
+function _halfFraction(htFraction: number | null | undefined): number {
+  if (htFraction == null || !Number.isFinite(htFraction) || htFraction <= 0 || htFraction >= 1) {
+    return 0.45;
+  }
+  return htFraction;
+}
+
+/**
+ * P(home | HT) / P(draw | HT) / P(away | HT) for the HALF_TIME_MATCH_ODDS
+ * market. Returns null when lambdas unavailable.
+ */
+export function predictHalfTimeMatchOdds(
+  featureMap: Record<string, number>,
+  outcome: "Home" | "Draw" | "Away",
+  htFraction?: number | null,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) {
+    return null;
+  }
+  const frac = _halfFraction(htFraction);
+  const lhHt = homeLambda * frac;
+  const laHt = awayLambda * frac;
+  const m = scorelineMatrix(lhHt, laHt);
+  const maxG = m.length - 1;
+  let p = 0;
+  for (let h = 0; h <= maxG; h += 1) {
+    for (let a = 0; a <= maxG; a += 1) {
+      if (outcome === "Home" && h > a) p += m[h]![a]!;
+      else if (outcome === "Away" && a > h) p += m[h]![a]!;
+      else if (outcome === "Draw" && h === a) p += m[h]![a]!;
+    }
+  }
+  return Math.max(0.01, Math.min(0.99, p));
+}
+
+/**
+ * P(home | SH) / P(draw | SH) / P(away | SH) for the SECOND_HALF_MATCH_ODDS
+ * market. Returns null when lambdas unavailable.
+ */
+export function predictSecondHalfMatchOdds(
+  featureMap: Record<string, number>,
+  outcome: "Home" | "Draw" | "Away",
+  htFraction?: number | null,
+): number | null {
+  const homeLambda = featureMap["home_goals_scored_avg"] ?? featureMap["home_xg_proxy"];
+  const awayLambda = featureMap["away_goals_scored_avg"] ?? featureMap["away_xg_proxy"];
+  if (homeLambda == null || awayLambda == null || homeLambda <= 0 || awayLambda <= 0) {
+    return null;
+  }
+  const frac = _halfFraction(htFraction);
+  const lh2 = homeLambda * (1 - frac);
+  const la2 = awayLambda * (1 - frac);
+  const m = scorelineMatrix(lh2, la2);
+  const maxG = m.length - 1;
+  let p = 0;
+  for (let h = 0; h <= maxG; h += 1) {
+    for (let a = 0; a <= maxG; a += 1) {
+      if (outcome === "Home" && h > a) p += m[h]![a]!;
+      else if (outcome === "Away" && a > h) p += m[h]![a]!;
+      else if (outcome === "Draw" && h === a) p += m[h]![a]!;
+    }
+  }
+  return Math.max(0.01, Math.min(0.99, p));
+}
+
 // ===================== Bundle F2.B.D (2026-05-19) NegBin corners =====================
 //
 // Corners are overdispersed (variance > mean). Poisson here would mis-price
