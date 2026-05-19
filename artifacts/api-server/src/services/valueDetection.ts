@@ -20,6 +20,8 @@ import { eq, desc, and, gte, lte, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { sqlIntList } from "../lib/dbHelpers";
 import { ensureExperimentRegistered, getExperimentTier } from "./promotionEngine";
+// F2.A.23: reuse TTK-aware Pinnacle freshness curve at emission stage
+import { effectivePinnacleMaxAgeSeconds } from "./inversionPipeline";
 
 import {
   predictOutcome,
@@ -1748,14 +1750,50 @@ export async function detectValueBets(options?: {
         continue;
       }
 
-      const pricing = selectPricingSources(groupRows);
+      // F2.A.23 (2026-05-19): emission-stage Pinnacle freshness gate.
+      // Q2 anchor audit found 77% of AH placements had NO fresh Pinnacle
+      // snapshot for their exact selection at ±10min, and the ones with
+      // snapshots averaged 21-28 min drift. The 6h ODDS_LOOKBACK_HOURS
+      // gathers candidates broadly; this per-bet filter then enforces
+      // the TTK-aware freshness curve (same one used at lazy-promote).
+      //
+      // Pre-filter: drop Pinnacle rows older than the TTK-bucket base.
+      // Uses BASE column (not edge-aware) since we haven't computed model
+      // edge yet — predictor runs after pricing selection. This is the
+      // CONSERVATIVE gate; lazy-promoter applies the edge-aware tighter
+      // curve later.
+      const matchKickoff = match.kickoffTime;
+      const ttkHours = matchKickoff
+        ? Math.max(0, (matchKickoff.getTime() - Date.now()) / 3_600_000)
+        : null;
+      const maxAgeBaseSec = await effectivePinnacleMaxAgeSeconds(null, ttkHours);
+      const nowMs = Date.now();
+      const freshGroupRows = groupRows.filter((r: typeof groupRows[number]) => {
+        const src = r.source ?? "";
+        const isPinnacle =
+          src === "oddspapi_pinnacle" || src === "api_football_real:Pinnacle";
+        if (!isPinnacle) return true; // Betfair / other sources unfiltered
+        const snapshotTime = (r as { snapshotTime?: Date }).snapshotTime;
+        if (!snapshotTime) return false; // missing timestamp = drop conservatively
+        const ageSec = (nowMs - snapshotTime.getTime()) / 1000;
+        return ageSec <= maxAgeBaseSec;
+      });
+
+      const pricing = selectPricingSources(freshGroupRows);
       if (!pricing.ok) {
         if (pricing.reason === "no_actionable_source") {
           pricingRejectNoBetfairExchange++; // legacy counter — repurposed
           recordDiagnosticReject(marketType, "no_actionable_source");
         } else {
+          // F2.A.23: distinguish "no Pinnacle ever" from "Pinnacle stale
+          // after freshness filter" so the diagnostic counter shows
+          // which leg is binding.
+          const hadStalePinnacle = groupRows.length > freshGroupRows.length;
           pricingRejectNoFairValueSource++;
-          recordDiagnosticReject(marketType, "no_fair_value_source");
+          recordDiagnosticReject(
+            marketType,
+            hadStalePinnacle ? "pinnacle_stale_at_emission" : "no_fair_value_source",
+          );
         }
         continue;
       }
