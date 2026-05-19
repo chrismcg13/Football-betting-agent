@@ -5074,6 +5074,85 @@ router.post("/admin/sync-pinnacle-coverage", async (_req, res) => {
   }
 });
 
+// F2.A.12.2 (2026-05-19): force-promote every league with confirmed Pinnacle
+// coverage into active ingestion. Universal across all tiers — Tier 1/2/3
+// distinction is just the legacy hardcoded set; this works off actual data.
+//
+// Inputs (any one is sufficient):
+//   - competition_config.has_pinnacle_odds = true
+//   - real ingestion in odds_snapshots (source ILIKE '%pinnacle%')
+//   - real fixture mapping in oddspapi_fixture_map
+//
+// Effect (both tables):
+//   - discovered_leagues.status = 'active', has_api_football_odds = true,
+//     has_pinnacle_odds = true (so ingestFixturesForDiscoveredLeagues pulls
+//     them next cron tick)
+//   - competition_config.has_pinnacle_odds = true (so oddspapi prefetch +
+//     lazyPromoter ranking prioritises them)
+router.post("/admin/force-promote-pinnacle-leagues", async (_req, res) => {
+  try {
+    const universe = await db.execute(sql`
+      SELECT DISTINCT cc.api_football_id, cc.name, cc.country
+      FROM competition_config cc
+      WHERE cc.api_football_id IS NOT NULL
+        AND cc.api_football_id < 900000
+        AND (
+          cc.has_pinnacle_odds = TRUE
+          OR EXISTS (
+            SELECT 1 FROM odds_snapshots os
+            JOIN matches m ON m.id = os.match_id
+            WHERE m.league = cc.name AND os.source ILIKE '%pinnacle%'
+            LIMIT 1
+          )
+          OR EXISTS (
+            SELECT 1 FROM oddspapi_fixture_map ofm
+            JOIN matches m ON m.id = ofm.match_id
+            WHERE m.league = cc.name
+            LIMIT 1
+          )
+        )
+    `);
+
+    type UniverseRow = { api_football_id: number; name: string; country: string };
+    const rows = (universe as { rows?: UniverseRow[] }).rows ?? [];
+
+    if (rows.length === 0) {
+      res.json({ success: true, universeSize: 0, ccUpdated: 0, dlUpdated: 0 });
+      return;
+    }
+
+    const ids = rows.map((r) => r.api_football_id);
+    const idList = sql.join(ids.map((id) => sql`${id}`), sql`, `);
+
+    const ccResult = await db.execute(sql`
+      UPDATE competition_config
+      SET has_pinnacle_odds = TRUE
+      WHERE api_football_id IN (${idList}) AND has_pinnacle_odds = FALSE
+    `);
+
+    const dlResult = await db.execute(sql`
+      UPDATE discovered_leagues
+      SET status = 'active',
+          has_api_football_odds = TRUE,
+          has_pinnacle_odds = TRUE,
+          last_checked = NOW()
+      WHERE league_id IN (${idList})
+        AND (status <> 'active' OR has_api_football_odds = FALSE OR has_pinnacle_odds = FALSE)
+    `);
+
+    res.json({
+      success: true,
+      universeSize: rows.length,
+      ccUpdated: (ccResult as { rowCount?: number }).rowCount ?? 0,
+      dlUpdated: (dlResult as { rowCount?: number }).rowCount ?? 0,
+      sampleLeagues: rows.slice(0, 20).map((r) => `${r.country} - ${r.name} (${r.api_football_id})`),
+    });
+  } catch (err) {
+    logger.error({ err }, "force-promote-pinnacle-leagues failed");
+    res.status(500).json({ success: false, message: String(err) });
+  }
+});
+
 router.post("/admin/rescue-pinnacle-mapping", async (req, res) => {
   try {
     const dryRun = String(req.query["dryRun"] ?? req.body?.dryRun ?? "false") === "true";
