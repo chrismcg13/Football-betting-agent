@@ -2504,6 +2504,22 @@ export function startSettlementCron(): void {
   }, { timezone: "UTC" });
   logger.info("Daily league-coverage mega-chain scheduler active — 04:30 UTC");
 
+  // F2.A.27 (2026-05-20): inversion-direct bypass health gate. Every 15min,
+  // measures anchor-absence rate in recent placements and flips the
+  // f2a25_inversion_bypass_enabled config accordingly. Safe default: when
+  // unset, bypass is OFF (system falls back to v_live_eligibility gate).
+  cron.schedule("*/15 * * * *", () => {
+    void (async () => {
+      try {
+        const { runF2A25HealthGate } = await import("./f2a25HealthGate");
+        await runF2A25HealthGate();
+      } catch (err) {
+        logger.error({ err }, "F2.A.27 health gate failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("F2.A.27 inversion-bypass health gate active — every 15 min");
+
   // Phase 3 A4 (2026-05-08): post-flip operational jobs. Both run every
   // 15 min. Pre-flip (live_mode_active != 'true') they short-circuit as
   // no-ops, so no harm in scheduling them now — they'll start working

@@ -1476,7 +1476,16 @@ export async function placePaperBet(
       return false;
     }
   })();
-  if (!isShadowBet && inversionOnForGate) {
+  // F2.A.27 (2026-05-20): the inversion-direct bypass only activates when
+  // the F2.A.23 emission-stage Pinnacle freshness gate is verified working
+  // by the f2a25HealthGate cron (every 15min). Config defaults to absent/
+  // false, so this branch falls through to the v_live_eligibility path
+  // until the health gate flips it on. Safety: a broken anchor gate must
+  // not be paired with a faster placement path.
+  const f2a25BypassEnabledRaw = await getConfigValue("f2a25_inversion_bypass_enabled");
+  const f2a25BypassEnabled = f2a25BypassEnabledRaw === "true";
+  const useInversionDirectBypass = inversionOnForGate && f2a25BypassEnabled;
+  if (!isShadowBet && useInversionDirectBypass) {
     // Resolve league for downstream adaptive-Kelly reuse without the scope check.
     try {
       const matchLeague = await db
@@ -1490,7 +1499,7 @@ export async function placePaperBet(
     }
     livePathTag = "inversion_direct";
   }
-  if (!isShadowBet && !inversionOnForGate) {
+  if (!isShadowBet && !useInversionDirectBypass) {
     try {
       const matchLeague = await db
         .select({ league: matchesTable.league })
