@@ -779,8 +779,33 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
           // Hoist for use at the placement call site.
           liveBetfairBack = currentBack != null && Number.isFinite(currentBack) && currentBack > 1.01 ? currentBack : null;
           if (currentBack == null || !Number.isFinite(currentBack) || currentBack <= 1.01) {
+            // F2.A.24 (2026-05-19): targeted on-demand Betfair sweep.
+            // 246k stale_or_absent_betfair rejections in 24h across 1,569
+            // bets was the top blocker for Pinnacle-leading promotions.
+            // Root cause: scheduled sweep doesn't prioritise (match, market)
+            // pairs the lazy promoter is actively trying to evaluate.
+            // Fire a single-event sweep here (fire-and-forget; result is
+            // available on the next lazy-promote tick).
+            //
+            // Bounded by 6h on-demand cache + isCachedAsUnavailable gate
+            // upstream. Throttled inherently by the lazy-promote loop
+            // iteration speed (~10ms/candidate).
+            if (m.betfair_event_id) {
+              void (async () => {
+                try {
+                  const { sweepEventOnDemand } = await import("./exchangeBookSweep");
+                  await sweepEventOnDemand(r.match_id, m.betfair_event_id!);
+                } catch (sweepErr) {
+                  logger.debug(
+                    { sweepErr, betId: r.id, matchId: r.match_id },
+                    "F2.A.24: on-demand sweep failed (non-blocking)",
+                  );
+                }
+              })();
+            }
             // Stale or absent Betfair best-back → no live executable
-            // price. Bundle 11 removes the stored-odds fallback.
+            // price. Bundle 11 removes the stored-odds fallback. Sweep
+            // fired in background; next lazy-promote tick may succeed.
             result.skipped_edge_evaporated++;
             await db.insert(complianceLogsTable).values({
               actionType: "lazy_promote_edge_outside_band",
@@ -795,6 +820,7 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
                 bfMaxAgeSec,
                 reason: "stale_or_absent_betfair",
                 source: "lazy_promote",
+                onDemandSweepTriggered: true,
               },
               timestamp: new Date(),
             } as any);
@@ -824,7 +850,13 @@ export async function runLazyPromoteShadowToPaper(opts?: LazyPromoteOpts): Promi
                   postSlipEdgePp,
                   minEdgePp,
                   maxEdgePp,
-                  reason: belowFloor ? "below_3pp_floor" : "above_7pp_ceiling",
+                  // F2.A.24: actual reason uses dynamic band values
+                  // (config-driven min_net_edge_pp / inversion_live_max_edge_pp).
+                  // Previous label "above_7pp_ceiling" was misleading when
+                  // operator widened ceiling to 9pp on 2026-05-17.
+                  reason: belowFloor
+                    ? `below_${minEdgePp}pp_floor`
+                    : `above_${maxEdgePp}pp_ceiling`,
                   source: "lazy_promote",
                 },
                 timestamp: new Date(),
