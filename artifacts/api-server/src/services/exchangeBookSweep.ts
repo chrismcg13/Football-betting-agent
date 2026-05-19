@@ -549,10 +549,36 @@ export async function runExchangeBookSweep(
         }
         if (!selectionName) continue;
 
+        // Bundle F2.B.A.2.1 (2026-05-19): split multi-line corner markets
+        // into per-line market_types so they align with the Pinnacle storage
+        // shape (TOTAL_CORNERS_85 etc.) and the Bundle D predictor +
+        // settlement resolvers. Without this, Betfair corner snapshots
+        // landed under "TOTAL_CORNERS_MULTI" — invisible to valueDetection
+        // (which iterates groups keyed on market_type) and to
+        // selectPricingSources (which joins Pinnacle to Betfair by market
+        // _type). Selection name stays "Over 8.5 Corners" — Pinnacle uses
+        // the same format.
+        let writeMarketType = ctx.internalMarketType;
+        if (
+          writeMarketType === "TOTAL_CORNERS_MULTI" ||
+          writeMarketType === "FIRST_HALF_CORNERS_MULTI"
+        ) {
+          const m = selectionName.match(/^(?:Over|Under)\s+(\d+\.\d+)/);
+          if (m) {
+            const lineX10 = Math.round(parseFloat(m[1]!) * 10);
+            const prefix = writeMarketType === "TOTAL_CORNERS_MULTI"
+              ? "TOTAL_CORNERS_"
+              : "FIRST_HALF_CORNERS_";
+            writeMarketType = `${prefix}${lineX10}`;
+          }
+          // If no line matched (e.g., "Push" / unfamiliar runner) leave as
+          // MULTI — downstream consumers will skip, no edge lost.
+        }
+
         try {
           await db.insert(oddsSnapshotsTable).values({
             matchId: ctx.match.id,
-            marketType: ctx.internalMarketType,
+            marketType: writeMarketType,
             selectionName,
             backOdds: back != null ? String(back) : null,
             layOdds: lay != null ? String(lay) : null,
