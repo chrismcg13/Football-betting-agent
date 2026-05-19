@@ -1350,6 +1350,16 @@ export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   "OVER_UNDER_45",
   "ASIAN_HANDICAP",
   "FIRST_HALF_OU_15",
+  // Bundle F2.B.D (2026-05-19): TOTAL_CORNERS restored. Betfair
+  // exchangeBookSweep already requests TOTAL_CORNERS / OVER_UNDER_CORNERS
+  // catalogue per F2.A.9.2 — Pinnacle direct quotes verified in
+  // odds_snapshots last 7d (76-622 matches/line). Settlement resolvers
+  // live in marketTypes.ts (pre-existing from earlier corner experiment).
+  "TOTAL_CORNERS_75",
+  "TOTAL_CORNERS_85",
+  "TOTAL_CORNERS_95",
+  "TOTAL_CORNERS_105",
+  "TOTAL_CORNERS_115",
 ]);
 
 // 2026-05-16 subtract bundle: TOTAL_CORNERS_* entirely subtracted; this

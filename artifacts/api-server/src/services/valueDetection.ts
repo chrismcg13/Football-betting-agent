@@ -35,6 +35,7 @@ import {
   predictTeamTotalGoals,
   predictAsianHandicap,
   predictAsianTotalGoals,
+  predictTotalCorners,
   getModelVersion,
   // 2026-05-16 subtract bundle: predictCards, predictCorners, predictWinToNil,
   // predictOddEven, predictHtFt, predictBttsHalf, predictSecondHalfResult
@@ -595,9 +596,31 @@ function getModelProbability(
     if (selectionName.startsWith("Over")) return 1 - under35;
     if (selectionName.startsWith("Under")) return under35;
   }
-  // 2026-05-16 subtract bundle: TOTAL_CARDS_25/35/45/55 + TOTAL_CORNERS_75/
-  // 85/95/105/115 emission branches removed. Zero placeable liquidity probes
-  // ever; zero non-paper bets ever placed. See feedback_subtract_before_restore.
+  // Bundle F2.B.D (2026-05-19): TOTAL_CORNERS_75/85/95/105/115 restored.
+  // Predictor uses NegBin (variance > mean — Poisson would mis-price the
+  // tail at 10.5/11.5 lines where the edge concentrates). Features
+  // home_corners_avg + away_corners_avg already populated by featureEngine
+  // (xCorners "for/against" split deferred). All 5 lines route through
+  // predictTotalCorners; line parsed from suffix.
+  if (
+    marketType === "TOTAL_CORNERS_75" ||
+    marketType === "TOTAL_CORNERS_85" ||
+    marketType === "TOTAL_CORNERS_95" ||
+    marketType === "TOTAL_CORNERS_105" ||
+    marketType === "TOTAL_CORNERS_115"
+  ) {
+    const suffix = marketType.split("_").pop()!;
+    const line = parseInt(suffix, 10) / 10; // "85" → 8.5
+    if (!Number.isFinite(line)) return null;
+    const tc = predictTotalCorners(enriched, line);
+    if (!tc) return null;
+    if (selectionName.startsWith("Over")) return tc.over;
+    if (selectionName.startsWith("Under")) return tc.under;
+    return null;
+  }
+  // 2026-05-16 subtract bundle: TOTAL_CARDS_25/35/45/55 emission branches
+  // removed. Zero placeable liquidity probes ever; zero non-paper bets ever
+  // placed. See feedback_subtract_before_restore.
   // Over/Under 0.5 goals
   if (marketType === "OVER_UNDER_05") {
     const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;

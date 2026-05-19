@@ -1501,6 +1501,106 @@ export function predictWinToNil(
   return { yes, no: 1 - yes };
 }
 
+// ===================== Bundle F2.B.D (2026-05-19) NegBin corners =====================
+//
+// Corners are overdispersed (variance > mean). Poisson here would mis-price
+// the tails — exactly the OVER lines at 10.5 / 11.5 where the edge lives.
+// Negative Binomial with shape k captures the dispersion: variance = mean ×
+// (1 + mean/k). Larger k → less overdispersion (approaches Poisson); k=2.5
+// is the global prior for corners (consistent across major leagues per
+// xCorners literature).
+//
+// Per-league k fit + xCorners multiplicative (corners_for × corners_against)
+// deferred — featureEngine currently has only home_corners_avg (corners
+// taken) per team, not the conceded-corners split. v1 uses additive
+// (home_corners_avg + away_corners_avg) which is the same shape as the
+// existing Poisson xGoals; the NegBin upgrade alone fixes the tail.
+//
+// All Bundle F2.A.10 predictors return null when lambdas unavailable so
+// they fall through to shadow; this mirrors that.
+
+const CORNERS_K_GLOBAL = 2.5;
+
+// log-gamma via Stirling-Lanczos for accurate combinatorics in NegBin PMF.
+// Standard implementation; max relative error ≈ 1e-15.
+function logGamma(x: number): number {
+  const cof = [
+    76.18009172947146, -86.50532032941677, 24.01409824083091,
+    -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5,
+  ];
+  let y = x;
+  const t = x + 5.5;
+  const tmp = (x + 0.5) * Math.log(t) - t;
+  let ser = 1.000000000190015;
+  for (let j = 0; j < 6; j += 1) {
+    y += 1;
+    ser += cof[j]! / y;
+  }
+  return tmp + Math.log((2.5066282746310005 * ser) / x);
+}
+
+// NegBin(r, p) PMF where r = k_disp (shape), p = k/(k+μ).
+// P(X = k_obs) = exp(logGamma(k_obs + r) - logGamma(k_obs + 1) - logGamma(r))
+//                × p^r × (1-p)^k_obs
+function negBinPmf(kObs: number, mean: number, kDisp: number): number {
+  if (mean <= 0 || kDisp <= 0 || kObs < 0) return 0;
+  const p = kDisp / (kDisp + mean);
+  const oneMinusP = mean / (kDisp + mean);
+  const logPmf =
+    logGamma(kObs + kDisp) -
+    logGamma(kObs + 1) -
+    logGamma(kDisp) +
+    kDisp * Math.log(p) +
+    kObs * Math.log(oneMinusP);
+  return Math.exp(logPmf);
+}
+
+// CDF: P(X ≤ floor(line)) via summed PMF. line is a Betfair line (e.g.
+// 9.5 → sum k=0..9). Capped at 30 for numerical safety; corners
+// distributions are tight enough that the tail beyond 30 is negligible.
+function negBinCdf(mean: number, kDisp: number, line: number): number {
+  const upper = Math.min(30, Math.floor(line));
+  let cdf = 0;
+  for (let k = 0; k <= upper; k += 1) {
+    cdf += negBinPmf(k, mean, kDisp);
+  }
+  return Math.max(0, Math.min(1, cdf));
+}
+
+/**
+ * Predict TOTAL_CORNERS over/under. Returns { over, under } each in
+ * [0.01, 0.99]. Returns null when corner features unavailable.
+ *
+ * λ = home_corners_avg + away_corners_avg (additive xCorners; per-team
+ * "for" / "against" split deferred to a follow-up).
+ * Distribution: NegBin(λ, k_global = 2.5).
+ */
+export function predictTotalCorners(
+  featureMap: Record<string, number>,
+  line: number,
+): { over: number; under: number } | null {
+  const homeCornersAvg = featureMap["home_corners_avg"];
+  const awayCornersAvg = featureMap["away_corners_avg"];
+  if (
+    homeCornersAvg == null ||
+    awayCornersAvg == null ||
+    !Number.isFinite(homeCornersAvg) ||
+    !Number.isFinite(awayCornersAvg) ||
+    homeCornersAvg < 0 ||
+    awayCornersAvg < 0
+  ) {
+    return null;
+  }
+  const lambda = homeCornersAvg + awayCornersAvg;
+  if (lambda <= 0) return null;
+  const under = negBinCdf(lambda, CORNERS_K_GLOBAL, line);
+  const overRaw = 1 - under;
+  return {
+    over: Math.max(0.01, Math.min(0.99, overRaw)),
+    under: Math.max(0.01, Math.min(0.99, under)),
+  };
+}
+
 // ===================== Training sample builder from DB records =====================
 export interface DbTrainingSample {
   features: number[];
