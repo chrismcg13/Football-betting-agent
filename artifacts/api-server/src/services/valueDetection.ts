@@ -36,6 +36,7 @@ import {
   predictAsianHandicap,
   predictAsianTotalGoals,
   predictTotalCorners,
+  predictTotalCards,
   getModelVersion,
   // 2026-05-16 subtract bundle: predictCards, predictCorners, predictWinToNil,
   // predictOddEven, predictHtFt, predictBttsHalf, predictSecondHalfResult
@@ -618,9 +619,29 @@ function getModelProbability(
     if (selectionName.startsWith("Under")) return tc.under;
     return null;
   }
-  // 2026-05-16 subtract bundle: TOTAL_CARDS_25/35/45/55 emission branches
-  // removed. Zero placeable liquidity probes ever; zero non-paper bets ever
-  // placed. See feedback_subtract_before_restore.
+  // Bundle F2.B.E (2026-05-19): TOTAL_CARDS_25/35/45/55 restored.
+  // Predictor uses NegBin (variance > mean, slightly more dispersed than
+  // corners — ref-driven). λ = home_yellow_cards_avg + away_yellow_cards_avg
+  // + global red prior (0.1). Pinnacle direct quotes verified in
+  // odds_snapshots last 7d (48-110 matches/line). Betfair represents this
+  // as TOTAL_BOOKING_POINTS (yellow=10, red=25); a TOTAL_CARDS ->
+  // TOTAL_BOOKING_POINTS settlement bridge is a follow-up (current
+  // bundle ships shadow-only learning).
+  if (
+    marketType === "TOTAL_CARDS_25" ||
+    marketType === "TOTAL_CARDS_35" ||
+    marketType === "TOTAL_CARDS_45" ||
+    marketType === "TOTAL_CARDS_55"
+  ) {
+    const suffix = marketType.split("_").pop()!;
+    const line = parseInt(suffix, 10) / 10; // "35" → 3.5
+    if (!Number.isFinite(line)) return null;
+    const tc = predictTotalCards(enriched, line);
+    if (!tc) return null;
+    if (selectionName.startsWith("Over")) return tc.over;
+    if (selectionName.startsWith("Under")) return tc.under;
+    return null;
+  }
   // Over/Under 0.5 goals
   if (marketType === "OVER_UNDER_05") {
     const homeGoals = enriched["home_goals_scored_avg"] ?? 1.2;

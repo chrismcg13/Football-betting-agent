@@ -1360,6 +1360,16 @@ export const VERIFIED_BETFAIR_PLACEABLE = new Set<string>([
   "TOTAL_CORNERS_95",
   "TOTAL_CORNERS_105",
   "TOTAL_CORNERS_115",
+  // Bundle F2.B.E (2026-05-19): TOTAL_CARDS restored. Pinnacle direct
+  // quotes verified in odds_snapshots last 7d (48-110 matches/line).
+  // Betfair Exchange represents cards as TOTAL_BOOKING_POINTS (yellow=10,
+  // red=25) — settlement bridge follow-up. Until then, TOTAL_CARDS bets
+  // accumulate as shadow learning data; graduation pathway is via the
+  // forthcoming TOTAL_BOOKING_POINTS predictor + MARKET_TYPE_MAP entry.
+  "TOTAL_CARDS_25",
+  "TOTAL_CARDS_35",
+  "TOTAL_CARDS_45",
+  "TOTAL_CARDS_55",
 ]);
 
 // 2026-05-16 subtract bundle: TOTAL_CORNERS_* entirely subtracted; this

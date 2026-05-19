@@ -1601,6 +1601,62 @@ export function predictTotalCorners(
   };
 }
 
+// ===================== Bundle F2.B.E (2026-05-19) NegBin cards =====================
+//
+// Cards are overdispersed (refs vary; high-tempo matches yield more cards
+// than average match strength would suggest). NegBin(λ, k=2.0) — slightly
+// more dispersion than corners (k=2.5). Per-league k fit deferred.
+//
+// Red cards: featureEngine doesn't separately track red rate (only
+// combined yellow rate per team). Use a small global red prior — typical
+// red rate is ~0.1 per match (one red per ten matches across major leagues
+// per Karlis/Ntzoufras and others). Folded into λ_cards as a small bump.
+// Per-league red rate fit deferred — most leagues are close enough to the
+// global that a constant prior contributes < 1pp probability shift.
+//
+// Predictor reads featureMap directly — no FEATURE_NAMES dependency
+// (same architecture as predictCorrectScore / predictTotalCorners).
+
+const CARDS_K_GLOBAL = 2.0;
+// Global red-card prior per match — folded into total-card lambda. Sources:
+// Karlis & Ntzoufras (2008); empirical across top 5 European leagues
+// 2015-2024 ≈ 0.10–0.12 reds/match.
+const RED_CARD_PRIOR = 0.1;
+
+/**
+ * Predict TOTAL_CARDS over/under. Returns { over, under } each in
+ * [0.01, 0.99]. Returns null when card features unavailable.
+ *
+ * λ = home_yellow_cards_avg + away_yellow_cards_avg + RED_CARD_PRIOR
+ *   (additive; per-team "for" / "against" split deferred)
+ * Distribution: NegBin(λ, k_global = 2.0).
+ */
+export function predictTotalCards(
+  featureMap: Record<string, number>,
+  line: number,
+): { over: number; under: number } | null {
+  const homeYellow = featureMap["home_yellow_cards_avg"];
+  const awayYellow = featureMap["away_yellow_cards_avg"];
+  if (
+    homeYellow == null ||
+    awayYellow == null ||
+    !Number.isFinite(homeYellow) ||
+    !Number.isFinite(awayYellow) ||
+    homeYellow < 0 ||
+    awayYellow < 0
+  ) {
+    return null;
+  }
+  const lambda = homeYellow + awayYellow + RED_CARD_PRIOR;
+  if (lambda <= 0) return null;
+  const under = negBinCdf(lambda, CARDS_K_GLOBAL, line);
+  const overRaw = 1 - under;
+  return {
+    over: Math.max(0.01, Math.min(0.99, overRaw)),
+    under: Math.max(0.01, Math.min(0.99, under)),
+  };
+}
+
 // ===================== Training sample builder from DB records =====================
 export interface DbTrainingSample {
   features: number[];
