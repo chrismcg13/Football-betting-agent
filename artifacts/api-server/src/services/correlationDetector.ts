@@ -130,6 +130,63 @@ const COMPLEMENTARY_RULES: ComplementaryRule[] = [
     market2: "OVER_UNDER_35", sel2Includes: "Over",
     thesis: "away dominance expressed via heavy attacking output",
   },
+  // ─── F2.A.18: cross-tempo correlation ──────────────────────────────────
+  // Goals + corners + cards on the same direction share the underlying
+  // "match-tempo" thesis. High-tempo open games produce more of all three;
+  // low-tempo grinds produce fewer. Backing same-direction on multiple
+  // tempo proxies at full Kelly over-leverages the same proposition.
+  // Haircut keeps both bets (genuine independent edges measured on each)
+  // but right-sizes the combined exposure. Config-tunable via
+  // complementary_haircut_tempo (default 0.85 = 15% reduction).
+  //
+  // Per-pair list rather than a generic loop so settlement timing of each
+  // pair stays explicit and tunable. Mirrors for Under direction.
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Over",
+    market2: "TOTAL_CORNERS_95", sel2Includes: "Over",
+    thesis: "high-tempo attacking match (goals + corners same direction)",
+  },
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Over",
+    market2: "TOTAL_CORNERS_105", sel2Includes: "Over",
+    thesis: "high-tempo attacking match (goals + corners same direction)",
+  },
+  {
+    market1: "OVER_UNDER_35", sel1Includes: "Over",
+    market2: "TOTAL_CORNERS_105", sel2Includes: "Over",
+    thesis: "high-tempo attacking match (goals + corners same direction)",
+  },
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Over",
+    market2: "TOTAL_CARDS_45", sel2Includes: "Over",
+    thesis: "high-tempo open game (goals + cards same direction)",
+  },
+  {
+    market1: "OVER_UNDER_35", sel1Includes: "Over",
+    market2: "TOTAL_CARDS_55", sel2Includes: "Over",
+    thesis: "high-tempo open game (goals + cards same direction)",
+  },
+  {
+    market1: "TOTAL_CORNERS_95", sel1Includes: "Over",
+    market2: "TOTAL_CARDS_45", sel2Includes: "Over",
+    thesis: "high-tempo physical game (corners + cards same direction)",
+  },
+  // Mirror Under direction (low-tempo defensive thesis)
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Under",
+    market2: "TOTAL_CORNERS_85", sel2Includes: "Under",
+    thesis: "low-tempo defensive match (goals + corners same direction)",
+  },
+  {
+    market1: "OVER_UNDER_15", sel1Includes: "Under",
+    market2: "TOTAL_CORNERS_85", sel2Includes: "Under",
+    thesis: "low-tempo defensive match (goals + corners same direction)",
+  },
+  {
+    market1: "OVER_UNDER_25", sel1Includes: "Under",
+    market2: "TOTAL_CARDS_35", sel2Includes: "Under",
+    thesis: "low-tempo cautious game (goals + cards same direction)",
+  },
 ];
 
 interface ConflictingRule {
@@ -232,17 +289,88 @@ const CORRELATED_PAIRS: CorrelatedPair[] = [
     market2: "DOUBLE_CHANCE", sel2Includes: "Away or Draw",
     reason: "Draw is a strict subset of DC Away or Draw — dominated",
   },
+  // ─── F2.A.18: Cards ↔ Booking Points proxy domination ──────────────────
+  // BOOKING_POINTS = 10×yellows + 25×reds, so it's a weighted re-encoding
+  // of the same card-count proposition. Backing both is paying vig twice
+  // on one underlying. Keep higher-scored bet only.
+  {
+    market1: "TOTAL_CARDS_25", sel1Includes: "Over",
+    market2: "TOTAL_BOOKING_POINTS_25", sel2Includes: "Over",
+    reason: "Cards and Booking Points proxy the same underlying card-count proposition",
+  },
+  {
+    market1: "TOTAL_CARDS_35", sel1Includes: "Over",
+    market2: "TOTAL_BOOKING_POINTS_35", sel2Includes: "Over",
+    reason: "Cards and Booking Points proxy the same underlying card-count proposition",
+  },
+  {
+    market1: "TOTAL_CARDS_45", sel1Includes: "Over",
+    market2: "TOTAL_BOOKING_POINTS_45", sel2Includes: "Over",
+    reason: "Cards and Booking Points proxy the same underlying card-count proposition",
+  },
+  {
+    market1: "TOTAL_CARDS_55", sel1Includes: "Over",
+    market2: "TOTAL_BOOKING_POINTS_55", sel2Includes: "Over",
+    reason: "Cards and Booking Points proxy the same underlying card-count proposition",
+  },
+  // (mirror for Under selections)
+  {
+    market1: "TOTAL_CARDS_25", sel1Includes: "Under",
+    market2: "TOTAL_BOOKING_POINTS_25", sel2Includes: "Under",
+    reason: "Cards and Booking Points proxy the same underlying card-count proposition",
+  },
+  {
+    market1: "TOTAL_CARDS_35", sel1Includes: "Under",
+    market2: "TOTAL_BOOKING_POINTS_35", sel2Includes: "Under",
+    reason: "Cards and Booking Points proxy the same underlying card-count proposition",
+  },
+  {
+    market1: "TOTAL_CARDS_45", sel1Includes: "Under",
+    market2: "TOTAL_BOOKING_POINTS_45", sel2Includes: "Under",
+    reason: "Cards and Booking Points proxy the same underlying card-count proposition",
+  },
+  // ─── F2.A.18: CORRECT_SCORE 0-0 ↔ Under 0.5 deterministic subset ──────
+  // CS "0-0" wins iff Under 0.5 wins (same event). CS "0-0" is a strict
+  // subset of Under 1.5 too. Keep higher-scored only.
+  {
+    market1: "CORRECT_SCORE", sel1Includes: "0 - 0",
+    market2: "OVER_UNDER_05", sel2Includes: "Under",
+    reason: "CS 0-0 is the same event as Under 0.5 — perfect subset",
+  },
+  // ─── F2.A.18: EUROPEAN_HANDICAP ↔ MATCH_ODDS same-side subset ─────────
+  // EH "Home -1" wins iff "Home wins by 2+". This is a strict subset of
+  // MO "Home" (which wins on any home win). Keep higher-scored only.
+  {
+    market1: "EUROPEAN_HANDICAP", sel1Includes: "Home -",
+    market2: "MATCH_ODDS", sel2Includes: "Home",
+    reason: "EH Home -N is a strict subset of MO Home — dominated",
+  },
+  {
+    market1: "EUROPEAN_HANDICAP", sel1Includes: "Away -",
+    market2: "MATCH_ODDS", sel2Includes: "Away",
+    reason: "EH Away -N is a strict subset of MO Away — dominated",
+  },
 ];
 
 // ─── Threshold category helper ────────────────────────────────────────────────
 
 // Returns a grouping key if the market is a threshold bet (goals OU, corners, cards).
 // Bets in the same category on the same match are correlated and should be deduped.
+//
+// F2.A.18 (2026-05-19): booking_points added (Bundle O markets); first_half
+// variants of goals + corners grouped separately (different propositions
+// from full-match but same proposition across lines). HALF_TIME_SCORE and
+// CORRECT_SCORE kept distinct from goals_ou — they're discrete outcomes,
+// not threshold rolls, but cross-market implications are caught in
+// CORRELATED_PAIRS below (CS 0-0 → Under 0.5, etc.).
 export function getThresholdCategory(marketType: string): string | null {
   if (/^OVER_UNDER_\d+$/.test(marketType)) return "goals_ou";
+  if (/^FIRST_HALF_OU_\d+$/.test(marketType)) return "first_half_goals_ou";
   if (marketType === "BTTS") return "btts";
   if (/^TOTAL_CORNERS_\d+$/.test(marketType)) return "corners";
+  if (marketType === "FIRST_HALF_CORNERS_MULTI") return "first_half_corners";
   if (/^TOTAL_CARDS_\d+$/.test(marketType)) return "cards";
+  if (/^TOTAL_BOOKING_POINTS_\d+$/.test(marketType) || marketType === "TOTAL_BOOKING_POINTS") return "booking_points";
   return null;
 }
 
@@ -490,6 +618,10 @@ export async function applyCorrelationDetection(
   const fhrMoHaircut = await readHaircut("complementary_haircut_fhr_mo", 0.8);
   const bttsOuHaircut = await readHaircut("complementary_haircut_btts_ou", 0.7);
   const moOuHaircut = await readHaircut("complementary_haircut_mo_ou", 0.8);
+  // F2.A.18: cross-tempo haircut for goals/corners/cards same-direction pairs.
+  // Default 0.85 (15% reduction) — mild positive correlation, lighter than
+  // BTTS+OU (0.7) which is a stronger same-direction tie.
+  const tempoHaircut = await readHaircut("complementary_haircut_tempo", 0.85);
   for (const [matchId, bets] of byMatch) {
     for (const rule of COMPLEMENTARY_RULES) {
       const b1 = bets.find((b) => ruleMatch(b, rule.market1, rule.sel1Includes));
@@ -505,10 +637,25 @@ export async function applyCorrelationDetection(
       const isMoOu =
         (rule.market1 === "MATCH_ODDS" && rule.market2.startsWith("OVER_UNDER_")) ||
         (rule.market1.startsWith("OVER_UNDER_") && rule.market2 === "MATCH_ODDS");
+      // F2.A.18: detect cross-tempo pairs (goals/corners/cards in any
+      // combination of two distinct families). Membership check on the
+      // family prefixes rather than enumerating every line pair.
+      const isTempo = ((): boolean => {
+        const familyOf = (m: string): string | null => {
+          if (m.startsWith("OVER_UNDER_") && !m.startsWith("OVER_UNDER_CORNERS")) return "goals";
+          if (m.startsWith("TOTAL_CORNERS_")) return "corners";
+          if (m.startsWith("TOTAL_CARDS_")) return "cards";
+          return null;
+        };
+        const f1 = familyOf(rule.market1);
+        const f2 = familyOf(rule.market2);
+        return f1 != null && f2 != null && f1 !== f2;
+      })();
       let haircut = 0.8;
       if (isFhrMo) haircut = fhrMoHaircut;
       else if (isBttsOu) haircut = bttsOuHaircut;
       else if (isMoOu) haircut = moOuHaircut;
+      else if (isTempo) haircut = tempoHaircut;
       const reductionPct = Math.round((1 - haircut) * 100);
 
       const msg = `Complementary bets on ${b1.homeTeam} vs ${b1.awayTeam}: ${b1.selectionName} + ${b2.selectionName} share the thesis '${rule.thesis}'. Stakes reduced ${reductionPct}% to manage correlated risk.`;
