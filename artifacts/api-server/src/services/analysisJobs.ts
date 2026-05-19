@@ -552,12 +552,31 @@ async function runMarketTypeAggregatePass(
       basis = `failed:${failed.join(",")}`;
     }
 
+    // Bundle F2.B.L (2026-05-19): median Betfair back-side size matched
+    // on settled live bets over last 30d. Proxy for "how much capital can
+    // I actually deploy on this market_type at decent slippage". Only
+    // computed from settled LIVE bets (paper_bets.betfair_size_matched
+    // is populated by betfairLive reconciliation). Defaults NULL when
+    // no live bets settled — operator reads NULL as "unknown".
+    const liquidityQ = await db.execute(sql`
+      SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY betfair_size_matched::float8) AS median_size
+      FROM paper_bets
+      WHERE market_type = ${marketType}
+        AND bet_track = 'live'
+        AND status IN ('won','lost')
+        AND betfair_size_matched IS NOT NULL
+        AND betfair_size_matched::numeric > 0
+        AND settled_at >= NOW() - INTERVAL '30 days'
+    `);
+    const medianBackVol = (((liquidityQ as any).rows?.[0]) as { median_size: number | string | null } | undefined)?.median_size ?? null;
+
     await db.execute(sql`
       INSERT INTO analysis_signal_strength
         (computed_at, league, market_type, bet_track, n,
          win_rate, wilson_lo95_winrate, roi, shrunk_roi,
          avg_clv, clv_t_stat, bootstrap_lo95_roi,
-         qualifies_live, qualification_basis)
+         qualifies_live, qualification_basis,
+         median_back_volume_at_1pct_slippage_30d)
       VALUES
         (${computedAt.toISOString()}::timestamptz,
          ${MT_AGG_LEAGUE_SENTINEL},
@@ -572,7 +591,8 @@ async function runMarketTypeAggregatePass(
          ${clvT},
          ${bootstrapLo95},
          ${qualifiesLive},
-         ${basis})
+         ${basis},
+         ${medianBackVol})
       ON CONFLICT (computed_at, league, market_type, bet_track) DO UPDATE SET
         n                    = EXCLUDED.n,
         win_rate             = EXCLUDED.win_rate,
@@ -582,7 +602,8 @@ async function runMarketTypeAggregatePass(
         clv_t_stat           = EXCLUDED.clv_t_stat,
         bootstrap_lo95_roi   = EXCLUDED.bootstrap_lo95_roi,
         qualifies_live       = EXCLUDED.qualifies_live,
-        qualification_basis  = EXCLUDED.qualification_basis
+        qualification_basis  = EXCLUDED.qualification_basis,
+        median_back_volume_at_1pct_slippage_30d = EXCLUDED.median_back_volume_at_1pct_slippage_30d
     `);
     rowsWritten += 1;
   }

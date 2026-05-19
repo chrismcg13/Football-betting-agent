@@ -5189,6 +5189,74 @@ export async function runMigrations() {
     `);
     logger.info("Bundle F2.B.H: calibration_buckets posterior + version columns ready");
 
+    // ── Bundle F2.B.I (2026-05-19): niche-league Betfair-coverage cache ──
+    // Three columns on competition_config so betfairMarketDiscovery can
+    // track which leagues have ever returned a Betfair market AND apply
+    // a negative-cache (skip leagues with 3+ fails and no successes in 30d).
+    await db.execute(sql`
+      ALTER TABLE competition_config
+        ADD COLUMN IF NOT EXISTS has_betfair_coverage BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS discovery_fail_count INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS last_discovery_attempt_at TIMESTAMPTZ
+    `);
+    logger.info("Bundle F2.B.I: competition_config Betfair-coverage columns ready");
+
+    // ── Bundle F2.B.L (2026-05-19): liquidity-aware deployability ──
+    // One column on analysis_signal_strength tracking median Betfair
+    // back-side volume at 1% slippage over the last 30d per (league x
+    // market_type). v_live_eligibility_market_types filter add in v2;
+    // first land the computed column for operator audit.
+    await db.execute(sql`
+      ALTER TABLE analysis_signal_strength
+        ADD COLUMN IF NOT EXISTS median_back_volume_at_1pct_slippage_30d NUMERIC(12,2)
+    `);
+    logger.info("Bundle F2.B.L: analysis_signal_strength liquidity column ready");
+
+    // ── Bundle F2.B.K (2026-05-19): cross-market predictor consistency ──
+    // SQL view comparing MATCH_ODDS-derived P(home_wins) to model_probability
+    // on the same match's other markets. Disagreement >2pp flags the
+    // predictor for inspection. Per-bet veto (with hysteresis) deferred —
+    // v1 ships the diagnostic view + admin endpoint.
+    await db.execute(sql`
+      CREATE OR REPLACE VIEW v_predictor_consistency AS
+      WITH mo AS (
+        SELECT match_id,
+               MAX(model_probability::float8) FILTER (WHERE selection_name = 'Home') AS mo_home,
+               MAX(model_probability::float8) FILTER (WHERE selection_name = 'Draw') AS mo_draw,
+               MAX(model_probability::float8) FILTER (WHERE selection_name = 'Away') AS mo_away,
+               MAX(placed_at) AS latest_mo_at
+        FROM paper_bets
+        WHERE market_type = 'MATCH_ODDS'
+          AND deleted_at IS NULL
+          AND placed_at >= NOW() - INTERVAL '24 hours'
+        GROUP BY match_id
+      ),
+      eh AS (
+        SELECT match_id,
+               MAX(model_probability::float8) FILTER (WHERE selection_name = 'Home 0') AS eh_home,
+               MAX(model_probability::float8) FILTER (WHERE selection_name = 'Draw 0') AS eh_draw,
+               MAX(model_probability::float8) FILTER (WHERE selection_name = 'Away 0') AS eh_away
+        FROM paper_bets
+        WHERE market_type = 'EUROPEAN_HANDICAP'
+          AND selection_name IN ('Home 0','Draw 0','Away 0')
+          AND deleted_at IS NULL
+          AND placed_at >= NOW() - INTERVAL '24 hours'
+        GROUP BY match_id
+      )
+      SELECT
+        mo.match_id,
+        mo.mo_home, mo.mo_draw, mo.mo_away,
+        eh.eh_home, eh.eh_draw, eh.eh_away,
+        ABS(COALESCE(mo.mo_home, 0) - COALESCE(eh.eh_home, 0)) * 100 AS disagreement_home_pp,
+        ABS(COALESCE(mo.mo_draw, 0) - COALESCE(eh.eh_draw, 0)) * 100 AS disagreement_draw_pp,
+        ABS(COALESCE(mo.mo_away, 0) - COALESCE(eh.eh_away, 0)) * 100 AS disagreement_away_pp,
+        mo.latest_mo_at
+      FROM mo
+      LEFT JOIN eh ON eh.match_id = mo.match_id
+      WHERE eh.match_id IS NOT NULL
+    `);
+    logger.info("Bundle F2.B.K: v_predictor_consistency view ready");
+
     logger.info("Migrations complete");
   } catch (err) {
     logger.error({ err }, "Migration failed");

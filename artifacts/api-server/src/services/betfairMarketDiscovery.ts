@@ -154,3 +154,151 @@ export async function runBetfairMarketDiscovery(): Promise<MarketDiscoveryResult
   logger.info(result, "betfair_market_discovery_complete");
   return result;
 }
+
+// ── Bundle F2.B.I (2026-05-19): niche-league discovery ─────────────────
+//
+// Fixture-driven discovery for leagues OUTSIDE the Tier A/B/C sample.
+// For each league with an upcoming fixture in the next 7d but NO
+// has_betfair_coverage=TRUE yet, picks one fixture and runs
+// listMarketsByEventId. If any markets returned, flips
+// has_betfair_coverage=TRUE (sticky — coverage doesn't disappear).
+// If none, increments discovery_fail_count + sets last_discovery_attempt_at.
+//
+// Negative-cache: skip leagues with fail_count >= 3 AND
+// has_betfair_coverage = FALSE AND last_discovery_attempt_at within 30d.
+// Newly-added leagues with intermittent Betfair coverage (Wed/Thu/Fri
+// fail, Mon succeeds) stay on the 6h cadence because the success flips
+// the boolean and removes them from the skip pool.
+//
+// Cost: bounded by uncovered-league-with-upcoming-fixture count. Each
+// league = 1 catalogue API call. Cron runs every 6h.
+
+const NICHE_DISCOVERY_FAIL_THRESHOLD = 3;
+const NICHE_DISCOVERY_FAIL_WINDOW_DAYS = 30;
+
+export interface NicheDiscoveryResult {
+  leagues_evaluated: number;
+  leagues_skipped_negative_cache: number;
+  newly_covered: string[];
+  failed_again: string[];
+  duration_ms: number;
+}
+
+export async function runNicheLeagueDiscovery(): Promise<NicheDiscoveryResult> {
+  const startedAt = Date.now();
+
+  // 1. Candidate leagues: have an upcoming fixture in next 7d, no
+  //    has_betfair_coverage=TRUE yet, not in negative-cache window.
+  const candidatesQ = await db.execute(sql`
+    WITH upcoming AS (
+      SELECT DISTINCT m.league, m.country
+      FROM matches m
+      WHERE m.status = 'scheduled'
+        AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '7 days'
+        AND m.betfair_event_id IS NOT NULL
+        AND m.betfair_event_id ~ '^[0-9]+$'
+    )
+    SELECT cc.id, cc.name AS league, cc.country,
+           cc.has_betfair_coverage, cc.discovery_fail_count,
+           cc.last_discovery_attempt_at
+    FROM competition_config cc
+    INNER JOIN upcoming u
+      ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(u.league, '-', ' '))
+     AND (cc.country IS NULL OR u.country IS NULL
+          OR LOWER(REPLACE(cc.country, '-', ' ')) = LOWER(REPLACE(u.country, '-', ' ')))
+    WHERE cc.has_betfair_coverage = FALSE
+      -- Negative cache: skip if 3+ fails in last 30d AND never succeeded
+      AND NOT (
+        cc.discovery_fail_count >= ${NICHE_DISCOVERY_FAIL_THRESHOLD}
+        AND cc.last_discovery_attempt_at IS NOT NULL
+        AND cc.last_discovery_attempt_at >= NOW() - INTERVAL '${sql.raw(String(NICHE_DISCOVERY_FAIL_WINDOW_DAYS))} days'
+      )
+  `);
+  const candidates = (((candidatesQ as any).rows ?? []) as Array<{
+    id: number; league: string; country: string | null;
+    has_betfair_coverage: boolean; discovery_fail_count: number;
+    last_discovery_attempt_at: string | null;
+  }>);
+
+  const newlyCovered: string[] = [];
+  const failedAgain: string[] = [];
+  let skippedNegativeCache = 0;
+
+  for (const cand of candidates) {
+    // Pick a single fixture for this league — cheapest catalogue call.
+    const fxQ = await db.execute(sql`
+      SELECT m.betfair_event_id
+      FROM matches m
+      WHERE LOWER(REPLACE(m.league, '-', ' ')) = LOWER(REPLACE(${cand.league}, '-', ' '))
+        AND m.status = 'scheduled'
+        AND m.kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '7 days'
+        AND m.betfair_event_id IS NOT NULL
+        AND m.betfair_event_id ~ '^[0-9]+$'
+      ORDER BY m.kickoff_time ASC
+      LIMIT 1
+    `);
+    const fxRow = ((fxQ as any).rows?.[0]) as { betfair_event_id: string } | undefined;
+    if (!fxRow?.betfair_event_id) continue;
+
+    try {
+      const markets = await listMarketsByEventId(fxRow.betfair_event_id);
+      if (markets && markets.length > 0) {
+        // Coverage confirmed — flip boolean, reset fail count.
+        await db.execute(sql`
+          UPDATE competition_config
+             SET has_betfair_coverage     = TRUE,
+                 discovery_fail_count     = 0,
+                 last_discovery_attempt_at = NOW()
+           WHERE id = ${cand.id}
+        `);
+        newlyCovered.push(cand.league);
+        logger.info({ league: cand.league, markets: markets.length }, "Niche-league discovery: Betfair coverage confirmed");
+      } else {
+        // No markets — increment fail count + timestamp.
+        await db.execute(sql`
+          UPDATE competition_config
+             SET discovery_fail_count      = discovery_fail_count + 1,
+                 last_discovery_attempt_at = NOW()
+           WHERE id = ${cand.id}
+        `);
+        failedAgain.push(cand.league);
+      }
+    } catch (err) {
+      // Network / API error — count as fail but log distinctly.
+      logger.warn({ err, league: cand.league }, "Niche-league discovery: catalogue call failed");
+      await db.execute(sql`
+        UPDATE competition_config
+           SET discovery_fail_count      = discovery_fail_count + 1,
+               last_discovery_attempt_at = NOW()
+         WHERE id = ${cand.id}
+      `);
+      failedAgain.push(cand.league);
+    }
+  }
+
+  // Count how many candidates were skipped by negative cache by querying
+  // the leagues we excluded above.
+  const skippedQ = await db.execute(sql`
+    SELECT COUNT(*)::int AS skipped
+    FROM competition_config cc
+    INNER JOIN (
+      SELECT DISTINCT league, country FROM matches
+      WHERE status = 'scheduled' AND kickoff_time BETWEEN NOW() AND NOW() + INTERVAL '7 days'
+    ) u ON LOWER(REPLACE(cc.name, '-', ' ')) = LOWER(REPLACE(u.league, '-', ' '))
+    WHERE cc.has_betfair_coverage = FALSE
+      AND cc.discovery_fail_count >= ${NICHE_DISCOVERY_FAIL_THRESHOLD}
+      AND cc.last_discovery_attempt_at IS NOT NULL
+      AND cc.last_discovery_attempt_at >= NOW() - INTERVAL '${sql.raw(String(NICHE_DISCOVERY_FAIL_WINDOW_DAYS))} days'
+  `);
+  skippedNegativeCache = (((skippedQ as any).rows?.[0]) as { skipped: number } | undefined)?.skipped ?? 0;
+
+  const result: NicheDiscoveryResult = {
+    leagues_evaluated: candidates.length,
+    leagues_skipped_negative_cache: skippedNegativeCache,
+    newly_covered: newlyCovered,
+    failed_again: failedAgain,
+    duration_ms: Date.now() - startedAt,
+  };
+  logger.info(result, "Niche-league Betfair discovery complete");
+  return result;
+}

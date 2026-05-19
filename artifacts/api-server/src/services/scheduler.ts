@@ -4734,6 +4734,27 @@ export function startScheduler(): void {
   }, { timezone: "UTC" });
   logger.info("Betfair market discovery scheduler active — daily 03:50 UTC");
 
+  // Bundle F2.B.I (2026-05-19): niche-league Betfair-coverage discovery.
+  // Every 6h, picks leagues with upcoming fixtures that haven't yet had
+  // has_betfair_coverage = TRUE flipped (skipping those in the
+  // negative-cache window per the asymmetric rule). Cheap — 1 catalogue
+  // call per uncovered league. Unblocks niche-league emission once
+  // coverage is confirmed.
+  cron.schedule("0 */6 * * *", () => {
+    void (async () => {
+      try {
+        const { runNicheLeagueDiscovery } = await import("./betfairMarketDiscovery");
+        const r = await runNicheLeagueDiscovery();
+        if (r.leagues_evaluated > 0 || r.newly_covered.length > 0) {
+          logger.info(r, "Niche-league Betfair discovery evaluated");
+        }
+      } catch (err) {
+        logger.error({ err }, "Niche-league Betfair discovery failed");
+      }
+    })();
+  }, { timezone: "UTC" });
+  logger.info("Niche-league Betfair discovery active — every 6h UTC");
+
   // Y3 (2026-05-07): weekly autonomous WC participant coverage audit —
   // Sunday 05:30 UTC. Identifies countries playing in WC qualifying
   // fixtures that lack a Tier 1 active club league + auto-promotes a

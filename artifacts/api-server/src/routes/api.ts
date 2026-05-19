@@ -6288,6 +6288,56 @@ router.post("/admin/fit-half-fractions", async (_req, res) => {
   }
 });
 
+// Bundle F2.B.I (2026-05-19): trigger niche-league Betfair discovery on
+// demand. Same code path as the 6h cron — useful after adding a new
+// league or to verify the negative-cache behavior without waiting.
+router.post("/admin/run-niche-league-discovery", async (_req, res) => {
+  try {
+    const { runNicheLeagueDiscovery } = await import("../services/betfairMarketDiscovery");
+    const result = await runNicheLeagueDiscovery();
+    res.json({ ok: true, result });
+  } catch (err) {
+    logger.error({ err }, "Niche-league discovery failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Bundle F2.B.K (2026-05-19): cross-market predictor consistency diagnostic.
+// Returns rows from v_predictor_consistency where MO and EH(0) disagree
+// by more than the threshold (default 2pp). Per-bet veto with hysteresis
+// is a follow-up; v1 ships the read-only diagnostic so operator can
+// monitor disagreement patterns before adding it to the placement gate.
+router.get("/admin/predictor-consistency", async (req, res) => {
+  try {
+    const threshold = req.query.threshold_pp != null
+      ? Number(req.query.threshold_pp)
+      : 2.0;
+    const rows = await db.execute(sql`
+      SELECT match_id,
+             ROUND(mo_home::numeric, 4) AS mo_home,
+             ROUND(mo_draw::numeric, 4) AS mo_draw,
+             ROUND(mo_away::numeric, 4) AS mo_away,
+             ROUND(eh_home::numeric, 4) AS eh_home,
+             ROUND(eh_draw::numeric, 4) AS eh_draw,
+             ROUND(eh_away::numeric, 4) AS eh_away,
+             ROUND(disagreement_home_pp::numeric, 3) AS d_home_pp,
+             ROUND(disagreement_draw_pp::numeric, 3) AS d_draw_pp,
+             ROUND(disagreement_away_pp::numeric, 3) AS d_away_pp,
+             latest_mo_at
+      FROM v_predictor_consistency
+      WHERE disagreement_home_pp > ${threshold}
+         OR disagreement_draw_pp > ${threshold}
+         OR disagreement_away_pp > ${threshold}
+      ORDER BY GREATEST(disagreement_home_pp, disagreement_draw_pp, disagreement_away_pp) DESC
+      LIMIT 50
+    `);
+    res.json({ ok: true, threshold_pp: threshold, rows: ((rows as any).rows ?? []) });
+  } catch (err) {
+    logger.error({ err }, "Predictor consistency query failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // 2026-05-11: manual trigger for the drawdown-targeted Kelly Monte-Carlo
 // (Task 17). Same code path as the daily 03:15 UTC cron, just run on
 // demand. Use after changing `drawdown_target_p1_pct` so the lookup

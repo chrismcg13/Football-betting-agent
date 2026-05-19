@@ -55,6 +55,15 @@ export const competitionConfigTable = pgTable("competition_config", {
   // for insider-info adjustment or back to 'proportional' for the legacy
   // baseline. See services/devig.ts for the implementations.
   devigMethod: text("devig_method").notNull().default("power"),
+  // Bundle F2.B.I (2026-05-19): niche-league Betfair-coverage tracking.
+  // Set TRUE the first time betfairMarketDiscovery observes ANY market
+  // for one of the league's fixtures. Once true, stays true (Betfair
+  // coverage is sticky per league). Negative-cache uses
+  // discovery_fail_count + last_discovery_attempt_at to demote
+  // never-covered leagues to monthly polling after 3 misses in 30d.
+  hasBetfairCoverage: boolean("has_betfair_coverage").notNull().default(false),
+  discoveryFailCount: integer("discovery_fail_count").notNull().default(0),
+  lastDiscoveryAttemptAt: timestamp("last_discovery_attempt_at", { withTimezone: true }),
 });
 
 export const insertCompetitionConfigSchema = createInsertSchema(competitionConfigTable).omit({
